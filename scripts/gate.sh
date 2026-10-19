@@ -28,20 +28,28 @@ echo "== cancho test"
 $C test || fail=1
 
 echo "== conformance (file layer)"
-# The program needs the library without src/main.cho (a program has one main).
+# Each program needs the library without src/main.cho (a program has one main)
+# and the shared helpers in tests/conformance/support.cho. They are built and
+# run against a scratch directory made here and removed on exit.
 libs=$(ls src/*.cho | grep -v '/main\.cho$')
-$C check tests/conformance/journal_files.cho $libs --std || fail=1
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/forge-conformance.XXXXXX") || exit 1
 trap 'rm -rf "$scratch"' EXIT
-if $C build tests/conformance/journal_files.cho $libs --std -o "$scratch/journal_files"; then
-  "$scratch/journal_files" "$scratch" > "$scratch/out.txt" || fail=1
-  cat "$scratch/out.txt"
-  grep -c '^ok ' "$scratch/out.txt" | sed 's/^/conformance cases held: /'
-  if grep -q '^FAIL ' "$scratch/out.txt"; then fail=1; fi
-else
-  echo "conformance: did not build"
-  fail=1
-fi
+held=0
+for prog in journal_files snapshot_files; do
+  echo "-- $prog"
+  $C check tests/conformance/$prog.cho tests/conformance/support.cho $libs --std || fail=1
+  mkdir "$scratch/$prog" || exit 1
+  if $C build tests/conformance/$prog.cho tests/conformance/support.cho $libs --std -o "$scratch/$prog.bin"; then
+    "$scratch/$prog.bin" "$scratch/$prog" > "$scratch/$prog.out" || fail=1
+    cat "$scratch/$prog.out"
+    held=$((held + $(grep -c '^ok ' "$scratch/$prog.out")))
+    if grep -q '^FAIL ' "$scratch/$prog.out"; then fail=1; fi
+  else
+    echo "conformance: $prog did not build"
+    fail=1
+  fi
+done
+echo "conformance cases held: $held"
 
 echo "== file budget (2000 lines)"
 for f in $(find src tests spike -name '*.cho'); do

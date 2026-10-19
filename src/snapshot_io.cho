@@ -1,0 +1,152 @@
+edition 9;
+module forge.snapshot_io;
+
+import std.buffer;
+import std.bytes;
+import std.map;
+import forge.journal;
+import forge.journal_io;
+import forge.snapshot;
+import forge.task;
+
+// The snapshot's file layer (docs/architecture.md, section 4.4). A snapshot
+// is replaced atomically and never edited in place; the protocol is the one
+// spike S5 measured:
+//
+//   1. open `snapshot.json.tmp` for writing (create or truncate)   open_tmp
+//   2. one write of the whole snapshot                             journal_io.write_all
+//   3. sync that file                                              journal_io.sync_file
+//   4. rename tmp over `snapshot.json`                             publish
+//   5. sync the directory                                          journal_io.sync_parent
+//
+// A crash before step 4 leaves `snapshot.json` exactly as it was (absent, or
+// the previous snapshot) and a `.tmp` file nobody reads; step 1 of the next
+// attempt truncates it. A crash after 4 and before 5 leaves the new snapshot
+// or the old one, never a mixture (the rename is atomic within a filesystem),
+// and the directory entry becomes durable at 5. `save` is these steps in this
+// order and nothing else; tests/conformance/crash_points.cho runs the same
+// steps one at a time and kills the process between them.
+//
+// Reading is `journal_io.read_all` (a missing file is empty, which
+// `snapshot.recover_with` takes as "no snapshot"). The capability is
+// `Fs("")` for the reason journal_io.cho gives (gap G9, cancho #534); both
+// paths are checked here first (`path_ok`), so the capability's trap on `..`
+// is never reached.
+
+// Step 1: open the temporary file, creating or truncating it. A path that is
+// not ok is `Failed(-2)`.
+pub fn open_tmp[&f, &p](fs: &f Fs(""), tmp: &p [byte]) -> [fs_write("")] Opened {
+    if journal_io.path_ok(tmp) == false {
+        return Opened::Failed(0 - 2);
+    }
+    return open_write(fs, tmp);
+}
+
+// Step 4: replace `final_path` with `tmp`. 0, an errno, or -2 for a path that
+// is not ok (neither path is handed to the capability then).
+pub fn publish[&f, &a, &b](fs: &f Fs(""), tmp: &a [byte], final_path: &b [byte]) -> [fs_write("")] int {
+    if journal_io.path_ok(tmp) == false || journal_io.path_ok(final_path) == false {
+        return 0 - 2;
+    }
+    match fs_rename(fs, tmp, final_path) {
+        Done::Ok(n) => {
+            return 0;
+        }
+        Done::Failed(e) => {
+            return e;
+        }
+    }
+}
+
+// All five steps. Both paths are checked first (-2) so that a bad final path
+// does not leave a temporary file behind. 0, or the first non-zero answer of a
+// step, and then the later steps are not run. An empty snapshot (what `snapshot.encode` answers
+// to arguments that describe no prefix) is refused with -3 and nothing is
+// opened: Forge never replaces a snapshot with nothing.
+pub fn save[&f, &a, &b, &s](fs: &f Fs(""), tmp: &a [byte], final_path: &b [byte], snap: &s [byte]) -> [fs_read(""), fs_write(""), file_write] int {
+    if journal_io.path_ok(tmp) == false || journal_io.path_ok(final_path) == false {
+        return 0 - 2;
+    }
+    if len(snap) == 0 {
+        return 0 - 3;
+    }
+    var status = 0;
+    match open_tmp(fs, tmp) {
+        Opened::Failed(e) => {
+            status = e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                status = journal_io.write_all(x, snap);
+                if status == 0 {
+                    status = journal_io.sync_file(x);
+                }
+            }
+            file_close(file);
+        }
+    }
+    if status == 0 {
+        status = publish(fs, tmp, final_path);
+    }
+    if status == 0 {
+        status = journal_io.sync_parent(fs, final_path);
+    }
+    return status;
+}
+
+// Start-up with a snapshot: read the journal and the snapshot, cut a torn
+// tail exactly as `journal_io.recover` does (only when nothing is wrong),
+// and recover the projection through the snapshot when it checks out.
+//
+// The journal file is what decides. A snapshot that cannot be read as a
+// file (any errno but "not found") is `Recovered.errno` and nothing else is
+// done; one that is invalid or disagrees is refused with its rule in the
+// `Outcome`, left on disk untouched for the operator, and the projection is a
+// full replay. The torn-tail cut is done by the journal layer's own planner
+// on the report, so a snapshot cannot change what is cut.
+pub fn recover[&h, &f, &j, &s](heap: &!h Heap, fs: &f Fs(""), journal_path: &j [byte], snapshot_path: &s [byte], strict: bool) -> [heap, fs_read(""), fs_write(""), file_read, file_write] (map.Map[int], journal.Report, journal_io.Recovered, snapshot.Outcome) {
+    let none = snapshot.Outcome { used: false, rule: 0, last_seq: 0 };
+    if journal_io.path_ok(journal_path) == false || journal_io.path_ok(snapshot_path) == false {
+        let (table, report) = journal.replay(heap, "");
+        return (table, journal.Report { records: 0, valid_bytes: 0, total_bytes: 0, torn_bytes: 0, tasks: 0, rule: task.rule_code(task.Rule::PathInvalid), line: 0 }, journal_io.Recovered { errno: 0, cut: 0 }, none);
+    }
+    let (data, errno) = journal_io.read_all(heap, fs, journal_path);
+    if errno != 0 {
+        buffer.drop(heap, data);
+        let (table, report) = journal.replay(heap, "");
+        return (table, report, journal_io.Recovered { errno: errno, cut: 0 }, none);
+    }
+    let (snap, snap_errno) = journal_io.read_all(heap, fs, snapshot_path);
+    if snap_errno != 0 {
+        buffer.drop(heap, data);
+        buffer.drop(heap, snap);
+        let (table, report) = journal.replay(heap, "");
+        return (table, report, journal_io.Recovered { errno: snap_errno, cut: 0 }, none);
+    }
+    let (empty_table, empty_report) = journal.replay(heap, "");
+    var table = empty_table;
+    var report = empty_report;
+    var outcome = none;
+    var cut = 0;
+    var failure = 0;
+    borrow data as &db in {
+        borrow snap as &sb in {
+            map.drop(heap, table);
+            let (t, r, o) = snapshot.recover_with(heap, buffer.bytes(sb), buffer.bytes(db), strict);
+            table = t;
+            report = r;
+            outcome = o;
+        }
+        let to = journal.recovery_cut(report);
+        if to >= 0 {
+            failure = journal_io.cut_torn_tail(fs, journal_path, to);
+            if failure == 0 {
+                cut = report.total_bytes - to;
+            }
+        }
+    }
+    buffer.drop(heap, data);
+    buffer.drop(heap, snap);
+    return (table, report, journal_io.Recovered { errno: failure, cut: cut }, outcome);
+}

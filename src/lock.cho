@@ -1,0 +1,75 @@
+edition 9;
+module forge.lock;
+
+import forge.journal_io;
+import forge.task;
+
+// The single-writer lock (docs/architecture.md, section 4.2 step 6): one
+// Forge writes a workspace at a time. The lock is `flock(LOCK_EX|LOCK_NB)`
+// on a file of its own, held on an open file for the life of the process
+// (spike S5 measured it; docs/file-writes.md section 7).
+//
+// Why flock and not the existence of a lock file: it is released by the
+// kernel when the process ends, however it ends. A killed Forge leaves no
+// stale lock and no human to remove it; tests/conformance/crash_points.cho
+// kills the holder at 25 points and takes the lock again each time.
+//
+// A second holder is refused with `workspace-locked` and nothing is changed.
+// The file is separate from the journal so that reading or recovering the
+// journal never touches the lock. The lock file is created if missing and is
+// otherwise never written.
+
+pub enum Lock {
+    // The lock is held for as long as this handle is open. Give it back with
+    // `let_go` at a clean exit; a crash needs nothing.
+    Held(File),
+    // A rule code (task.rule_code): `workspace-locked` when another writer
+    // holds it, `path-invalid` for a path the capability must not see.
+    Refused(int),
+    // The file could not be opened or locked for another reason: an errno.
+    Failed(int),
+}
+
+// EWOULDBLOCK: 11 on Linux, 35 on macOS (docs/file-writes.md section 10.1).
+fn would_block(errno: int) -> [] bool {
+    return errno == 11 || errno == 35;
+}
+
+pub fn acquire[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_write(""), file_write] Lock {
+    if journal_io.path_ok(path) == false {
+        return Lock::Refused(task.rule_code(task.Rule::PathInvalid));
+    }
+    match open_append(fs, path) {
+        Opened::Failed(e) => {
+            return Lock::Failed(e);
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var errno = 0;
+            borrow mut file as &!x in {
+                match file_lock(x) {
+                    Done::Ok(n) => {
+                        errno = 0;
+                    }
+                    Done::Failed(e) => {
+                        errno = e;
+                    }
+                }
+            }
+            if errno == 0 {
+                return Lock::Held(file);
+            }
+            file_close(file);
+            if would_block(errno) {
+                return Lock::Refused(task.rule_code(task.Rule::WorkspaceLocked));
+            }
+            return Lock::Failed(errno);
+        }
+    }
+}
+
+// Let go of the lock at a clean exit.
+pub fn let_go(file: File) -> [] int {
+    file_close(file);
+    return 0;
+}

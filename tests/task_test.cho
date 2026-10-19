@@ -193,6 +193,10 @@ fn test_rule_names_are_the_documented_ones() -> [] int {
     test.assert(bytes.equal(task.rule_code_name(7), "event-unknown"));
     test.assert(bytes.equal(task.rule_code_name(8), "journal-corrupt"));
     test.assert(bytes.equal(task.rule_code_name(9), "path-invalid"));
+    test.assert(bytes.equal(task.rule_code_name(10), "snapshot-invalid"));
+    test.assert(bytes.equal(task.rule_code_name(11), "snapshot-mismatch"));
+    test.assert(bytes.equal(task.rule_code_name(12), "workspace-locked"));
+    test.assert(bytes.equal(task.rule_code_name(13), "none"));
     test.assert(bytes.equal(task.rule_code_name(0), "none"));
     return 0;
 }

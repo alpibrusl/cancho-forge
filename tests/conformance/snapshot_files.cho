@@ -1,0 +1,517 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.map;
+import forge.journal;
+import forge.journal_io;
+import forge.lock;
+import forge.snapshot;
+import forge.snapshot_io;
+import forge.support;
+import forge.task;
+
+// Conformance for the snapshot and lock file layers, against real files in a
+// scratch directory the gate makes and removes (like journal_files.cho). Prints
+// "ok   <case>" or "FAIL <case>" and exits 0 only if every case held. Usage:
+// snapshot_files <existing dir>.
+//
+// Not here: a process killed between the steps. That is
+// tests/conformance/crash_points.cho, which runs these same steps in a child
+// and kills it at each one.
+
+// Submit one move at `seq`, append what it produced durably. The table is
+// returned; `rc` is not needed here (every move below is legal).
+fn step[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], table: map.Map[int], seq: int, id: &i [byte], target: task.State, actor: task.Actor, observed: bool) -> [heap, fs_read(""), fs_write(""), file_write] map.Map[int] {
+    let (next, record, rule) = journal.submit(heap, table, seq, id, target, actor, observed);
+    borrow record as &rb in {
+        journal_io.append(fs, path, buffer.bytes(rb), seq == 1);
+    }
+    buffer.drop(heap, record);
+    return next;
+}
+
+// Eight records over tasks a and b: a reaches verification, b is cancelled.
+fn write_eight[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_write] int {
+    var t = map.empty(heap, 16, 0, 0);
+    t = step(heap, fs, path, t, 1, "a", task.State::Proposed, task.Actor::Human, false);
+    t = step(heap, fs, path, t, 2, "b", task.State::Proposed, task.Actor::Human, false);
+    t = step(heap, fs, path, t, 3, "a", task.State::Approved, task.Actor::Human, false);
+    t = step(heap, fs, path, t, 4, "a", task.State::Ready, task.Actor::Forge, false);
+    t = step(heap, fs, path, t, 5, "b", task.State::Cancelled, task.Actor::Human, false);
+    t = step(heap, fs, path, t, 6, "a", task.State::Running, task.Actor::Forge, false);
+    t = step(heap, fs, path, t, 7, "a", task.State::Verification, task.Actor::Forge, false);
+    t = step(heap, fs, path, t, 8, "a", task.State::Accepted, task.Actor::Forge, true);
+    map.drop(heap, t);
+    return 0;
+}
+
+// The first `n` whole lines of `data`.
+fn first_lines[&h, &d](heap: &!h Heap, data: &d [byte], n: int) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    var seen = 0;
+    var k = 0;
+    while k < len(data) && seen < n {
+        out = buffer.push(heap, out, data[k]);
+        if int_of(data[k]) == 10 {
+            seen = seen + 1;
+        }
+        k = k + 1;
+    }
+    return out;
+}
+
+// Write a snapshot of the first `n` records of the journal at `jpath`, with
+// `save`, to `spath` (tmp is `tpath`). Answers save's code.
+fn snapshot_of[&h, &f, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), jpath: &j [byte], tpath: &t [byte], spath: &s [byte], n: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write] int {
+    let (data, errno) = support.contents_of(heap, fs, jpath);
+    var rc = 0 - 100;
+    borrow data as &db in {
+        let prefix = first_lines(heap, buffer.bytes(db), n);
+        borrow prefix as &pb in {
+            let (table, report) = journal.replay(heap, buffer.bytes(pb));
+            borrow table as &tb in {
+                let snap = snapshot.encode(heap, tb, report.records, report.valid_bytes, buffer.bytes(db));
+                borrow snap as &sb in {
+                    rc = snapshot_io.save(fs, tpath, spath, buffer.bytes(sb));
+                }
+                buffer.drop(heap, snap);
+            }
+            map.drop(heap, table);
+        }
+        buffer.drop(heap, prefix);
+    }
+    buffer.drop(heap, data);
+    return rc;
+}
+
+// What `snapshot_io.recover` answered, flattened.
+struct Got {
+    rule: int,
+    records: int,
+    cut: int,
+    errno: int,
+    used: bool,
+    snap_rule: int,
+    last_seq: int,
+    a: int,
+    b: int,
+}
+
+fn got[&h, &f, &j, &s](heap: &!h Heap, fs: &f Fs(""), jpath: &j [byte], spath: &s [byte], strict: bool) -> [heap, fs_read(""), fs_write(""), file_read, file_write] Got {
+    let (table, report, done, outcome) = snapshot_io.recover(heap, fs, jpath, spath, strict);
+    var a = 0;
+    var b = 0;
+    borrow table as &tb in {
+        a = journal.state_of(tb, "a");
+        b = journal.state_of(tb, "b");
+    }
+    map.drop(heap, table);
+    return Got { rule: report.rule, records: report.records, cut: done.cut, errno: done.errno, used: outcome.used, snap_rule: outcome.rule, last_seq: outcome.last_seq, a: a, b: b };
+}
+
+fn named(rule: int, name: &static [byte]) -> [] bool {
+    return bytes.equal(task.rule_code_name(rule), name);
+}
+
+// ---- cases -----------------------------------------------------------------
+
+fn case_steps[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var failed = 0;
+    let steps = support.under(heap, dir, "steps.jsonl");
+    let whole = support.under(heap, dir, "whole.jsonl");
+    borrow steps as &stb in {
+        borrow whole as &whb in {
+            let rec = "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"task\":\"a\",\"actor\":\"human\"}\n";
+            var rc = 0;
+            match journal_io.open_appender(fs, buffer.bytes(stb)) {
+                Opened::Failed(e) => {
+                    rc = e;
+                }
+                Opened::Ok(opened) => {
+                    var file = opened;
+                    borrow mut file as &!x in {
+                        rc = journal_io.write_all(x, rec);
+                        if rc == 0 {
+                            rc = journal_io.sync_file(x);
+                        }
+                    }
+                    file_close(file);
+                }
+            }
+            if rc == 0 {
+                rc = journal_io.sync_parent(fs, buffer.bytes(stb));
+            }
+            let rc2 = journal_io.append(fs, buffer.bytes(whb), rec, true);
+            let (x1, e1) = support.contents_of(heap, fs, buffer.bytes(stb));
+            borrow x1 as &x1b in {
+                failed = failed + support.verdict(io, rc == 0 && rc2 == 0 && support.unchanged(heap, fs, buffer.bytes(whb), buffer.bytes(x1b)) && support.size_of(heap, fs, buffer.bytes(whb)) == len(rec), "steps: open, write, sync, sync-dir give the file append gives");
+            }
+            buffer.drop(heap, x1);
+        }
+    }
+    buffer.drop(heap, steps);
+    buffer.drop(heap, whole);
+    var refused = false;
+    match journal_io.open_appender(fs, "/a/../b") {
+        Opened::Failed(e) => {
+            refused = e == 0 - 2;
+        }
+        Opened::Ok(opened) => {
+            file_close(opened);
+        }
+    }
+    failed = failed + support.verdict(io, refused, "steps: open_appender refuses a .. path (-2) before the capability");
+    failed = failed + support.verdict(io, journal_io.sync_parent(fs, "/a/../b") == 0 - 2 && journal_io.cut_torn_tail(fs, "/a/../b", 0) == 0 - 2, "steps: sync_parent and cut_torn_tail refuse a .. path (-2)");
+    return failed;
+}
+
+fn case_save_and_recover[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var failed = 0;
+    let j = support.under(heap, dir, "save.jsonl");
+    let s = support.under(heap, dir, "save.snap");
+    let t = support.under(heap, dir, "save.snap.tmp");
+    let none = support.under(heap, dir, "save.nosnap");
+    borrow j as &jb in {
+        borrow s as &sb in {
+            borrow t as &tb in {
+                borrow none as &nb in {
+                    let jp = buffer.bytes(jb);
+                    let sp = buffer.bytes(sb);
+                    let tp = buffer.bytes(tb);
+                    failed = failed + support.verdict(io, write_eight(heap, fs, jp) == 0, "save: eight records written");
+                    let full = got(heap, fs, jp, buffer.bytes(nb), true);
+                    failed = failed + support.verdict(io, full.rule == 0 && full.records == 8 && full.used == false && full.snap_rule == 0 && full.a == 7 && full.b == 9, "recover: no snapshot file is a full replay and not a refusal");
+                    failed = failed + support.verdict(io, support.exists(fs, sp) == false, "save: no snapshot yet");
+                    failed = failed + support.verdict(io, snapshot_of(heap, fs, jp, tp, sp, 5) == 0, "save: a snapshot at record 5 is written");
+                    failed = failed + support.verdict(io, support.exists(fs, sp) && support.exists(fs, tp) == false, "save: snapshot.json exists and the temporary file is gone (renamed)");
+                    let (first, e1) = support.contents_of(heap, fs, sp);
+                    var first_len = 0;
+                    borrow first as &fb in {
+                        first_len = buffer.size(fb);
+                    }
+                    let lax = got(heap, fs, jp, sp, false);
+                    let strict = got(heap, fs, jp, sp, true);
+                    failed = failed + support.verdict(io, lax.used && lax.last_seq == 5 && lax.snap_rule == 0 && lax.records == 8 && lax.a == full.a && lax.b == full.b && lax.rule == 0, "recover: the snapshot at 5 plus the tail equals the full replay");
+                    failed = failed + support.verdict(io, strict.used && strict.last_seq == 5 && strict.records == 8 && strict.a == full.a && strict.b == full.b, "recover: and strict mode agrees");
+                    // replace it: a snapshot at 8
+                    failed = failed + support.verdict(io, snapshot_of(heap, fs, jp, tp, sp, 8) == 0, "save: a second snapshot (at 8) replaces the first");
+                    var changed = false;
+                    borrow first as &fb2 in {
+                        changed = support.unchanged(heap, fs, sp, buffer.bytes(fb2)) == false;
+                    }
+                    let again = got(heap, fs, jp, sp, true);
+                    failed = failed + support.verdict(io, changed && support.exists(fs, tp) == false && again.used && again.last_seq == 8 && again.a == 7 && again.b == 9, "save: the old snapshot is gone, the new one is used, no .tmp left");
+                    buffer.drop(heap, first);
+                    // saving nothing is refused, nothing is opened
+                    failed = failed + support.verdict(io, snapshot_io.save(fs, tp, sp, "") == 0 - 3 && support.exists(fs, tp) == false, "save: an empty snapshot is refused (-3) and the old one stays");
+                    failed = failed + support.verdict(io, snapshot_io.save(fs, "/a/../x", sp, "x") == 0 - 2 && snapshot_io.save(fs, tp, "/a/../x", "x") == 0 - 2 && support.exists(fs, tp) == false, "save: a .. path on either side is refused (-2) before anything is opened");
+                    let r = got(heap, fs, jp, sp, true);
+                    failed = failed + support.verdict(io, r.used && r.last_seq == 8, "save: and the snapshot is as it was");
+                }
+            }
+        }
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, s);
+    buffer.drop(heap, t);
+    buffer.drop(heap, none);
+    return failed;
+}
+
+fn case_leftover_tmp[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var failed = 0;
+    let j = support.under(heap, dir, "tmp.jsonl");
+    let s = support.under(heap, dir, "tmp.snap");
+    let t = support.under(heap, dir, "tmp.snap.tmp");
+    borrow j as &jb in {
+        borrow s as &sb in {
+            borrow t as &tb in {
+                let jp = buffer.bytes(jb);
+                let sp = buffer.bytes(sb);
+                let tp = buffer.bytes(tb);
+                write_eight(heap, fs, jp);
+                // a crash before the rename leaves a half-written .tmp
+                match snapshot_io.open_tmp(fs, tp) {
+                    Opened::Failed(e) => {
+                        failed = failed + support.verdict(io, false, "tmp: could not create the leftover");
+                    }
+                    Opened::Ok(opened) => {
+                        var file = opened;
+                        borrow mut file as &!x in {
+                            journal_io.write_all(x, "{\"v\":1,\"last_seq\":4,\"journal_by");
+                        }
+                        file_close(file);
+                    }
+                }
+                let o = got(heap, fs, jp, sp, true);
+                failed = failed + support.verdict(io, o.used == false && o.snap_rule == 0 && o.rule == 0 && o.records == 8 && support.exists(fs, tp), "tmp: a leftover .tmp is never read and not removed by recovery");
+                failed = failed + support.verdict(io, snapshot_of(heap, fs, jp, tp, sp, 6) == 0 && support.exists(fs, tp) == false, "tmp: the next save truncates the leftover and renames it away");
+                let o2 = got(heap, fs, jp, sp, true);
+                failed = failed + support.verdict(io, o2.used && o2.last_seq == 6 && o2.a == 7, "tmp: and the snapshot it wrote is the one used");
+            }
+        }
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, s);
+    buffer.drop(heap, t);
+    return failed;
+}
+
+fn case_refused_snapshots[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var failed = 0;
+    let j = support.under(heap, dir, "ref.jsonl");
+    let s = support.under(heap, dir, "ref.snap");
+    let t = support.under(heap, dir, "ref.snap.tmp");
+    let short = support.under(heap, dir, "ref-short.jsonl");
+    borrow j as &jb in {
+        borrow s as &sb in {
+            borrow t as &tb in {
+                borrow short as &shb in {
+                    let jp = buffer.bytes(jb);
+                    let sp = buffer.bytes(sb);
+                    let tp = buffer.bytes(tb);
+                    write_eight(heap, fs, jp);
+                    snapshot_of(heap, fs, jp, tp, sp, 5);
+                    let (good, e0) = support.contents_of(heap, fs, sp);
+                    let (jdata, e1) = support.contents_of(heap, fs, jp);
+
+                    // 1. a torn snapshot file: the line cut in half
+                    borrow good as &gb in {
+                        let text = buffer.bytes(gb);
+                        support.put_file(fs, sp, text[0..len(text) / 2]);
+                        let (torn, e2) = support.contents_of(heap, fs, sp);
+                        let o = got(heap, fs, jp, sp, false);
+                        failed = failed + support.verdict(io, o.used == false && named(o.snap_rule, "snapshot-invalid") && o.rule == 0 && o.records == 8 && o.a == 7 && o.b == 9, "refused: a half snapshot is snapshot-invalid; the table is a full replay");
+                        borrow torn as &trb in {
+                            failed = failed + support.verdict(io, support.unchanged(heap, fs, sp, buffer.bytes(trb)), "refused: the snapshot file is left untouched for the operator");
+                        }
+                        buffer.drop(heap, torn);
+                        borrow jdata as &jdb in {
+                            failed = failed + support.verdict(io, support.unchanged(heap, fs, jp, buffer.bytes(jdb)), "refused: the journal is untouched");
+                            // 2. the right snapshot, against a journal cut back to 3 records
+                            support.put_file(fs, sp, text);
+                            let cut = first_lines(heap, buffer.bytes(jdb), 3);
+                            borrow cut as &cb in {
+                                support.put_file(fs, buffer.bytes(shb), buffer.bytes(cb));
+                                let m = got(heap, fs, buffer.bytes(shb), sp, true);
+                                failed = failed + support.verdict(io, m.used == false && named(m.snap_rule, "snapshot-mismatch") && m.rule == 0 && m.records == 3, "refused: a snapshot beyond the journal is snapshot-mismatch; the journal's 3 records are used");
+                                failed = failed + support.verdict(io, support.unchanged(heap, fs, sp, text) && support.unchanged(heap, fs, buffer.bytes(shb), buffer.bytes(cb)), "refused: neither file is touched");
+                            }
+                            buffer.drop(heap, cut);
+                        }
+                        // 3. garbage in the snapshot file
+                        support.put_file(fs, sp, "this is not a snapshot\n");
+                        let g = got(heap, fs, jp, sp, false);
+                        failed = failed + support.verdict(io, g.used == false && named(g.snap_rule, "snapshot-invalid") && g.records == 8, "refused: garbage is snapshot-invalid");
+                        // 4. an empty snapshot file is an absent one, not a refusal
+                        support.put_file(fs, sp, "");
+                        let z = got(heap, fs, jp, sp, true);
+                        failed = failed + support.verdict(io, z.used == false && z.snap_rule == 0 && z.records == 8, "refused: an empty snapshot file is taken as none");
+                    }
+                    buffer.drop(heap, good);
+                    buffer.drop(heap, jdata);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, s);
+    buffer.drop(heap, t);
+    buffer.drop(heap, short);
+    return failed;
+}
+
+fn case_torn_tail_with_a_snapshot[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var failed = 0;
+    let j = support.under(heap, dir, "tt.jsonl");
+    let s = support.under(heap, dir, "tt.snap");
+    let t = support.under(heap, dir, "tt.snap.tmp");
+    borrow j as &jb in {
+        borrow s as &sb in {
+            borrow t as &tb in {
+                let jp = buffer.bytes(jb);
+                let sp = buffer.bytes(sb);
+                let tp = buffer.bytes(tb);
+                write_eight(heap, fs, jp);
+                snapshot_of(heap, fs, jp, tp, sp, 5);
+                let whole = support.size_of(heap, fs, jp);
+                let tail = "{\"v\":1,\"seq\":9,\"kind\":\"task.pro";
+                journal_io.append(fs, jp, tail, false);
+                let o = got(heap, fs, jp, sp, true);
+                failed = failed + support.verdict(io, o.used && o.last_seq == 5 && o.rule == 0 && o.records == 8 && o.cut == len(tail) && o.errno == 0, "torn + snapshot: the snapshot is used and the torn tail is cut");
+                failed = failed + support.verdict(io, support.size_of(heap, fs, jp) == whole, "torn + snapshot: the journal is back to its last whole record");
+                let o2 = got(heap, fs, jp, sp, true);
+                failed = failed + support.verdict(io, o2.used && o2.cut == 0 && o2.records == 8, "torn + snapshot: a second recovery changes nothing");
+                // garbage line AND torn tail: refused, nothing cut, even with a snapshot
+                journal_io.append(fs, jp, "garbage\n{\"v\":1,\"seq\":10,\"ki", false);
+                let (before, e) = support.contents_of(heap, fs, jp);
+                borrow before as &bb in {
+                    let c = got(heap, fs, jp, sp, true);
+                    failed = failed + support.verdict(io, named(c.rule, "journal-corrupt") && c.cut == 0 && c.errno == 0, "corrupt + snapshot: journal-corrupt is reported and nothing is cut");
+                    failed = failed + support.verdict(io, support.unchanged(heap, fs, jp, buffer.bytes(bb)), "corrupt + snapshot: the journal is byte-for-byte untouched");
+                }
+                buffer.drop(heap, before);
+            }
+        }
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, s);
+    buffer.drop(heap, t);
+    return failed;
+}
+
+fn case_paths[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var failed = 0;
+    let j = support.under(heap, dir, "paths.jsonl");
+    borrow j as &jb in {
+        let (table, report, done, outcome) = snapshot_io.recover(heap, fs, buffer.bytes(jb), "/a/../snap", true);
+        map.drop(heap, table);
+        failed = failed + support.verdict(io, named(report.rule, "path-invalid") && done.errno == 0 && outcome.used == false, "paths: recover with a .. snapshot path is path-invalid, not a trap");
+        let (t2, r2, d2, o2) = snapshot_io.recover(heap, fs, "rel/journal", buffer.bytes(jb), true);
+        map.drop(heap, t2);
+        failed = failed + support.verdict(io, named(r2.rule, "path-invalid"), "paths: recover with a relative journal path is path-invalid");
+    }
+    buffer.drop(heap, j);
+    var nodir = support.under(heap, dir, "no/such/dir/snap");
+    var nodir_tmp = support.under(heap, dir, "no/such/dir/snap.tmp");
+    borrow nodir as &nb in {
+        borrow nodir_tmp as &ntb in {
+            failed = failed + support.verdict(io, snapshot_io.save(fs, buffer.bytes(ntb), buffer.bytes(nb), "x\n") > 0, "paths: save into a missing directory is an errno");
+        }
+    }
+    buffer.drop(heap, nodir);
+    buffer.drop(heap, nodir_tmp);
+    return failed;
+}
+
+// A second acquire in the SAME process is a second open file description, so
+// flock refuses it exactly as it would a second process
+// (tests/conformance/crash_points.cho does it across processes, with a kill).
+fn case_lock[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_write(""), file_write, io_write] int {
+    var failed = 0;
+    let l = support.under(heap, dir, "lock");
+    borrow l as &lb in {
+        let lp = buffer.bytes(lb);
+        match lock.acquire(fs, lp) {
+            lock.Lock::Held(first) => {
+                failed = failed + support.verdict(io, true, "lock: the first writer holds the lock");
+                var second = 0 - 1;
+                match lock.acquire(fs, lp) {
+                    lock.Lock::Held(again) => {
+                        second = 0;
+                        lock.let_go(again);
+                    }
+                    lock.Lock::Refused(rule) => {
+                        if named(rule, "workspace-locked") {
+                            second = 1;
+                        }
+                    }
+                    lock.Lock::Failed(e) => {
+                        second = 0 - e;
+                    }
+                }
+                failed = failed + support.verdict(io, second == 1, "lock: a second writer is refused with workspace-locked");
+                lock.let_go(first);
+            }
+            lock.Lock::Refused(rule) => {
+                failed = failed + support.verdict(io, false, "lock: the first writer holds the lock");
+            }
+            lock.Lock::Failed(e) => {
+                failed = failed + support.verdict(io, false, "lock: the first writer holds the lock");
+            }
+        }
+        var after = 0 - 1;
+        match lock.acquire(fs, lp) {
+            lock.Lock::Held(again) => {
+                after = 1;
+                lock.let_go(again);
+            }
+            lock.Lock::Refused(rule) => {
+                after = 0;
+            }
+            lock.Lock::Failed(e) => {
+                after = 0 - e;
+            }
+        }
+        failed = failed + support.verdict(io, after == 1, "lock: after the holder lets go it can be taken again");
+    }
+    buffer.drop(heap, l);
+    var bad = 0;
+    match lock.acquire(fs, "/a/../lock") {
+        lock.Lock::Held(file) => {
+            lock.let_go(file);
+        }
+        lock.Lock::Refused(rule) => {
+            if named(rule, "path-invalid") {
+                bad = 1;
+            }
+        }
+        lock.Lock::Failed(e) => {
+            bad = 0 - e;
+        }
+    }
+    failed = failed + support.verdict(io, bad == 1, "lock: a .. path is path-invalid, not a trap");
+    var missing = support.under(heap, dir, "no/such/dir/lock");
+    var errno = 0;
+    borrow missing as &mb in {
+        match lock.acquire(fs, buffer.bytes(mb)) {
+            lock.Lock::Held(file) => {
+                lock.let_go(file);
+            }
+            lock.Lock::Refused(rule) => {
+                errno = 0 - 1;
+            }
+            lock.Lock::Failed(e) => {
+                errno = e;
+            }
+        }
+    }
+    buffer.drop(heap, missing);
+    failed = failed + support.verdict(io, errno == 2, "lock: a missing directory is Failed(ENOENT), not a refusal");
+    return failed;
+}
+
+fn run[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var failed = 0;
+    failed = failed + case_steps(heap, fs, io, dir);
+    failed = failed + case_save_and_recover(heap, fs, io, dir);
+    failed = failed + case_leftover_tmp(heap, fs, io, dir);
+    failed = failed + case_refused_snapshots(heap, fs, io, dir);
+    failed = failed + case_torn_tail_with_a_snapshot(heap, fs, io, dir);
+    failed = failed + case_paths(heap, fs, io, dir);
+    failed = failed + case_lock(heap, fs, io, dir);
+    return failed;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow mut console as &!i in {
+            borrow mut memory as &!h in {
+                borrow args as &g in {
+                    if arg_count(g) == 2 {
+                        status = run(h, f, i, arg(g, 1));
+                    } else {
+                        io.error_all(i, "usage: snapshot_files <existing directory>\n");
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}
