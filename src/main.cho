@@ -63,7 +63,7 @@ fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args)
     var code = 0;
     borrow jpath as &jb in {
         borrow spath as &sb in {
-            if journal_io.path_ok(buffer.bytes(jb)) == false {
+            if journal_io.path_ok(fs, buffer.bytes(jb)) == false {
                 io.error_all(io, "forge: path-invalid: <dir> must be absolute, with no .. component\n");
                 code = 2;
             } else if journal_io.exists(fs, buffer.bytes(jb)) == false {

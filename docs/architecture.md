@@ -322,7 +322,7 @@ missing, never written) and takes `file_lock` (`flock(LOCK_EX|LOCK_NB)`) on
 that handle; the handle is held for the life of the process. Answers
 `Held(file)`, `Refused(rule)` or `Failed(errno)`:
 * another holder, `EWOULDBLOCK` (11 on Linux, 35 on macOS): `workspace-locked`;
-* a path with `..`, relative or with a NUL: `path-invalid`, nothing opened;
+* a path with two dots in a row anywhere (`..`, `a..b`), relative or with a NUL: `path-invalid`, nothing opened (the rule for the dots is the compiler's, asked with `fs_covers`; spike S8);
 * anything else (a missing directory: ENOENT): `Failed(errno)`, which is an I/O
   error and not a refusal by Forge.
 
@@ -499,7 +499,11 @@ If the narrowed capability were the only check, a mistaken dispatch would
 kill the whole runtime mid-run instead of producing a refusal with a rule
 tag in the journal. So Forge refuses first, with a tag, and treats the
 capability bound as the backstop that makes a policy bug a crash rather
-than a breach. Missing or unparseable policy is `Deny` (fail closed,
+than a breach. *(Added after spike S8: the policy layer must not keep its own
+copy of the bound's rule. Forge's copy refused a `..` component and accepted
+`/a/..b`, which the capability traps on, so the layer meant to prevent the crash
+was the way into it. It now asks the compiler, `fs_covers` / `exec_covers`, so
+the two cannot drift.)* Missing or unparseable policy is `Deny` (fail closed,
 principle 9).
 
 ### 5.3 Layer 3: what a worker is given
@@ -655,7 +659,7 @@ ones by `tests/conformance/journal_files.cho`):
 | `snapshot-invalid` | a snapshot file that is not one JSON line this build reads (section 4.6); the journal is used instead | `test_unreadable_snapshots_are_snapshot_invalid`, `test_a_snapshot_without_its_newline_or_empty_of_content_is_snapshot_invalid`, conformance `refused: a half snapshot`, `refused: garbage` |
 | `snapshot-mismatch` | a well-formed snapshot that disagrees with the journal (beyond it, off a boundary, wrong count, wrong hash, a lying projection under strict); the journal is used instead | `test_a_snapshot_with_the_wrong_hash_is_a_mismatch`, `..._of_another_history_...`, `..._beyond_the_journal_...`, `..._off_a_record_boundary_...`, `..._of_no_records_with_tasks_...`, `test_strict_mode_catches_...`, conformance `refused: a snapshot beyond the journal` |
 | `workspace-locked` | another Forge holds the workspace lock (section 4.7) | conformance `lock: a second writer is refused`, and `crash_points` at 24 points across processes |
-| `path-invalid` | a journal path that is not absolute, has a `..` component, a NUL, or is longer than 512 bytes: refused before the file capability (which traps on `..`) is reached | conformance `path:`, `recover: a .. path`, `append: a .. path` |
+| `path-invalid` | a journal path that is not absolute, has two dots in a row anywhere (`..` as a component or inside a name), a NUL, or is longer than 512 bytes: refused before the file capability (which traps on the byte pair) is reached. *Corrected after spike S8: this row said "a `..` component", which is what Forge's hand-written check tested and the capability does not: `/a/..b` passed the check and trapped.* | conformance `path:` (two cases), `recover: a .. path`, `append: a .. path`, `recover/append/exists: a name with .. inside` |
 
 Designed, not implemented (no test reaches them yet; they are not claims):
 
@@ -691,10 +695,10 @@ upstream; the status of each is in its row below.
 
 | # | Gap | Effect on Forge | Needed from cancho |
 |---|---|---|---|
-| G1 | **Open: [cancho #534](https://github.com/alpibrusl/cancho/issues/534); partly answered 2026-10-19 by cancho #546 (merged).** `narrow` still takes only literals; a run-time bound is a `Dir` (`Fs`) and `exec_spawn_under(&Exec(""), &Dir, ...)` (`Exec`, row `exec_under`, which names no path) | Workers and workspace directories fixed at build, unless Forge adopts the new calls (not yet tried) | A bound carried as a value (a single file, a prefix the type can show) is not built: `docs/processes.md` section 9 |
-| G2 | **Answered 2026-10-19: [cancho #535](https://github.com/alpibrusl/cancho/issues/535) closed by cancho #540.** Out-of-bound spawn still traps by design, but `exec_covers` and `fs_covers` (edition 9, no row) ask first by the rule the operation traps on | Forge's policy can use the predicate instead of its own copy of the rule (not yet adopted, M4) | None |
+| G1 | **Open: [cancho #534](https://github.com/alpibrusl/cancho/issues/534); partly answered 2026-10-19 by cancho #546 (merged).** `narrow` still takes only literals; a run-time bound is a `Dir` (`Fs`) and `exec_spawn_under(&Exec(""), &Dir, ...)` (`Exec`, row `exec_under`, which names no path) | Workers and workspace directories fixed at build, unless Forge adopts the new calls (tried in S9 for workers: the directory is `argv[1]`, the report says `exec_under` and not the directory; not yet in a worker adapter) | A bound carried as a value (a single file, a prefix the type can show) is not built: `docs/processes.md` section 9 |
+| G2 | **Answered 2026-10-19: [cancho #535](https://github.com/alpibrusl/cancho/issues/535) closed by cancho #540.** Out-of-bound spawn still traps by design, but `exec_covers` and `fs_covers` (edition 9, no row) ask first by the rule the operation traps on | Forge's policy uses the predicate instead of its own copy of the rule: **adopted for the journal path (S8)**, which exposed a defect in the copy; for worker names, S9 (the guard is `len > 0`, not rooted, `exec_covers`) | None |
 | G3 | **Built: [cancho #533](https://github.com/alpibrusl/cancho/issues/533), merged** (`child_kill_group`, rev `8411e9a`; S7 re-run, no `/bin/kill`). Was: kill reaches only the pid | Nothing now; workers that start subprocesses are started detached | None. Residual: a descendant that leaves the group; the orphan after a Forge crash (G4) |
 | G4 | **Open, no issue; `docs/processes.md` section 9** (narrowed by #533 for a live supervisor only). No kill-by-pid capability; parent death does not kill children | Restart cannot cleanly stop an orphaned worker | `docs/processes.md` section 9: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` on Linux only |
 | G5 | `fsync` durability on macOS is weaker | Durability promise differs per platform | `F_FULLFSYNC` (`docs/file-writes.md` section 6) |
 | G6 | **Fixed: [cancho #536](https://github.com/alpibrusl/cancho/issues/536) (closed; in `8411e9a`).** Header of `docs/processes.md` says slices 3 and 4 are "designed, not built"; its own slice table and `std/process.cho` say built | Misleading; S1-S2, S6, S7 use `std.process.capture` successfully | Correct the header in the cancho repository |
-| G9 | **Open: [cancho #534](https://github.com/alpibrusl/cancho/issues/534)** (with G1; cancho #546 documents `Dir` as the answer for a directory bound, not tried against the journal). A library function over `Fs` cannot be generic in the prefix: `Fs("/x")` is not accepted where a function declares `Fs("")` *(measured, M1; see `spike/RESULTS.md`, "M1 findings")* | `src/journal_io.cho` is written against `Fs("")` and guards the path itself (`path-invalid`); a binary that links it reports `fs_read("")`, `fs_write("")`. The production `forge` binary links it in M2, and that widening is a visible diff in `cancho authority` and says so in its commit | The same run-time-chosen-bound question as G1, for `Fs`; or a way to declare a function generic in a capability's prefix |
+| G9 | **Open: [cancho #534](https://github.com/alpibrusl/cancho/issues/534)** (with G1; cancho #546 documents `Dir` as the answer for a directory bound, not tried against the journal). A library function over `Fs` cannot be generic in the prefix: `Fs("/x")` is not accepted where a function declares `Fs("")` *(measured, M1; see `spike/RESULTS.md`, "M1 findings")* | `src/journal_io.cho` is written against `Fs("")` and guards the path itself (`path-invalid`); a binary that links it reports `fs_read("")`, `fs_write("")`. The production `forge` binary links it in M2, and that widening is a visible diff in `cancho authority` and says so in its commit. `path_ok` now asks `fs_covers`, so the `..`/length rule is the compiler's and not a copy (S8) | The same run-time-chosen-bound question as G1, for `Fs`; or a way to declare a function generic in a capability's prefix |

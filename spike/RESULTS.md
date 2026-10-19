@@ -11,7 +11,7 @@ says so.
 | Backend | the compiler's default (LLVM via `clang`/`cc`); not cross-checked on Cranelift |
 | Not covered | macOS; a real Cancho Code; concurrency of several workers; large journals; anything over a network |
 | Reproduce | `CANCHO=/path/to/cancho spike/run.sh` (regenerates the transcript in the appendix) and `CANCHO=... scripts/gate.sh` |
-| Files | `spike/s1_capture.cho` ... `s7_grandchild.cho`, `spike/mock_worker.cho`, `spike/run.sh` |
+| Files | `spike/s1_capture.cho` ... `s9_under.cho`, `spike/mock_worker.cho`, `spike/run.sh` |
 
 Every `.cho` file in the repository passes `cancho fmt --check` and
 `cancho check <file> --std` (the gate prints `gate: PASS`); `cancho test`
@@ -33,6 +33,8 @@ findings".)
 | Report exit status / signal | **PASS** | S2, S6 |
 | Kill a child explicitly | **PASS**, with a trap for the unwary (section S2) | S2 |
 | Kill what the child started (a grandchild) | **PASS by default for a detached worker** (`exec_spawn_detached`: `capture` kills the group at the deadline, or `child_kill_group` by hand), with `Exec` narrowed to `/bin/sh` and no `/bin/kill`; a plain `exec_spawn` worker still leaks its grandchild (the control). *Corrected after #533: M0 recorded FAIL here, PASS only with `/bin/kill` in an `Exec("/bin")` bound.* | S7 |
+| Ask whether a path is inside a bound, before a trap | **PASS** (`fs_covers`): and it found a **defect in Forge's own copy of the rule** (`/tmp/a..b/j` passed `path_ok` and killed the process), now fixed | S8 |
+| Start a worker beneath a directory chosen at deployment | **PASS** (`exec_spawn_under`, row `exec_under`, no path in the report); a name the guard refuses is never spawned | S9 |
 | Pass a narrowed `Exec` | **PASS**: allowed spawns run; outside spawn and `..` path **trap** (SIGILL, exit 132) -- a refusal-as-value does not exist | S3 |
 | `cancho authority` reports it | **PASS**: `exec("/bin/echo")`, `exec("/usr/bin")`; Forge's S6 dispatcher reports no filesystem, no network, no foreign code | S3, S6 |
 | Append + sync a journal | **PASS** | S5 |
@@ -326,6 +328,59 @@ What the measurement does not show, and the cancho document says:
 * After a Forge crash there is no `Child` to hold (gap G4, still open).
 * Mode `k` waits 300 ms by spinning on the clock for the worker to have started
   its `sleep`; it is a spike, a real dispatcher polls (S2).
+
+## S8 -- Forge's own copy of the path rule, against `fs_covers`
+
+`spike/s8_covers.cho` holds Forge's `path_ok` as M1 first wrote it (`old_path_ok`: absolute, 512 bytes at most, no NUL,
+no `..` **component**) beside the compiler's answer (`fs_covers`, cancho #540, which is the byte rule the operations trap
+on), and for a path the old rule accepts it really opens the file. Compiler: `7e4088b`, Linux x86-64.
+
+| path | old `path_ok` | `fs_covers` | opened under `Fs("")` |
+|---|---|---|---|
+| `/tmp/x/journal.jsonl`, `/tmp/a.b/j`, `/tmp/.hidden/j`, `/tmp//x`, `/tmp/x/` | yes | yes | ran (exit 0) |
+| `/tmp/a/../b`, `/tmp/x/..`, `/tmp/..` | no | no | not attempted |
+| `/tmp/a..b/j`, `/tmp/..b/j`, `/tmp/b../j`, `/tmp/x/j..` | **yes** | **no** | **SIGILL, exit 132** |
+
+**A defect in M1, found by asking the compiler instead of keeping a copy.** The old rule read the trap as "a `..`
+component"; the compiler's rule is "two dots in a row anywhere" (`docs/processes.md` 4.13). So a journal path with `..`
+inside a name passed Forge's check and killed Forge with no journal entry and no rule tag, which is the "no input may
+reach a panic" rule broken in the layer that exists to prevent it. It was not found by the 62 conformance cases because
+the one that touched the corner asserted the wrong answer (`path: dots inside a name are ok`, now corrected to the
+opposite). Fix: `journal_io.path_ok(fs, path)` keeps Forge's own policy (absolute, 512 bytes, no NUL) and asks
+`fs_covers(fs, path)` for the rest; the hand-written component loop is deleted. The new cases (`recover`, `append` and
+`exists` on `a..b/journal.jsonl`) end in `path-invalid` / `-2` / `false` and not in a trap.
+
+## S9 -- a workers directory chosen at deployment (`exec_spawn_under`), with the guard in front
+
+`spike/s9_under.cho`: the workers directory is `argv[1]`, opened once with `open_dir`, and a worker is started by
+**name** beneath it with `exec_spawn_under` under `Exec("")`. The guard is `len(name) > 0`, not rooted, and
+`exec_covers(exec, name)`: the half of the name rule the capability leaves to the caller plus the half the compiler
+answers. The binary is built once; the directory is a run-time argument (gap G1: `narrow` still takes only a literal).
+
+```
+$ cancho authority spike/s9_under.cho --std
+performs
+    args
+    exec_under
+    fs_read("")
+    io_write
+```
+
+| name | result |
+|---|---|
+| `mock_worker`, `./mock_worker` | `exited 0` (the S6 mock worker, beneath `/tmp/s9/bin`) |
+| the same binary, `argv[1]` another directory holding a `mock_worker` | `exited 0`: the bound is the argument |
+| `nope` | `failed errno 2` |
+| `/bin/echo`, `../x`, `a..b`, empty | `refused`; the spawn is never attempted, so nothing traps |
+| a missing workers directory | exit 3, nothing spawned |
+
+What changed against S3: the report no longer says `exec("/bin/echo")` or `exec("/usr/bin")`, it says `exec_under`,
+which names no path, and `fs_read("")` (the open of the directory). **The report no longer names the directory**: a
+reviewer reading `cancho authority` learns that Forge starts programs beneath a directory it was given, and has to read
+the deployment to learn which. That is the cost, and `docs/threat-model.md` is where it is weighed. A link in the
+directory pointing outside it is followed (`docs/processes.md` 4.14); nothing here refuses one.
+
+---
 
 ---
 
@@ -635,4 +690,35 @@ worker timed out; killed and reaped
 worker ended by signal 256
 child_kill_group rc=0
 'sleep 77' processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
+
+=== S8 Forge's old path rule against fs_covers (the capability traps on what the old rule let through)
+--- /tmp/x/journal.jsonl
+old path_ok     yes
+fs_covers       yes
+opened          no
+exit=0
+--- /tmp/a..b/j
+old path_ok     yes
+fs_covers       no
+Illegal instruction
+exit=132
+--- /tmp/a/../b
+old path_ok     no
+fs_covers       no
+exit=0
+
+=== S9 a worker started beneath a directory given at run time, guard first
+performs
+    args
+    exec_under
+    fs_read("")
+    io_write
+never touches
+--- [mock_worker]: exited 0
+--- [./mock_worker]: exited 0
+--- [nope]: failed errno 2
+--- [/bin/echo]: refused
+--- [../x]: refused
+--- [a..b]: refused
+--- []: refused
 ```

@@ -36,7 +36,7 @@ fn would_block(errno: int) -> [] bool {
 }
 
 pub fn acquire[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_write(""), file_write] Lock {
-    if journal_io.path_ok(path) == false {
+    if journal_io.path_ok(fs, path) == false {
         return Lock::Refused(task.rule_code(task.Rule::PathInvalid));
     }
     match open_append(fs, path) {

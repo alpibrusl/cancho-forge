@@ -36,7 +36,7 @@ import forge.task;
 // Step 1: open the temporary file, creating or truncating it. A path that is
 // not ok is `Failed(-2)`.
 pub fn open_tmp[&f, &p](fs: &f Fs(""), tmp: &p [byte]) -> [fs_write("")] Opened {
-    if journal_io.path_ok(tmp) == false {
+    if journal_io.path_ok(fs, tmp) == false {
         return Opened::Failed(0 - 2);
     }
     return open_write(fs, tmp);
@@ -45,7 +45,7 @@ pub fn open_tmp[&f, &p](fs: &f Fs(""), tmp: &p [byte]) -> [fs_write("")] Opened 
 // Step 4: replace `final_path` with `tmp`. 0, an errno, or -2 for a path that
 // is not ok (neither path is handed to the capability then).
 pub fn publish[&f, &a, &b](fs: &f Fs(""), tmp: &a [byte], final_path: &b [byte]) -> [fs_write("")] int {
-    if journal_io.path_ok(tmp) == false || journal_io.path_ok(final_path) == false {
+    if journal_io.path_ok(fs, tmp) == false || journal_io.path_ok(fs, final_path) == false {
         return 0 - 2;
     }
     match fs_rename(fs, tmp, final_path) {
@@ -64,7 +64,7 @@ pub fn publish[&f, &a, &b](fs: &f Fs(""), tmp: &a [byte], final_path: &b [byte])
 // to arguments that describe no prefix) is refused with -3 and nothing is
 // opened: Forge never replaces a snapshot with nothing.
 pub fn save[&f, &a, &b, &s](fs: &f Fs(""), tmp: &a [byte], final_path: &b [byte], snap: &s [byte]) -> [fs_read(""), fs_write(""), file_write] int {
-    if journal_io.path_ok(tmp) == false || journal_io.path_ok(final_path) == false {
+    if journal_io.path_ok(fs, tmp) == false || journal_io.path_ok(fs, final_path) == false {
         return 0 - 2;
     }
     if len(snap) == 0 {
@@ -107,7 +107,7 @@ pub fn save[&f, &a, &b, &s](fs: &f Fs(""), tmp: &a [byte], final_path: &b [byte]
 // on the report, so a snapshot cannot change what is cut.
 pub fn recover[&h, &f, &j, &s](heap: &!h Heap, fs: &f Fs(""), journal_path: &j [byte], snapshot_path: &s [byte], strict: bool) -> [heap, fs_read(""), fs_write(""), file_read, file_write] (map.Map[int], journal.Report, journal_io.Recovered, snapshot.Outcome) {
     let none = snapshot.Outcome { used: false, rule: 0, last_seq: 0 };
-    if journal_io.path_ok(journal_path) == false || journal_io.path_ok(snapshot_path) == false {
+    if journal_io.path_ok(fs, journal_path) == false || journal_io.path_ok(fs, snapshot_path) == false {
         let (table, report) = journal.replay(heap, "");
         return (table, journal.Report { records: 0, valid_bytes: 0, total_bytes: 0, torn_bytes: 0, tasks: 0, rule: task.rule_code(task.Rule::PathInvalid), line: 0 }, journal_io.Recovered { errno: 0, cut: 0 }, none);
     }

@@ -41,7 +41,7 @@ proposes and executes.
   corrupt complete line; snapshots that agree with the journal or are refused
   (snapshot plus tail equals a full replay, tested after every prefix); the
   single-writer lock; a read-only `forge status` and `forge history`; 82 unit
-  tests, 62 file cases, and a program that kills a writer with
+  tests, 65 file cases, and a program that kills a writer with
   `child_kill_group` at each of 25 crash points of append, sync, snapshot and
   rename and recovers (420 checks), all in the gate. A process kill is not a
   power loss: that is not tested. Not done: objectives and artifacts, segments,
@@ -74,11 +74,11 @@ spike/run.sh           # re-runs every spike and prints the evidence
 
 Read [`spike/RESULTS.md`](spike/RESULTS.md) first: it lists what cancho cannot
 do yet that shapes the later milestones (grants fixed at build time, cancho
-#534, partly answered by cancho #546 but not yet used here; orphaned workers
+#534, partly answered by cancho #546 and tried in spike S9, not yet used by a worker adapter; orphaned workers
 after a crash). Two were fixed upstream: a kill that reached one pid (cancho
 #533, `child_kill_group`; the spike passes without `/bin/kill`) and a bound
 violation that traps with no way to ask first (#535, `exec_covers` and
-`fs_covers`, cancho #540). The compiler pin is now cancho `7e4088b`, with the gate
+`fs_covers`, cancho #540; Forge's journal path rule now asks `fs_covers`, and doing so found that the copy it replaced let `/a/..b` through to a trap, spike S8). The compiler pin is now cancho `7e4088b`, with the gate
 and the spikes re-run on it.
 
 ## More

@@ -69,7 +69,7 @@ snapshot + tail, refused when invalid or when it disagrees), `src/lock.cho`
 `src/main.cho` (the read-only operator CLI: `forge status <dir>`, `forge
 history <dir> [task]`), `src/event.cho` extended (`transition`, `refusal`).
 Measured: **82 tests** under `cancho test` (9 event, 22 task, 25 journal, 18
-snapshot, 8 report), **62 file cases** in two conformance programs, **25 crash
+snapshot, 8 report), **65 file cases** in two conformance programs, **25 crash
 points** (a child writer killed with `child_kill_group` after each step of
 append, sync, snapshot and rename, then recovered, 420 checks, 0 failed), 13 CLI
 cases and the checked-in authority report (`docs/authority.txt`) in the gate.
@@ -180,8 +180,8 @@ the pilot's journal size and replay time.
 
 | need | milestone | status in cancho |
 |---|---|---|
-| run-time-chosen bound for `Fs`/`Exec` (G1, G9) | M2 decide, M4 depend | open: cancho #534; `Dir` and `exec_spawn_under` merged (cancho #546), not yet tried here |
-| asking before a bound violation (G2) | M4 | **built**: `exec_covers`/`fs_covers`, cancho #540 (closed #535); not yet adopted here |
+| run-time-chosen bound for `Fs`/`Exec` (G1, G9) | M2 decide, M4 depend | open: cancho #534; `Dir` and `exec_spawn_under` merged (cancho #546) and **tried here (S9)**: a workers directory given at run time, report `exec_under`, no path named; not yet used by a worker adapter (M2) |
+| asking before a bound violation (G2) | M4 | **built**: `exec_covers`/`fs_covers`, cancho #540 (closed #535); **adopted for the journal path** (`journal_io.path_ok`, S8, which found and fixed a defect in the copy it replaced); for a worker name, S9 only until M2 |
 | group kill for a detached child (G3) | M2 | **built** (cancho #533, `child_kill_group`, edition 9; S7) |
 | kill-by-pid capability, parent-death cleanup (G4) | M2 | open rows in `docs/processes.md` section 9 |
 | `F_FULLFSYNC` on macOS (G5) | M1 | noted in `docs/file-writes.md` section 6 |

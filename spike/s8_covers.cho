@@ -1,0 +1,94 @@
+edition 9;
+
+import std.io;
+
+// Spike 8: Forge's own path rule against the compiler's (cancho #535, `fs_covers`).
+// `old_path_ok` is Forge's rule as M1 first wrote it (a copy of the rule the capability traps on, by component).
+//   argv[1]  a mode:
+//     v  print Forge's verdict (`path_ok`) and the compiler's (`fs_covers`) for argv[2], and open nothing
+//     e  `open_read(fs, argv[2])` only if `old_path_ok` accepts it: what that rule did with a path it let through
+//   argv[2]  the path
+// `old_path_ok` was written to refuse what the capability traps on; this asks whether it does.
+
+fn old_path_ok[&p](path: &p [byte]) -> [] bool {
+    if len(path) < 2 || len(path) > 512 || int_of(path[0]) != 47 {
+        return false;
+    }
+    var start = 0;
+    var k = 0;
+    while k <= len(path) {
+        var edge = k == len(path);
+        if edge == false {
+            let c = int_of(path[k]);
+            if c == 0 {
+                return false;
+            }
+            edge = c == 47;
+        }
+        if edge {
+            if k - start == 2 && int_of(path[start]) == 46 && int_of(path[start + 1]) == 46 {
+                return false;
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn yes_no[&i](io: &!i Io, label: &i [byte], value: bool) -> [io_write] int {
+    io.write_all(io, label);
+    if value {
+        io.write_all(io, " yes\n");
+    } else {
+        io.write_all(io, " no\n");
+    }
+    return 0;
+}
+
+fn go[&f, &i, &g](fs: &f Fs(""), io: &!i Io, g: &g Args) -> [args, io_write, fs_read("")] int {
+    let mode = int_of(arg(g, 1)[0]);
+    let path = arg(g, 2);
+    if mode == 'v' {
+        yes_no(io, "old path_ok    ", old_path_ok(path));
+        yes_no(io, "fs_covers      ", fs_covers(fs, path));
+    }
+    if mode == 'e' {
+        if old_path_ok(path) {
+            match open_read(fs, path) {
+                Opened::Failed(e) => {
+                    yes_no(io, "opened         ", false);
+                }
+                Opened::Ok(opened) => {
+                    file_close(opened);
+                    yes_no(io, "opened         ", true);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    release(heap);
+    var console = io;
+    var status = 2;
+    borrow fs as &f in {
+        borrow mut console as &!i in {
+            borrow args as &g in {
+                status = go(f, i, g);
+            }
+        }
+    }
+    release(fs);
+    release(console);
+    release(args);
+    return status;
+}
