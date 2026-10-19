@@ -1,0 +1,34 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import forge.event;
+
+// Milestone 0 has no runtime. This binary prints one journal record, so the
+// event module is linked, checked and run by the same gate as everything else.
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    borrow mut console as &!i in {
+        borrow mut memory as &!h in {
+            let sample = event.record(h, 1, "company.created", "none");
+            borrow sample as &b in {
+                buffer.write(i, b);
+            }
+            buffer.drop(h, sample);
+        }
+    }
+    release(console);
+    release(memory);
+    return 0;
+}

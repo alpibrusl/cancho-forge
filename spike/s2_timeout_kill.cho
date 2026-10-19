@@ -1,0 +1,144 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.process;
+import std.signals as sg;
+
+// Spike 2: a deadline that kills, an output bound that kills, a non-zero
+// exit, and an explicit `child_kill` + `child_wait` (docs/processes.md
+// sections 4.7, 7.1). Each case prints how it ended and how long it took.
+
+fn say_ran[&i](io: &!i Io, ran: process.Ran) -> [io_write] int {
+    match ran {
+        process.Ran::Code(n) => {
+            io.write_all(io, "code ");
+            io.print_int(io, n);
+        }
+        process.Ran::Signaled(s) => {
+            io.write_all(io, "signaled ");
+            io.print_int(io, s);
+        }
+        process.Ran::TimedOut => {
+            io.write_all(io, "timed out");
+        }
+        process.Ran::TooMuch => {
+            io.write_all(io, "too much");
+        }
+        process.Ran::Failed(e) => {
+            io.write_all(io, "failed errno ");
+            io.print_int(io, e);
+        }
+    }
+    return 0;
+}
+
+fn capture_case[&h, &x, &c, &i, &p, &a](heap: &!h Heap, exec: &x Exec("/bin"), clock: &c Clock, io: &!i Io, label: &p [byte], path: &a [byte], args: &a [byte], most: int, timeout: int) -> [heap, exec("/bin"), clock, poll, io_write] int {
+    let start = clock_ms(clock);
+    io.write_all(io, label);
+    io.write_all(io, ": ");
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            io.write_all(io, "channels failed\n");
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match exec_spawn(exec, path, args, "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    io.write_all(io, "spawn failed errno ");
+                    io.print_int(io, e);
+                    io.newline(io);
+                }
+                Spawned::Ok(child) => {
+                    let (out, ran) = process.capture(heap, clock, child, to_child, from_child, "", most, timeout);
+                    say_ran(io, ran);
+                    io.write_all(io, ", kept ");
+                    borrow out as &o in {
+                        io.print_int(io, buffer.size(o));
+                    }
+                    io.write_all(io, " bytes, ");
+                    io.print_int(io, clock_ms(clock) - start);
+                    io.write_all(io, " ms\n");
+                    buffer.drop(heap, out);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// No capture: start `sleep 30`, kill it with TERM ourselves, reap it.
+fn kill_case[&x, &c, &i](exec: &x Exec("/bin"), clock: &c Clock, io: &!i Io) -> [exec("/bin"), child_signal, clock, io_write] int {
+    let start = clock_ms(clock);
+    io.write_all(io, "explicit kill: ");
+    match exec_spawn(exec, "/bin/sleep", "30\0", "", Stdio::Null, Stdio::Null, Stdio::Null) {
+        Spawned::Failed(e) => {
+            io.write_all(io, "spawn failed errno ");
+            io.print_int(io, e);
+            io.newline(io);
+        }
+        Spawned::Ok(child) => {
+            var rc = 0 - 1;
+            borrow child as &ch in {
+                rc = child_kill(ch, sg.sigterm());
+            }
+            io.write_all(io, "child_kill rc=");
+            io.print_int(io, rc);
+            io.write_all(io, ", ");
+            match child_wait(child) {
+                Exited::Code(n) => {
+                    io.write_all(io, "exited code ");
+                    io.print_int(io, n);
+                }
+                Exited::Signaled(s) => {
+                    io.write_all(io, "signaled ");
+                    io.print_int(io, s);
+                }
+                Exited::Failed(e) => {
+                    io.write_all(io, "wait failed errno ");
+                    io.print_int(io, e);
+                }
+            }
+            io.write_all(io, ", ");
+            io.print_int(io, clock_ms(clock) - start);
+            io.write_all(io, " ms\n");
+        }
+    }
+    return 0;
+}
+
+fn all[&h, &x, &c, &i](heap: &!h Heap, exec: &x Exec("/bin"), clock: &c Clock, io: &!i Io) -> [heap, exec("/bin"), child_signal, clock, poll, io_write] int {
+    capture_case(heap, exec, clock, io, "deadline 300ms vs sleep 30", "/bin/sleep", "30\0", 4096, 300);
+    capture_case(heap, exec, clock, io, "bound 1000 vs yes", "/bin/yes", "", 1000, 5000);
+    capture_case(heap, exec, clock, io, "nonzero exit", "/bin/sh", "-c\0exit 3\0", 4096, 5000);
+    capture_case(heap, exec, clock, io, "stderr not captured", "/bin/sh", "-c\0echo out; echo err 1>&2\0", 4096, 5000);
+    kill_case(exec, clock, io);
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(signals);
+    release(tty);
+    let bin = narrow(exec, "/bin");
+    var console = io;
+    var memory = heap;
+    borrow bin as &x in {
+        borrow clock as &c in {
+            borrow mut console as &!i in {
+                borrow mut memory as &!h in {
+                    all(h, x, c, i);
+                }
+            }
+        }
+    }
+    release(bin);
+    release(clock);
+    release(console);
+    release(memory);
+    return 0;
+}

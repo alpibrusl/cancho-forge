@@ -1,0 +1,63 @@
+edition 9;
+
+import std.buffer;
+import std.test;
+import forge.event;
+
+// Unit tests for src/event.cho. Run with `cancho test` (cancho.toml).
+
+fn test_record_is_one_line_ending_in_newline[&h](heap: &!h Heap) -> [heap] int {
+    let r = event.record(heap, 7, "task.dispatched", "t-1");
+    var newlines = 0;
+    var last = 0;
+    borrow r as &b in {
+        let text = buffer.bytes(b);
+        var k = 0;
+        while k < len(text) {
+            if int_of(text[k]) == 10 {
+                newlines = newlines + 1;
+            }
+            k = k + 1;
+        }
+        last = int_of(text[len(text) - 1]);
+    }
+    buffer.drop(heap, r);
+    test.assert_eq(newlines, 1);
+    test.assert_eq(last, 10);
+    return 0;
+}
+
+fn test_seq_round_trips[&h](heap: &!h Heap) -> [heap] int {
+    let r = event.record(heap, 42, "task.approved", "t-9");
+    var got = 0;
+    borrow r as &b in {
+        let text = buffer.bytes(b);
+        got = event.seq_of(heap, text[0..len(text) - 1]);
+    }
+    buffer.drop(heap, r);
+    test.assert_eq(got, 42);
+    return 0;
+}
+
+fn test_a_torn_record_is_not_a_record[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(event.seq_of(heap, "{\"v\":1,\"seq\":4,\"kind\":\"task.run"), 0 - 1);
+    return 0;
+}
+
+fn test_not_an_event_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(event.seq_of(heap, "[1,2,3]"), 0 - 1);
+    test.assert_eq(event.seq_of(heap, ""), 0 - 1);
+    test.assert_eq(event.seq_of(heap, "{\"v\":1,\"seq\":\"4\"}"), 0 - 1);
+    test.assert_eq(event.seq_of(heap, "{\"v\":1}"), 0 - 1);
+    return 0;
+}
+
+fn test_an_unknown_schema_version_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(event.seq_of(heap, "{\"v\":2,\"seq\":1}"), 0 - 1);
+    return 0;
+}
+
+fn test_unknown_fields_are_ignored[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(event.seq_of(heap, "{\"v\":1,\"seq\":5,\"future\":{\"x\":[1,2]}}"), 5);
+    return 0;
+}

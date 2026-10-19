@@ -1,0 +1,13 @@
+[package]
+name = "cancho-forge"
+cancho = "2aa83b23dd3d9ea0f4551098597bc7b51dc2aecd"
+
+[[bin]]
+name = "forge"
+sources = ["src"]
+std = true
+
+[[test]]
+name = "event"
+sources = ["tests/event_test.cho", "src/event.cho"]
+std = true

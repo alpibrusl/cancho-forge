@@ -1,0 +1,161 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.json;
+
+// Spike 4: can std.json write a Forge task event, parse it back, read nested
+// fields, tolerate unknown ones, and refuse malformed input as a value?
+// (docs/json.md). Prints one line per check: "ok" or "FAIL".
+
+fn verdict[&i](io: &!i Io, label: &i [byte], good: bool) -> [io_write] int {
+    io.write_all(io, label);
+    if good {
+        io.write_all(io, ": ok\n");
+        return 0;
+    }
+    io.write_all(io, ": FAIL\n");
+    return 1;
+}
+
+// A `task.dispatched` event, with a nested task, a limits object, an array of
+// criteria and a note that needs escaping.
+fn event[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "v");
+    w = json.put_int(heap, w, 1);
+    w = json.put_key(heap, w, "seq");
+    w = json.put_int(heap, w, 7);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, "task.dispatched");
+    w = json.put_key(heap, w, "task");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "id");
+    w = json.put_string(heap, w, "t-1");
+    w = json.put_key(heap, w, "worker");
+    w = json.put_string(heap, w, "mock");
+    w = json.put_key(heap, w, "limits");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "timeout_ms");
+    w = json.put_int(heap, w, 5000);
+    w = json.put_key(heap, w, "budget_cents");
+    w = json.put_int(heap, w, 120);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "criteria");
+    w = json.begin_array(heap, w);
+    w = json.put_string(heap, w, "tests pass");
+    w = json.put_string(heap, w, "no new deps");
+    w = json.end_array(heap, w);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "note");
+    w = json.put_string(heap, w, "café \"quoted\"\n");
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// Parse `text`, answering the node count or a negative error.
+fn nodes_of[&h, &s](heap: &!h Heap, text: &s [byte]) -> [heap] int {
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    var n = 0;
+    borrow mut tape as &!t in {
+        n = json.parse(text, contents(t));
+    }
+    unbox_slice(heap, tape);
+    return n;
+}
+
+fn checks[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_write] int {
+    var failures = 0;
+    let built = event(heap);
+    borrow built as &b in {
+        let text = buffer.bytes(b);
+        io.write_all(io, "event: ");
+        io.write_all(io, text);
+        io.newline(io);
+
+        let tape = box_slice(heap, json.tape_len(text), 0);
+        borrow mut tape as &!t in {
+            let tp = contents(t);
+            let n = json.parse(text, tp);
+            failures = failures + verdict(io, "parses", n > 0);
+            failures = failures + verdict(io, "seq == 7", json.to_int(text, tp, json.get(text, tp, 0, "seq")) == 7);
+            let task = json.get(text, tp, 0, "task");
+            failures = failures + verdict(io, "task is object", json.is_object(tp, task));
+            failures = failures + verdict(io, "task.id == t-1", json.string_equals(text, tp, json.get(text, tp, task, "id"), "t-1"));
+            let limits = json.get(text, tp, task, "limits");
+            failures = failures + verdict(io, "task.limits.timeout_ms == 5000", json.to_int(text, tp, json.get(text, tp, limits, "timeout_ms")) == 5000);
+            let criteria = json.get(text, tp, task, "criteria");
+            failures = failures + verdict(io, "criteria has 2", json.count(tp, criteria) == 2);
+            failures = failures + verdict(io, "criteria[1] == no new deps", json.string_equals(text, tp, json.at(tp, criteria, 1), "no new deps"));
+            failures = failures + verdict(io, "missing key is node -1", json.get(text, tp, 0, "nope") < 0);
+            failures = failures + verdict(io, "missing key reads as 0", json.to_int(text, tp, json.get(text, tp, 0, "nope")) == 0);
+            // The escaped note decodes to the original bytes: caf + 2-byte e-acute + ' "quoted"\n' = 15 bytes.
+            let note = json.get(text, tp, 0, "note");
+            failures = failures + verdict(io, "note has an escape", !json.string_plain(tp, note));
+            failures = failures + verdict(io, "note decodes to 15 bytes", json.string_length(text, tp, note) == 15);
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, built);
+
+    // Unknown fields are skipped, not refused.
+    failures = failures + verdict(io, "unknown field tolerated", nodes_of(heap, "{\"v\":1,\"future\":{\"a\":[1,2,{\"b\":null}]},\"seq\":2}") > 0);
+    // Malformed input is a value (negative), never a trap.
+    failures = failures + verdict(io, "truncated is negative", nodes_of(heap, "{\"seq\":7,\"kind\":") < 0);
+    failures = failures + verdict(io, "empty is negative", nodes_of(heap, "") < 0);
+    failures = failures + verdict(io, "trailing garbage is negative", nodes_of(heap, "{\"a\":1} x") < 0);
+    failures = failures + verdict(io, "bare word is negative", nodes_of(heap, "{\"a\":tru}") < 0);
+    failures = failures + verdict(io, "unquoted key is negative", nodes_of(heap, "{a:1}") < 0);
+    failures = failures + verdict(io, "single quotes negative", nodes_of(heap, "{'a':1}") < 0);
+
+    // An integer past 64 bits is reported by fits_int, not wrapped silently.
+    let big = "{\"n\":99999999999999999999}";
+    let tape2 = box_slice(heap, json.tape_len(big), 0);
+    borrow mut tape2 as &!t2 in {
+        let tp2 = contents(t2);
+        json.parse(big, tp2);
+        failures = failures + verdict(io, "oversized int does not fit", !json.fits_int(big, tp2, json.get(big, tp2, 0, "n")));
+    }
+    unbox_slice(heap, tape2);
+
+    // Round trip: a one-line event must contain no raw newline (journal framing).
+    let again = event(heap);
+    var newlines = 0;
+    borrow again as &a in {
+        let raw = buffer.bytes(a);
+        var k = 0;
+        while k < len(raw) {
+            if int_of(raw[k]) == 10 {
+                newlines = newlines + 1;
+            }
+            k = k + 1;
+        }
+    }
+    buffer.drop(heap, again);
+    failures = failures + verdict(io, "serialised event has no raw newline", newlines == 0);
+    return failures;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(args);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var failures = 0;
+    borrow mut console as &!i in {
+        borrow mut memory as &!h in {
+            failures = checks(h, i);
+        }
+    }
+    release(console);
+    release(memory);
+    return failures;
+}

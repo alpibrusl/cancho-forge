@@ -1,0 +1,127 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.process;
+
+// Spike 7: what a kill reaches. A worker that starts its own subprocess
+// (Cancho Code will: compilers, test runners) is killed at its deadline; does
+// the grandchild die with it? The grandchild is `sleep 77`, so an external
+// `pgrep -x sleep` after this program exits answers it.
+//
+//   argv[1] = p  plain exec_spawn: `capture` kills the worker's pid only.
+//             g  exec_spawn_detached (the worker leads its own process group),
+//                then `/bin/kill -KILL -- -<pid>` started through the same
+//                narrowed Exec, which reaches the whole group
+//                (docs/processes.md 4.11, "What the caller can do with the pid").
+
+// Run /bin/kill against the group of `pid`; answers its exit code.
+fn kill_group[&h, &x](heap: &!h Heap, exec: &x Exec("/bin"), pid: int) -> [heap, exec("/bin")] int {
+    var args = process.argv(heap, 32);
+    let (a1, e1) = process.add(heap, args, "-KILL");
+    let (a2, e2) = process.add(heap, a1, "--");
+    var text = buffer.empty(heap, 16);
+    text = buffer.push(heap, text, byte_of('-'));
+    text = buffer.push_nat(heap, text, pid);
+    var code = 0 - 1;
+    borrow text as &t in {
+        let (a3, e3) = process.add(heap, a2, buffer.bytes(t));
+        borrow a3 as &l in {
+            match exec_spawn(exec, "/bin/kill", process.list(l), "", Stdio::Null, Stdio::Null, Stdio::Null) {
+                Spawned::Failed(e) => {
+                    code = 0 - e;
+                }
+                Spawned::Ok(child) => {
+                    match child_wait(child) {
+                        Exited::Code(n) => {
+                            code = n;
+                        }
+                        Exited::Signaled(s) => {
+                            code = 0 - 1000;
+                        }
+                        Exited::Failed(e) => {
+                            code = 0 - e;
+                        }
+                    }
+                }
+            }
+        }
+        process.drop(heap, a3);
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+fn begin[&x](exec: &x Exec("/bin"), detached: bool, child_in: ChildEnd, child_out: ChildEnd) -> [exec("/bin"), exec_detached] Spawned {
+    if detached {
+        return exec_spawn_detached(exec, "/bin/sh", "-c\0sleep 77 & wait\0", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+    }
+    return exec_spawn(exec, "/bin/sh", "-c\0sleep 77 & wait\0", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+}
+
+fn run[&h, &x, &c, &i](heap: &!h Heap, exec: &x Exec("/bin"), clock: &c Clock, io: &!i Io, grouped: bool) -> [heap, exec("/bin"), exec_detached, clock, poll, io_write] int {
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            io.write_all(io, "channels failed\n");
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match begin(exec, grouped, child_in, child_out) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    io.write_all(io, "spawn failed\n");
+                }
+                Spawned::Ok(child) => {
+                    var pid = 0;
+                    borrow child as &ch in {
+                        pid = child_pid(ch);
+                    }
+                    let (out, ran) = process.capture(heap, clock, child, to_child, from_child, "", 4096, 300);
+                    buffer.drop(heap, out);
+                    match ran {
+                        process.Ran::TimedOut => {
+                            io.write_all(io, "worker timed out; killed and reaped\n");
+                        }
+                        _ => {
+                            io.write_all(io, "unexpected ending\n");
+                        }
+                    }
+                    if grouped {
+                        io.write_all(io, "kill -KILL -- -pid: exit ");
+                        io.print_int(io, kill_group(heap, exec, pid));
+                        io.newline(io);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(net);
+    release(signals);
+    release(tty);
+    let bin = narrow(exec, "/bin");
+    var console = io;
+    var memory = heap;
+    borrow bin as &x in {
+        borrow clock as &c in {
+            borrow mut console as &!i in {
+                borrow mut memory as &!h in {
+                    borrow args as &g in {
+                        run(h, x, c, i, int_of(arg(g, 1)[0]) == 'g');
+                    }
+                }
+            }
+        }
+    }
+    release(bin);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return 0;
+}

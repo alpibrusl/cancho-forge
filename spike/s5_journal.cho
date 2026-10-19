@@ -1,0 +1,340 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.json;
+
+// Spike 5: an append-only JSONL journal with sync, torn-tail recovery,
+// atomic snapshot by rename, and a single-writer lock. docs/file-writes.md.
+// The directory is a compile-time literal because an `Fs` prefix is
+// (docs/filesystem.md); the spike's driver (run.sh) creates it.
+//
+//   argv[1] = append (seq 1-3) | append2 (seq 4-6) | tear | recover | snapshot | snapshot-torn | lock
+
+fn journal() -> [] &static [byte] {
+    return "/tmp/cancho-forge-spike/journal.jsonl";
+}
+
+fn snapshot_tmp() -> [] &static [byte] {
+    return "/tmp/cancho-forge-spike/snapshot.json.tmp";
+}
+
+fn snapshot_final() -> [] &static [byte] {
+    return "/tmp/cancho-forge-spike/snapshot.json";
+}
+
+fn say_done[&i](io: &!i Io, label: &i [byte], d: Done) -> [io_write] int {
+    io.write_all(io, label);
+    io.write_all(io, ": ");
+    match d {
+        Done::Ok(n) => {
+            io.write_all(io, "ok ");
+            io.print_int(io, n);
+        }
+        Done::Failed(e) => {
+            io.write_all(io, "FAILED errno ");
+            io.print_int(io, e);
+        }
+    }
+    io.newline(io);
+    return 0;
+}
+
+// A directory is made durable by syncing a handle opened on it (file-writes.md 5.2).
+fn sync_dir[&f, &i](fs: &f Fs("/tmp/cancho-forge-spike"), io: &!i Io) -> [fs_read("/tmp/cancho-forge-spike"), file_write, io_write] int {
+    match open_read(fs, "/tmp/cancho-forge-spike") {
+        Opened::Failed(e) => {
+            say_done(io, "open dir", Done::Failed(e));
+        }
+        Opened::Ok(opened) => {
+            var dir = opened;
+            borrow mut dir as &!d in {
+                say_done(io, "sync dir", file_sync(d));
+            }
+            file_close(dir);
+        }
+    }
+    return 0;
+}
+
+// One record: {"seq":N,"kind":K,"task":"t-1"} and the newline that ends it.
+fn record[&h, &k](heap: &!h Heap, seq: int, kind: &k [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 96);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "seq");
+    w = json.put_int(heap, w, seq);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, kind);
+    w = json.put_key(heap, w, "task");
+    w = json.put_string(heap, w, "t-1");
+    w = json.end_object(heap, w);
+    var line = json.finish(w);
+    return buffer.push(heap, line, byte_of(10));
+}
+
+// Append one record with ONE write call, so a record is never split by this
+// process; returns the bytes written or -errno.
+fn append_one[&h, &k, &x](heap: &!h Heap, file: &!x File, seq: int, kind: &k [byte]) -> [heap, file_write] int {
+    let line = record(heap, seq, kind);
+    var wrote = 0;
+    borrow line as &l in {
+        match file_write(file, buffer.bytes(l)) {
+            Done::Ok(n) => {
+                wrote = n;
+            }
+            Done::Failed(e) => {
+                wrote = 0 - e;
+            }
+        }
+    }
+    buffer.drop(heap, line);
+    return wrote;
+}
+
+fn do_append[&h, &f, &i](heap: &!h Heap, first: int, fs: &f Fs("/tmp/cancho-forge-spike"), io: &!i Io) -> [heap, fs_read("/tmp/cancho-forge-spike"), fs_write("/tmp/cancho-forge-spike"), file_write, io_write] int {
+    match open_append(fs, journal()) {
+        Opened::Failed(e) => {
+            say_done(io, "open_append", Done::Failed(e));
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                io.write_all(io, "wrote bytes: ");
+                io.print_int(io, append_one(heap, x, first, "task.proposed"));
+                io.write_all(io, ", ");
+                io.print_int(io, append_one(heap, x, first + 1, "task.approved"));
+                io.write_all(io, ", ");
+                io.print_int(io, append_one(heap, x, first + 2, "task.dispatched"));
+                io.newline(io);
+                say_done(io, "file_sync", file_sync(x));
+            }
+            file_close(file);
+            sync_dir(fs, io);
+        }
+    }
+    return 0;
+}
+
+// A crash in the middle of a record: half a line, no newline, no sync.
+fn do_tear[&f, &i](fs: &f Fs("/tmp/cancho-forge-spike"), io: &!i Io) -> [fs_write("/tmp/cancho-forge-spike"), file_write, io_write] int {
+    match open_append(fs, journal()) {
+        Opened::Failed(e) => {
+            say_done(io, "open_append", Done::Failed(e));
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                say_done(io, "torn write", file_write(x, "{\"seq\":4,\"kind\":\"task.run"));
+            }
+            file_close(file);
+        }
+    }
+    return 0;
+}
+
+// Parse one complete line; answer its `seq`, or -1 when it is not an event.
+fn seq_of[&h, &s](heap: &!h Heap, line: &s [byte]) -> [heap] int {
+    let tape = box_slice(heap, json.tape_len(line), 0);
+    var seq = 0 - 1;
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(line, tp) > 0 {
+            let node = json.get(line, tp, 0, "seq");
+            if json.is_int(tp, node) {
+                seq = json.to_int(line, tp, node);
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return seq;
+}
+
+// Read the whole journal into a buffer, 4 KiB at a time.
+fn slurp[&h, &x](heap: &!h Heap, file: &!x File) -> [heap, file_read] buffer.Buffer {
+    var all = buffer.empty(heap, 256);
+    let scratch = box_slice(heap, 4096, byte_of(0));
+    var more = true;
+    borrow mut scratch as &!sw in {
+        while more {
+            match file_read(file, contents(sw)) {
+                Read::Got(n) => {
+                    all = buffer.append(heap, all, contents(sw)[0..n]);
+                }
+                Read::End => {
+                    more = false;
+                }
+                Read::Failed(e) => {
+                    more = false;
+                }
+            }
+        }
+    }
+    unbox_slice(heap, scratch);
+    return all;
+}
+
+fn do_recover[&h, &f, &i](heap: &!h Heap, fs: &f Fs("/tmp/cancho-forge-spike"), io: &!i Io) -> [heap, fs_read("/tmp/cancho-forge-spike"), fs_write("/tmp/cancho-forge-spike"), file_read, file_write, io_write] int {
+    match open_rw(fs, journal()) {
+        Opened::Failed(e) => {
+            say_done(io, "open_rw", Done::Failed(e));
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                let all = slurp(heap, x);
+                var good_end = 0;
+                var start = 0;
+                var records = 0;
+                var bad = 0;
+                var total = 0;
+                borrow all as &a in {
+                    let text = buffer.bytes(a);
+                    total = len(text);
+                    var k = 0;
+                    while k < len(text) {
+                        if int_of(text[k]) == 10 {
+                            if seq_of(heap, text[start..k]) == records + 1 {
+                                records = records + 1;
+                                good_end = k + 1;
+                            } else {
+                                bad = bad + 1;
+                            }
+                            start = k + 1;
+                        }
+                        k = k + 1;
+                    }
+                }
+                buffer.drop(heap, all);
+                io.write_all(io, "recovered records=");
+                io.print_int(io, records);
+                io.write_all(io, " valid_bytes=");
+                io.print_int(io, good_end);
+                io.write_all(io, " file_bytes=");
+                io.print_int(io, total);
+                io.write_all(io, " corrupt_complete_lines=");
+                io.print_int(io, bad);
+                io.newline(io);
+                // Only bytes after the last newline are a torn write. A complete
+                // line that is not the next event is corruption or a duplicate:
+                // report it and change nothing (fail closed).
+                if bad > 0 {
+                    io.write_all(io, "REFUSED: complete line(s) that are not the next event; file left untouched\n");
+                } else if start < total {
+                    say_done(io, "truncate torn tail", file_truncate(x, start));
+                    say_done(io, "file_sync", file_sync(x));
+                }
+            }
+            file_close(file);
+        }
+    }
+    return 0;
+}
+
+// Atomic replace: write a temp file, sync it, rename over the old name, sync
+// the directory. `tear` skips the rename, as a crash before it would.
+fn do_snapshot[&f, &i](fs: &f Fs("/tmp/cancho-forge-spike"), io: &!i Io, publish: bool) -> [fs_read("/tmp/cancho-forge-spike"), fs_write("/tmp/cancho-forge-spike"), file_write, io_write] int {
+    match open_write(fs, snapshot_tmp()) {
+        Opened::Failed(e) => {
+            say_done(io, "open_write tmp", Done::Failed(e));
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                say_done(io, "write tmp", file_write(x, "{\"last_seq\":3,\"tasks\":{\"t-1\":\"running\"}}\n"));
+                say_done(io, "sync tmp", file_sync(x));
+            }
+            file_close(file);
+            if publish {
+                say_done(io, "rename", fs_rename(fs, snapshot_tmp(), snapshot_final()));
+                sync_dir(fs, io);
+            } else {
+                io.write_all(io, "crash before rename: snapshot.json untouched\n");
+            }
+        }
+    }
+    return 0;
+}
+
+// One writer at a time: flock is per open file description, so a second
+// open in the same process conflicts exactly as a second process would.
+fn do_lock[&f, &i](fs: &f Fs("/tmp/cancho-forge-spike"), io: &!i Io) -> [fs_write("/tmp/cancho-forge-spike"), file_write, io_write] int {
+    match open_append(fs, journal()) {
+        Opened::Failed(e) => {
+            say_done(io, "first open", Done::Failed(e));
+        }
+        Opened::Ok(first) => {
+            var one = first;
+            match open_append(fs, journal()) {
+                Opened::Failed(e) => {
+                    say_done(io, "second open", Done::Failed(e));
+                }
+                Opened::Ok(second) => {
+                    var two = second;
+                    borrow mut one as &!a in {
+                        borrow mut two as &!b in {
+                            say_done(io, "lock by first writer", file_lock(a));
+                            say_done(io, "lock by second writer (must fail)", file_lock(b));
+                        }
+                    }
+                    file_close(two);
+                }
+            }
+            file_close(one);
+        }
+    }
+    return 0;
+}
+
+fn pick[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs("/tmp/cancho-forge-spike"), io: &!i Io, g: &g Args) -> [heap, fs_read("/tmp/cancho-forge-spike"), fs_write("/tmp/cancho-forge-spike"), file_read, file_write, io_write, args] int {
+    let a = arg(g, 1);
+    let mode = int_of(a[0]);
+    if mode == 'a' && len(a) == 6 {
+        do_append(heap, 1, fs, io);
+    }
+    if mode == 'a' && len(a) != 6 {
+        do_append(heap, 4, fs, io);
+    }
+    if mode == 't' {
+        do_tear(fs, io);
+    }
+    if mode == 'r' {
+        do_recover(heap, fs, io);
+    }
+    if mode == 's' && len(a) == 8 {
+        do_snapshot(fs, io, true);
+    }
+    if mode == 's' && len(a) != 8 {
+        do_snapshot(fs, io, false);
+    }
+    if mode == 'l' {
+        do_lock(fs, io);
+    }
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    let data = narrow(fs, "/tmp/cancho-forge-spike");
+    var console = io;
+    var memory = heap;
+    borrow data as &f in {
+        borrow mut console as &!i in {
+            borrow mut memory as &!h in {
+                borrow args as &g in {
+                    pick(h, f, i, g);
+                }
+            }
+        }
+    }
+    release(data);
+    release(console);
+    release(memory);
+    release(args);
+    return 0;
+}

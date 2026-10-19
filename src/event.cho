@@ -1,0 +1,53 @@
+edition 9;
+module forge.event;
+
+import std.buffer;
+import std.json;
+
+// A journal record is one JSON object on one line (docs/architecture.md,
+// "The journal is the source of truth"). The first fields are fixed:
+//   v    schema version, 1
+//   seq  position in the journal, starting at 1, no gaps
+//   kind a dotted event name
+//   task the task id the event is about
+// Readers ignore fields they do not know, so a later version can add some.
+
+pub fn schema_version() -> [] int {
+    return 1;
+}
+
+// The record and the newline that ends it. A reader treats bytes after the
+// last newline as a torn write, so the newline is part of the record.
+pub fn record[&h, &k, &t](heap: &!h Heap, seq: int, kind: &k [byte], task: &t [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 96);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "v");
+    w = json.put_int(heap, w, schema_version());
+    w = json.put_key(heap, w, "seq");
+    w = json.put_int(heap, w, seq);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, kind);
+    w = json.put_key(heap, w, "task");
+    w = json.put_string(heap, w, task);
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}
+
+// The `seq` of one complete line, or -1 when the line is not a record: not
+// JSON, not an object, no integer `seq`, or a `v` this build does not know.
+pub fn seq_of[&h, &s](heap: &!h Heap, line: &s [byte]) -> [heap] int {
+    let tape = box_slice(heap, json.tape_len(line), 0);
+    var seq = 0 - 1;
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(line, tp) > 0 && json.is_object(tp, 0) {
+            let version = json.get(line, tp, 0, "v");
+            let node = json.get(line, tp, 0, "seq");
+            if json.is_int(tp, node) && json.is_int(tp, version) && json.to_int(line, tp, version) == schema_version() {
+                seq = json.to_int(line, tp, node);
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return seq;
+}

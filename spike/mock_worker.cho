@@ -1,0 +1,122 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.json;
+
+// A mock Forge worker (docs/worker-contract.md): one JSON request on stdin,
+// one JSON response on stdout, exit 0. argv[1] injects a failure so the
+// supervisor's error mapping can be measured:
+//   (none)  succeed
+//   h       hang (never answers; the supervisor must time it out)
+//   g       answer something that is not JSON
+//   x       exit 3 with nothing on stdout
+//   f       answer a well-formed result whose state is "failed"
+// It holds no capability but `Io` and `Heap`: no `Fs`, `Net`, `Exec`.
+
+fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var all = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        all = buffer.push(heap, all, byte_of(c));
+        c = getchar(io);
+    }
+    return all;
+}
+
+fn respond[&h, &i, &s](heap: &!h Heap, io: &!i Io, request: &s [byte], state: &s [byte]) -> [heap, io_write] int {
+    let tape = box_slice(heap, json.tape_len(request), 0);
+    var w = json.writer(heap, 128);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        let n = json.parse(request, tp);
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "v");
+        w = json.put_int(heap, w, 1);
+        w = json.put_key(heap, w, "state");
+        w = json.put_string(heap, w, state);
+        w = json.put_key(heap, w, "task_id");
+        if n > 0 {
+            w = json.put_string(heap, w, json.string_view(request, tp, json.get(request, tp, json.get(request, tp, 0, "task"), "id")));
+        } else {
+            w = json.put_null(heap, w);
+        }
+        w = json.put_key(heap, w, "evidence");
+        w = json.begin_array(heap, w);
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "kind");
+        w = json.put_string(heap, w, "log");
+        w = json.put_key(heap, w, "ref");
+        w = json.put_string(heap, w, "file:artifacts/t-1/worker.log");
+        w = json.end_object(heap, w);
+        w = json.end_array(heap, w);
+        w = json.end_object(heap, w);
+    }
+    unbox_slice(heap, tape);
+    let out = json.finish(w);
+    borrow out as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, out);
+    return 0;
+}
+
+fn work[&h, &i, &g](heap: &!h Heap, io: &!i Io, g: &g Args) -> [heap, io_read, io_write, args] int {
+    let request = read_request(heap, io);
+    var code = 0;
+    var mode = 0;
+    if arg_count(g) > 1 {
+        mode = int_of(arg(g, 1)[0]);
+    }
+    if mode == 'h' {
+        // Never answer: keep reading after end of input until killed.
+        var c = getchar(io);
+        while c >= 0 || c < 0 {
+            c = getchar(io);
+        }
+    }
+    if mode == 'x' {
+        code = 3;
+    }
+    if mode == 'g' {
+        io.write_all(io, "this is not json\n");
+    }
+    if mode == 0 {
+        borrow request as &r in {
+            respond(heap, io, buffer.bytes(r), "succeeded");
+        }
+    }
+    if mode == 'f' {
+        borrow request as &r in {
+            respond(heap, io, buffer.bytes(r), "failed");
+        }
+    }
+    buffer.drop(heap, request);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow mut console as &!i in {
+        borrow mut memory as &!h in {
+            borrow args as &g in {
+                code = work(h, i, g);
+            }
+        }
+    }
+    release(console);
+    release(memory);
+    release(args);
+    return code;
+}
