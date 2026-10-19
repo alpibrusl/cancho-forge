@@ -428,7 +428,7 @@ building them found:
 What did not work or is not built, and what each blocks. "Needed from
 cancho" is a proposed feature. **Corrected after M0**: the tracker was
 searched and the gaps filed or found. G1 and G9 are [cancho #534](https://github.com/alpibrusl/cancho/issues/534)
-(open), G2 is [#535](https://github.com/alpibrusl/cancho/issues/535) (open), G3 was
+(still open; **corrected 2026-10-19**: cancho #546 answers part of it, below), G2 was [#535](https://github.com/alpibrusl/cancho/issues/535) (**closed: `exec_covers`/`fs_covers`, cancho #540**), G3 was
 [#533](https://github.com/alpibrusl/cancho/issues/533) and is **built and merged**
 (`child_kill_group`, S7), G4 stays open and is a row of `docs/processes.md`
 section 9 (no issue), G6 was [#536](https://github.com/alpibrusl/cancho/issues/536)
@@ -437,15 +437,15 @@ checked by reading `docs/processes.md` at rev `8411e9a`).
 
 | # | Gap | Blocks | Needed from cancho |
 |---|---|---|---|
-| G1 | **Open: cancho #534.** `narrow` accepts only literals, so `Exec`/`Fs` bounds are fixed at build time | Per-task, run-time scoped grants (design doc 6.4); a workers/workspace directory from configuration | A way to narrow to a deployment-time value. Existing open row: `docs/processes.md` section 9, "A bound chosen at deployment" (it says `Fs` has the same question) |
-| G2 | **Open: cancho #535.** A bound violation is a trap (SIGILL), not a value | A policy bug crashes the runtime instead of producing a journalled refusal | Accept as designed and pre-check in Forge (the plan), or a checked variant returning `Failed(EPERM)` |
+| G1 | **Open: cancho #534, partly answered 2026-10-19 (cancho #546, merged).** `narrow` still accepts only literals. A run-time bound is now a `Dir` (for `Fs`, edition 6) and, for `Exec`, `exec_spawn_under(&Exec(""), &Dir, name, ...)` (edition 9; its row is `exec_under`, which names no path). Forge has **not** used either yet | Per-task, run-time scoped grants (design doc 6.4); a workers/workspace directory from configuration | A way to narrow to a deployment-time value. Existing open row: `docs/processes.md` section 9, "A bound chosen at deployment" (it says `Fs` has the same question) |
+| G2 | ~~Open: cancho #535. A bound violation is a trap (SIGILL), not a value~~ **Answered 2026-10-19: cancho #540 (merged, closed #535)**: `exec_covers(&Exec, path)` and `fs_covers(&Fs, path)` (edition 9, no row) say whether a path is inside the bound by the rule the operations trap on, so Forge can ask first and journal a refusal instead of duplicating the rule. The violation still traps by design | Nothing now; **not yet adopted in Forge's policy layer** (M4) | None. Forge's own pre-check can be replaced by the predicate once the pin carries it (it does as of this pin) |
 | G3 | ~~`capture`/`child_kill` reach the pid only; grandchildren survive (S7)~~ **Built: cancho #533 (merged), `child_kill_group`; S7 re-run, PASS with no `/bin/kill`** | Nothing now; M2 starts workers with `exec_spawn_detached` | None. Residual, from cancho's own document: a descendant that leaves the group is not reached; the orphan after a Forge crash is G4 |
 | G4 | **Open, no issue: a row of `docs/processes.md` section 9** (cancho #533 narrowed it: a supervisor that is alive can stop a worker's group with the `Child` it holds; after a supervisor *crash* nothing changes). No kill-by-pid capability; children outlive a dead parent (documented, not measured) | Safely stopping an orphaned worker after a Forge crash (M2) | `docs/processes.md` section 9 rows: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` (Linux only) |
 | G5 | `fsync` on macOS does not flush the drive cache (documented); only Linux was run | The durability promise on macOS (M1) | `F_FULLFSYNC` (`docs/file-writes.md` section 6) |
 | G6 | **Fixed: cancho #536 (closed, in rev `8411e9a`).** `docs/processes.md`'s status header says "slices 3 and 4 designed, not built", but its own slice table, `std/process.cho` and S1/S2/S6/S7 show `std.process` working | Nothing, but it misled the brief for this spike | Correct the header in the cancho repository (a document-only fix, per `CONTRIBUTING.md`) |
 | G7 | `cancho check` refuses a library with no `main`; `cancho test` is the only check for library-only files | Gate shape (we check `src/*.cho` as one program and rely on `cancho test` for tests) | None required; noted |
 | G8 | No `cancho` command walks a directory tree from a program without `std.dirs`/`Fs`; the 2,000-line rule is enforced by a shell loop in `scripts/gate.sh`, not in cancho | "Pure cancho" gate (M1 plans a cancho test using `std.dirs`) | None required |
-| G9 | **Open: cancho #534** (same issue as G1). A function over `Fs` cannot be generic in the prefix (M1 findings above) | The journal's file layer cannot be narrowed to the workspace; it holds `Fs("")` and guards paths itself | Same as G1, for `Fs`; or a prefix-generic capability parameter |
+| G9 | **Open: cancho #534** (same issue as G1). A function over `Fs` cannot be generic in the prefix (M1 findings above). cancho #546 documents `Dir` as the answer when the bound is a directory; **not tried against Forge's journal** | The journal's file layer cannot be narrowed to the workspace; it holds `Fs("")` and guards paths itself | Same as G1, for `Fs`; or a prefix-generic capability parameter |
 
 Not spiked, and therefore not claimed: SHA-256 evidence hashing; stderr
 capture (`capture_both`); `exec_spawn_in` (working directory); `Signals`

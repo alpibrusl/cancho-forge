@@ -74,9 +74,12 @@ spike/run.sh           # re-runs every spike and prints the evidence
 
 Read [`spike/RESULTS.md`](spike/RESULTS.md) first: it lists what cancho cannot
 do yet that shapes the later milestones (grants fixed at build time, cancho
-#534; a bound violation that traps, #535; orphaned workers after a crash). A
-kill that reached one pid was one of them: it is built (cancho #533) and the
-spike now passes without `/bin/kill`.
+#534, partly answered by cancho #546 but not yet used here; orphaned workers
+after a crash). Two were fixed upstream: a kill that reached one pid (cancho
+#533, `child_kill_group`; the spike passes without `/bin/kill`) and a bound
+violation that traps with no way to ask first (#535, `exec_covers` and
+`fs_covers`, cancho #540). The compiler pin is now cancho `7e4088b`, with the gate
+and the spikes re-run on it.
 
 ## More
 

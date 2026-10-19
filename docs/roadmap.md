@@ -180,8 +180,8 @@ the pilot's journal size and replay time.
 
 | need | milestone | status in cancho |
 |---|---|---|
-| run-time-chosen `narrow` for `Fs`/`Exec` (G1, G9) | M2 decide, M4 depend | open: cancho #534 |
-| non-trapping bound violation (G2) | M4 | open: cancho #535 |
+| run-time-chosen bound for `Fs`/`Exec` (G1, G9) | M2 decide, M4 depend | open: cancho #534; `Dir` and `exec_spawn_under` merged (cancho #546), not yet tried here |
+| asking before a bound violation (G2) | M4 | **built**: `exec_covers`/`fs_covers`, cancho #540 (closed #535); not yet adopted here |
 | group kill for a detached child (G3) | M2 | **built** (cancho #533, `child_kill_group`, edition 9; S7) |
 | kill-by-pid capability, parent-death cleanup (G4) | M2 | open rows in `docs/processes.md` section 9 |
 | `F_FULLFSYNC` on macOS (G5) | M1 | noted in `docs/file-writes.md` section 6 |
