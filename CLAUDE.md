@@ -40,5 +40,5 @@ The rules that matter most here:
   path, never a trap. (A trap is how cancho enforces a capability bound;
   Forge checks first so the bound is never what stops it. See
   `spike/RESULTS.md`, S3.)
-- **Compiler pin.** `cancho.toml` names the compiler revision. Do not
+- **Compiler pin.** `cancho.toml` and `.cancho-rev` name the compiler revision (CI reads `.cancho-rev`; keep them equal). Do not
   bump it without re-running `spike/run.sh` and the gate.
