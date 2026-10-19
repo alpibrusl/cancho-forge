@@ -19,14 +19,15 @@ atomic rename and locking. The gate (`scripts/gate.sh`) passes.
 
 | item | why it is not done |
 |---|---|
-| Audit of the real Cancho Code interface (task, planning, checker, journal, execution) | no access to it in M0; the worker contract is written ahead of it and must be corrected in place |
-| Audit of `lex-loom` (what is implemented, experimental, proposed) and the component reuse/migration matrix | same; the design document's section 14 asks for it |
-| License and dependency review of those two | same. Forge has no third-party dependencies (`THIRD_PARTY.md`) and is EUPL-1.2 like cancho; reuse of Loom or Cancho Code code is unchecked |
+| ~~Audit of the real Cancho Code interface~~ | **Done after M0**: [`cancho-code-audit.md`](cancho-code-audit.md). Source read, both offline gates run, a stand-in build, a TERM and a resume. The worker contract was corrected in place (five points, listed at its top). **Not done**: a build with a real model. |
+| Audit of `lex-loom` (what is implemented, experimental, proposed) | **Still owed**: no copy of it was available. The reuse matrix for Cancho Code and cancho is done (audit section 9); `lex-loom`'s row is not. |
+| License and dependency review | **Done for Cancho Code and cancho** (both EUPL-1.2, same holder, nothing vendored; what may be reused and on what terms: audit section 9). **Still owed for `lex-loom`** and for any provider's terms for model output, which were not reviewed. |
 | MVP acceptance-test plan | the nine success criteria exist (design doc section 7); mapping each to a test is M1's first task |
 | One golden-path scenario fully specified | sketched in the design document; a sample repository and one objectively testable change must be chosen |
 | Filing the cancho issues for G1-G5 | none were found or filed in M0 |
 
-**Exit criteria (revised):** the above audits written; the golden path
+**Exit criteria (revised, status):** the above audits written (Cancho Code
+done, `lex-loom` open); the golden path
 specified end to end; no critical dependency on an undocumented internal
 API; licence compatibility understood.
 
@@ -51,13 +52,36 @@ write, after write before sync, after sync, mid-record, mid-snapshot);
 invalid transitions are refused with `transition-invalid`; every transition
 is a queryable event; duplicate and torn-record tests pass.
 
-*Gaps in play:* G5 (macOS durability: state the promise per platform).
+*Gaps in play:* G5 (macOS durability: state the promise per platform), **G9**
+(found in M1: a library cannot be generic in the `Fs` prefix, so the file
+layer holds `Fs("")` and guards paths itself).
+
+**Status of M1 (what exists, honestly).** Built and in the gate:
+`src/task.cho` (the state machine, 18 edges, the decision order, nine rule
+tags), `src/journal.cho` (replay, torn-tail planning, refuse-on-corrupt,
+`submit`, the write path that records refusals), `src/journal_io.cho` (read,
+append with sync, recover), `src/event.cho` extended (`transition`,
+`refusal`); 56 tests under `cancho test` and 24 file cases in
+`tests/conformance/journal_files.cho`. **Not built:** the `schemas/`, objective
+/ execution / artifact / decision records, projections beyond task state,
+snapshots with `last_seq`, segments and rotation, the lock in the runtime
+(spike S5 measured the primitive), the operator CLI, the checked-in authority
+report for `forge`, the file-budget check as a `cancho test`, and the exit
+test "state survives a kill at every instrumented crash point" (the
+conformance program simulates a torn write by appending half a record; it does
+not kill a process). Note the exit criterion names `transition-invalid`; it
+now has company: `accept-unverified`, `actor-not-allowed`, `task-unknown`,
+`task-duplicate`, `event-malformed`, `event-unknown`, `journal-corrupt`,
+`path-invalid` (architecture section 7).
 
 ## M2 -- Worker contract and Cancho Code adapter
 
 *Leans on:* `std.process`, `Exec`. *Justified by:* S1, S2, S3, S6.
 
-Work: audit Cancho Code first and correct `worker-contract.md`; mock
+Work: ~~audit Cancho Code first and correct `worker-contract.md`~~ (done,
+`cancho-code-audit.md`; **the adapter's design changed**: Cancho Code is an
+`async`, process-and-directory worker started detached with a group kill, not
+a `sync` stdio worker; contract section 9); mock
 worker rewritten to the contract (request-driven failure injection); a
 contract-test suite run against mock and, then, the adapter; the adapter
 (`src/worker.cho`) normalising the endings of contract section 5; execution

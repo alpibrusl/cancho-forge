@@ -1,0 +1,253 @@
+edition 9;
+module forge.journal_io;
+
+import std.buffer;
+import std.bytes;
+import std.map;
+import forge.journal;
+import forge.task;
+
+// The journal's file layer (docs/architecture.md, section 4.2 and 4.3): read
+// a whole journal, append one record durably, recover a torn tail. Every
+// decision is `forge.journal`'s; this file only moves bytes.
+//
+// Its capability is `Fs("")`, and that is a measured limit, not a choice: a
+// function that takes `Fs("/x")` cannot be handed a narrower one, and a
+// library cannot be generic in the prefix (docs/architecture.md, gap G9). So
+// the path is checked here, in layer 2, before the capability could trap:
+// `path_ok` refuses a relative path, a `..` component and a NUL
+// (`path-invalid`). A binary that links this file reports `fs_read("")` and
+// `fs_write("")` in `cancho authority`; today only the conformance program
+// does (tests/conformance/journal_files.cho), `forge` itself does not.
+//
+// Errors are values. An `errno` is a positive int; a short write is -1.
+
+// A path Forge will hand to the file capability: absolute, at most 512
+// bytes, no NUL, and no `..` component (the capability traps on one).
+pub fn path_ok[&p](path: &p [byte]) -> [] bool {
+    if len(path) < 2 || len(path) > 512 || int_of(path[0]) != 47 {
+        return false;
+    }
+    var start = 0;
+    var k = 0;
+    while k <= len(path) {
+        var edge = k == len(path);
+        if edge == false {
+            let c = int_of(path[k]);
+            if c == 0 {
+                return false;
+            }
+            edge = c == 47;
+        }
+        if edge {
+            if k - start == 2 && int_of(path[start]) == 46 && int_of(path[start + 1]) == 46 {
+                return false;
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// The directory part of an absolute path ("/a/b/c" gives "/a/b"; "/c" gives "/").
+fn parent_of[&p](path: &p [byte]) -> [] &p [byte] {
+    var k = len(path);
+    while k > 1 && int_of(path[k - 1]) != 47 {
+        k = k - 1;
+    }
+    if k <= 1 {
+        return path[0..1];
+    }
+    return path[0..k - 1];
+}
+
+// What reading the journal produced: its bytes, and 0 or an errno. A file
+// that does not exist is an empty journal (errno 2 is not an error here).
+pub fn read_all[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
+    var all = buffer.empty(heap, 256);
+    if path_ok(path) == false {
+        return (all, 0 - 2);
+    }
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            if e == 2 {
+                return (all, 0);
+            }
+            return (all, e);
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var errno = 0;
+            let scratch = box_slice(heap, 4096, byte_of(0));
+            var more = true;
+            borrow mut file as &!x in {
+                borrow mut scratch as &!sw in {
+                    while more {
+                        match file_read(x, contents(sw)) {
+                            Read::Got(n) => {
+                                all = buffer.append(heap, all, contents(sw)[0..n]);
+                            }
+                            Read::End => {
+                                more = false;
+                            }
+                            Read::Failed(e) => {
+                                errno = e;
+                                more = false;
+                            }
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, scratch);
+            file_close(file);
+            return (all, errno);
+        }
+    }
+}
+
+// Append `record` (one or more whole records, newline included) with ONE
+// write on an append handle and make it durable with `file_sync`; with
+// `new_file`, also sync the directory so the file's existence is durable.
+// 0, or an errno, or -1 for a short write, or -2 for a path that is not ok.
+// Forge stops on any non-zero answer: after a failed sync the file's
+// contents are unknown (docs/file-writes.md, section 5.1).
+pub fn append[&f, &p, &r](fs: &f Fs(""), path: &p [byte], record: &r [byte], new_file: bool) -> [fs_read(""), fs_write(""), file_write] int {
+    if path_ok(path) == false {
+        return 0 - 2;
+    }
+    var status = 0;
+    match open_append(fs, path) {
+        Opened::Failed(e) => {
+            status = e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                match file_write(x, record) {
+                    Done::Ok(n) => {
+                        if n != len(record) {
+                            status = 0 - 1;
+                        }
+                    }
+                    Done::Failed(e) => {
+                        status = e;
+                    }
+                }
+                if status == 0 {
+                    match file_sync(x) {
+                        Done::Ok(n) => {
+                            status = 0;
+                        }
+                        Done::Failed(e) => {
+                            status = e;
+                        }
+                    }
+                }
+            }
+            file_close(file);
+        }
+    }
+    if status == 0 && new_file {
+        match open_read(fs, parent_of(path)) {
+            Opened::Failed(e) => {
+                status = e;
+            }
+            Opened::Ok(dir) => {
+                var handle = dir;
+                borrow mut handle as &!d in {
+                    match file_sync(d) {
+                        Done::Ok(n) => {
+                            status = 0;
+                        }
+                        Done::Failed(e) => {
+                            status = e;
+                        }
+                    }
+                }
+                file_close(handle);
+            }
+        }
+    }
+    return status;
+}
+
+// Cut the journal to `length` bytes and sync. 0 or an errno. Only
+// `recover` calls this, and only with a length `journal.recovery_cut` offered.
+fn cut_to[&f, &p](fs: &f Fs(""), path: &p [byte], length: int) -> [fs_read(""), fs_write(""), file_write] int {
+    var status = 0;
+    match open_rw(fs, path) {
+        Opened::Failed(e) => {
+            status = e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                match file_truncate(x, length) {
+                    Done::Ok(n) => {
+                        status = 0;
+                    }
+                    Done::Failed(e) => {
+                        status = e;
+                    }
+                }
+                if status == 0 {
+                    match file_sync(x) {
+                        Done::Ok(n) => {
+                            status = 0;
+                        }
+                        Done::Failed(e) => {
+                            status = e;
+                        }
+                    }
+                }
+            }
+            file_close(file);
+        }
+    }
+    return status;
+}
+
+// What recovery did, beside the replay: `errno` is 0 or the I/O error that
+// stopped it; `cut` is the number of bytes removed (0 when nothing was).
+pub struct Recovered {
+    errno: int,
+    cut: int,
+}
+
+// Start-up: read the journal, replay it, and cut a torn tail if there is one
+// and nothing else is wrong. A complete bad line is never cut: the report
+// carries its rule, the file is untouched, and the table must not be used.
+// A path that is not ok is `path-invalid` and nothing is opened.
+pub fn recover[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] (map.Map[int], journal.Report, Recovered) {
+    if path_ok(path) == false {
+        let (table, report) = journal.replay(heap, "");
+        return (table, journal.Report { records: 0, valid_bytes: 0, total_bytes: 0, torn_bytes: 0, tasks: 0, rule: task.rule_code(task.Rule::PathInvalid), line: 0 }, Recovered { errno: 0, cut: 0 });
+    }
+    let (data, errno) = read_all(heap, fs, path);
+    if errno != 0 {
+        buffer.drop(heap, data);
+        let (table, report) = journal.replay(heap, "");
+        return (table, report, Recovered { errno: errno, cut: 0 });
+    }
+    let (empty_table, empty_report) = journal.replay(heap, "");
+    var table = empty_table;
+    var report = empty_report;
+    var cut = 0;
+    var failure = 0;
+    borrow data as &db in {
+        map.drop(heap, table);
+        let (t, r) = journal.replay(heap, buffer.bytes(db));
+        table = t;
+        report = r;
+        let to = journal.recovery_cut(r);
+        if to >= 0 {
+            failure = cut_to(fs, path, to);
+            if failure == 0 {
+                cut = r.total_bytes - to;
+            }
+        }
+    }
+    buffer.drop(heap, data);
+    return (table, report, Recovered { errno: failure, cut: cut });
+}

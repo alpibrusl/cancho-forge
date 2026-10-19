@@ -1,0 +1,391 @@
+edition 9;
+
+import std.bytes;
+import std.option;
+import std.test;
+import forge.task;
+
+// Unit tests for src/task.cho: the edge table, the decision order, the rule
+// names, and the property that a worker can never move a task. Run with
+// `cancho test` (cancho.toml). Every rule tag of docs/architecture.md that
+// task.cho can answer is reached by name here.
+
+fn state_of(code: int) -> [] task.State {
+    match task.state_of_code(code) {
+        option.Option::Some(s) => {
+            return s;
+        }
+        option.Option::None => {
+            return task.State::Proposed;
+        }
+    }
+}
+
+fn actor_of(n: int) -> [] task.Actor {
+    if n == 0 {
+        return task.Actor::Forge;
+    }
+    if n == 1 {
+        return task.Actor::Worker;
+    }
+    return task.Actor::Human;
+}
+
+// "" for a move, else the rule name of the refusal.
+fn refusal_of(d: task.Decision) -> [] &static [byte] {
+    match d {
+        task.Decision::Moved(s) => {
+            return "";
+        }
+        task.Decision::Refused(r) => {
+            return task.rule_name(r);
+        }
+    }
+}
+
+// The code of the state a decision moves to, 0 for a refusal.
+fn moved_to(d: task.Decision) -> [] int {
+    match d {
+        task.Decision::Moved(s) => {
+            return task.state_code(s);
+        }
+        task.Decision::Refused(r) => {
+            return 0;
+        }
+    }
+}
+
+fn code_of_kind[&k](kind: &k [byte]) -> [] int {
+    match task.target_of_kind(kind) {
+        option.Option::Some(s) => {
+            return task.state_code(s);
+        }
+        option.Option::None => {
+            return 0;
+        }
+    }
+}
+
+// ---- the edge table -----------------------------------------------------
+
+// An independent oracle: row = from (proposed ... cancelled), column = to.
+fn row(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "010000011";
+    }
+    if code == 2 {
+        return "001000001";
+    }
+    if code == 3 {
+        return "000110001";
+    }
+    if code == 4 {
+        return "001011001";
+    }
+    if code == 5 {
+        return "001000001";
+    }
+    if code == 6 {
+        return "001000111";
+    }
+    return "000000000";
+}
+
+fn test_the_edge_table_is_exactly_the_documented_one() -> [] int {
+    var from = 1;
+    var legal = 0;
+    while from <= 9 {
+        var to = 1;
+        while to <= 9 {
+            let want = int_of(row(from)[to - 1]) == 49;
+            let got = task.can_move(state_of(from), state_of(to));
+            if want {
+                legal = legal + 1;
+            }
+            test.assert(want == got);
+            to = to + 1;
+        }
+        from = from + 1;
+    }
+    test.assert_eq(legal, 18);
+    return 0;
+}
+
+fn test_terminal_states_have_no_way_out() -> [] int {
+    var to = 1;
+    while to <= 9 {
+        test.assert(task.can_move(task.State::Accepted, state_of(to)) == false);
+        test.assert(task.can_move(task.State::Rejected, state_of(to)) == false);
+        test.assert(task.can_move(task.State::Cancelled, state_of(to)) == false);
+        to = to + 1;
+    }
+    return 0;
+}
+
+fn test_no_state_moves_to_itself() -> [] int {
+    var s = 1;
+    while s <= 9 {
+        test.assert(task.can_move(state_of(s), state_of(s)) == false);
+        s = s + 1;
+    }
+    return 0;
+}
+
+fn test_the_happy_path_walks_every_step() -> [] int {
+    test.assert(task.can_move(task.State::Proposed, task.State::Approved));
+    test.assert(task.can_move(task.State::Approved, task.State::Ready));
+    test.assert(task.can_move(task.State::Ready, task.State::Running));
+    test.assert(task.can_move(task.State::Running, task.State::Verification));
+    test.assert(task.can_move(task.State::Verification, task.State::Accepted));
+    return 0;
+}
+
+fn test_nothing_skips_verification_to_accepted() -> [] int {
+    var s = 1;
+    while s <= 9 {
+        if s != 6 {
+            test.assert(task.can_move(state_of(s), task.State::Accepted) == false);
+        }
+        s = s + 1;
+    }
+    return 0;
+}
+
+// ---- codes and names ----------------------------------------------------
+
+fn test_state_codes_round_trip() -> [] int {
+    var c = 1;
+    while c <= 9 {
+        test.assert_eq(task.state_code(state_of(c)), c);
+        c = c + 1;
+    }
+    test.assert_eq(code_of_kind("task.proposed"), 1);
+    return 0;
+}
+
+fn test_no_code_outside_one_to_nine_is_a_state() -> [] int {
+    test.assert(bytes.equal(task.code_name(0), "none"));
+    test.assert(bytes.equal(task.code_name(10), "none"));
+    test.assert(bytes.equal(task.code_name(0 - 1), "none"));
+    return 0;
+}
+
+fn test_state_names_are_the_documented_ones() -> [] int {
+    test.assert(bytes.equal(task.code_name(1), "proposed"));
+    test.assert(bytes.equal(task.code_name(2), "approved"));
+    test.assert(bytes.equal(task.code_name(3), "ready"));
+    test.assert(bytes.equal(task.code_name(4), "running"));
+    test.assert(bytes.equal(task.code_name(5), "blocked"));
+    test.assert(bytes.equal(task.code_name(6), "verification"));
+    test.assert(bytes.equal(task.code_name(7), "accepted"));
+    test.assert(bytes.equal(task.code_name(8), "rejected"));
+    test.assert(bytes.equal(task.code_name(9), "cancelled"));
+    return 0;
+}
+
+fn test_rule_names_are_the_documented_ones() -> [] int {
+    test.assert(bytes.equal(task.rule_code_name(1), "transition-invalid"));
+    test.assert(bytes.equal(task.rule_code_name(2), "accept-unverified"));
+    test.assert(bytes.equal(task.rule_code_name(3), "actor-not-allowed"));
+    test.assert(bytes.equal(task.rule_code_name(4), "task-unknown"));
+    test.assert(bytes.equal(task.rule_code_name(5), "task-duplicate"));
+    test.assert(bytes.equal(task.rule_code_name(6), "event-malformed"));
+    test.assert(bytes.equal(task.rule_code_name(7), "event-unknown"));
+    test.assert(bytes.equal(task.rule_code_name(8), "journal-corrupt"));
+    test.assert(bytes.equal(task.rule_code_name(9), "path-invalid"));
+    test.assert(bytes.equal(task.rule_code_name(0), "none"));
+    return 0;
+}
+
+fn test_kinds_and_states_agree() -> [] int {
+    var c = 1;
+    while c <= 9 {
+        let kind = task.kind_of_state(state_of(c));
+        test.assert_eq(code_of_kind(kind), c);
+        c = c + 1;
+    }
+    test.assert_eq(code_of_kind("task.done"), 0);
+    test.assert_eq(code_of_kind("task."), 0);
+    test.assert_eq(code_of_kind(""), 0);
+    test.assert_eq(code_of_kind("TASK.ACCEPTED"), 0);
+    return 0;
+}
+
+fn test_recorded_kinds_are_a_closed_list() -> [] int {
+    test.assert(task.is_recorded_kind("refusal"));
+    test.assert(task.is_recorded_kind("execution.started"));
+    test.assert(task.is_recorded_kind("approval.granted"));
+    test.assert(task.is_recorded_kind("budget.reserved"));
+    test.assert(task.is_recorded_kind("policy.loaded"));
+    test.assert(task.is_recorded_kind("company.created"));
+    test.assert(task.is_recorded_kind("deploy.started") == false);
+    test.assert(task.is_recorded_kind("") == false);
+    test.assert(task.is_recorded_kind("refusals") == false);
+    return 0;
+}
+
+fn test_task_ids_are_a_closed_set() -> [] int {
+    test.assert(task.id_ok("t-1"));
+    test.assert(task.id_ok("T_1.2-x"));
+    test.assert(task.id_ok("") == false);
+    test.assert(task.id_ok("a b") == false);
+    test.assert(task.id_ok("a/b") == false);
+    test.assert(task.id_ok("..") == false);
+    test.assert(task.id_ok(".") == false);
+    test.assert(task.id_ok(".hidden") == false);
+    test.assert(task.id_ok("-x") == false);
+    test.assert(task.id_ok("_x") == false);
+    test.assert(task.id_ok("a.b"));
+    test.assert(task.id_ok("9"));
+    test.assert(task.id_ok("Z"));
+    test.assert(task.id_ok("a\"b") == false);
+    test.assert(task.id_ok("\n") == false);
+    test.assert(task.id_ok("0123456789012345678901234567890123456789012345678901234567890123"));
+    test.assert(task.id_ok("01234567890123456789012345678901234567890123456789012345678901234") == false);
+    return 0;
+}
+
+// ---- decisions: every refusal reached by name ---------------------------
+
+fn test_a_proposal_creates_a_task() -> [] int {
+    let d = task.decide(0, task.State::Proposed, task.Actor::Human, false);
+    test.assert_eq(moved_to(d), 1);
+    let f = task.decide(0, task.State::Proposed, task.Actor::Forge, false);
+    test.assert_eq(moved_to(f), 1);
+    return 0;
+}
+
+fn test_transition_invalid_is_reached() -> [] int {
+    // running -> approved is not an edge
+    let d = task.decide(4, task.State::Approved, task.Actor::Forge, false);
+    test.assert(bytes.equal(refusal_of(d), "transition-invalid"));
+    // a terminal state has no way out
+    let t = task.decide(7, task.State::Ready, task.Actor::Human, false);
+    test.assert(bytes.equal(refusal_of(t), "transition-invalid"));
+    // ready -> verification skips running
+    let s = task.decide(3, task.State::Verification, task.Actor::Forge, false);
+    test.assert(bytes.equal(refusal_of(s), "transition-invalid"));
+    return 0;
+}
+
+fn test_accept_unverified_is_reached() -> [] int {
+    // a worker's claim, from verification, the only place accepted is legal
+    let w = task.decide(6, task.State::Accepted, task.Actor::Worker, true);
+    test.assert(bytes.equal(refusal_of(w), "accept-unverified"));
+    // Forge, but without an observed basis
+    let u = task.decide(6, task.State::Accepted, task.Actor::Forge, false);
+    test.assert(bytes.equal(refusal_of(u), "accept-unverified"));
+    // a human's word is not an observation either
+    let h = task.decide(6, task.State::Accepted, task.Actor::Human, true);
+    test.assert(bytes.equal(refusal_of(h), "accept-unverified"));
+    // a worker claim is accept-unverified even where the edge is also illegal
+    let r = task.decide(4, task.State::Accepted, task.Actor::Worker, true);
+    test.assert(bytes.equal(refusal_of(r), "accept-unverified"));
+    return 0;
+}
+
+fn test_only_a_forge_observation_accepts() -> [] int {
+    let d = task.decide(6, task.State::Accepted, task.Actor::Forge, true);
+    test.assert_eq(moved_to(d), 7);
+    // observed, but the edge is not legal from running
+    let bad = task.decide(4, task.State::Accepted, task.Actor::Forge, true);
+    test.assert(bytes.equal(refusal_of(bad), "transition-invalid"));
+    return 0;
+}
+
+fn test_actor_not_allowed_is_reached() -> [] int {
+    let d = task.decide(2, task.State::Ready, task.Actor::Worker, false);
+    test.assert(bytes.equal(refusal_of(d), "actor-not-allowed"));
+    let p = task.decide(0, task.State::Proposed, task.Actor::Worker, false);
+    test.assert(bytes.equal(refusal_of(p), "actor-not-allowed"));
+    return 0;
+}
+
+fn test_task_unknown_is_reached() -> [] int {
+    let d = task.decide(0, task.State::Approved, task.Actor::Human, false);
+    test.assert(bytes.equal(refusal_of(d), "task-unknown"));
+    let a = task.decide(0, task.State::Accepted, task.Actor::Forge, true);
+    test.assert(bytes.equal(refusal_of(a), "task-unknown"));
+    return 0;
+}
+
+fn test_task_duplicate_is_reached() -> [] int {
+    var c = 1;
+    while c <= 9 {
+        let d = task.decide(c, task.State::Proposed, task.Actor::Human, false);
+        test.assert(bytes.equal(refusal_of(d), "task-duplicate"));
+        c = c + 1;
+    }
+    return 0;
+}
+
+// ---- the property the design rests on -----------------------------------
+
+// For every current state (0 to 9), every target and both bases, a worker
+// never moves a task: the answer is always a refusal.
+fn test_a_worker_never_moves_a_task() -> [] int {
+    var cur = 0;
+    while cur <= 9 {
+        var to = 1;
+        while to <= 9 {
+            let a = task.decide(cur, state_of(to), task.Actor::Worker, true);
+            let b = task.decide(cur, state_of(to), task.Actor::Worker, false);
+            test.assert_eq(moved_to(a), 0);
+            test.assert_eq(moved_to(b), 0);
+            to = to + 1;
+        }
+        cur = cur + 1;
+    }
+    return 0;
+}
+
+// For every combination, `accepted` is reached only by Forge, observed,
+// from verification. That is 10 states x 3 actors x 2 bases = 60 cases and
+// exactly one of them moves.
+fn test_accepted_is_reached_in_exactly_one_way() -> [] int {
+    var moves = 0;
+    var cur = 0;
+    while cur <= 9 {
+        var a = 0;
+        while a < 3 {
+            var obs = 0;
+            while obs < 2 {
+                let d = task.decide(cur, task.State::Accepted, actor_of(a), obs == 1);
+                if moved_to(d) == 7 {
+                    moves = moves + 1;
+                    test.assert_eq(cur, 6);
+                    test.assert_eq(a, 0);
+                    test.assert_eq(obs, 1);
+                }
+                obs = obs + 1;
+            }
+            a = a + 1;
+        }
+        cur = cur + 1;
+    }
+    test.assert_eq(moves, 1);
+    return 0;
+}
+
+// Every move a non-worker actor is allowed follows the edge table: decide
+// moves exactly when can_move says so (and accept needs its basis).
+fn test_decide_follows_the_table() -> [] int {
+    var from = 1;
+    while from <= 9 {
+        var to = 1;
+        while to <= 9 {
+            if to != 7 {
+                let d = task.decide(from, state_of(to), task.Actor::Human, false);
+                let want = task.can_move(state_of(from), state_of(to));
+                if to == 1 {
+                    test.assert_eq(moved_to(d), 0);
+                } else {
+                    test.assert(moved_to(d) == to == want);
+                }
+            }
+            to = to + 1;
+        }
+        from = from + 1;
+    }
+    return 0;
+}

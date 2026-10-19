@@ -7,6 +7,13 @@
 > commands and their output, in [`spike/RESULTS.md`](../spike/RESULTS.md) under
 > the spike number cited. Claims marked *(designed)* have not been built or
 > measured. A claim that turns out false is corrected here, in place.
+>
+> **Corrected after M0** (by the Cancho Code audit,
+> [`cancho-code-audit.md`](cancho-code-audit.md), and by building M1's core):
+> section 5.3 (credentials are not passed on stdin), section 6 (the real edge
+> table; `retry` goes through `ready`), section 7 (the rules M1 implements and
+> tests), section 8, and section 9 (G9: a library cannot be generic in the
+> `Fs` prefix). Each is marked where it changed.
 
 ---
 
@@ -131,15 +138,17 @@ lock                      held with flock for the life of the process
 A **record** is one JSON object on one line, ended by `\n`:
 
 ```json
-{"v":1,"seq":7,"kind":"task.dispatched","task":"t-1"}
+{"v":1,"seq":7,"kind":"task.running","task":"t-1","actor":"forge"}
 ```
 
 `v` is the schema version; `seq` starts at 1 and has no gaps across
 segments; `kind` is a dotted event name; unknown fields are ignored by
 readers so a later version can add fields (*measured*, S4, and unit tests
-in `tests/event_test.cho`). A fuller record also carries `ts`, `actor`
-(worker or human identity, never the same namespace), `rule` (on refusals),
-and the policy version that decided it.
+in `tests/event_test.cho`). **As built in M1** (`src/event.cho`): a task event
+carries `actor` (`forge`, `worker` or `human`: never the same namespace) and,
+for a fact Forge itself checked, `basis: "observed"`; a refusal is a record of
+kind `refusal` with `task` and `rule`. A fuller record will also carry `ts`
+and the policy version that decided it *(designed)*.
 
 ### 4.2 Write protocol *(measured, S5)*
 
@@ -185,6 +194,26 @@ line:
   the two cases are separate here.
 * Then rebuild projections by replaying from the last snapshot whose
   `last_seq` is not beyond the journal.
+
+**As built in M1** *(measured: `tests/journal_test.cho`, 25 cases, and
+`tests/conformance/journal_files.cho`, 24 cases against real files)*: the pure
+core is `src/journal.cho` (`replay` over a byte slice into the state of every
+task, `recovery_cut`, `submit`), the file layer `src/journal_io.cho`
+(`read_all`, `append`, `recover`). Details that the paragraph above leaves to
+the reader:
+
+* A complete line the *state machine* refuses (say a `task.running` for a task
+  still `proposed`) is not "corrupt bytes". It is reported under the
+  machine's own tag (`transition-invalid`, `accept-unverified`, ...) with the
+  1-based line number, and, like corruption, nothing is cut.
+* A record whose `seq` is not exactly the next one, a `v` this build does not
+  know, a line that is not a JSON object, an empty line: `journal-corrupt`.
+* A tail that is a whole, valid record without its newline is still a torn
+  tail: the newline is part of the record, and the tail is cut.
+* The first failure ends the replay; the table it leaves behind must not be
+  used, and the report says so (`rule` is non-zero).
+* Recovery never takes its decision from the file layer: `journal.recovery_cut`
+  is a pure function of the report, and is -1 whenever the replay was refused.
 
 Reconciling work that was in flight is a *policy*, not a mechanism:
 an `execution.started` with no `execution.finished` becomes
@@ -282,8 +311,16 @@ trap)*:
 * a working directory (`exec_spawn_in` with a `Dir` capability) that is
   the execution directory.
 
-Credentials a worker needs are passed per task, on stdin, in the request,
-and are never journalled. Worker identity is a name Forge assigns and
+**(Corrected.)** The draft said credentials "are passed per task, on stdin, in
+the request". The Cancho Code audit showed that is not how its real
+interface works: the API key is a **file path** named inside the agent command
+line (`--key-file`), read by the agent, never an environment variable or an
+argument value, and the build tool has no stdin protocol at all
+([`cancho-code-audit.md`](cancho-code-audit.md) 2.2). So the rule is: a
+credential is a file Forge grants by path, in a command line Forge builds from
+configuration and never from a task; the key's *contents* are never journalled,
+and its path is filtered from anything shown. A worker that does read a
+request on stdin may still be given a per-task credential there. Worker identity is a name Forge assigns and
 journals; it is a different namespace from human operators.
 
 ### 5.4 What the model does not give us
@@ -311,48 +348,109 @@ Stated now so nobody discovers it later (each is expanded in
 ## 6. The task state machine
 
 Runtime-owned. A worker never causes a transition by saying so; it
-returns data and Forge decides.
+returns data and Forge decides. **As built in M1** in `src/task.cho`
+*(measured: `tests/task_test.cho`, 22 cases, an independent oracle of the
+whole 9 x 9 table)*:
 
 ```
 proposed -> approved -> ready -> running -> verification -> accepted
-   |           |          |        |  ^          |
-   |           |          |        |  +-- retry -+--> rejected
-   v           v          v        v
-cancelled   cancelled  blocked   failed / lost -> ready (within retry budget) | blocked
 ```
 
+That is the happy path. Off it: any non-terminal state can be `cancelled`; a
+proposal can be `rejected`; `ready` and `running` can be `blocked`, which
+returns only to `ready`; `running` goes back to `ready` when an execution is
+lost or fails within the retry budget; `verification` can be `rejected` or go
+back to `ready` for a repair.
+
+The table, one row per state (these 18 edges are all of them):
+
+| from | to |
+|---|---|
+| `proposed` | `approved`, `rejected`, `cancelled` |
+| `approved` | `ready`, `cancelled` |
+| `ready` | `running`, `blocked`, `cancelled` |
+| `running` | `verification`, `ready`, `blocked`, `cancelled` |
+| `blocked` | `ready`, `cancelled` |
+| `verification` | `accepted`, `rejected`, `ready`, `cancelled` |
+| `accepted`, `rejected`, `cancelled` | (terminal: nothing) |
+
+**Corrected from the M0 diagram.** M0 drew `verification -> running` as
+"retry". There is no such edge: a repair or a retry goes back through
+`ready`, so the budget and the policy are consulted again before the next
+dispatch, and no task is ever `running` without having been `ready` first.
+M0's `failed` and `lost` are not states: a failed or lost execution is an
+event, and the task returns to `ready` (within its retry budget) or to
+`blocked`. `proposed -> rejected` is new: declining a proposal needs no
+approval first.
+
 * `running -> verification` is the only exit that carries a worker's
-  `succeeded`; `verification -> accepted` requires Forge-observed evidence
-  for every acceptance criterion (M3). A worker's `succeeded` alone never
-  accepts *(measured as far as M0 can: S6 maps it to "verification, not
-  accepted")*.
-* Every transition is an event; an invalid transition is refused with
-  `transition-invalid` and written as an event too.
+  `succeeded`; `verification -> accepted` requires a Forge-observed check
+  (M3 supplies the evidence; M1 enforces the *form*). A worker's `succeeded`
+  alone never accepts *(measured as far as M0 can: S6 maps it to
+  "verification, not accepted"; measured in M1 as a property over every
+  state, every actor and both bases: exactly one of 60 combinations reaches
+  `accepted`, Forge + `basis: observed` from `verification`)*.
+* **The decision order is part of the contract** (`task.decide`):
+  1. a `task.proposed` event creates a task (`task-duplicate` if it exists,
+     `actor-not-allowed` if a worker wrote it); any other event needs a task
+     that exists (`task-unknown`);
+  2. a move to `accepted` needs `actor` forge *and* `basis` observed, else
+     `accept-unverified`, whoever wrote it (a worker's claim, a human's word
+     and an unobserved Forge event alike); this is checked **before** the edge,
+     so a worker claiming `accepted` from `running` is `accept-unverified`, the
+     more informative refusal;
+  3. a worker never moves a task: `actor-not-allowed`;
+  4. the edge must be in the table: `transition-invalid`.
+* Every transition is an event; a refused move is written as a `refusal`
+  event with its rule tag (`journal.submit`), changes no state when
+  replayed, and so "why is it in this state" has an answer.
 * The transition table is an `enum` and a total `match`; the compiler
   refuses a state added without handling it (rule `match-not-exhaustive`,
   *measured*: a `match` missing `S::C` is refused with "this `match` does
   not cover `S::C`"). A `_` arm defeats that, so state matches in Forge do
-  not use `_`; reviewers look for it.
+  not use `_`; reviewers look for it. (`to` in `can_move` is compared by code
+  because the language has no `==` on enums; `from` is matched exhaustively.)
+* A task id is 1 to 64 bytes of letters, digits, `.`, `_`, `-`, starting
+  with a letter or digit: it is the projection's key and a path component
+  (`executions/<id>/`), so it can be neither `.` nor `..`.
 
 ## 7. Refusals and rule tags
 
 Every refusal has a stable `rule`, as the compiler's do (`docs/agent-errors.md`
 in cancho). It is a kebab-case name, appears in the journal event, the CLI
-output and the final report, and has a test that reaches it. The first set:
+output and the final report, and has a test that reaches it. **A rule ships
+with its row here and a test; the "Reached by" column says which, and a rule
+with no test yet is marked *designed* and does not exist in code.**
+
+Implemented in M1 (`task.Rule`, `src/task.cho`; each reached by a named test
+in `tests/task_test.cho` and/or `tests/journal_test.cho`, and the file-level
+ones by `tests/conformance/journal_files.cho`):
+
+| rule | meaning | Reached by |
+|---|---|---|
+| `transition-invalid` | event would make a task move along an edge not in the table (including any move out of `accepted`, `rejected`, `cancelled`) | `test_transition_invalid_is_reached`, `test_an_illegal_transition_in_the_journal_is_reported_by_its_own_tag`, `test_submit_a_refused_move_is_recorded_not_applied` |
+| `accept-unverified` | a move to `accepted` not written by Forge with `basis: observed`: a worker's claim, a human's word, or an unobserved Forge event | `test_accept_unverified_is_reached`, `test_accepted_is_reached_in_exactly_one_way`, `test_a_worker_claim_of_acceptance_in_the_journal_is_refused`, conformance `claim:` and `refusal:` |
+| `actor-not-allowed` | a worker wrote an event that would move a task, or propose one | `test_actor_not_allowed_is_reached`, `test_a_worker_never_moves_a_task`, `test_a_worker_actor_cannot_move_a_task_in_the_journal` |
+| `task-unknown` | an event for a task id Forge has never seen proposed | `test_task_unknown_is_reached`, `test_events_for_a_task_never_proposed_or_proposed_twice_are_refused` |
+| `task-duplicate` | a `task.proposed` for an id that exists | `test_task_duplicate_is_reached` (all nine states), same journal test |
+| `event-malformed` | a task event with no or non-string `task` / `actor`, an `actor` that is not forge / worker / human, a `basis` that is not a string, or a task id outside the closed set | `test_malformed_task_events_are_refused`, `test_submit_with_a_bad_id_is_recorded_against_no_task` |
+| `event-unknown` | a kind that is neither a `task.*` kind nor in a namespace M1 records (`refusal`, `execution.`, `approval.`, `budget.`, `policy.`, `company.`) | `test_unknown_kinds_are_refused` |
+| `journal-corrupt` | a complete journal line that is not the next record: not JSON, not an object, unknown `v`, `seq` not exactly next (gap, duplicate, not starting at 1), wrong types | `test_garbage_in_the_middle_...`, `test_a_duplicated_run_of_seqs_...`, `test_a_gap_in_seq_is_corrupt`, `test_lines_that_are_not_records_are_corrupt`, conformance `duplicate:` and `garbage + torn:` |
+| `path-invalid` | a journal path that is not absolute, has a `..` component, a NUL, or is longer than 512 bytes: refused before the file capability (which traps on `..`) is reached | conformance `path:`, `recover: a .. path`, `append: a .. path` |
+
+Designed, not implemented (no test reaches them yet; they are not claims):
 
 | rule | meaning |
 |---|---|
-| `transition-invalid` | event would make a task move along an edge not in the table |
 | `policy-denied` | policy decision `Deny`, with the policy version |
 | `policy-missing` | no policy loaded or it did not parse (fail closed) |
 | `approval-missing` | a protected action without a granted approval |
 | `budget-exhausted` | a reservation would exceed a limit |
 | `worker-protocol` | worker reply is not valid for the contract |
 | `worker-contract-version` | no common contract version |
-| `worker-timeout`, `worker-output-overflow`, `worker-crashed`, `worker-error`, `worker-unavailable` | observed ending of a worker process (section 5 of the worker contract) |
+| `worker-timeout`, `worker-output-overflow`, `worker-crashed`, `worker-error`, `worker-unavailable` | observed ending of a worker process (section 5 of the worker contract; the Cancho Code binding adds how an exit code is read, section 9.4) |
 | `evidence-ref-invalid` | a path outside the execution directory, or a hash that does not match |
-| `journal-corrupt` | a complete journal line that is not the next record |
-| `journal-sync-failed` | `fsync` failed; contents unknown; Forge stops |
+| `journal-sync-failed` | `fsync` failed; contents unknown; Forge stops (the file layer returns the errno today; the stop is M2) |
 | `workspace-locked` | another Forge holds the lock |
 
 The contract and the roadmap may add rules; none ships without its row
@@ -360,10 +458,10 @@ here and a test.
 
 ## 8. What this ADR does not decide
 
-Policy language syntax, the cost accounting source, the shape of the
-operator UI, and anything about Cancho Code's real interface (the contract
-is written ahead of it and must be checked against it before M2 starts;
-the roadmap says so). Those are M1-M5.
+Policy language syntax, the cost accounting source, and the shape of the
+operator UI. Those are M1-M5. (M0 also deferred Cancho Code's real interface;
+that audit is done, [`cancho-code-audit.md`](cancho-code-audit.md), and the
+worker contract was corrected by it.)
 
 ## 9. Open gaps this decision depends on
 
@@ -379,3 +477,4 @@ reference is an existing open row in `docs/processes.md` section 9).
 | G4 | No kill-by-pid capability; parent death does not kill children | Restart cannot cleanly stop an orphaned worker | `docs/processes.md` section 9: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` on Linux only |
 | G5 | `fsync` durability on macOS is weaker | Durability promise differs per platform | `F_FULLFSYNC` (`docs/file-writes.md` section 6) |
 | G6 | Header of `docs/processes.md` says slices 3 and 4 are "designed, not built"; its own slice table and `std/process.cho` say built | Misleading; S1-S2, S6, S7 use `std.process.capture` successfully | Correct the header in the cancho repository |
+| G9 | A library function over `Fs` cannot be generic in the prefix: `Fs("/x")` is not accepted where a function declares `Fs("")` *(measured, M1; see `spike/RESULTS.md`, "M1 findings")* | `src/journal_io.cho` is written against `Fs("")` and guards the path itself (`path-invalid`); a binary that links it reports `fs_read("")`, `fs_write("")`. The production `forge` binary links it in M2, and that widening is a visible diff in `cancho authority` and says so in its commit | The same run-time-chosen-bound question as G1, for `Fs`; or a way to declare a function generic in a capability's prefix |

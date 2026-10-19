@@ -1,0 +1,566 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.map;
+import std.test;
+import forge.event;
+import forge.journal;
+import forge.task;
+
+// Unit tests for src/journal.cho: replay over a byte slice, torn-tail
+// recovery planning, the refuse-on-corrupt-complete-line rule of
+// spike/RESULTS.md S5, and the write path (submit). Pure: no file is
+// touched. The file layer is exercised by tests/conformance/journal_files.cho.
+
+// ---- helpers ------------------------------------------------------------
+
+// `journal` with one more transition record appended.
+fn add[&h, &a, &b, &c, &d](heap: &!h Heap, journal: buffer.Buffer, seq: int, kind: &a [byte], id: &b [byte], actor: &c [byte], basis: &d [byte]) -> [heap] buffer.Buffer {
+    let r = event.transition(heap, seq, kind, id, actor, basis);
+    var out = journal;
+    borrow r as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, r);
+    return out;
+}
+
+// proposed, approved, ready, running, verification for task `id`, seq 1..5.
+fn happy[&h, &i](heap: &!h Heap, id: &i [byte]) -> [heap] buffer.Buffer {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, 1, "task.proposed", id, "human", "");
+    j = add(heap, j, 2, "task.approved", id, "human", "");
+    j = add(heap, j, 3, "task.ready", id, "forge", "");
+    j = add(heap, j, 4, "task.running", id, "forge", "");
+    j = add(heap, j, 5, "task.verification", id, "forge", "");
+    return j;
+}
+
+fn report_of[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] journal.Report {
+    let (table, report) = journal.replay(heap, data);
+    map.drop(heap, table);
+    return report;
+}
+
+fn state_after[&h, &d, &i](heap: &!h Heap, data: &d [byte], id: &i [byte]) -> [heap] int {
+    let (table, report) = journal.replay(heap, data);
+    var code = 0;
+    borrow table as &tb in {
+        code = journal.state_of(tb, id);
+    }
+    map.drop(heap, table);
+    return code;
+}
+
+fn rule_of[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] &static [byte] {
+    return task.rule_code_name(report_of(heap, data).rule);
+}
+
+// ---- clean replays ------------------------------------------------------
+
+fn test_an_empty_journal_replays_to_nothing[&h](heap: &!h Heap) -> [heap] int {
+    let r = report_of(heap, "");
+    test.assert_eq(r.records, 0);
+    test.assert_eq(r.valid_bytes, 0);
+    test.assert_eq(r.total_bytes, 0);
+    test.assert_eq(r.torn_bytes, 0);
+    test.assert_eq(r.tasks, 0);
+    test.assert_eq(r.rule, 0);
+    test.assert_eq(r.line, 0);
+    test.assert_eq(journal.recovery_cut(r), 0 - 1);
+    return 0;
+}
+
+fn test_the_happy_path_replays_to_verification[&h](heap: &!h Heap) -> [heap] int {
+    let j = happy(heap, "t-1");
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let r = report_of(heap, data);
+        test.assert_eq(r.records, 5);
+        test.assert_eq(r.rule, 0);
+        test.assert_eq(r.tasks, 1);
+        test.assert_eq(r.valid_bytes, len(data));
+        test.assert_eq(r.torn_bytes, 0);
+        test.assert_eq(state_after(heap, data, "t-1"), 6);
+        test.assert_eq(state_after(heap, data, "t-2"), 0);
+        test.assert_eq(journal.recovery_cut(r), 0 - 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_two_tasks_do_not_disturb_each_other[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, 1, "task.proposed", "a", "human", "");
+    j = add(heap, j, 2, "task.proposed", "b", "human", "");
+    j = add(heap, j, 3, "task.approved", "b", "human", "");
+    j = add(heap, j, 4, "task.cancelled", "a", "human", "");
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        test.assert_eq(report_of(heap, data).rule, 0);
+        test.assert_eq(report_of(heap, data).tasks, 2);
+        test.assert_eq(state_after(heap, data, "a"), 9);
+        test.assert_eq(state_after(heap, data, "b"), 2);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_the_full_accepted_path_needs_an_observed_forge_event[&h](heap: &!h Heap) -> [heap] int {
+    var j = happy(heap, "t-1");
+    j = add(heap, j, 6, "task.accepted", "t-1", "forge", "observed");
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        test.assert_eq(report_of(heap, data).rule, 0);
+        test.assert_eq(state_after(heap, data, "t-1"), 7);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_unknown_fields_and_recorded_kinds_change_nothing[&h](heap: &!h Heap) -> [heap] int {
+    let data = "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"task\":\"t-1\",\"actor\":\"human\",\"future\":{\"x\":[1,2]}}\n{\"v\":1,\"seq\":2,\"kind\":\"execution.started\",\"task\":\"t-1\",\"pid\":7}\n{\"v\":1,\"seq\":3,\"kind\":\"refusal\",\"task\":\"t-1\",\"rule\":\"transition-invalid\"}\n";
+    let r = report_of(heap, data);
+    test.assert_eq(r.rule, 0);
+    test.assert_eq(r.records, 3);
+    test.assert_eq(state_after(heap, data, "t-1"), 1);
+    return 0;
+}
+
+// ---- torn tail ----------------------------------------------------------
+
+fn test_a_torn_tail_is_reported_and_only_it_is_cut[&h](heap: &!h Heap) -> [heap] int {
+    var j = happy(heap, "t-1");
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":6,\"kind\":\"task.acc");
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let r = report_of(heap, data);
+        test.assert_eq(r.rule, 0);
+        test.assert_eq(r.records, 5);
+        test.assert_eq(r.torn_bytes, len(data) - r.valid_bytes);
+        test.assert(r.torn_bytes > 0);
+        test.assert_eq(journal.recovery_cut(r), r.valid_bytes);
+        // the cut prefix replays clean and offers nothing more: idempotent
+        let cut = data[0..journal.recovery_cut(r)];
+        let again = report_of(heap, cut);
+        test.assert_eq(again.rule, 0);
+        test.assert_eq(again.records, 5);
+        test.assert_eq(again.torn_bytes, 0);
+        test.assert_eq(journal.recovery_cut(again), 0 - 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// A tail that is a whole, valid record missing only its newline is still torn:
+// the newline is part of the record (src/event.cho).
+fn test_a_valid_record_without_its_newline_is_torn[&h](heap: &!h Heap) -> [heap] int {
+    let j = happy(heap, "t-1");
+    var k = j;
+    k = buffer.append(heap, k, "{\"v\":1,\"seq\":6,\"kind\":\"task.cancelled\",\"task\":\"t-1\",\"actor\":\"human\"}");
+    borrow k as &kb in {
+        let r = report_of(heap, buffer.bytes(kb));
+        test.assert_eq(r.rule, 0);
+        test.assert_eq(r.records, 5);
+        test.assert(r.torn_bytes > 0);
+        test.assert_eq(state_after(heap, buffer.bytes(kb), "t-1"), 6);
+    }
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_a_journal_that_is_only_a_torn_line_cuts_to_zero[&h](heap: &!h Heap) -> [heap] int {
+    let data = "{\"v\":1,\"seq\":1,\"kind\":\"task.prop";
+    let r = report_of(heap, data);
+    test.assert_eq(r.rule, 0);
+    test.assert_eq(r.records, 0);
+    test.assert_eq(r.torn_bytes, len(data));
+    test.assert_eq(journal.recovery_cut(r), 0);
+    return 0;
+}
+
+fn test_after_last_newline_finds_the_tail() -> [] int {
+    test.assert_eq(journal.after_last_newline(""), 0);
+    test.assert_eq(journal.after_last_newline("abc"), 0);
+    test.assert_eq(journal.after_last_newline("abc\n"), 4);
+    test.assert_eq(journal.after_last_newline("abc\ndef"), 4);
+    test.assert_eq(journal.after_last_newline("\n\n"), 2);
+    return 0;
+}
+
+// ---- a complete bad line is corruption: refuse, cut nothing --------------
+
+fn test_garbage_in_the_middle_is_corrupt_and_nothing_is_cut[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, 1, "task.proposed", "t-1", "human", "");
+    j = buffer.append(heap, j, "this is not json\n");
+    j = add(heap, j, 3, "task.approved", "t-1", "human", "");
+    // and a torn tail as well: it must not be offered for cutting either
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":4,\"ki");
+    borrow j as &jb in {
+        let r = report_of(heap, buffer.bytes(jb));
+        test.assert(bytes.equal(task.rule_code_name(r.rule), "journal-corrupt"));
+        test.assert_eq(r.line, 2);
+        test.assert_eq(r.records, 1);
+        test.assert(r.torn_bytes > 0);
+        test.assert_eq(journal.recovery_cut(r), 0 - 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// The S5 case: seq 1-3 appended again after 6 records.
+fn test_a_duplicated_run_of_seqs_is_corrupt_not_torn[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 1024);
+    j = add(heap, j, 1, "task.proposed", "t-1", "human", "");
+    j = add(heap, j, 2, "task.approved", "t-1", "human", "");
+    j = add(heap, j, 3, "task.ready", "t-1", "forge", "");
+    j = add(heap, j, 1, "task.proposed", "t-1", "human", "");
+    j = add(heap, j, 2, "task.approved", "t-1", "human", "");
+    j = add(heap, j, 3, "task.ready", "t-1", "forge", "");
+    borrow j as &jb in {
+        let r = report_of(heap, buffer.bytes(jb));
+        test.assert(bytes.equal(task.rule_code_name(r.rule), "journal-corrupt"));
+        test.assert_eq(r.line, 4);
+        test.assert_eq(r.records, 3);
+        test.assert_eq(journal.recovery_cut(r), 0 - 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_gap_in_seq_is_corrupt[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, 1, "task.proposed", "t-1", "human", "");
+    j = add(heap, j, 2, "task.approved", "t-1", "human", "");
+    j = add(heap, j, 4, "task.ready", "t-1", "forge", "");
+    borrow j as &jb in {
+        let r = report_of(heap, buffer.bytes(jb));
+        test.assert(bytes.equal(task.rule_code_name(r.rule), "journal-corrupt"));
+        test.assert_eq(r.line, 3);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_journal_not_starting_at_one_is_corrupt[&h](heap: &!h Heap) -> [heap] int {
+    let data = "{\"v\":1,\"seq\":2,\"kind\":\"task.proposed\",\"task\":\"t\",\"actor\":\"human\"}\n";
+    test.assert(bytes.equal(rule_of(heap, data), "journal-corrupt"));
+    return 0;
+}
+
+fn test_lines_that_are_not_records_are_corrupt[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "[1,2,3]\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "null\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "\"x\"\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "{}\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1}\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":2,\"seq\":1,\"kind\":\"company.created\"}\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":\"1\",\"kind\":\"company.created\"}\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1.0,\"kind\":\"company.created\"}\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":7}\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"company.created\"} trailing\n"), "journal-corrupt"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"company.created\"}\n"), "none"));
+    return 0;
+}
+
+fn test_inputs_that_must_not_trap_are_values[&h](heap: &!h Heap) -> [heap] int {
+    // a seq wider than 64 bits saturates and is simply not the next one
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":99999999999999999999999,\"kind\":\"company.created\"}\n"), "journal-corrupt"));
+    // deep nesting, a long unterminated line, NUL bytes, a lone newline run
+    var deep = buffer.empty(heap, 4096);
+    var n = 0;
+    while n < 3000 {
+        deep = buffer.push(heap, deep, byte_of(91));
+        n = n + 1;
+    }
+    deep = buffer.push(heap, deep, byte_of(10));
+    borrow deep as &db in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(db)), "journal-corrupt"));
+    }
+    buffer.drop(heap, deep);
+    test.assert(bytes.equal(rule_of(heap, "\n\n\n"), "journal-corrupt"));
+    var nul = buffer.empty(heap, 16);
+    nul = buffer.push(heap, nul, byte_of(0));
+    nul = buffer.push(heap, nul, byte_of(0));
+    nul = buffer.push(heap, nul, byte_of(10));
+    borrow nul as &nb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(nb)), "journal-corrupt"));
+    }
+    buffer.drop(heap, nul);
+    return 0;
+}
+
+// ---- a well-formed line the state machine refuses ------------------------
+
+fn test_an_illegal_transition_in_the_journal_is_reported_by_its_own_tag[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, 1, "task.proposed", "t-1", "human", "");
+    j = add(heap, j, 2, "task.running", "t-1", "forge", "");
+    borrow j as &jb in {
+        let r = report_of(heap, buffer.bytes(jb));
+        test.assert(bytes.equal(task.rule_code_name(r.rule), "transition-invalid"));
+        test.assert_eq(r.line, 2);
+        test.assert_eq(r.records, 1);
+        test.assert_eq(journal.recovery_cut(r), 0 - 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_worker_claim_of_acceptance_in_the_journal_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    var j = happy(heap, "t-1");
+    j = add(heap, j, 6, "task.accepted", "t-1", "worker", "observed");
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(jb)), "accept-unverified"));
+    }
+    buffer.drop(heap, j);
+    var k = happy(heap, "t-1");
+    k = add(heap, k, 6, "task.accepted", "t-1", "forge", "");
+    borrow k as &kb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(kb)), "accept-unverified"));
+    }
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_a_worker_actor_cannot_move_a_task_in_the_journal[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, 1, "task.proposed", "t-1", "human", "");
+    j = add(heap, j, 2, "task.approved", "t-1", "worker", "");
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(jb)), "actor-not-allowed"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_events_for_a_task_never_proposed_or_proposed_twice_are_refused[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, 1, "task.approved", "ghost", "human", "");
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(jb)), "task-unknown"));
+    }
+    buffer.drop(heap, j);
+    var k = buffer.empty(heap, 256);
+    k = add(heap, k, 1, "task.proposed", "t-1", "human", "");
+    k = add(heap, k, 2, "task.proposed", "t-1", "human", "");
+    borrow k as &kb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(kb)), "task-duplicate"));
+    }
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_malformed_task_events_are_refused[&h](heap: &!h Heap) -> [heap] int {
+    // no actor
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"task\":\"t-1\"}\n"), "event-malformed"));
+    // an actor that is not forge, worker or human
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"task\":\"t-1\",\"actor\":\"robot\"}\n"), "event-malformed"));
+    // a task id outside the closed set, and one that is not a string
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"task\":\"a b\",\"actor\":\"human\"}\n"), "event-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"task\":\"..\",\"actor\":\"human\"}\n"), "event-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"task\":7,\"actor\":\"human\"}\n"), "event-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"actor\":\"human\"}\n"), "event-malformed"));
+    // a basis that is not a string
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"task.proposed\",\"task\":\"t-1\",\"actor\":\"human\",\"basis\":1}\n"), "event-malformed"));
+    return 0;
+}
+
+fn test_unknown_kinds_are_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"deploy.started\",\"task\":\"t-1\"}\n"), "event-unknown"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"task.finished\",\"task\":\"t-1\",\"actor\":\"forge\"}\n"), "event-unknown"));
+    test.assert(bytes.equal(rule_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"\"}\n"), "event-unknown"));
+    return 0;
+}
+
+// ---- the write path: submit ----------------------------------------------
+
+fn test_submit_a_legal_move_writes_a_transition_that_replays[&h](heap: &!h Heap) -> [heap] int {
+    var table = map.empty(heap, 16, 0, 0);
+    var journal_bytes = buffer.empty(heap, 512);
+    let (t1, rec1, rule1) = journal.submit(heap, table, 1, "t-1", task.State::Proposed, task.Actor::Human, false);
+    table = t1;
+    test.assert_eq(rule1, 0);
+    borrow rec1 as &r1 in {
+        journal_bytes = buffer.append(heap, journal_bytes, buffer.bytes(r1));
+    }
+    buffer.drop(heap, rec1);
+    let (t2, rec2, rule2) = journal.submit(heap, table, 2, "t-1", task.State::Approved, task.Actor::Human, false);
+    table = t2;
+    test.assert_eq(rule2, 0);
+    borrow rec2 as &r2 in {
+        journal_bytes = buffer.append(heap, journal_bytes, buffer.bytes(r2));
+    }
+    buffer.drop(heap, rec2);
+    var live = 0;
+    borrow table as &tb in {
+        live = journal.state_of(tb, "t-1");
+    }
+    test.assert_eq(live, 2);
+    map.drop(heap, table);
+    borrow journal_bytes as &jb in {
+        let r = report_of(heap, buffer.bytes(jb));
+        test.assert_eq(r.rule, 0);
+        test.assert_eq(r.records, 2);
+        test.assert_eq(state_after(heap, buffer.bytes(jb), "t-1"), live);
+    }
+    buffer.drop(heap, journal_bytes);
+    return 0;
+}
+
+// A refused move is written as a `refusal` record carrying the rule tag; the
+// state does not change, and the record replays clean.
+fn test_submit_a_refused_move_is_recorded_not_applied[&h](heap: &!h Heap) -> [heap] int {
+    var table = map.empty(heap, 16, 0, 0);
+    var journal_bytes = buffer.empty(heap, 512);
+    let (t1, rec1, rule1) = journal.submit(heap, table, 1, "t-1", task.State::Proposed, task.Actor::Human, false);
+    table = t1;
+    borrow rec1 as &r1 in {
+        journal_bytes = buffer.append(heap, journal_bytes, buffer.bytes(r1));
+    }
+    buffer.drop(heap, rec1);
+    // running straight from proposed: not an edge
+    let (t2, rec2, rule2) = journal.submit(heap, table, 2, "t-1", task.State::Running, task.Actor::Forge, false);
+    table = t2;
+    test.assert(bytes.equal(task.rule_code_name(rule2), "transition-invalid"));
+    borrow rec2 as &r2 in {
+        test.assert(bytes.find(buffer.bytes(r2), "\"kind\":\"refusal\"") >= 0);
+        test.assert(bytes.find(buffer.bytes(r2), "\"rule\":\"transition-invalid\"") >= 0);
+        journal_bytes = buffer.append(heap, journal_bytes, buffer.bytes(r2));
+    }
+    buffer.drop(heap, rec2);
+    // and a worker claiming acceptance
+    let (t3, rec3, rule3) = journal.submit(heap, table, 3, "t-1", task.State::Accepted, task.Actor::Worker, true);
+    table = t3;
+    test.assert(bytes.equal(task.rule_code_name(rule3), "accept-unverified"));
+    borrow rec3 as &r3 in {
+        journal_bytes = buffer.append(heap, journal_bytes, buffer.bytes(r3));
+    }
+    buffer.drop(heap, rec3);
+    var live = 0;
+    borrow table as &tb in {
+        live = journal.state_of(tb, "t-1");
+    }
+    test.assert_eq(live, 1);
+    map.drop(heap, table);
+    borrow journal_bytes as &jb in {
+        let r = report_of(heap, buffer.bytes(jb));
+        test.assert_eq(r.rule, 0);
+        test.assert_eq(r.records, 3);
+        test.assert_eq(state_after(heap, buffer.bytes(jb), "t-1"), 1);
+    }
+    buffer.drop(heap, journal_bytes);
+    test.assert_eq(rule1, 0);
+    return 0;
+}
+
+fn test_submit_with_a_bad_id_is_recorded_against_no_task[&h](heap: &!h Heap) -> [heap] int {
+    let table = map.empty(heap, 16, 0, 0);
+    let (t, rec, rule) = journal.submit(heap, table, 1, "../etc", task.State::Proposed, task.Actor::Human, false);
+    test.assert(bytes.equal(task.rule_code_name(rule), "event-malformed"));
+    borrow rec as &rb in {
+        test.assert(bytes.find(buffer.bytes(rb), "etc") < 0);
+        test.assert_eq(report_of(heap, buffer.bytes(rb)).rule, 0);
+    }
+    buffer.drop(heap, rec);
+    map.drop(heap, t);
+    return 0;
+}
+
+// A property over the write path: a fixed pseudo-random run of 200 proposed
+// moves, some legal and some not, then replay. The replayed table equals the
+// table the writes produced, task by task, and the record always replays.
+fn test_replay_of_what_submit_wrote_equals_what_submit_built[&h](heap: &!h Heap) -> [heap] int {
+    var table = map.empty(heap, 16, 0, 0);
+    var journal_bytes = buffer.empty(heap, 4096);
+    var seed = 12345;
+    var seq = 1;
+    var n = 0;
+    var moved = 0;
+    var refused = 0;
+    while n < 200 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        let pick = seed / 65536;
+        let which = pick % 3;
+        var id = "a";
+        if which == 1 {
+            id = "b";
+        }
+        if which == 2 {
+            id = "c";
+        }
+        let target = pick / 3 % 9 + 1;
+        let actor = pick / 27 % 3;
+        let (next, rec, rule) = journal.submit(heap, table, seq, id, state_at(target), actor_at(actor), actor == 0 && pick % 2 == 0);
+        table = next;
+        if rule == 0 {
+            moved = moved + 1;
+        } else {
+            refused = refused + 1;
+        }
+        borrow rec as &rb in {
+            journal_bytes = buffer.append(heap, journal_bytes, buffer.bytes(rb));
+        }
+        buffer.drop(heap, rec);
+        seq = seq + 1;
+        n = n + 1;
+    }
+    borrow journal_bytes as &jb in {
+        let data = buffer.bytes(jb);
+        let r = report_of(heap, data);
+        test.assert_eq(r.rule, 0);
+        test.assert_eq(r.records, 200);
+        borrow table as &tb in {
+            test.assert_eq(state_after(heap, data, "a"), journal.state_of(tb, "a"));
+            test.assert_eq(state_after(heap, data, "b"), journal.state_of(tb, "b"));
+            test.assert_eq(state_after(heap, data, "c"), journal.state_of(tb, "c"));
+        }
+    }
+    test.assert(moved > 5);
+    test.assert(refused > 50);
+    test.assert_eq(moved + refused, 200);
+    map.drop(heap, table);
+    buffer.drop(heap, journal_bytes);
+    return 0;
+}
+
+fn state_at(code: int) -> [] task.State {
+    if code == 2 {
+        return task.State::Approved;
+    }
+    if code == 3 {
+        return task.State::Ready;
+    }
+    if code == 4 {
+        return task.State::Running;
+    }
+    if code == 5 {
+        return task.State::Blocked;
+    }
+    if code == 6 {
+        return task.State::Verification;
+    }
+    if code == 7 {
+        return task.State::Accepted;
+    }
+    if code == 8 {
+        return task.State::Rejected;
+    }
+    if code == 9 {
+        return task.State::Cancelled;
+    }
+    return task.State::Proposed;
+}
+
+fn actor_at(n: int) -> [] task.Actor {
+    if n == 0 {
+        return task.Actor::Forge;
+    }
+    if n == 1 {
+        return task.Actor::Worker;
+    }
+    return task.Actor::Human;
+}

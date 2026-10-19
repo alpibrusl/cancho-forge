@@ -51,3 +51,48 @@ pub fn seq_of[&h, &s](heap: &!h Heap, line: &s [byte]) -> [heap] int {
     unbox_slice(heap, tape);
     return seq;
 }
+
+// A record for a task event (docs/architecture.md, sections 4.1 and 6): the
+// fixed fields, then `actor` (forge, worker or human) and, when `basis` is
+// not empty, `basis`. `basis` is "observed" only for a fact Forge itself
+// checked; the state machine reads it for `task.accepted`.
+pub fn transition[&h, &k, &t, &a, &b](heap: &!h Heap, seq: int, kind: &k [byte], task: &t [byte], actor: &a [byte], basis: &b [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "v");
+    w = json.put_int(heap, w, schema_version());
+    w = json.put_key(heap, w, "seq");
+    w = json.put_int(heap, w, seq);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, kind);
+    w = json.put_key(heap, w, "task");
+    w = json.put_string(heap, w, task);
+    w = json.put_key(heap, w, "actor");
+    w = json.put_string(heap, w, actor);
+    if len(basis) > 0 {
+        w = json.put_key(heap, w, "basis");
+        w = json.put_string(heap, w, basis);
+    }
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}
+
+// The record of a refusal (kind "refusal"): what was declined is written down
+// with its rule tag, so "why is it in this state" has an answer. It changes
+// no state when replayed.
+pub fn refusal[&h, &t, &r](heap: &!h Heap, seq: int, task: &t [byte], rule: &r [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "v");
+    w = json.put_int(heap, w, schema_version());
+    w = json.put_key(heap, w, "seq");
+    w = json.put_int(heap, w, seq);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, "refusal");
+    w = json.put_key(heap, w, "task");
+    w = json.put_string(heap, w, task);
+    w = json.put_key(heap, w, "rule");
+    w = json.put_string(heap, w, rule);
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}
