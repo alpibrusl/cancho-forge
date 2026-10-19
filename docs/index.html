@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cancho-forge: a company runtime that enforces authority</title>
+<meta name="description" content="cancho-forge keeps company state, budgets, approvals and evidence in the runtime, around workers such as cancho-code. Written entirely in cancho.">
+<meta property="og:title" content="cancho-forge: a company runtime that enforces authority">
+<meta property="og:description" content="Authority, budgets and evidence are enforced by the runtime, not requested in a prompt.">
+<meta name="color-scheme" content="light dark">
+<style>
+:root {
+  --bg: #fbfcfd; --fg: #14181a; --muted: #55606a; --line: #dfe5e7; --surface: #ffffff; --soft: #eff4f4;
+  --accent: #1f5fa6; --accent-fg: #ffffff; --good: #0f7b5f; --bad: #b42d27; --warn: #92400e;
+  --term-bg: #0f1519; --term-fg: #d6e2e6; --term-dim: #7d8f96; --term-good: #5fd3a6; --term-bad: #ff8a80; --term-acc: #8ec0ff;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0b0f14; --fg: #e7ebec; --muted: #9aa8ae; --line: #212a2d; --surface: #131a1c; --soft: #172022;
+    --accent: #7fb2ff; --accent-fg: #07162c; --good: #4fd1a5; --bad: #ff7b73; --warn: #f3c77a; --term-bg: #0a1013; }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; scroll-padding-top: 4rem; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 1rem/1.6 var(--font); }
+a { color: var(--accent); text-underline-offset: .15em; }
+.wrap { width: 100%; max-width: 64rem; margin: 0 auto; padding: 0 16px; }
+header.top { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+header.top .wrap { display: flex; align-items: center; gap: 1.5rem; height: 3.4rem; }
+.brand { font: 700 1rem var(--mono); color: var(--fg); text-decoration: none; }
+nav { display: flex; gap: 1.2rem; margin-left: auto; }
+nav a { color: var(--muted); text-decoration: none; font-size: .93rem; }
+nav a:hover { color: var(--fg); }
+@media (max-width: 40rem) { nav a.opt { display: none; } }
+.hero { padding: 3.5rem 0 2rem; text-align: center; }
+.hero h1 { font-size: clamp(2rem, 6vw, 3.4rem); line-height: 1.1; margin: 0 auto 1rem; letter-spacing: -.03em; max-width: 18ch; }
+.hero .sub { font-size: 1.2rem; color: var(--muted); max-width: 36rem; margin: 0 auto 1.6rem; }
+.cta { display: flex; gap: .8rem; justify-content: center; flex-wrap: wrap; }
+.btn { display: inline-block; padding: .65rem 1.2rem; border-radius: 8px; font-weight: 600; text-decoration: none; border: 1px solid var(--line); color: var(--fg); background: var(--surface); }
+.btn.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+section { margin: 0; padding: 3rem 0; }
+section.alt { background: var(--soft); }
+h2 { font-size: clamp(1.4rem, 3vw, 1.9rem); margin: 0 0 .6rem; letter-spacing: -.02em; text-align: center; }
+.lead { text-align: center; color: var(--muted); max-width: 38rem; margin: 0 auto 2rem; }
+.term { background: var(--term-bg); color: var(--term-fg); border-radius: 12px; border: 1px solid var(--line); max-width: 46rem; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+.term .bar { display: flex; align-items: center; gap: .4rem; padding: .55rem .8rem; border-bottom: 1px solid #1f2a30; font: .78rem var(--mono); color: var(--term-dim); }
+.term .bar i { width: .7rem; height: .7rem; border-radius: 50%; background: #2c3a41; display: inline-block; }
+.term pre { margin: 0; padding: 1rem 1.1rem; min-height: 17.5rem; overflow-x: auto; font: .85rem/1.55 var(--mono); white-space: pre; }
+.term .g { color: var(--term-good); } .term .b { color: var(--term-bad); } .term .d { color: var(--term-dim); } .term .a { color: var(--term-acc); }
+.caption { text-align: center; color: var(--muted); font-size: .88rem; max-width: 46rem; margin: .8rem auto 0; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 1rem; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 1.2rem; }
+.card h3 { margin: 0 0 .4rem; font-size: 1.05rem; }
+.card p { margin: 0; color: var(--muted); font-size: .95rem; }
+.card .ic { font-size: 1.5rem; margin-bottom: .4rem; }
+.nums { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 1rem; text-align: center; }
+.num b { display: block; font-size: 2.3rem; letter-spacing: -.03em; color: var(--accent); }
+.num span { color: var(--muted); font-size: .92rem; }
+.fine { max-width: 46rem; margin: 1.5rem auto 0; color: var(--muted); font-size: .88rem; text-align: center; }
+pre.code { background: var(--soft); border: 1px solid var(--line); border-radius: 8px; padding: .9rem 1rem; overflow-x: auto; font: .85rem/1.5 var(--mono); max-width: 46rem; margin: 0 auto 1rem; }
+code { font: .9em var(--mono); }
+.steps { max-width: 46rem; margin: 0 auto; padding-left: 1.2rem; }
+.steps li { margin: .4rem 0; }
+@media (max-width: 40rem) { .kbcols { grid-template-columns: repeat(2, 1fr); min-height: 0; } }
+footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(--muted); font-size: .9rem; text-align: center; }
+</style>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href=".">cancho-forge</a>
+  <nav>
+    <a href="#why">Why</a><a class="opt" href="#measured">Measured</a><a class="opt" href="#gaps">Gaps</a><a href="#try">Try it</a>
+    <a href="https://github.com/alpibrusl/cancho-forge">GitHub</a>
+  </nav>
+</div></header>
+
+<div class="wrap hero">
+  <h1>An agent company you can audit.</h1>
+  <p class="sub">cancho-forge keeps state, budgets, approvals and evidence in the runtime, so a worker cannot mark its own work accepted or grant itself authority.</p>
+  <div class="cta"><a class="btn primary" href="#try">Try it</a><a class="btn" href="#why">Why a runtime</a><a class="btn" href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">Read the spike</a></div>
+</div>
+
+<div class="wrap" style="padding-bottom:2.5rem">
+  <div class="term" role="img" aria-label="Output of a real run: five ways a worker can end, each classified by the dispatcher">
+    <div class="bar"><i></i><i></i><i></i> the terminal</div>
+<pre>
+<span class="d">$ cancho run spike/s6_dispatch.cho --std</span>
+<span class="g">normal      : worker_claims_succeeded -&gt; verification (not accepted) [2 ms]</span>
+<span class="b">reports fail: worker_reports_failed [3 ms]</span>
+<span class="b">garbage     : protocol_error: stdout is not a JSON object [2 ms]</span>
+<span class="b">exit 3      : worker_error exit 3 [1 ms]</span>
+<span class="b">hang (500ms): worker_timeout (child killed and reaped) [501 ms]</span>
+
+<span class="d">$ cancho authority spike/s6_dispatch.cho --std</span>
+<span class="a">performs</span>  child_signal  clock  exec("/tmp/cancho-forge-spike/bin")  heap  ...
+<span class="a">never touches</span>  the filesystem · the network · signals · foreign code
+</pre>
+  </div>
+  <p class="caption">A real run of the Milestone 0 spike. A worker that says "succeeded" only reaches <em>verification</em>; the runtime, not the worker, decides what is accepted. The dispatcher can run one directory of programs and cannot read a file.</p>
+</div>
+
+<section class="alt" id="why"><div class="wrap">
+  <h2>Authority is a property of the runtime</h2>
+  <p class="lead">Prompts ask agents to behave. Forge makes the misbehaviour impossible to express, and says so in a report you can read.</p>
+  <div class="cards">
+    <div class="card"><div class="ic">📒</div><h3>One journal</h3><p>Every objective, task, attempt, approval and cost is an append-only record. Recovery cuts only a torn last line and refuses, changing nothing, on a corrupt complete one.</p></div>
+    <div class="card"><div class="ic">🔒</div><h3>Narrowed capabilities</h3><p>A worker gets an <code>Exec</code> bound to its own programs. Going outside the bound is a trap, so the policy layer refuses first and journals why.</p></div>
+    <div class="card"><div class="ic">🧾</div><h3>Evidence, not claims</h3><p>A worker's "success" is an assertion. Acceptance needs checks Forge ran itself, tied to the artifact they ran on.</p></div>
+    <div class="card"><div class="ic">🧱</div><h3>Pure cancho</h3><p>No Python, Rust or shell in the product. <code>cancho authority</code> prints what each program can reach.</p></div>
+  </div>
+</div></section>
+
+<section id="measured"><div class="wrap">
+  <h2>Measured, at Milestone 0</h2>
+  <p class="lead">Seven spikes ask whether cancho can carry a runtime like this. Each number is from a run you can repeat.</p>
+  <div class="nums">
+    <div class="num"><b>301 ms</b><span>a 300 ms deadline: the child is killed and reaped</span></div>
+    <div class="num"><b>1000 B</b><span>output bound: a runaway <code>yes</code> stopped at exactly the limit</span></div>
+    <div class="num"><b>165 → 140</b><span>bytes: a torn journal tail is cut, and a second recovery changes nothing</span></div>
+    <div class="num"><b>5 / 5</b><span>worker endings classified: normal, failed, garbage, exit 3, hang</span></div>
+    <div class="num"><b>6 / 6</b><span>tests of the journal record pass under <code>cancho test</code></span></div>
+    <div class="num"><b>0</b><span>files the dispatcher can read or write</span></div>
+  </div>
+  <p class="fine">Linux x86_64 only, one compiler revision (pinned in <code>cancho.toml</code>), a mock worker. Not measured: macOS, a real Cancho Code, several workers at once, power loss. Commands and verbatim output: <a href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">spike/RESULTS.md</a>.</p>
+</div></section>
+
+<section class="alt" id="gaps"><div class="wrap">
+  <h2>What the spike found missing</h2>
+  <p class="lead">Written down before any of it is built around.</p>
+  <div class="cards">
+    <div class="card"><h3>Grants fixed at build time</h3><p><code>narrow</code> takes literals, so a per-task bound cannot be chosen at run time.</p></div>
+    <div class="card"><h3>A kill reaches one pid</h3><p>A worker's own subprocesses survive it. A process-group kill works, but widens the <code>Exec</code> bound.</p></div>
+    <div class="card"><h3>Contract is provisional</h3><p>The real Cancho Code interface has not been audited yet, so <code>forge-worker/1</code> will change in M2.</p></div>
+  </div>
+</div></section>
+
+<section id="try"><div class="wrap">
+  <h2>Try it</h2>
+  <p class="lead">You need the <a href="https://github.com/alpibrusl/cancho">cancho</a> compiler at the revision in <code>cancho.toml</code>.</p>
+<pre class="code"><code>git clone https://github.com/alpibrusl/cancho-forge.git
+cd cancho-forge
+export CANCHO=&lt;path-to-the-cancho-binary&gt;
+scripts/gate.sh      # fmt, check, test, file budget  →  gate: PASS
+spike/run.sh         # re-runs every spike and prints the evidence</code></pre>
+  <p class="lead" style="margin-bottom:0">Nothing here runs a company yet: this is Milestone 0, the architecture and the measurements that shaped it.</p>
+</div></section>
+
+<section class="alt"><div class="wrap">
+  <h2>Go deeper</h2>
+  <div class="cards">
+    <div class="card"><h3><a href="https://github.com/alpibrusl/cancho-forge/blob/main/docs/architecture.md">Architecture</a></h3><p>Why cancho, the journal design and the authority model.</p></div>
+    <div class="card"><h3><a href="https://github.com/alpibrusl/cancho-forge/blob/main/docs/worker-contract.md">Worker contract</a></h3><p><code>forge-worker/1</code>: five verbs, a JSON envelope, evidence references.</p></div>
+    <div class="card"><h3><a href="https://github.com/alpibrusl/cancho-forge/blob/main/docs/roadmap.md">Roadmap</a></h3><p>Milestones M1 to M7, and what M0 still owes.</p></div>
+  </div>
+</div></section>
+<footer><div class="wrap">cancho-forge · EUPL-1.2 · written in <a href="https://github.com/alpibrusl/cancho">cancho</a></div></footer>
+</body>
+</html>
