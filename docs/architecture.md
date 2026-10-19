@@ -14,6 +14,10 @@
 > table; `retry` goes through `ready`), section 7 (the rules M1 implements and
 > tests), section 8, and section 9 (G9: a library cannot be generic in the
 > `Fs` prefix). Each is marked where it changed.
+>
+> **Corrected after the pin bump** to rev `8411e9a` (cancho #533, #536): the
+> spikes below were measured at `2aa83b2`; all were re-run at `8411e9a`, and
+> only S7 changed (group kill is built; G3, section 5.4 and section 9).
 
 ---
 
@@ -110,7 +114,7 @@ what is used. Nothing in the right-hand column is a Forge feature yet.
 | Company state, task graph, event records (6.1, 6.2, 10) | An append-only JSONL journal; projections rebuilt by replay; `std.json` for records, `enum` + exhaustive `match` for the task state machine | S4, S5; `src/event.cho` and its tests |
 | Durable storage, restart recovery | `open_append`, `file_write`, `file_sync`, directory sync, `file_truncate`, `fs_rename`, `file_lock` under one narrowed `Fs` (`docs/file-writes.md`) | S5 |
 | Worker interface (6.3) | `std.process` over `exec_spawn`: `channels`, `capture` (stdin written while stdout is read, size bound, deadline, reap on every path), `capture_both` for stderr; `Argv` for the `\0` argument list | S1, S2, S6 |
-| Bounded execution: timeout, output cap, cancellation (6.2, 6.6) | `Clock` + `Poller` deadline inside `capture`; `child_kill`; `Signals` narrowed to `INT,TERM` to stop Forge itself | S2, S6; signals designed (`docs/signals.md`), not spiked |
+| Bounded execution: timeout, output cap, cancellation (6.2, 6.6) | `Clock` + `Poller` deadline inside `capture`; `child_kill`; `child_kill_group` for a worker started `exec_spawn_detached` (which `capture` calls itself on its kill paths); `Signals` narrowed to `INT,TERM` to stop Forge itself | S2, S6, S7; signals designed (`docs/signals.md`), not spiked |
 | Policy and authority (6.4) | Pure cancho functions over a policy document (parsed with `std.json`) called before every effect; the narrowed capabilities are the second, structural layer (section 5) | S3 (bounds); policy module designed |
 | Budgets and resource limits (6.6) | Integers in the journal: reservation, usage and release events; the same replay that rebuilds state rebuilds the remaining budget | designed |
 | Approval gates (6.2, 7) | `approval.requested` / `approval.granted` events; an operator CLI reads `Args`/`Io`, writes events. Approvals are journal facts, so they survive restarts | designed |
@@ -235,7 +239,8 @@ bounded**:
   recorded in the intent. Today a still-running worker survives its
   parent *(documented, `docs/processes.md` section 4.7; not measured
   here)*, and killing it by pid needs `/bin/kill` under an `Exec`
-  (gap G4).
+  (gap G4, still open: `child_kill_group` needs the `Child`, which died
+  with the crashed Forge).
 
 ### 4.5 Artifacts
 
@@ -340,10 +345,20 @@ Stated now so nobody discovers it later (each is expanded in
   A worker that is a cancho program has a `cancho authority` report Forge
   can read and compare to what it granted; any other worker needs an OS
   sandbox (`lex-os`), which is outside M1-M5.
-* **G3. Killing a worker does not kill its children.** Measured, S7: a
-  killed worker's grandchild kept running. With `exec_spawn_detached`
-  and `/bin/kill -KILL -- -<pid>` through the same `Exec`, the group
-  dies. This costs `/bin/kill` in the `Exec` bound.
+* **G3. ~~Killing a worker does not kill its children.~~ Built (cancho
+  #533, merged; corrected in place after the pin bump to `8411e9a`).**
+  Measured, S7: a plain `exec_spawn` worker's grandchild still survives a
+  kill (the control). A worker started with `exec_spawn_detached` leads
+  its own process group, and `child_kill_group(&Child, signal)` (edition
+  9, cancho `docs/processes.md` 4.12) signals that group; `std.process.capture`
+  does it itself, before the pid's kill, on its deadline, output-bound
+  and watch-failure paths. No `/bin/kill`: the dispatcher's `Exec` is
+  narrowed to the worker alone and the authority report has no
+  `exec("/bin")` (S7 prints it). Residual, from cancho's document: a
+  descendant that calls `setsid`/`setpgid` leaves the group; a worker that
+  exits by itself and leaves a subprocess behind is not killed by
+  `capture` (the dispatcher calls `child_kill_group` before `child_wait`
+  to cover it); after a Forge *crash* there is no `Child` to hold (G4).
 
 ## 6. The task state machine
 
@@ -468,13 +483,15 @@ worker contract was corrected by it.)
 Collected from the spike; each says what cancho feature would remove it.
 No cancho issue for any of them was found or filed in M0 (the one
 reference is an existing open row in `docs/processes.md` section 9).
+**Corrected after M0, in place:** the gaps were searched for and filed
+upstream; the status of each is in its row below.
 
 | # | Gap | Effect on Forge | Needed from cancho |
 |---|---|---|---|
-| G1 | `narrow` takes only literals | No run-time scoped grants; workers and workspace directories are fixed at build | A way to narrow to a value chosen at deployment (`docs/processes.md` section 9, "A bound chosen at deployment"; same question for `Fs`) |
-| G2 | Out-of-bound spawn traps | Policy must pre-check; a policy bug is a crash | Either accepted as designed, or a checked variant that answers `Failed(EPERM)` |
-| G3 | Kill reaches only the pid | A timed-out worker can leave a compiler or test runner running | A group-kill on a detached child (today: `/bin/kill` under `Exec`, measured to work) |
-| G4 | No kill-by-pid capability; parent death does not kill children | Restart cannot cleanly stop an orphaned worker | `docs/processes.md` section 9: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` on Linux only |
+| G1 | **Open: [cancho #534](https://github.com/alpibrusl/cancho/issues/534).** `narrow` takes only literals | No run-time scoped grants; workers and workspace directories are fixed at build | A way to narrow to a value chosen at deployment (`docs/processes.md` section 9, "A bound chosen at deployment"; same question for `Fs`) |
+| G2 | **Open: [cancho #535](https://github.com/alpibrusl/cancho/issues/535).** Out-of-bound spawn traps | Policy must pre-check; a policy bug is a crash | Either accepted as designed, or a checked variant that answers `Failed(EPERM)` |
+| G3 | **Built: [cancho #533](https://github.com/alpibrusl/cancho/issues/533), merged** (`child_kill_group`, rev `8411e9a`; S7 re-run, no `/bin/kill`). Was: kill reaches only the pid | Nothing now; workers that start subprocesses are started detached | None. Residual: a descendant that leaves the group; the orphan after a Forge crash (G4) |
+| G4 | **Open, no issue; `docs/processes.md` section 9** (narrowed by #533 for a live supervisor only). No kill-by-pid capability; parent death does not kill children | Restart cannot cleanly stop an orphaned worker | `docs/processes.md` section 9: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` on Linux only |
 | G5 | `fsync` durability on macOS is weaker | Durability promise differs per platform | `F_FULLFSYNC` (`docs/file-writes.md` section 6) |
-| G6 | Header of `docs/processes.md` says slices 3 and 4 are "designed, not built"; its own slice table and `std/process.cho` say built | Misleading; S1-S2, S6, S7 use `std.process.capture` successfully | Correct the header in the cancho repository |
-| G9 | A library function over `Fs` cannot be generic in the prefix: `Fs("/x")` is not accepted where a function declares `Fs("")` *(measured, M1; see `spike/RESULTS.md`, "M1 findings")* | `src/journal_io.cho` is written against `Fs("")` and guards the path itself (`path-invalid`); a binary that links it reports `fs_read("")`, `fs_write("")`. The production `forge` binary links it in M2, and that widening is a visible diff in `cancho authority` and says so in its commit | The same run-time-chosen-bound question as G1, for `Fs`; or a way to declare a function generic in a capability's prefix |
+| G6 | **Fixed: [cancho #536](https://github.com/alpibrusl/cancho/issues/536) (closed; in `8411e9a`).** Header of `docs/processes.md` says slices 3 and 4 are "designed, not built"; its own slice table and `std/process.cho` say built | Misleading; S1-S2, S6, S7 use `std.process.capture` successfully | Correct the header in the cancho repository |
+| G9 | **Open: [cancho #534](https://github.com/alpibrusl/cancho/issues/534)** (with G1). A library function over `Fs` cannot be generic in the prefix: `Fs("/x")` is not accepted where a function declares `Fs("")` *(measured, M1; see `spike/RESULTS.md`, "M1 findings")* | `src/journal_io.cho` is written against `Fs("")` and guards the path itself (`path-invalid`); a binary that links it reports `fs_read("")`, `fs_write("")`. The production `forge` binary links it in M2, and that widening is a visible diff in `cancho authority` and says so in its commit | The same run-time-chosen-bound question as G1, for `Fs`; or a way to declare a function generic in a capability's prefix |

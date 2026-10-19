@@ -51,11 +51,12 @@ $C build mock_worker.cho --std -o "$D/bin/mock_worker" && $C run s6_dispatch.cho
 $C authority mock_worker.cho --std | sed -n 1,6p
 $C authority s6_dispatch.cho --std | sed -n 1,10p
 
-say "S7 what a kill reaches (grandchild 'sleep 77')"
+say "S7 what a kill reaches (grandchild 'sleep 77'); no /bin/kill, no exec(\"/bin\")"
 $C build s7_grandchild.cho --std -o "$D/s7" || exit 1
-for m in p g; do
+$C authority s7_grandchild.cho --std | sed -n '/^performs/,/^never/p'
+for m in p g k; do
   printf -- '--- mode %s\n' "$m"; "$D/s7" $m; sleep 0.3
-  echo "sleep processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):"
-  ps -eo pid,pgid,stat,comm | awk '$4 == "sleep" { print "  " $0 }'
-  pkill -x sleep 2>/dev/null
+  echo "'sleep 77' processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):"
+  ps -eo pid,pgid,stat,args | awk '$4 == "sleep" && $5 == "77" { print "  " $1, $2, $3, $4, $5 }'
+  pkill -f '^sleep 77$' 2>/dev/null || true
 done

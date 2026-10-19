@@ -6,7 +6,7 @@ says so.
 
 | | |
 |---|---|
-| Compiler | `cancho 0.0.0 (rev 2aa83b23dd3d9ea0f4551098597bc7b51dc2aecd, host x86_64-unknown-linux-gnu)`, `/home/user/cancho/target/release/cancho` |
+| Compiler | `cancho 0.0.0 (rev 8411e9ade1805eedec64b8a217610efb0cd0cd4c, host x86_64-unknown-linux-gnu)`, `/home/user/cancho-bin/cancho`. The M0 spikes were first run on rev `2aa83b2`; the pin was bumped after M1's first commits (cancho #533 and #536) and every spike re-run: nothing the bump changed altered a result except S7, rewritten below |
 | Machine | Linux 6.18, x86_64, a cloud sandbox container (so: no init reaping orphans -- see S7) |
 | Backend | the compiler's default (LLVM via `clang`/`cc`); not cross-checked on Cranelift |
 | Not covered | macOS; a real Cancho Code; concurrency of several workers; large journals; anything over a network |
@@ -30,7 +30,7 @@ M1: `cancho test` now runs 56 tests in three sets and the gate also runs a
 | Enforce an output bound | **PASS**: exactly 1000 bytes kept, child killed | S2 |
 | Report exit status / signal | **PASS** | S2, S6 |
 | Kill a child explicitly | **PASS**, with a trap for the unwary (section S2) | S2 |
-| Kill what the child started (a grandchild) | **FAIL by default; PASS with `exec_spawn_detached` + `/bin/kill -KILL -- -pid`** | S7 |
+| Kill what the child started (a grandchild) | **PASS by default for a detached worker** (`exec_spawn_detached`: `capture` kills the group at the deadline, or `child_kill_group` by hand), with `Exec` narrowed to `/bin/sh` and no `/bin/kill`; a plain `exec_spawn` worker still leaks its grandchild (the control). *Corrected after #533: M0 recorded FAIL here, PASS only with `/bin/kill` in an `Exec("/bin")` bound.* | S7 |
 | Pass a narrowed `Exec` | **PASS**: allowed spawns run; outside spawn and `..` path **trap** (SIGILL, exit 132) -- a refusal-as-value does not exist | S3 |
 | `cancho authority` reports it | **PASS**: `exec("/bin/echo")`, `exec("/usr/bin")`; Forge's S6 dispatcher reports no filesystem, no network, no foreign code | S3, S6 |
 | Append + sync a journal | **PASS** | S5 |
@@ -257,29 +257,73 @@ mock (see `docs/worker-contract.md` section 8).
 A worker that starts subprocesses (compilers, test runners) is the normal
 case for an engineering worker. `s7_grandchild.cho` starts
 `/bin/sh -c 'sleep 77 & wait'`, times it out at 300 ms, and lets an outside
-`ps` look at `sleep`.
+`ps` (matched on the arguments `sleep 77`) look at the grandchild.
+
+**M0 result, rev `2aa83b2` (kept, because the gap table cites it):** a plain
+`capture` kill reached the worker's pid only (the `sleep` stayed `S`), and the
+only way to reach the group was `exec_spawn_detached` plus
+`/bin/kill -KILL -- -<pid>` through an `Exec("/bin")` bound, which put
+`exec("/bin")` in the authority report. That was gap G3, filed upstream as
+cancho #533.
+
+**After #533, rev `8411e9a`.** `child_kill_group(&Child, signal)` (edition 9,
+cancho `docs/processes.md` 4.12) signals the group a detached child leads, and
+`std.process.capture` sends the group KILL before the pid's on every path on
+which it kills (deadline, output bound, failed watch). The spike was rewritten:
+`Exec` is narrowed to `/bin/sh` alone, `/bin/kill` is gone, and three modes run
+(`p` plain `exec_spawn`, the control; `g` `exec_spawn_detached` and let
+`capture` kill; `k` `exec_spawn_detached`, no `capture`, the program calls
+`child_kill_group` and `child_wait` itself). Verbatim, from `spike/run.sh`:
 
 ```
-mode p (plain exec_spawn)
-  worker timed out; killed and reaped
-  13171  12639 S  sleep          <- grandchild ALIVE (state S), in the parent's process group
-
-mode g (exec_spawn_detached, then /bin/kill -KILL -- -<pid> through the same Exec)
-  worker timed out; killed and reaped
-  kill -KILL -- -pid: exit 0
-  13178  13177 Z  sleep          <- grandchild killed (Z: dead, not yet reaped by this
-                                    container's init; it was a live S before the group kill)
+=== S7 what a kill reaches (grandchild 'sleep 77'); no /bin/kill, no exec("/bin")
+performs
+    args
+    child_signal
+    clock
+    exec("/bin/sh")
+    exec_detached
+    heap
+    io_write
+    pipe_read
+    pipe_write
+    poll
+never touches
+--- mode p
+worker timed out; killed and reaped
+'sleep 77' processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
+  17483 12215 S sleep 77
+--- mode g
+worker timed out; killed and reaped
+'sleep 77' processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
+--- mode k
+worker ended by signal 256
+child_kill_group rc=0
+'sleep 77' processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
 ```
 
-**FAIL by default**: `capture`'s `KILL` reaches the worker's pid only, and
-its children keep running, re-parented. **PASS with the documented
-workaround**: start the worker with `exec_spawn_detached` (its own session
-and group) and, after `capture`, run `/bin/kill -KILL -- -<pid>` through the
-same narrowed `Exec`; the group, which outlives its reaped leader while it
-has members, dies. Costs: `/bin/kill` must lie inside the `Exec` bound
-(the authority report then says `exec("/bin")`, broader than a single
-worker directory) and the pid is a bare number (reuse hazard,
-`docs/processes.md` 4.11). A native group-kill is gap G3.
+**PASS by default.** The authority report names `exec("/bin/sh")` and
+`exec_detached`; it has no `exec("/bin")` and no `/bin/kill`. Mode `p` is the
+control: the grandchild is alive (`S`) and sits in the parent's process group
+(pgid 12215), so the other two modes cannot have passed for any reason. In
+mode `g` and `k` the grandchild is gone (not even a zombie: on this run the
+container reaped it; the M0 run showed `Z`, "dead, not yet reaped"). `child_kill_group`
+answers `0`; `child_wait` then reports `Signaled(256)`, the KILL bit.
+
+What the measurement does not show, and the cancho document says:
+
+* Only a descendant that stayed in the group is reached; one that calls
+  `setsid`/`setpgid` is not (cancho `docs/processes.md` section 9). Not
+  measured here (our grandchild is `sleep`).
+* A worker that exits by itself and leaves a subprocess behind is not killed
+  by `capture` (the exit ends the capture). The dispatcher must call
+  `child_kill_group` itself before `child_wait` if it wants that; not
+  measured here.
+* `Exec("/bin/sh")` bounds what *Forge* may start, not what the worker then
+  starts: the grandchild `sleep` is outside the bound, as in M0 (gap G2).
+* After a Forge crash there is no `Child` to hold (gap G4, still open).
+* Mode `k` waits 300 ms by spinning on the clock for the worker to have started
+  its `sleep`; it is a spike, a real dispatcher polls (S2).
 
 ---
 
@@ -342,21 +386,26 @@ instead).
 ## Gaps
 
 What did not work or is not built, and what each blocks. "Needed from
-cancho" is a proposed feature; **no cancho issue for any of these was
-found or filed** (the GitHub tracker was not searched in M0), except where
-a row of `docs/processes.md` section 9 already names it.
+cancho" is a proposed feature. **Corrected after M0**: the tracker was
+searched and the gaps filed or found. G1 and G9 are [cancho #534](https://github.com/alpibrusl/cancho/issues/534)
+(open), G2 is [#535](https://github.com/alpibrusl/cancho/issues/535) (open), G3 was
+[#533](https://github.com/alpibrusl/cancho/issues/533) and is **built and merged**
+(`child_kill_group`, S7), G4 stays open and is a row of `docs/processes.md`
+section 9 (no issue), G6 was [#536](https://github.com/alpibrusl/cancho/issues/536)
+and is **fixed** (closed; the header on cancho main says slices 0 to 6 are built,
+checked by reading `docs/processes.md` at rev `8411e9a`).
 
 | # | Gap | Blocks | Needed from cancho |
 |---|---|---|---|
-| G1 | `narrow` accepts only literals, so `Exec`/`Fs` bounds are fixed at build time | Per-task, run-time scoped grants (design doc 6.4); a workers/workspace directory from configuration | A way to narrow to a deployment-time value. Existing open row: `docs/processes.md` section 9, "A bound chosen at deployment" (it says `Fs` has the same question) |
-| G2 | A bound violation is a trap (SIGILL), not a value | A policy bug crashes the runtime instead of producing a journalled refusal | Accept as designed and pre-check in Forge (the plan), or a checked variant returning `Failed(EPERM)` |
-| G3 | `capture`/`child_kill` reach the pid only; grandchildren survive (S7) | Clean timeouts for workers that spawn subprocesses (M2) | A group-kill on a detached child. Workable today through `/bin/kill`, at the price of widening the `Exec` bound |
-| G4 | No kill-by-pid capability; children outlive a dead parent (documented, not measured) | Safely stopping an orphaned worker after a Forge crash (M2) | `docs/processes.md` section 9 rows: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` (Linux only) |
+| G1 | **Open: cancho #534.** `narrow` accepts only literals, so `Exec`/`Fs` bounds are fixed at build time | Per-task, run-time scoped grants (design doc 6.4); a workers/workspace directory from configuration | A way to narrow to a deployment-time value. Existing open row: `docs/processes.md` section 9, "A bound chosen at deployment" (it says `Fs` has the same question) |
+| G2 | **Open: cancho #535.** A bound violation is a trap (SIGILL), not a value | A policy bug crashes the runtime instead of producing a journalled refusal | Accept as designed and pre-check in Forge (the plan), or a checked variant returning `Failed(EPERM)` |
+| G3 | ~~`capture`/`child_kill` reach the pid only; grandchildren survive (S7)~~ **Built: cancho #533 (merged), `child_kill_group`; S7 re-run, PASS with no `/bin/kill`** | Nothing now; M2 starts workers with `exec_spawn_detached` | None. Residual, from cancho's own document: a descendant that leaves the group is not reached; the orphan after a Forge crash is G4 |
+| G4 | **Open, no issue: a row of `docs/processes.md` section 9** (cancho #533 narrowed it: a supervisor that is alive can stop a worker's group with the `Child` it holds; after a supervisor *crash* nothing changes). No kill-by-pid capability; children outlive a dead parent (documented, not measured) | Safely stopping an orphaned worker after a Forge crash (M2) | `docs/processes.md` section 9 rows: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` (Linux only) |
 | G5 | `fsync` on macOS does not flush the drive cache (documented); only Linux was run | The durability promise on macOS (M1) | `F_FULLFSYNC` (`docs/file-writes.md` section 6) |
-| G6 | `docs/processes.md`'s status header says "slices 3 and 4 designed, not built", but its own slice table, `std/process.cho` and S1/S2/S6/S7 show `std.process` working | Nothing, but it misled the brief for this spike | Correct the header in the cancho repository (a document-only fix, per `CONTRIBUTING.md`) |
+| G6 | **Fixed: cancho #536 (closed, in rev `8411e9a`).** `docs/processes.md`'s status header says "slices 3 and 4 designed, not built", but its own slice table, `std/process.cho` and S1/S2/S6/S7 show `std.process` working | Nothing, but it misled the brief for this spike | Correct the header in the cancho repository (a document-only fix, per `CONTRIBUTING.md`) |
 | G7 | `cancho check` refuses a library with no `main`; `cancho test` is the only check for library-only files | Gate shape (we check `src/*.cho` as one program and rely on `cancho test` for tests) | None required; noted |
 | G8 | No `cancho` command walks a directory tree from a program without `std.dirs`/`Fs`; the 2,000-line rule is enforced by a shell loop in `scripts/gate.sh`, not in cancho | "Pure cancho" gate (M1 plans a cancho test using `std.dirs`) | None required |
-| G9 | A function over `Fs` cannot be generic in the prefix (M1 findings above) | The journal's file layer cannot be narrowed to the workspace; it holds `Fs("")` and guards paths itself | Same as G1, for `Fs`; or a prefix-generic capability parameter |
+| G9 | **Open: cancho #534** (same issue as G1). A function over `Fs` cannot be generic in the prefix (M1 findings above) | The journal's file layer cannot be narrowed to the workspace; it holds `Fs("")` and guards paths itself | Same as G1, for `Fs`; or a prefix-generic capability parameter |
 
 Not spiked, and therefore not claimed: SHA-256 evidence hashing; stderr
 capture (`capture_both`); `exec_spawn_in` (working directory); `Signals`
@@ -368,12 +417,15 @@ Cancho Code and `lex-loom`.
 
 ## Appendix: full transcript of `spike/run.sh`
 
-Run with `CANCHO=/home/user/cancho/target/release/cancho spike/run.sh`
-(exit 0). The S7 section lists `sleep` as `S` (alive) after mode `p` and
-`Z` after mode `g`; a leftover `Z` from the previous mode can also show in
-mode `g`'s listing, because this container has no init to reap orphans.
+Run with `CANCHO=/home/user/cancho-bin/cancho spike/run.sh` (rev
+`8411e9a`, exit 0), re-recorded after the pin bump and the S7 rewrite. The
+S7 section lists only `sleep 77` processes (`ps` matched on its arguments;
+an earlier listing by command name also showed unrelated `sleep`s of other
+programs on the machine): `S` (alive) after mode `p`, nothing after modes
+`g` and `k`.
 
 ```
+
 === gate: fmt, check
 fmt: ok
 check s1_capture: ok
@@ -390,11 +442,11 @@ ran: code 0
 stdout: hello from child
 
 === S2 deadline, output bound, exit status, explicit kill
-deadline 300ms vs sleep 30: timed out, kept 0 bytes, 301 ms
+deadline 300ms vs sleep 30: timed out, kept 0 bytes, 302 ms
 bound 1000 vs yes: too much, kept 1000 bytes, 2 ms
 nonzero exit: code 3, kept 0 bytes, 2 ms
 stderr not captured: code 0, kept 4 bytes, 2 ms
-explicit kill: child_kill rc=0, signaled 8, 1 ms
+explicit kill: child_kill rc=0, signaled 8, 0 ms
 
 === S3 narrowed Exec: allowed spawns run, outside spawns trap
 performs
@@ -497,11 +549,11 @@ lock by first writer: ok 0
 lock by second writer (must fail): FAILED errno 11
 
 === S6 worker round trip (mock worker over stdio)
-normal      : worker_claims_succeeded -> verification (not accepted) [1 ms]
+normal      : worker_claims_succeeded -> verification (not accepted) [2 ms]
 reports fail: worker_reports_failed [2 ms]
-garbage     : protocol_error: stdout is not a JSON object [2 ms]
+garbage     : protocol_error: stdout is not a JSON object [1 ms]
 exit 3      : worker_error exit 3 [1 ms]
-hang (500ms): worker_timeout (child killed and reaped) [501 ms]
+hang (500ms): worker_timeout (child killed and reaped) [502 ms]
 performs
     args
     heap
@@ -519,15 +571,28 @@ performs
     poll
 never touches
 
-=== S7 what a kill reaches (grandchild 'sleep 77')
+=== S7 what a kill reaches (grandchild 'sleep 77'); no /bin/kill, no exec("/bin")
+performs
+    args
+    child_signal
+    clock
+    exec("/bin/sh")
+    exec_detached
+    heap
+    io_write
+    pipe_read
+    pipe_write
+    poll
+never touches
 --- mode p
 worker timed out; killed and reaped
-sleep processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
-  13171 12639 S    sleep
+'sleep 77' processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
+  24327 19878 S sleep 77
 --- mode g
 worker timed out; killed and reaped
-kill -KILL -- -pid: exit 0
-sleep processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
-  13171 12639 Z    sleep
-  13178 13177 Z    sleep
+'sleep 77' processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
+--- mode k
+worker ended by signal 256
+child_kill_group rc=0
+'sleep 77' processes (pid pgid state; S = alive, Z = killed, not yet reaped by init):
 ```

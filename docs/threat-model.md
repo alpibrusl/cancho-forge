@@ -44,7 +44,7 @@ claims of success, evidence a worker supplies, repository content, stderr.
 | T2 | Worker runs a program it was not meant to | `Exec` narrowed to the workers directory; policy pre-check | bound **measured** (S3: a spawn outside the prefix and a path with a `..` component both trap, exit 132) |
 | T3 | Worker inherits a secret from Forge | `exec_spawn` passes an empty environment and no descriptors; `LD_*`/`DYLD_*` entries trap (`docs/processes.md` 4.3, 4.5) | designed in cancho; Forge passes `""` (S1, S2, S6) |
 | T4 | Worker hangs or floods output | deadline and byte cap in `capture`; kill and reap | **measured** (S2: 301 ms for a 300 ms deadline; 1000-byte cap) |
-| T5 | Worker leaves processes running after a kill (orphaned compiler, test runner) | Detached start + group kill | **measured to leak by default, to work with `exec_spawn_detached` + `/bin/kill -- -pgid`** (S7); costs `/bin/kill` in the `Exec` bound |
+| T5 | Worker leaves processes running after a kill (orphaned compiler, test runner) | Detached start + group kill (`child_kill_group`, which `capture` also does) | **measured**: leaks for a plain `exec_spawn`; gone with `exec_spawn_detached`, by `capture` or by `child_kill_group` by hand, with `Exec` narrowed to the worker and no `/bin/kill` (S7, corrected after cancho #533). Not reached: a descendant that calls `setsid`; the orphan after a Forge crash (G4) |
 | T6 | Forge crashes mid-run and loses or doubles work | Append-only journal, sync before effect, torn-tail truncation, intent-before-effect events, idempotency key | torn tail and sync **measured** (S5); reconciliation designed |
 | T7 | Journal tampered or corrupted | A complete line that is not the next record refuses recovery and changes nothing (`journal-corrupt`) | **measured** (S5) for corruption; *tamper evidence* (hash chain) is out of MVP scope |
 | T8 | Two Forge processes write one workspace | `file_lock` on `.forge/lock` | **measured** (S5: second lock fails, errno 11) |
@@ -97,8 +97,9 @@ passed to the worker.
 
 1. T14: the trap-on-violation backstop kills Forge. Needs a checked
    alternative from cancho or discipline in the policy layer (G2).
-2. T5 and G3: group kill requires starting workers detached and giving
-   `Exec` access to `/bin/kill`.
+2. T5 and G3: group kill requires starting workers detached
+   (`exec_spawn_detached`); it no longer needs `Exec` access to
+   `/bin/kill` (corrected after cancho #533).
 3. Compile-time-only narrowing (G1) means workspace and worker directories
    are fixed in the binary; per-task scope is policy, not capability.
 4. Orphaned workers after a Forge crash (G4) are only detectable by pid.

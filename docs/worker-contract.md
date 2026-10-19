@@ -219,7 +219,8 @@ input to a policy decision.
   directory survives and the same command resumes it.
 * Cancellation reaches only the worker's own process **unless Forge started
   it detached and kills its group** (S7). Workers that start subprocesses
-  must be started that way; architecture G3.
+  must be started that way; architecture G3 (built: `child_kill_group`,
+  no `/bin/kill` in the `Exec` bound; corrected after cancho #533).
 * `async` worker: `cancel` is idempotent; `too_late` means the result
   already exists, and Forge then reads it with `result`.
 
@@ -313,7 +314,7 @@ output it relays (`threat-model.md`):
 | `execute` over stdio, the five endings of section 5 rows 2, 5, 6, 7, 8 | spike S6: Forge-side dispatcher + `mock_worker.cho` | **measured** |
 | bounds: deadline, output cap, exit status, kill | S2 | **measured** |
 | the `Exec` bound a worker is started under | S3 | **measured** |
-| a worker's subprocesses are killed with it | S7 | **measured: not by default; with a detached start and a group kill, yes** |
+| a worker's subprocesses are killed with it | S7 | **measured: not for a plain start; yes for a detached start, killed by `capture` or by `child_kill_group`, with no `/bin/kill`** (corrected after cancho #533) |
 | `capabilities`, `cancel`, `status`, `result`, `async` level | | designed |
 | contract tests run against mock and the real adapter | `tests/contract/` (M2) | not started |
 | evidence hash recomputation | `std.crypto.sha256` exists | not spiked |

@@ -7,88 +7,89 @@ import std.process;
 // Spike 7: what a kill reaches. A worker that starts its own subprocess
 // (Cancho Code will: compilers, test runners) is killed at its deadline; does
 // the grandchild die with it? The grandchild is `sleep 77`, so an external
-// `pgrep -x sleep` after this program exits answers it.
+// `ps` after this program exits answers it.
 //
-//   argv[1] = p  plain exec_spawn: `capture` kills the worker's pid only.
-//             g  exec_spawn_detached (the worker leads its own process group),
-//                then `/bin/kill -KILL -- -<pid>` started through the same
-//                narrowed Exec, which reaches the whole group
-//                (docs/processes.md 4.11, "What the caller can do with the pid").
+// The first version of this spike needed `/bin/kill -KILL -- -<pid>` started
+// through an `Exec("/bin")` bound (gap G3, cancho #533). `child_kill_group`
+// (edition 9, docs/processes.md 4.12) removed that: this version holds `Exec`
+// narrowed to the one worker, `/bin/sh`, and the authority report has no
+// `exec("/bin")`.
+//
+//   argv[1] = p  plain exec_spawn: `capture` kills the worker's pid only
+//                (`child_kill_group` answers ESRCH for a child that leads no
+//                group of its own); the control.
+//             g  exec_spawn_detached: the worker leads its own group, and
+//                `capture` itself kills the group at the deadline.
+//             k  exec_spawn_detached, no `capture`: this program polls its own
+//                deadline, then calls `child_kill_group` and `child_wait` on
+//                the `Child` it holds (the call a dispatcher makes when it,
+//                not `capture`, ends a worker).
 
-// Run /bin/kill against the group of `pid`; answers its exit code.
-fn kill_group[&h, &x](heap: &!h Heap, exec: &x Exec("/bin"), pid: int) -> [heap, exec("/bin")] int {
-    var args = process.argv(heap, 32);
-    let (a1, e1) = process.add(heap, args, "-KILL");
-    let (a2, e2) = process.add(heap, a1, "--");
-    var text = buffer.empty(heap, 16);
-    text = buffer.push(heap, text, byte_of('-'));
-    text = buffer.push_nat(heap, text, pid);
-    var code = 0 - 1;
-    borrow text as &t in {
-        let (a3, e3) = process.add(heap, a2, buffer.bytes(t));
-        borrow a3 as &l in {
-            match exec_spawn(exec, "/bin/kill", process.list(l), "", Stdio::Null, Stdio::Null, Stdio::Null) {
-                Spawned::Failed(e) => {
-                    code = 0 - e;
-                }
-                Spawned::Ok(child) => {
-                    match child_wait(child) {
-                        Exited::Code(n) => {
-                            code = n;
-                        }
-                        Exited::Signaled(s) => {
-                            code = 0 - 1000;
-                        }
-                        Exited::Failed(e) => {
-                            code = 0 - e;
-                        }
-                    }
-                }
-            }
-        }
-        process.drop(heap, a3);
-    }
-    buffer.drop(heap, text);
-    return code;
-}
-
-fn begin[&x](exec: &x Exec("/bin"), detached: bool, child_in: ChildEnd, child_out: ChildEnd) -> [exec("/bin"), exec_detached] Spawned {
+fn begin[&x](exec: &x Exec("/bin/sh"), detached: bool, child_in: ChildEnd, child_out: ChildEnd) -> [exec("/bin/sh"), exec_detached] Spawned {
     if detached {
         return exec_spawn_detached(exec, "/bin/sh", "-c\0sleep 77 & wait\0", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
     }
     return exec_spawn(exec, "/bin/sh", "-c\0sleep 77 & wait\0", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
 }
 
-fn run[&h, &x, &c, &i](heap: &!h Heap, exec: &x Exec("/bin"), clock: &c Clock, io: &!i Io, grouped: bool) -> [heap, exec("/bin"), exec_detached, clock, poll, io_write] int {
+// Mode k: stop the worker's group ourselves. Answers child_kill_group's code.
+fn stop_group[&c, &io](clock: &c Clock, child: Child, io: &!io Io) -> [clock, io_write] int {
+    // The deadline: spin on the clock until the worker has started its sleep.
+    let start = clock_ms(clock);
+    while clock_ms(clock) - start < 300 {
+    }
+    var code = 0 - 1;
+    borrow child as &ch in {
+        code = child_kill_group(ch, 256);
+    }
+    match child_wait(child) {
+        Exited::Signaled(s) => {
+            io.write_all(io, "worker ended by signal ");
+            io.print_int(io, s);
+            io.newline(io);
+        }
+        Exited::Code(n) => {
+            io.write_all(io, "worker exited by itself\n");
+        }
+        Exited::Failed(e) => {
+            io.write_all(io, "wait failed\n");
+        }
+    }
+    return code;
+}
+
+fn run[&h, &x, &c, &i](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, io: &!i Io, mode: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll, io_write] int {
     match process.channels() {
         process.Channels::Failed(e) => {
             io.write_all(io, "channels failed\n");
         }
         process.Channels::Ok(to_child, child_in, from_child, child_out) => {
-            match begin(exec, grouped, child_in, child_out) {
+            match begin(exec, mode != 'p', child_in, child_out) {
                 Spawned::Failed(e) => {
                     process.close(to_child, from_child);
                     io.write_all(io, "spawn failed\n");
                 }
                 Spawned::Ok(child) => {
-                    var pid = 0;
-                    borrow child as &ch in {
-                        pid = child_pid(ch);
-                    }
-                    let (out, ran) = process.capture(heap, clock, child, to_child, from_child, "", 4096, 300);
-                    buffer.drop(heap, out);
-                    match ran {
-                        process.Ran::TimedOut => {
-                            io.write_all(io, "worker timed out; killed and reaped\n");
-                        }
-                        _ => {
-                            io.write_all(io, "unexpected ending\n");
-                        }
-                    }
-                    if grouped {
-                        io.write_all(io, "kill -KILL -- -pid: exit ");
-                        io.print_int(io, kill_group(heap, exec, pid));
+                    if mode == 'k' {
+                        process.close(to_child, from_child);
+                        // No capture here: the program is its own supervisor.
+                        // 300 ms is slept off by the worker's own `wait`; a real
+                        // dispatcher polls (S2). The stop is what is measured.
+                        let rc = stop_group(clock, child, io);
+                        io.write_all(io, "child_kill_group rc=");
+                        io.print_int(io, rc);
                         io.newline(io);
+                    } else {
+                        let (out, ran) = process.capture(heap, clock, child, to_child, from_child, "", 4096, 300);
+                        buffer.drop(heap, out);
+                        match ran {
+                            process.Ran::TimedOut => {
+                                io.write_all(io, "worker timed out; killed and reaped\n");
+                            }
+                            _ => {
+                                io.write_all(io, "unexpected ending\n");
+                            }
+                        }
                     }
                 }
             }
@@ -104,21 +105,21 @@ fn main(world: World) -> [] int {
     release(net);
     release(signals);
     release(tty);
-    let bin = narrow(exec, "/bin");
+    let sh = narrow(exec, "/bin/sh");
     var console = io;
     var memory = heap;
-    borrow bin as &x in {
+    borrow sh as &x in {
         borrow clock as &c in {
             borrow mut console as &!i in {
                 borrow mut memory as &!h in {
                     borrow args as &g in {
-                        run(h, x, c, i, int_of(arg(g, 1)[0]) == 'g');
+                        run(h, x, c, i, int_of(arg(g, 1)[0]));
                     }
                 }
             }
         }
     }
-    release(bin);
+    release(sh);
     release(clock);
     release(console);
     release(memory);
