@@ -1,6 +1,7 @@
 edition 9;
 
 import std.buffer;
+import std.bytes;
 import std.test;
 import forge.event;
 
@@ -59,5 +60,56 @@ fn test_an_unknown_schema_version_is_refused[&h](heap: &!h Heap) -> [heap] int {
 
 fn test_unknown_fields_are_ignored[&h](heap: &!h Heap) -> [heap] int {
     test.assert_eq(event.seq_of(heap, "{\"v\":1,\"seq\":5,\"future\":{\"x\":[1,2]}}"), 5);
+    return 0;
+}
+
+fn test_a_transition_record_carries_actor_and_basis_only_when_given[&h](heap: &!h Heap) -> [heap] int {
+    let with = event.transition(heap, 3, "task.accepted", "t-1", "forge", "observed");
+    var has_basis = false;
+    var has_actor = false;
+    var one_line = false;
+    borrow with as &b in {
+        let text = buffer.bytes(b);
+        has_basis = bytes.find(text, "\"basis\":\"observed\"") >= 0;
+        has_actor = bytes.find(text, "\"actor\":\"forge\"") >= 0;
+        one_line = bytes.count_byte(text, 10) == 1 && int_of(text[len(text) - 1]) == 10;
+        test.assert_eq(event.seq_of(heap, text[0..len(text) - 1]), 3);
+    }
+    buffer.drop(heap, with);
+    test.assert(has_basis);
+    test.assert(has_actor);
+    test.assert(one_line);
+    let without = event.transition(heap, 4, "task.ready", "t-1", "forge", "");
+    var absent = false;
+    borrow without as &w in {
+        absent = bytes.find(buffer.bytes(w), "basis") < 0;
+    }
+    buffer.drop(heap, without);
+    test.assert(absent);
+    return 0;
+}
+
+fn test_a_refusal_record_names_its_rule[&h](heap: &!h Heap) -> [heap] int {
+    let r = event.refusal(heap, 9, "t-1", "transition-invalid");
+    borrow r as &b in {
+        let text = buffer.bytes(b);
+        test.assert(bytes.find(text, "\"kind\":\"refusal\"") >= 0);
+        test.assert(bytes.find(text, "\"rule\":\"transition-invalid\"") >= 0);
+        test.assert_eq(bytes.count_byte(text, 10), 1);
+        test.assert_eq(event.seq_of(heap, text[0..len(text) - 1]), 9);
+    }
+    buffer.drop(heap, r);
+    return 0;
+}
+
+fn test_a_hostile_task_id_is_escaped_not_spliced[&h](heap: &!h Heap) -> [heap] int {
+    let r = event.refusal(heap, 1, "a\"}\n{\"seq\":2", "event-malformed");
+    borrow r as &b in {
+        let text = buffer.bytes(b);
+        // still one record on one line, and it still reads back as seq 1
+        test.assert_eq(bytes.count_byte(text, 10), 1);
+        test.assert_eq(event.seq_of(heap, text[0..len(text) - 1]), 1);
+    }
+    buffer.drop(heap, r);
     return 0;
 }

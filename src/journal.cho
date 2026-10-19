@@ -1,0 +1,211 @@
+edition 9;
+module forge.journal;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.map;
+import std.option;
+import forge.event;
+import forge.task;
+
+// The journal's pure core (docs/architecture.md, sections 4.1 to 4.3):
+// replay a journal that is already in memory into the state of every task,
+// plan what recovery may cut, and turn a proposed move into the record that
+// will be appended (a transition, or a refusal). It takes bytes and answers
+// values; its rows are `[heap]` at most, so it can touch no file. The file
+// layer is `forge.journal_io`.
+//
+// The rule S5 established (spike/RESULTS.md) and this module keeps:
+//
+//   * Bytes after the last newline are a torn tail: a crash cut a record.
+//     Recovery may cut those, and only those.
+//   * A COMPLETE line that is not the next valid record is corruption or a
+//     duplicate. Replay stops at it, names the rule and the line, and
+//     recovery cuts nothing. Treating "not valid" as "torn" truncated three
+//     good lines in the spike; that is why the two cases are kept apart.
+//
+// A record is "valid" when it is JSON, an object, version 1, carries exactly
+// the next `seq`, and a `kind` this build knows (task.cho); a task event is
+// also one the state machine accepts. The first failure ends the replay.
+// A well-formed line the state machine refuses is reported under the
+// machine's own tag (e.g. `transition-invalid`), not `journal-corrupt`: the
+// bytes are fine, the history they describe is not one Forge could have
+// written.
+
+// What a replay found. `rule` is 0 for a clean replay, else a
+// `task.rule_code`. `line` is the 1-based number of the line that ended the
+// replay (0 when clean).
+pub struct Report {
+    records: int,
+    valid_bytes: int,
+    total_bytes: int,
+    torn_bytes: int,
+    tasks: int,
+    rule: int,
+    line: int,
+}
+
+// The offset just after the last newline in `data` (0 when there is none).
+pub fn after_last_newline[&d](data: &d [byte]) -> [] int {
+    var k = len(data);
+    while k > 0 {
+        if int_of(data[k - 1]) == 10 {
+            return k;
+        }
+        k = k - 1;
+    }
+    return 0;
+}
+
+// Apply one complete line (without its newline) that must carry `expect` as
+// its `seq`. Answers the table and 0, or the table unchanged and a rule code.
+fn apply[&h, &l](heap: &!h Heap, tasks: map.Map[int], line: &l [byte], expect: int) -> [heap] (map.Map[int], int) {
+    var table = tasks;
+    var rule = 0;
+    let tape = box_slice(heap, json.tape_len(line), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(line, tp) > 0 && json.is_object(tp, 0) {
+            let version = json.get(line, tp, 0, "v");
+            let seqn = json.get(line, tp, 0, "seq");
+            let kindn = json.get(line, tp, 0, "kind");
+            let taskn = json.get(line, tp, 0, "task");
+            let actorn = json.get(line, tp, 0, "actor");
+            let basisn = json.get(line, tp, 0, "basis");
+            let shaped = json.is_int(tp, version) && json.is_int(tp, seqn) && json.is_string(tp, kindn);
+            if shaped == false || json.to_int(line, tp, version) != event.schema_version() || json.to_int(line, tp, seqn) != expect {
+                rule = task.rule_code(task.Rule::JournalCorrupt);
+            } else {
+                let kind = json.string_view(line, tp, kindn);
+                match task.target_of_kind(kind) {
+                    option.Option::Some(target) => {
+                        let fields = json.is_string(tp, taskn) && json.is_string(tp, actorn) && (basisn < 0 || json.is_string(tp, basisn));
+                        if fields == false {
+                            rule = task.rule_code(task.Rule::EventMalformed);
+                        } else {
+                            let id = json.string_view(line, tp, taskn);
+                            match task.actor_of_name(json.string_view(line, tp, actorn)) {
+                                option.Option::Some(actor) => {
+                                    if task.id_ok(id) == false {
+                                        rule = task.rule_code(task.Rule::EventMalformed);
+                                    } else {
+                                        let observed = basisn >= 0 && json.string_equals(line, tp, basisn, "observed");
+                                        var current = 0;
+                                        borrow table as &tb in {
+                                            current = map.get(tb, id, 0);
+                                        }
+                                        match task.decide(current, target, actor, observed) {
+                                            task.Decision::Moved(s) => {
+                                                table = map.put(heap, table, id, task.state_code(s));
+                                            }
+                                            task.Decision::Refused(r) => {
+                                                rule = task.rule_code(r);
+                                            }
+                                        }
+                                    }
+                                }
+                                option.Option::None => {
+                                    rule = task.rule_code(task.Rule::EventMalformed);
+                                }
+                            }
+                        }
+                    }
+                    option.Option::None => {
+                        if task.is_recorded_kind(kind) == false {
+                            rule = task.rule_code(task.Rule::EventUnknown);
+                        }
+                    }
+                }
+            }
+        } else {
+            rule = task.rule_code(task.Rule::JournalCorrupt);
+        }
+    }
+    unbox_slice(heap, tape);
+    return (table, rule);
+}
+
+// Replay `data`, the whole journal, into the state of every task (task id
+// to `task.state_code`). On a refusal the table holds what replayed before
+// the failing line and must not be trusted: the report says so (`rule`).
+pub fn replay[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] (map.Map[int], Report) {
+    var table = map.empty(heap, 16, 0, 0);
+    var records = 0;
+    var good = 0;
+    var start = 0;
+    var rule = 0;
+    var bad_line = 0;
+    var k = 0;
+    while k < len(data) && rule == 0 {
+        if int_of(data[k]) == 10 {
+            let (next, r) = apply(heap, table, data[start..k], records + 1);
+            table = next;
+            if r == 0 {
+                records = records + 1;
+                good = k + 1;
+            } else {
+                rule = r;
+                bad_line = records + 1;
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    let torn = len(data) - after_last_newline(data);
+    var count = 0;
+    borrow table as &tb in {
+        count = map.size(tb);
+    }
+    return (table, Report { records: records, valid_bytes: good, total_bytes: len(data), torn_bytes: torn, tasks: count, rule: rule, line: bad_line });
+}
+
+// How many bytes the journal may be cut to, or -1 when it must not be cut:
+// the replay was refused (a complete bad line is never "repaired") or there
+// is no torn tail. Only bytes after the last newline are ever offered.
+pub fn recovery_cut(r: Report) -> [] int {
+    if r.rule != 0 {
+        return 0 - 1;
+    }
+    if r.torn_bytes == 0 {
+        return 0 - 1;
+    }
+    return r.valid_bytes;
+}
+
+// The state code of `id` in a replayed table (0: Forge has never seen it).
+pub fn state_of[&m, &i](tasks: &m map.Map[int], id: &i [byte]) -> [] int {
+    return map.get(tasks, id, 0);
+}
+
+// The write path, in memory. A proposed move of task `id` to `target` by
+// `actor` (`observed`: its basis is a check Forge itself ran), at journal
+// position `seq`. Answers the table (moved if the move is legal), the record
+// to append, and 0, or the rule code of the refusal; a refusal answers a
+// `refusal` record instead, so the declined move is part of the history and
+// changes no state when replayed. An id that is not a legal id is recorded
+// against the empty task.
+pub fn submit[&h, &i](heap: &!h Heap, tasks: map.Map[int], seq: int, id: &i [byte], target: task.State, actor: task.Actor, observed: bool) -> [heap] (map.Map[int], buffer.Buffer, int) {
+    var table = tasks;
+    if task.id_ok(id) == false {
+        let rule = task.Rule::EventMalformed;
+        return (table, event.refusal(heap, seq, "", task.rule_name(rule)), task.rule_code(rule));
+    }
+    var current = 0;
+    borrow table as &tb in {
+        current = map.get(tb, id, 0);
+    }
+    match task.decide(current, target, actor, observed) {
+        task.Decision::Moved(s) => {
+            var basis = "";
+            if observed {
+                basis = "observed";
+            }
+            table = map.put(heap, table, id, task.state_code(s));
+            return (table, event.transition(heap, seq, task.kind_of_state(s), id, task.actor_name(actor), basis), 0);
+        }
+        task.Decision::Refused(r) => {
+            return (table, event.refusal(heap, seq, id, task.rule_name(r)), task.rule_code(r));
+        }
+    }
+}

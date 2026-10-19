@@ -11,3 +11,13 @@ std = true
 name = "event"
 sources = ["tests/event_test.cho", "src/event.cho"]
 std = true
+
+[[test]]
+name = "task"
+sources = ["tests/task_test.cho", "src/task.cho"]
+std = true
+
+[[test]]
+name = "journal"
+sources = ["tests/journal_test.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true

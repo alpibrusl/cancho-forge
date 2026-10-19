@@ -1,0 +1,516 @@
+edition 9;
+module forge.task;
+
+import std.bytes;
+import std.option;
+
+// The task state machine (docs/architecture.md, section 6) and the refusals
+// it can answer (section 7). Pure: the effect row of every function here is
+// empty, so nothing in this file can touch a file, a process or the clock.
+//
+// A worker never moves a task by saying so. It returns data; Forge decides,
+// and an event is the record of the decision. Two rules carry that:
+//
+//   * a task becomes `accepted` only by an event Forge wrote itself
+//     (`actor` forge) on the strength of a check Forge observed (`basis`
+//     observed). A worker's claim of success is the ordinary reason for a
+//     task to *enter* `verification`, never to leave it as `accepted`.
+//   * an edge that is not in `can_move` is a refusal with a rule tag, not a
+//     guess and not a trap.
+//
+// State matches below never use `_`: the compiler then refuses a state that
+// is added and not handled (docs/architecture.md, section 6).
+
+pub enum State {
+    Proposed,
+    Approved,
+    Ready,
+    Running,
+    Blocked,
+    Verification,
+    Accepted,
+    Rejected,
+    Cancelled,
+}
+
+// Who wrote the event. Never the same namespace for workers and humans.
+pub enum Actor {
+    Forge,
+    Worker,
+    Human,
+}
+
+// Every refusal this module and `forge.journal` can answer. The names are
+// stable (docs/architecture.md, section 7); a test reaches each.
+pub enum Rule {
+    TransitionInvalid,
+    AcceptUnverified,
+    ActorNotAllowed,
+    TaskUnknown,
+    TaskDuplicate,
+    EventMalformed,
+    EventUnknown,
+    JournalCorrupt,
+    PathInvalid,
+}
+
+// What an event does to a task: it moves to a state, or it is refused.
+pub enum Decision {
+    Moved(State),
+    Refused(Rule),
+}
+
+// ---- names and codes ---------------------------------------------------
+
+// 1..9, in the order of the declaration. 0 is "no such task" in a table.
+pub fn state_code(s: State) -> [] int {
+    match s {
+        State::Proposed => {
+            return 1;
+        }
+        State::Approved => {
+            return 2;
+        }
+        State::Ready => {
+            return 3;
+        }
+        State::Running => {
+            return 4;
+        }
+        State::Blocked => {
+            return 5;
+        }
+        State::Verification => {
+            return 6;
+        }
+        State::Accepted => {
+            return 7;
+        }
+        State::Rejected => {
+            return 8;
+        }
+        State::Cancelled => {
+            return 9;
+        }
+    }
+}
+
+pub fn state_name(s: State) -> [] &static [byte] {
+    match s {
+        State::Proposed => {
+            return "proposed";
+        }
+        State::Approved => {
+            return "approved";
+        }
+        State::Ready => {
+            return "ready";
+        }
+        State::Running => {
+            return "running";
+        }
+        State::Blocked => {
+            return "blocked";
+        }
+        State::Verification => {
+            return "verification";
+        }
+        State::Accepted => {
+            return "accepted";
+        }
+        State::Rejected => {
+            return "rejected";
+        }
+        State::Cancelled => {
+            return "cancelled";
+        }
+    }
+}
+
+// The state a stored code names, or None for 0 and for a code no state has.
+pub fn state_of_code(code: int) -> [] option.Option[State] {
+    if code == 1 {
+        return option.Option::Some(State::Proposed);
+    }
+    if code == 2 {
+        return option.Option::Some(State::Approved);
+    }
+    if code == 3 {
+        return option.Option::Some(State::Ready);
+    }
+    if code == 4 {
+        return option.Option::Some(State::Running);
+    }
+    if code == 5 {
+        return option.Option::Some(State::Blocked);
+    }
+    if code == 6 {
+        return option.Option::Some(State::Verification);
+    }
+    if code == 7 {
+        return option.Option::Some(State::Accepted);
+    }
+    if code == 8 {
+        return option.Option::Some(State::Rejected);
+    }
+    if code == 9 {
+        return option.Option::Some(State::Cancelled);
+    }
+    return option.Option::None;
+}
+
+// The name of the state a stored code names; "none" for 0 or an unknown code.
+pub fn code_name(code: int) -> [] &static [byte] {
+    match state_of_code(code) {
+        option.Option::Some(s) => {
+            return state_name(s);
+        }
+        option.Option::None => {
+            return "none";
+        }
+    }
+}
+
+pub fn rule_code(r: Rule) -> [] int {
+    match r {
+        Rule::TransitionInvalid => {
+            return 1;
+        }
+        Rule::AcceptUnverified => {
+            return 2;
+        }
+        Rule::ActorNotAllowed => {
+            return 3;
+        }
+        Rule::TaskUnknown => {
+            return 4;
+        }
+        Rule::TaskDuplicate => {
+            return 5;
+        }
+        Rule::EventMalformed => {
+            return 6;
+        }
+        Rule::EventUnknown => {
+            return 7;
+        }
+        Rule::JournalCorrupt => {
+            return 8;
+        }
+        Rule::PathInvalid => {
+            return 9;
+        }
+    }
+}
+
+// The stable, documented name (docs/architecture.md, section 7).
+pub fn rule_name(r: Rule) -> [] &static [byte] {
+    match r {
+        Rule::TransitionInvalid => {
+            return "transition-invalid";
+        }
+        Rule::AcceptUnverified => {
+            return "accept-unverified";
+        }
+        Rule::ActorNotAllowed => {
+            return "actor-not-allowed";
+        }
+        Rule::TaskUnknown => {
+            return "task-unknown";
+        }
+        Rule::TaskDuplicate => {
+            return "task-duplicate";
+        }
+        Rule::EventMalformed => {
+            return "event-malformed";
+        }
+        Rule::EventUnknown => {
+            return "event-unknown";
+        }
+        Rule::JournalCorrupt => {
+            return "journal-corrupt";
+        }
+        Rule::PathInvalid => {
+            return "path-invalid";
+        }
+    }
+}
+
+// The name for a stored rule code; "none" for 0 (no refusal).
+pub fn rule_code_name(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return rule_name(Rule::TransitionInvalid);
+    }
+    if code == 2 {
+        return rule_name(Rule::AcceptUnverified);
+    }
+    if code == 3 {
+        return rule_name(Rule::ActorNotAllowed);
+    }
+    if code == 4 {
+        return rule_name(Rule::TaskUnknown);
+    }
+    if code == 5 {
+        return rule_name(Rule::TaskDuplicate);
+    }
+    if code == 6 {
+        return rule_name(Rule::EventMalformed);
+    }
+    if code == 7 {
+        return rule_name(Rule::EventUnknown);
+    }
+    if code == 8 {
+        return rule_name(Rule::JournalCorrupt);
+    }
+    if code == 9 {
+        return rule_name(Rule::PathInvalid);
+    }
+    return "none";
+}
+
+// ---- the edge table -----------------------------------------------------
+
+fn is_state(a: State, b: State) -> [] bool {
+    return state_code(a) == state_code(b);
+}
+
+// The legal edges. `from` is matched exhaustively; `to` is compared by code.
+// Terminal states (accepted, rejected, cancelled) have no way out.
+//
+//   proposed     -> approved | rejected | cancelled
+//   approved     -> ready | cancelled
+//   ready        -> running | blocked | cancelled
+//   running      -> verification | ready (lost or failed, within the retry
+//                   budget) | blocked | cancelled
+//   blocked      -> ready | cancelled
+//   verification -> accepted | rejected | ready (repair) | cancelled
+pub fn can_move(from: State, to: State) -> [] bool {
+    match from {
+        State::Proposed => {
+            return is_state(to, State::Approved) || is_state(to, State::Rejected) || is_state(to, State::Cancelled);
+        }
+        State::Approved => {
+            return is_state(to, State::Ready) || is_state(to, State::Cancelled);
+        }
+        State::Ready => {
+            return is_state(to, State::Running) || is_state(to, State::Blocked) || is_state(to, State::Cancelled);
+        }
+        State::Running => {
+            return is_state(to, State::Verification) || is_state(to, State::Ready) || is_state(to, State::Blocked) || is_state(to, State::Cancelled);
+        }
+        State::Blocked => {
+            return is_state(to, State::Ready) || is_state(to, State::Cancelled);
+        }
+        State::Verification => {
+            return is_state(to, State::Accepted) || is_state(to, State::Rejected) || is_state(to, State::Ready) || is_state(to, State::Cancelled);
+        }
+        State::Accepted => {
+            return false;
+        }
+        State::Rejected => {
+            return false;
+        }
+        State::Cancelled => {
+            return false;
+        }
+    }
+}
+
+// ---- events -------------------------------------------------------------
+
+// The state an event kind moves a task to, for the nine `task.*` kinds.
+pub fn target_of_kind[&k](kind: &k [byte]) -> [] option.Option[State] {
+    if bytes.equal(kind, "task.proposed") {
+        return option.Option::Some(State::Proposed);
+    }
+    if bytes.equal(kind, "task.approved") {
+        return option.Option::Some(State::Approved);
+    }
+    if bytes.equal(kind, "task.ready") {
+        return option.Option::Some(State::Ready);
+    }
+    if bytes.equal(kind, "task.running") {
+        return option.Option::Some(State::Running);
+    }
+    if bytes.equal(kind, "task.blocked") {
+        return option.Option::Some(State::Blocked);
+    }
+    if bytes.equal(kind, "task.verification") {
+        return option.Option::Some(State::Verification);
+    }
+    if bytes.equal(kind, "task.accepted") {
+        return option.Option::Some(State::Accepted);
+    }
+    if bytes.equal(kind, "task.rejected") {
+        return option.Option::Some(State::Rejected);
+    }
+    if bytes.equal(kind, "task.cancelled") {
+        return option.Option::Some(State::Cancelled);
+    }
+    return option.Option::None;
+}
+
+// The kind an event for a move to `s` has.
+pub fn kind_of_state(s: State) -> [] &static [byte] {
+    match s {
+        State::Proposed => {
+            return "task.proposed";
+        }
+        State::Approved => {
+            return "task.approved";
+        }
+        State::Ready => {
+            return "task.ready";
+        }
+        State::Running => {
+            return "task.running";
+        }
+        State::Blocked => {
+            return "task.blocked";
+        }
+        State::Verification => {
+            return "task.verification";
+        }
+        State::Accepted => {
+            return "task.accepted";
+        }
+        State::Rejected => {
+            return "task.rejected";
+        }
+        State::Cancelled => {
+            return "task.cancelled";
+        }
+    }
+}
+
+// Kinds in a namespace M1 records and does not interpret: the projection
+// passes over them (they take their meaning in later milestones) and the
+// journal still checks their position. Anything else that is not a `task.*`
+// kind is `event-unknown`.
+pub fn is_recorded_kind[&k](kind: &k [byte]) -> [] bool {
+    return bytes.equal(kind, "refusal") || bytes.starts_with(kind, "execution.") || bytes.starts_with(kind, "approval.") || bytes.starts_with(kind, "budget.") || bytes.starts_with(kind, "policy.") || bytes.starts_with(kind, "company.");
+}
+
+pub fn actor_of_name[&n](name: &n [byte]) -> [] option.Option[Actor] {
+    if bytes.equal(name, "forge") {
+        return option.Option::Some(Actor::Forge);
+    }
+    if bytes.equal(name, "worker") {
+        return option.Option::Some(Actor::Worker);
+    }
+    if bytes.equal(name, "human") {
+        return option.Option::Some(Actor::Human);
+    }
+    return option.Option::None;
+}
+
+pub fn actor_name(a: Actor) -> [] &static [byte] {
+    match a {
+        Actor::Forge => {
+            return "forge";
+        }
+        Actor::Worker => {
+            return "worker";
+        }
+        Actor::Human => {
+            return "human";
+        }
+    }
+}
+
+fn is_forge(a: Actor) -> [] bool {
+    match a {
+        Actor::Forge => {
+            return true;
+        }
+        Actor::Worker => {
+            return false;
+        }
+        Actor::Human => {
+            return false;
+        }
+    }
+}
+
+fn is_worker(a: Actor) -> [] bool {
+    match a {
+        Actor::Forge => {
+            return false;
+        }
+        Actor::Worker => {
+            return true;
+        }
+        Actor::Human => {
+            return false;
+        }
+    }
+}
+
+// A task id: 1 to 64 bytes of letters, digits, `.`, `_` and `-`, starting with
+// a letter or a digit. It is the key of the projection and a path component
+// later (executions/<id>/), so it is closed over a small set, never needs
+// escaping, and can be neither `.` nor `..`.
+pub fn id_ok[&i](id: &i [byte]) -> [] bool {
+    if len(id) < 1 || len(id) > 64 {
+        return false;
+    }
+    let first = int_of(id[0]);
+    if first < 48 || first > 57 && first < 65 || first > 90 && first < 97 || first > 122 {
+        return false;
+    }
+    var k = 0;
+    while k < len(id) {
+        let c = int_of(id[k]);
+        let ok = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 46 || c == 95 || c == 45;
+        if ok == false {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// The one decision. `current` is the stored code of the task (0: Forge has
+// never seen it), `target` the state the event is for, `actor` who wrote it,
+// `observed` whether the event says its basis is a check Forge observed.
+//
+// Order matters and is part of the contract:
+//   1. a `proposed` event creates; anything else needs a task that exists
+//   2. a move to `accepted` needs a Forge actor *and* an observed basis, and
+//      is `accept-unverified` otherwise (a worker's claim, a human's word and
+//      an unobserved Forge event alike)
+//   3. a worker never moves a task: `actor-not-allowed`
+//   4. the edge must be in the table: `transition-invalid`
+pub fn decide(current: int, target: State, actor: Actor, observed: bool) -> [] Decision {
+    if state_code(target) == state_code(State::Proposed) {
+        if is_worker(actor) {
+            return Decision::Refused(Rule::ActorNotAllowed);
+        }
+        if current != 0 {
+            return Decision::Refused(Rule::TaskDuplicate);
+        }
+        return Decision::Moved(target);
+    }
+    if current == 0 {
+        return Decision::Refused(Rule::TaskUnknown);
+    }
+    if state_code(target) == state_code(State::Accepted) {
+        if is_forge(actor) == false || observed == false {
+            return Decision::Refused(Rule::AcceptUnverified);
+        }
+    }
+    if is_worker(actor) {
+        return Decision::Refused(Rule::ActorNotAllowed);
+    }
+    match state_of_code(current) {
+        option.Option::Some(from) => {
+            if can_move(from, target) {
+                return Decision::Moved(target);
+            }
+            return Decision::Refused(Rule::TransitionInvalid);
+        }
+        option.Option::None => {
+            return Decision::Refused(Rule::TransitionInvalid);
+        }
+    }
+}

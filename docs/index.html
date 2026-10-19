@@ -118,10 +118,10 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
     <div class="num"><b>1000 B</b><span>output bound: a runaway <code>yes</code> stopped at exactly the limit</span></div>
     <div class="num"><b>165 → 140</b><span>bytes: a torn journal tail is cut, and a second recovery changes nothing</span></div>
     <div class="num"><b>5 / 5</b><span>worker endings classified: normal, failed, garbage, exit 3, hang</span></div>
-    <div class="num"><b>6 / 6</b><span>tests of the journal record pass under <code>cancho test</code></span></div>
+    <div class="num"><b>56 / 56</b><span>tests pass under <code>cancho test</code> (journal record, task state machine, journal replay), and 24 / 24 file cases of the conformance program</span></div>
     <div class="num"><b>0</b><span>files the dispatcher can read or write</span></div>
   </div>
-  <p class="fine">Linux x86_64 only, one compiler revision (pinned in <code>cancho.toml</code>), a mock worker. Not measured: macOS, a real Cancho Code, several workers at once, power loss. Commands and verbatim output: <a href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">spike/RESULTS.md</a>.</p>
+  <p class="fine">Linux x86_64 only, one compiler revision (pinned in <code>cancho.toml</code>), a mock worker. The 56 tests and 24 file cases are Milestone 1's core, added after the spikes. Not measured: macOS, a real Cancho Code run with a model (its interface was audited against a stand-in agent, <a href="https://github.com/alpibrusl/cancho-forge/blob/main/docs/cancho-code-audit.md">docs/cancho-code-audit.md</a>), several workers at once, power loss. Commands and verbatim output: <a href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">spike/RESULTS.md</a>.</p>
 </div></section>
 
 <section class="alt" id="gaps"><div class="wrap">

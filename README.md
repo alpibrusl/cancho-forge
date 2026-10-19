@@ -30,14 +30,23 @@ proposes and executes.
 - **Measured, at Milestone 0** (Linux x86_64, a mock worker): a 300 ms deadline
   ended in 301 ms; a runaway output was stopped at exactly 1,000 bytes; a torn
   journal tail was cut from 165 to 140 bytes and a second recovery changed
-  nothing; five ways of a worker ending were each classified. Nothing here runs
-  a company yet. Not measured: macOS, a real cancho-code, several workers at
-  once, power loss. Conditions and caveats:
-  [`spike/RESULTS.md`](spike/RESULTS.md).
+  nothing; five ways of a worker ending were each classified. Conditions and
+  caveats: [`spike/RESULTS.md`](spike/RESULTS.md).
+- **What exists now (Milestone 1's core, nothing more).** A task state
+  machine with 18 legal edges and nine named refusals; a journal that replays
+  into task state, cuts only a torn tail, and refuses (changing nothing) on a
+  corrupt complete line; 56 unit tests and 24 file cases, all in the gate.
+  Not done: a CLI over it, snapshots, the lock in the runtime, kill-at-every-
+  crash-point tests, objectives and artifacts, any worker adapter, policy,
+  budgets, verification. **Nothing here runs a company yet.** Not measured:
+  macOS, a real cancho-code run with a model, several workers at once, power
+  loss. The Cancho Code interface was audited, not exercised with a model:
+  [`docs/cancho-code-audit.md`](docs/cancho-code-audit.md).
 
 **[Project page](https://alpibrusl.github.io/cancho-forge)** ·
 [Architecture](docs/architecture.md) ·
 [Worker contract](docs/worker-contract.md) ·
+[Cancho Code audit](docs/cancho-code-audit.md) ·
 [Roadmap](docs/roadmap.md)
 
 ## Try it
@@ -48,7 +57,7 @@ revision named in `cancho.toml`, and `clang`.
 ```sh
 git clone https://github.com/alpibrusl/cancho-forge.git && cd cancho-forge
 export CANCHO=<path-to-the-cancho-binary>
-scripts/gate.sh        # fmt --check, check, test, file budget  ->  gate: PASS
+scripts/gate.sh        # fmt --check, check, test, file conformance, file budget  ->  gate: PASS
 spike/run.sh           # re-runs every spike and prints the evidence
 ```
 

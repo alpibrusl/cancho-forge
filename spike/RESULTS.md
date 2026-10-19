@@ -15,7 +15,9 @@ says so.
 
 Every `.cho` file in the repository passes `cancho fmt --check` and
 `cancho check <file> --std` (the gate prints `gate: PASS`); `cancho test`
-runs the 6 tests of `tests/event_test.cho` and they pass.
+runs the 6 tests of `tests/event_test.cho` and they pass. (Corrected after
+M1: `cancho test` now runs 56 tests in three sets and the gate also runs a
+24-case file conformance program; see "M1 findings".)
 
 ## Summary
 
@@ -281,6 +283,62 @@ worker directory) and the pid is a bare number (reuse hazard,
 
 ---
 
+## M1 findings -- what building the core measured
+
+Not spikes: these were found writing `src/task.cho`, `src/journal.cho`,
+`src/journal_io.cho` and their tests, with the same compiler (rev `2aa83b2`).
+
+**A library cannot be generic in the `Fs` prefix (G9).** A scratch program
+(not kept in `spike/`, because the gate requires every `spike/*.cho` to check
+clean and this one is refused by design):
+
+```cancho
+fn size_of[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] int { ... }
+...
+let data = narrow(fs, "/tmp/cancho-forge-conf");
+borrow data as &d in { n = size_of(d, "/tmp/cancho-forge-conf/x"); }
+```
+
+```
+$ cancho check fs2.cho --std
+fs2.cho:16:21: error: expected `""`, found `"/tmp/cancho-forge-conf"`
+```
+
+So a function that declares `Fs("")` takes only the whole filesystem, and one
+that declares `Fs("/x")` fixes `/x` in the library. `src/journal_io.cho` takes
+`Fs("")` and refuses a bad path itself (`path-invalid`); see architecture
+section 9, G9.
+
+**`cancho test` hands a test only a `Heap` and an `Io`** (`docs/testing.md`
+section 3, confirmed by the runner: "releases `ffi`/`fs`/`args`"). So file
+behaviour is in `tests/conformance/journal_files.cho`, a program the gate
+builds and runs on a scratch directory; the pure logic is tested through
+`cancho test`.
+
+**Counts, at the commit that added them.** `cancho test`: 9 (event, three added
+for `transition`, `refusal` and an escaped hostile id) + 22 (task) + 25
+(journal) = 56 tests, all pass. Conformance: 24 cases against real
+files, all pass. Seven hand-made mutations of the source (an extra edge, the
+acceptance check removed, the worker check removed, recovery cutting despite
+a refusal, the `seq` check removed, duplicates allowed, the torn-tail finder
+starting from zero) each turned at least one suite red; a conformance mutation
+(a cut to the full length instead of to the last whole record) failed 3 cases.
+That is evidence the tests can fail, not proof they cover everything.
+
+**Edge cases that do not trap, measured by tests.** A `seq` of
+99999999999999999999999 (`json.to_int` saturates; it is simply not the next
+seq), 3,000 nested `[` on one line, a line of NUL bytes, a run of bare
+newlines, a seq of `1.0` or `"1"`, and a line with trailing text each answer
+`journal-corrupt` as a value. (S4 listed deep nesting as untested; it now is,
+at that one depth.)
+
+**Row exactness caught a mutation for free.** Removing the only call that
+used `file_write` from `recover` was refused at build time ("declared but not
+performed"), so a mutation of that kind has to keep the row honest.
+
+**Names.** `join` is a builtin and cannot be redefined (`under` is used
+instead).
+
 ## Gaps
 
 What did not work or is not built, and what each blocks. "Needed from
@@ -298,6 +356,7 @@ a row of `docs/processes.md` section 9 already names it.
 | G6 | `docs/processes.md`'s status header says "slices 3 and 4 designed, not built", but its own slice table, `std/process.cho` and S1/S2/S6/S7 show `std.process` working | Nothing, but it misled the brief for this spike | Correct the header in the cancho repository (a document-only fix, per `CONTRIBUTING.md`) |
 | G7 | `cancho check` refuses a library with no `main`; `cancho test` is the only check for library-only files | Gate shape (we check `src/*.cho` as one program and rely on `cancho test` for tests) | None required; noted |
 | G8 | No `cancho` command walks a directory tree from a program without `std.dirs`/`Fs`; the 2,000-line rule is enforced by a shell loop in `scripts/gate.sh`, not in cancho | "Pure cancho" gate (M1 plans a cancho test using `std.dirs`) | None required |
+| G9 | A function over `Fs` cannot be generic in the prefix (M1 findings above) | The journal's file layer cannot be narrowed to the workspace; it holds `Fs("")` and guards paths itself | Same as G1, for `Fs`; or a prefix-generic capability parameter |
 
 Not spiked, and therefore not claimed: SHA-256 evidence hashing; stderr
 capture (`capture_both`); `exec_spawn_in` (working directory); `Signals`
