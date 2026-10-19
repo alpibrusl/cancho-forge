@@ -170,7 +170,7 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
   <p class="lead">Written down before any of it is built around.</p>
   <div class="cards">
     <div class="card"><h3>Grants fixed at build time</h3><p><code>narrow</code> takes literals, so a per-task bound cannot be chosen at run time.</p></div>
-    <div class="card"><h3>Grants fixed at build time, bounds that trap</h3><p>Filed upstream as cancho #534 and #535, both open. A worker's subprocesses used to survive a kill; cancho #533 (<code>child_kill_group</code>) fixed that and the spike now passes with no <code>/bin/kill</code> in the <code>Exec</code> bound.</p></div>
+    <div class="card"><h3>Grants fixed at build time, bounds that trap</h3><p>Filed upstream as cancho #534 (open, partly answered by <code>Dir</code> and <code>exec_spawn_under</code>, cancho #546) and #535 (closed: <code>exec_covers</code> asks before a spawn, cancho #540). A worker's subprocesses used to survive a kill; cancho #533 (<code>child_kill_group</code>) fixed that. Forge has not adopted the new calls yet; the pin is now cancho <code>7e4088b</code>.</p></div>
     <div class="card"><h3>Contract is provisional</h3><p>The real Cancho Code interface has not been audited yet, so <code>forge-worker/1</code> will change in M2.</p></div>
   </div>
 </div></section>
