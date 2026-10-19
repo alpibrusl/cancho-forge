@@ -1,20 +1,35 @@
 # Worker contract, version 1
 
-> **Status: draft, `forge-worker/1`. The `execute` path over stdio is
-> measured with a cancho mock worker (spike S6); everything else is
-> designed.** This contract is written *ahead of* Cancho Code's real
-> interface. Milestone 2 starts by auditing Cancho Code and correcting this
-> document in place wherever the two disagree; nothing here binds Cancho
-> Code to internals. See [`architecture.md`](architecture.md) for why the
-> transport is a child process and how Forge limits what the child gets.
+> **Status: draft, `forge-worker/1`, corrected once by the Cancho Code audit
+> ([`cancho-code-audit.md`](cancho-code-audit.md)).** The `execute` path over
+> stdio is measured with a cancho mock worker (spike S6); the Cancho Code
+> binding (section 9) is measured against its real command line with a
+> stand-in agent, not a real model; everything else is designed. This
+> contract was written *ahead of* Cancho Code's real interface and the audit
+> showed it wrong in five places, listed next and fixed where they occur,
+> each marked **(corrected)**. Nothing here binds Cancho Code to internals.
+> See [`architecture.md`](architecture.md) for why the transport is a child
+> process and how Forge limits what the child gets.
+
+### What the audit changed, and why
+
+| # | Was | Now | Evidence |
+|---|---|---|---|
+| 1 | The only transport is one JSON object on stdin and one on stdout. | That is the **stdio binding** (mock worker, third-party workers). Cancho Code has no stdin protocol: its request is `argv` plus a brief file, its answer a run directory, tab-separated lines and an exit code. That is the **process-and-directory binding** (section 9). The JSON messages of section 3 stay the contract's *model*; an adapter translates. | audit 2.1, 3.1 |
+| 2 | Exit 0 means "a protocol response", non-zero is `worker-error`. | Per binding. In the Cancho Code binding the exit code **is** the verdict (0 `done`, 1 `stuck`/`gate_failed`, 3 `plan_failed`, 4 `provider_error`); only 2 (usage, which Forge treats as its own bug) and signals are errors. | audit 3.1 |
+| 3 | The first Cancho Code adapter is `sync`; cancel is TERM then KILL and the process is reaped. | It is `async` (minutes, resumable). There is no cooperative cancel; TERM leaves **no verdict and an orphaned agent**, so Forge starts it detached and kills the group. | audit 4 (run) |
+| 4 | Task type `repo.change` with `grants.workspace`. | Cancho Code builds a **new project from a brief**: `project.build`. `repo.change` is not claimed for it. | audit 2.1, 7 |
+| 5 | `cost.source` is `worker-reported`; `limits.budget` is enforced by the worker; credentials travel on stdin. | Cancho Code records tokens only; money is `derived-from-tokens` with Forge's own dated price table; there is no money limit, only attempt and round ceilings; the key is a **file path** in the agent command. | audit 3.4, 2.2 |
 
 ---
 
 ## 1. Shape
 
 A worker is an **executable** Forge starts as a child process, once per
-call, under an `Exec` capability narrowed to the workers directory. A call
-is:
+call, under an `Exec` capability narrowed to the workers directory. There
+are two bindings of the same model: this section and sections 2-4 describe
+the **stdio binding**; section 9 is the **process-and-directory binding**
+that Cancho Code needs **(corrected)**. In the stdio binding a call is:
 
 ```
 <worker-path> <verb>        stdin: one JSON request      stdout: one JSON response
@@ -54,9 +69,12 @@ messages and is not ruled out; it is not needed for M2 and would need `Net`.
 | `sync` | `capabilities`, `execute` | `execute` runs to completion inside the deadline and answers a final result on stdout. `cancel` is Forge killing the process. |
 | `async` | all five | `execute` may answer `state:"accepted"` quickly and keep working in the background, writing `status.json` and `result.json` in the execution directory; `status`, `result` and `cancel` read and act on that. |
 
-The mock worker and the first Cancho Code adapter are `sync`.
-`capabilities.async` declares the level. Async is designed, not spiked
-(see section 8).
+The mock worker is `sync`. **(corrected)** The Cancho Code adapter is
+`async`, not `sync`: a build is a plan stage and then a model call per unit,
+minutes in all, and the work is resumable from its directory (audit section
+4). `capabilities.level` declares the level. For the stdio binding async is
+designed, not spiked; for the Cancho Code binding the start / status / result
+/ cancel semantics are in section 9 and were measured with a stand-in agent.
 
 ## 2. Envelope
 
@@ -65,7 +83,7 @@ Every request and response carries:
 | field | type | meaning |
 |---|---|---|
 | `contract` | string | `"forge-worker/1"`. Major version only; a breaking change makes `/2`. |
-| `request_id` | string | Forge-generated idempotency key, journalled before the call. A repeated `request_id` for `execute` means the same request: the worker must not start the work twice. |
+| `request_id` | string | Forge-generated idempotency key, journalled before the call. A repeated `request_id` for `execute` means the same request: the worker must not start the work twice. **(corrected)** A process-and-directory worker has no field to carry it: Forge makes the execution directory name a function of `request_id` and holds the exclusion itself, because Cancho Code does not (audit section 4). |
 | `verb` | string | in requests: the verb. |
 
 Rules: unknown fields are ignored (so a minor addition is not a break).
@@ -92,6 +110,13 @@ Request: `{"contract":"forge-worker/1","verb":"capabilities","request_id":"r-0"}
   ]
 }
 ```
+
+**(corrected)** `repo.change` above is the mock worker's. Cancho Code's
+types are `project.build` (a brief becomes a verified new project) and,
+later, `file.fix` (one broken file, its `fix` tool); it reads no existing
+repository. Cancho Code has no `capabilities` call at all (no `--version`):
+Forge keeps a static table per pinned revision (`.cancho-rev` of the
+worker), and `cancho authority` of the binary is the review artefact.
 
 Forge picks the highest `supports` entry it also supports; none is
 `worker-contract-version`. A task whose `type` is not listed is refused by
@@ -123,7 +148,12 @@ registration and cached per worker version; a worker may not widen its
   the gate**: Forge verifies independently (M3).
 * `limits` are Forge's decision, taken from policy and the budget. The
   worker enforces what it can; Forge enforces `timeout_ms` and
-  `max_output_bytes` itself regardless.
+  `max_output_bytes` itself regardless. **(corrected)** "What it can" is
+  less than assumed for Cancho Code: it has per-call and per-unit ceilings
+  (`--plan-seconds`, `--agent-seconds`, `--attempts`, `--rounds`), **no
+  whole-run deadline and no money limit** (audit 2.1). For that worker Forge's
+  deadline is the only total, and `limits.budget` is Forge's own reservation,
+  not a flag the worker honours.
 * `grants.workspace` and `grants.execution_dir` are the only directories the
   worker is told about; paths are relative to Forge's root and the worker's
   working directory is `execution_dir`. A worker is *told* the boundary; it
@@ -148,6 +178,12 @@ Response:
   "error": null
 }
 ```
+
+`cost.source` is `worker-reported` (the worker said so; untrusted),
+`derived-from-tokens` **(corrected, new)** (Forge or its adapter computed it
+from token counts the worker recorded, with Forge's own dated price table), or
+`forge-measured`. Cancho Code is always `derived-from-tokens`: it records
+tokens only (`usage.jsonl`), never money (audit 3.4).
 
 `state`:
 
@@ -175,6 +211,12 @@ input to a policy decision.
   either way (measured: `child_kill` with `std.signals.sigterm()` ends
   `sleep` in 1 ms and the exit reports `signaled`, S2). The task event is
   `execution.cancelled`, whatever the worker managed to say.
+  **(corrected)** "reaped either way" is true of the pid Forge started and of
+  nothing it started. Measured against Cancho Code's `build` (audit 4): TERM
+  gives exit 143 and no verdict, and the agent process it had started kept
+  running. So a worker that starts subprocesses is always started detached and
+  killed by group (S7), and the cancel is never the end of the *work*: the
+  directory survives and the same command resumes it.
 * Cancellation reaches only the worker's own process **unless Forge started
   it detached and kills its group** (S7). Workers that start subprocesses
   must be started that way; architecture G3.
@@ -227,10 +269,10 @@ child process; the rule tags are the refusals of architecture section 7.
 | 2 | deadline passed; child killed and reaped | `worker-timeout` | retry under budget, else `failed` | `hang (500ms): worker_timeout ... [501 ms]` |
 | 3 | stdout past `max_output_bytes`; child killed | `worker-output-overflow` | `failed`, not retried automatically | S2: `bound 1000 vs yes: too much, kept 1000 bytes` |
 | 4 | ended by a signal | `worker-crashed` | retry under budget | `child_kill`: `signaled 8` (S2) |
-| 5 | non-zero exit status | `worker-error` | retry under budget | `exit 3: worker_error exit 3` |
+| 5 | non-zero exit status **(corrected: stdio binding only; the Cancho Code binding reads the exit code as a verdict, section 9.4)** | `worker-error` | retry under budget | `exit 3: worker_error exit 3` |
 | 6 | exit 0 but stdout is not a JSON object, or fails section 2 | `worker-protocol` | `failed`; never retried blindly | `garbage: protocol_error` |
 | 7 | well-formed response with `state: failed` | (worker's own `error.code`) | per `retryable`, under budget | `reports fail: worker_reports_failed` |
-| 8 | well-formed, `state: succeeded` | (none) | `verification` | `normal: worker_claims_succeeded -> verification (not accepted)` |
+| 8 | well-formed, `state: succeeded` (Cancho Code binding: `done`, exit 0, and `build.json.verdict == "done"`) | (none) | `verification` | `normal: worker_claims_succeeded -> verification (not accepted)` |
 | 9 | `evidence` ref or hash invalid | `evidence-ref-invalid` | `failed` | not spiked |
 | 10 | `request_id` mismatch | `worker-protocol` | `failed` | not spiked |
 
@@ -275,7 +317,8 @@ output it relays (`threat-model.md`):
 | `capabilities`, `cancel`, `status`, `result`, `async` level | | designed |
 | contract tests run against mock and the real adapter | `tests/contract/` (M2) | not started |
 | evidence hash recomputation | `std.crypto.sha256` exists | not spiked |
-| the real Cancho Code interface | audit at the start of M2 | **not done: this document may be wrong about it** |
+| the real Cancho Code interface | [`cancho-code-audit.md`](cancho-code-audit.md): source read, both offline gates run (`scripts/test-build.sh`, `scripts/test-mcp.sh`), a stand-in run, a TERM, a resume, an `env -i` run | **done in M0; corrected sections marked above. Not done: a run with a real model** |
+| the Cancho Code binding of section 9 as an adapter | `src/worker.cho` (M2) | designed from the audit; not built |
 
 The mock worker (`spike/mock_worker.cho`) implements `execute` only, and
 selects its behaviour from an argument for failure injection. The M2
@@ -289,3 +332,75 @@ envelope: it answers `{"v":1,"state":...,"task_id":...,"evidence":[...]}`
 stdout is a JSON object with a known `state`. So section 5 rows 9 and 10,
 and the `request_id` and hash rules, are not exercised. M2 brings the mock
 and the dispatcher up to this text, not the other way round.
+
+---
+
+## 9. The process-and-directory binding (Cancho Code) *(corrected: new)*
+
+This section is derived from [`cancho-code-audit.md`](cancho-code-audit.md)
+and cites it; every number and line there was read or run. It is a *binding*:
+it says how the messages of section 3 are carried when the worker is a
+command-line tool with a work directory, not how the tool must change.
+
+### 9.1 Mapping
+
+| Message | Carried as |
+|---|---|
+| `execute` request | Forge creates `executions/<id>/` (name derived from `request_id`; characters `A-Za-z0-9._-` only, no `..`; the worker's path rules are narrower than Forge's, audit 2.1), writes the brief into `brief.txt` there, and starts, **detached, in its own process group**, `cancho-build <checker> <abs>/brief.txt <abs>/executions/<id> "<agent-command>" --provider P --model M --guide G [--attempts N] [--rounds N] [--agent-seconds N] [--plan-seconds N] [--jobs N]`. The argument vector, including the agent command (which names the key file), is built by Forge from configuration, **never from a task**. |
+| `execute` response | `{"state":"accepted"}` at once; the pid and its start token are journalled (`execution.started`) before the call returns. |
+| `status` | read `executions/<id>/build.json`: `stage` `plan`/`build`/`done`, `units_verified`/`units_total`, `verdict`. Liveness is Forge's own (pid and start token), not `build.json`'s: it has no update timestamp. |
+| `result` | when the process has ended: the exit code **and** `build.json.verdict` (they must agree under the table in 9.4, else `worker-protocol`), plus the evidence of 9.3. |
+| `cancel` | kill the process group (TERM, grace, KILL); the task event is `execution.cancelled`; the directory is kept. A later `execute` with the same `request_id` resumes the same work. |
+| `request_id` | the directory name; Forge takes a lock on it. Two builds in one directory are unguarded by the tool. |
+
+### 9.2 Limits
+
+`timeout_ms` is Forge's own deadline on the whole process (there is none
+inside). `--attempts`, `--rounds`, `--agent-seconds`, `--plan-seconds` are
+chosen from policy and bound the worst case; `--jobs` is operator
+configuration (concurrent units). Money: Forge reserves a worst-case
+estimate from the ceilings and records actual usage from `usage.jsonl`
+(M4); the tool itself will spend whatever its ceilings allow.
+
+### 9.3 Evidence
+
+The adapter lists files that exist under `executions/<id>/` and Forge hashes
+them (the tool records no hash). A `ref` must satisfy section 4 and the
+tool's own file layout:
+
+| kind | ref |
+|---|---|
+| `file` | `project.cho` (and the plan's other files, listed in `plan.json` `files`) |
+| `log` | `run.log`, `journal/events.jsonl`, `trail-<id>.jsonl`, `agent-<id>.log` |
+| `test_output` | `journal/blobs/<id>-a<N>-acceptance.txt`, `journal/blobs/<id>-a<N>-checker.json` |
+| `report` | `build.json` |
+
+The tool's `diff` blobs are a diff between a model's attempts, not a patch of
+a repository; they are `log`, never `patch`. All of it is `claimed`.
+`journal/events.jsonl` may stop growing at 2 MiB with the run continuing
+(audit 3.3), so its absence of an event is not evidence of absence.
+
+### 9.4 Endings
+
+| Observation | Contract outcome |
+|---|---|
+| exit 0 and `verdict == "done"` | `state: succeeded` (a claim; the compiler and the unit's own examples are its evidence, Forge's are M3's) |
+| exit 1 and `verdict` `stuck` | `partial` if `units_verified > 0`, else `failed`; `error.code` `stuck`; the units are in `plan.json`, `state.txt`; **retryable only through `--retry`/`--patch`, which is a new request** |
+| exit 1 and `verdict` `gate_failed` | `partial`, `error.code` `gate_failed` |
+| exit 3, `plan_failed` | `failed`, `error.code` `plan_failed`, nothing built |
+| exit 4, `provider_error` | `failed`, `error.code` `provider_error`, `retryable: true` (kept units are kept) |
+| exit 2 | `worker-error` and a Forge bug: the arguments were wrong |
+| killed by Forge | `execution.cancelled` / `worker-timeout`; the verdict is absent |
+| signal, trap, or exit 143 not from Forge | `worker-crashed` |
+| verdict and exit code disagree, `build.json` missing or not an object, unknown verdict word | `worker-protocol` |
+| process gone with no verdict and Forge did not kill it | `execution.lost` after recovery (architecture 4.3) |
+
+`stuck`, `gate_failed` and `plan_failed` are **outcomes**, not worker errors:
+they are the tool working, and they are never retried blindly.
+
+### 9.5 Still open
+
+A run with a real model: its latency, token use, cost and the share of runs
+that end `done` have **not** been measured by Forge; the numbers in Cancho
+Code's own README are its claims. The MCP front door is an alternative
+binding (audit 5) and has not been spiked from a cancho client.
