@@ -63,13 +63,41 @@ code { font: .9em var(--mono); }
 .steps li { margin: .4rem 0; }
 @media (max-width: 40rem) { .kbcols { grid-template-columns: repeat(2, 1fr); min-height: 0; } }
 footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(--muted); font-size: .9rem; text-align: center; }
+.term .bar button { margin-left: auto; font: .78rem var(--mono); color: var(--term-fg); background: #1b262c; border: 1px solid #2c3a41; border-radius: 6px; padding: .2rem .6rem; cursor: pointer; }
+.demo { display: grid; grid-template-columns: 1fr; gap: 1rem; max-width: 64rem; margin: 0 auto; align-items: start; }
+@media (min-width: 60rem) { .demo { grid-template-columns: 1fr 1fr; } }
+.demo .term { margin: 0; max-width: none; }
+.demo .term pre { min-height: 20rem; font-size: .8rem; }
+.side { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.12); overflow: hidden; }
+.sidehead { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .55rem .8rem; border-bottom: 1px solid var(--line); font-size: .85rem; }
+.sidehead span { font: .78rem var(--mono); color: var(--muted); }
+.sidebody { padding: .8rem; min-height: 20rem; }
+.side iframe { display: block; width: 100%; height: 20rem; border: 0; background: var(--bg); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr)); gap: .5rem; }
+.tile { background: var(--soft); border: 1px solid var(--line); border-radius: 8px; padding: .5rem .6rem; font-size: .8rem; transition: background .3s, border-color .3s; }
+.tile b { display: block; font: 600 .82rem var(--mono); }
+.tile .m { color: var(--muted); display: block; overflow-wrap: anywhere; }
+.tile b { overflow-wrap: anywhere; }
+.tile.hot { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, var(--surface)); }
+.tile.hot .m { color: var(--bad); font-weight: 600; }
+.tile.ok { border-color: var(--good); }
+.tile.ok .m { color: var(--good); font-weight: 600; }
+.bar2 { height: .9rem; border-radius: 6px; background: var(--soft); border: 1px solid var(--line); overflow: hidden; margin: .4rem 0 .8rem; position: relative; }
+.bar2 i { display: block; height: 100%; background: var(--accent); transition: width .5s; }
+.bar2 i.torn { background: var(--bad); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: .2rem .8rem; font: .82rem var(--mono); }
+.kv span:nth-child(odd) { color: var(--muted); }
+.promptbox { max-width: 52rem; margin: 0 auto; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--surface); }
+.pbar { display: flex; justify-content: space-between; align-items: center; padding: .45rem .8rem; border-bottom: 1px solid var(--line); background: var(--soft); font: .8rem var(--mono); color: var(--muted); }
+.pbar button { font: 600 .8rem var(--font); padding: .25rem .7rem; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-fg); cursor: pointer; margin-right: .6rem; }
+.promptbox pre { margin: 0; padding: 1rem; max-height: 26rem; overflow: auto; font: .8rem/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
 <header class="top"><div class="wrap">
   <a class="brand" href=".">cancho-forge</a>
   <nav>
-    <a href="#why">Why</a><a class="opt" href="#measured">Measured</a><a class="opt" href="#gaps">Gaps</a><a href="#try">Try it</a>
+    <a href="#why">Why</a><a class="opt" href="#measured">Measured</a><a class="opt" href="#gaps">Gaps</a><a class="opt" href="#agent">Ask your agent</a><a href="#try">Try it</a>
     <a href="https://github.com/alpibrusl/cancho-forge">GitHub</a>
   </nav>
 </div></header>
@@ -77,26 +105,26 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
 <div class="wrap hero">
   <h1>An agent company you can audit.</h1>
   <p class="sub">cancho-forge keeps state, budgets, approvals and evidence in the runtime, so a worker cannot mark its own work accepted or grant itself authority.</p>
-  <div class="cta"><a class="btn primary" href="#try">Try it</a><a class="btn" href="#why">Why a runtime</a><a class="btn" href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">Read the spike</a></div>
+  <div class="cta"><a class="btn primary" href="#try">Try it</a><a class="btn" href="#why">Why a runtime</a><a class="btn" href="#agent">Ask your agent to try it</a></div>
 </div>
 
 <div class="wrap" style="padding-bottom:2.5rem">
-  <div class="term" role="img" aria-label="Output of a real run: five ways a worker can end, each classified by the dispatcher">
-    <div class="bar"><i></i><i></i><i></i> the terminal</div>
-<pre>
-<span class="d">$ cancho run spike/s6_dispatch.cho --std</span>
-<span class="g">normal      : worker_claims_succeeded -&gt; verification (not accepted) [2 ms]</span>
-<span class="b">reports fail: worker_reports_failed [3 ms]</span>
-<span class="b">garbage     : protocol_error: stdout is not a JSON object [2 ms]</span>
-<span class="b">exit 3      : worker_error exit 3 [1 ms]</span>
-<span class="b">hang (500ms): worker_timeout (child killed and reaped) [501 ms]</span>
-
-<span class="d">$ cancho authority spike/s6_dispatch.cho --std</span>
-<span class="a">performs</span>  child_signal  clock  exec("/tmp/cancho-forge-spike/bin")  heap  ...
-<span class="a">never touches</span>  the filesystem · the network · signals · foreign code
-</pre>
+  <div class="demo">
+    <div class="term" role="img" aria-label="Replay of a real run: a journal with a torn tail is recovered, a duplicate is refused untouched, and five ways a worker can end are classified">
+      <div class="bar"><i></i><i></i><i></i> the terminal <button id="replay" type="button">↻ replay</button></div>
+      <pre id="screen"></pre>
+    </div>
+    <div class="side" aria-label="The same run: the journal file and the worker endings">
+      <div class="sidehead"><b>The same run, as state</b><span>spike S5 and S6</span></div>
+      <div class="sidebody">
+        <div class="bar2" aria-hidden="true"><i id="jbar"></i></div>
+        <div class="kv"><span>records</span><span id="jrec">0</span><span>valid bytes</span><span id="jvalid">0</span><span>file bytes</span><span id="jfile">0</span><span>journal</span><span id="jstate">empty</span></div>
+        <div class="tiles" id="jchips" style="margin:.8rem 0"></div>
+        <div class="tiles" id="wtiles"></div>
+      </div>
+    </div>
   </div>
-  <p class="caption">A real run of the Milestone 0 spike. A worker that says "succeeded" only reaches <em>verification</em>; the runtime, not the worker, decides what is accepted. The dispatcher can run one directory of programs and cannot read a file.</p>
+  <p class="caption">One real run of the Milestone 0 spike (<code>spike/run.sh</code>, Linux, a mock worker): the journal's records, the torn tail being cut and a duplicate being refused, then the five ways a worker can end. The right side is drawn from the same numbers as the log; the replay shows the lines of the run that matter, in order. Not a live session. Verbatim output: <a href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">spike/RESULTS.md</a>.</p>
 </div>
 
 <section class="alt" id="why"><div class="wrap">
@@ -134,6 +162,44 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
   </div>
 </div></section>
 
+<section class="alt" id="agent"><div class="wrap">
+  <h2>Ask your coding agent to try it</h2>
+  <p class="lead">Paste this into Claude Code, Codex or any coding agent that can run commands. It installs the pinned compiler, proves the install with the gate (no network, no key, no model), and runs the spikes that produced the numbers above.</p>
+  <div class="promptbox">
+    <div class="pbar"><span>prompt</span><span><button type="button" id="copyprompt">Copy</button> <a href="https://raw.githubusercontent.com/alpibrusl/cancho-forge/main/docs/agent-prompt.md">raw</a></span></div>
+    <pre id="agentprompt">Install cancho-forge and check it on this machine. Work in a new empty directory, keep every path free of spaces, and never use sudo. Run steps 2 to 5 in one shell session. Report honestly; do not retry a failing command in a loop and do not edit the repository to make a command pass.
+
+1. Check that `git`, `cargo` (Rust, via rustup), a C compiler (`cc`), `clang` and `sh` exist. If one is missing, stop and tell me which; do not install system packages on your own.
+
+2. Get the two repositories side by side, both cloned into the new empty directory (call it the parent):
+   git clone https://github.com/alpibrusl/cancho-forge.git
+   git clone https://github.com/alpibrusl/cancho.git
+   git -C cancho checkout "$(cat cancho-forge/.cancho-rev)"
+
+3. Build the compiler (a few minutes) and point at it:
+   (cd cancho &amp;&amp; cargo build --release -p cancho)
+   export CANCHO="$PWD/cancho/target/release/cancho"
+
+4. Prove the install works. This needs no network, no key and no model. Start from the parent directory:
+   cd cancho-forge
+   sh scripts/gate.sh        # must end with: gate: PASS
+   The gate runs `cancho fmt --check`, `cancho check`, `cancho test`, a 24-case file conformance program and a 2,000-line file budget.
+
+5. Run the Milestone 0 spikes. They start real child processes and write under /tmp/cancho-forge-spike (about 15 seconds):
+   sh spike/run.sh
+   Read the output. Find these in it and show me the lines:
+   - the five ways a worker can end (`normal`, `reports fail`, `garbage`, `exit 3`, `hang`) and how each was classified;
+   - the journal lines: the torn tail being cut (`file_bytes=165` then `140`), and `REFUSED: complete line(s) that are not the next event; file left untouched`;
+   - `lock by second writer (must fail): FAILED errno 11`.
+
+6. Tell me, briefly:
+   - whether the gate printed `gate: PASS`, and how many tests it ran;
+   - the lines asked for in step 5;
+   - anything that failed, with the exact error.
+Nothing here runs a company yet: this is Milestone 0 and the first part of Milestone 1. Docs: README.md, spike/RESULTS.md (what was measured), docs/cancho-code-audit.md (the real interface of cancho-code), docs/architecture.md.</pre>
+  </div>
+  <p class="fine">It needs no key and no model, and nothing in it runs a company: this is Milestone 0 and the first part of Milestone 1. The same text is in <a href="https://github.com/alpibrusl/cancho-forge/blob/main/docs/agent-prompt.md">docs/agent-prompt.md</a>, and a Claude Code skill for working on the repository is in <a href="https://github.com/alpibrusl/cancho-forge/blob/main/skills/cancho-forge/SKILL.md">skills/cancho-forge</a>.</p>
+</div></section>
 <section id="try"><div class="wrap">
   <h2>Try it</h2>
   <p class="lead">You need the <a href="https://github.com/alpibrusl/cancho">cancho</a> compiler at the revision in <code>cancho.toml</code>.</p>
@@ -154,5 +220,90 @@ spike/run.sh         # re-runs every spike and prints the evidence</code></pre>
   </div>
 </div></section>
 <footer><div class="wrap">cancho-forge · EUPL-1.2 · written in <a href="https://github.com/alpibrusl/cancho">cancho</a></div></footer>
+<script>
+(function () {
+  var screen = document.getElementById("screen");
+  var lines = [
+    ["d", "$ sh spike/run.sh          # S5: the journal"],
+    ["g", "wrote bytes: 46, 46, 48", {j: "add", from: 1, to: 3}],
+    ["a", "file_sync: ok 0 / sync dir: ok 0"],
+    ["b", "torn write: ok 25", {j: "tear"}],
+    ["a", "recovered records=3 valid_bytes=140 file_bytes=165"],
+    ["g", "truncate torn tail: ok 0   bytes now: 140", {j: "cut"}],
+    ["a", "recovered records=3 valid_bytes=140 file_bytes=140"],
+    ["g", "wrote bytes: 46, 46, 48", {j: "add", from: 4, to: 6}],
+    ["a", "recovered records=6 valid_bytes=280 file_bytes=280"],
+    ["d", "--- duplicate seq must be refused, file untouched"],
+    ["b", "wrote bytes: 46, 46, 48", {j: "dup"}],
+    ["b", "recovered records=6 valid_bytes=280 file_bytes=420"],
+    ["b", "  corrupt_complete_lines=3"],
+    ["b", "REFUSED: complete line(s) that are not the next event;"],
+    ["b", "         file left untouched   bytes before/after: 420/420", {j: "refused"}],
+    ["d", "$ sh spike/run.sh          # S6: five worker endings"],
+    ["g", "normal      : worker_claims_succeeded", {w: 0, c: "ok"}],
+    ["g", "             -> verification (not accepted)"],
+    ["b", "reports fail: worker_reports_failed", {w: 1, c: "hot"}],
+    ["b", "garbage     : protocol_error: stdout is not a JSON object", {w: 2, c: "hot"}],
+    ["b", "exit 3      : worker_error exit 3", {w: 3, c: "hot"}],
+    ["b", "hang (500ms): worker_timeout (child killed and reaped)", {w: 4, c: "hot"}]
+  ];
+  var W = [["normal", "worker_claims_succeeded", "-> verification, not accepted"], ["reports fail", "worker_reports_failed", ""], ["garbage", "protocol_error", ""], ["exit 3", "worker_error", ""], ["hang (500 ms)", "worker_timeout", "child killed and reaped"]];
+  var J, Wd;
+  function onReset() { J = {chips: [], valid: 0, file: 0, torn: false, state: "empty"}; Wd = {}; draw(); }
+  function onAct(a) {
+    if (!a) { return; }
+    if (a.j === "add") { for (var n = a.from; n <= a.to; n++) { J.chips.push({t: "seq " + n}); } J.valid += 140; J.file += 140; J.state = "synced"; }
+    else if (a.j === "tear") { J.chips.push({t: "seq 4 torn, 25 B", hot: true, torn: true}); J.file += 25; J.torn = true; J.state = "torn tail"; }
+    else if (a.j === "cut") { J.chips = J.chips.filter(function (c) { return !c.torn; }); J.file -= 25; J.torn = false; J.state = "recovered"; }
+    else if (a.j === "dup") { for (var m = 1; m <= 3; m++) { J.chips.push({t: "seq " + m + " again", hot: true}); } J.file += 140; J.state = "corrupt lines"; }
+    else if (a.j === "refused") { J.state = "refused, untouched"; }
+    else if (a.w !== undefined) { Wd[a.w] = a.c; }
+    draw();
+  }
+  function draw() {
+    document.getElementById("jrec").textContent = J.chips.filter(function (c) { return !c.hot; }).length;
+    document.getElementById("jvalid").textContent = J.valid;
+    document.getElementById("jfile").textContent = J.file;
+    document.getElementById("jstate").textContent = J.state;
+    var bar = document.getElementById("jbar");
+    bar.style.width = (J.file ? Math.round(100 * J.valid / J.file) : 0) + "%";
+    bar.className = J.torn ? "torn" : "";
+    document.getElementById("jchips").innerHTML = J.chips.map(function (c) { return '<div class="tile' + (c.hot ? " hot" : "") + '"><b>' + c.t + "</b></div>"; }).join("");
+    document.getElementById("wtiles").innerHTML = Object.keys(Wd).map(function (k) { var w = W[k]; return '<div class="tile ' + Wd[k] + '"><b>' + w[0] + '</b><span class="m">' + w[1] + (w[2] ? "<br>" + w[2] : "") + "</span></div>"; }).join("");
+  }
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+  function span(l, text) { return '<span class="' + l[0] + '">' + esc(text) + "</span>"; }
+  var reduce = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var timer = null;
+  function full() {
+    clearTimeout(timer); onReset();
+    for (var i = 0; i < lines.length; i++) { if (lines[i][2]) { onAct(lines[i][2]); } }
+    screen.innerHTML = lines.map(function (l) { return span(l, l[1]); }).join("\n");
+  }
+  function play() {
+    clearTimeout(timer); screen.innerHTML = ""; onReset();
+    var i = 0, j = 0, html = "";
+    (function tick() {
+      if (i >= lines.length) { return; }
+      var l = lines[i];
+      j += 3;
+      screen.innerHTML = html + span(l, l[1].slice(0, j));
+      if (j >= l[1].length) {
+        html += span(l, l[1]) + "\n"; onAct(l[2]); i++; j = 0;
+        timer = setTimeout(tick, l[0] === "b" ? 1100 : 550);
+      } else { timer = setTimeout(tick, 14); }
+    })();
+  }
+  document.getElementById("replay").addEventListener("click", function () { if (reduce) { full(); } else { play(); } });
+  var copyBtn = document.getElementById("copyprompt");
+  copyBtn.addEventListener("click", function () {
+    var text = document.getElementById("agentprompt").textContent, done = function (ok) { copyBtn.textContent = ok ? "Copied" : "Select and copy"; setTimeout(function () { copyBtn.textContent = "Copy"; }, 2000); };
+    if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); }); }
+    else { var r = document.createRange(); r.selectNodeContents(document.getElementById("agentprompt")); var sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); done(false); }
+  });
+  full();
+  if (!reduce) { play(); }
+})();
+</script>
 </body>
 </html>

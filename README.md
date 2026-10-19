@@ -51,6 +51,10 @@ proposes and executes.
 
 ## Try it
 
+**Claude Code skill:** copy [`skills/cancho-forge`](skills/cancho-forge/SKILL.md) into `~/.claude/skills/` (or your project's `.claude/skills/`) and the agent knows how to run the gate, read the spikes and extend Forge with the rules built in. Other agents can read the same file as plain instructions.
+
+**Or ask your coding agent to do it:** paste [`docs/agent-prompt.md`](docs/agent-prompt.md) into Claude Code, Codex or similar. It installs the pinned compiler, proves the install with the gate (no network, no key, no model) and runs the spikes.
+
 You need the [cancho](https://github.com/alpibrusl/cancho) compiler, at the
 revision named in `cancho.toml`, and `clang`.
 
