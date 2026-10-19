@@ -91,6 +91,9 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
 .pbar { display: flex; justify-content: space-between; align-items: center; padding: .45rem .8rem; border-bottom: 1px solid var(--line); background: var(--soft); font: .8rem var(--mono); color: var(--muted); }
 .pbar button { font: 600 .8rem var(--font); padding: .25rem .7rem; border-radius: 6px; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-fg); cursor: pointer; margin-right: .6rem; }
 .promptbox pre { margin: 0; padding: 1rem; max-height: 26rem; overflow: auto; font: .8rem/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.vid { max-width: 46rem; margin: 1.2rem auto 0; }
+.vid video { width: 100%; height: auto; display: block; border-radius: 12px; border: 1px solid var(--line); background: var(--term-bg); }
+.vid .caption { margin-top: .5rem; }
 </style>
 </head>
 <body>
@@ -125,6 +128,15 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
     </div>
   </div>
   <p class="caption">One real run of the Milestone 0 spike (<code>spike/run.sh</code>, Linux, a mock worker): the journal's records, the torn tail being cut and a duplicate being refused, then the five ways a worker can end. The right side is drawn from the same numbers as the log; the replay shows the lines of the run that matter, in order. Not a live session. Verbatim output: <a href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">spike/RESULTS.md</a>.</p>
+
+  <div class="vid">
+    <video controls preload="none" playsinline poster="demo/forge-demo.poster.jpg" aria-label="A 28-second recording of the replay above">
+      <source src="demo/forge-demo.mp4" type="video/mp4">
+      <source src="demo/forge-demo.webm" type="video/webm">
+      Your browser cannot play this video: <a href="demo/forge-demo.mp4">download the recording</a>.
+    </video>
+    <p class="caption">The same replay as a 28-second video you can share. It is a recording of this page, not a live session. <a href="demo/forge-demo.mp4">Download</a>.</p>
+  </div>
 </div>
 
 <section class="alt" id="why"><div class="wrap">

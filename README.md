@@ -16,6 +16,9 @@ proposes and executes.
 [AUTHORITY]       dispatcher   exec("/tmp/cancho-forge-spike/bin")   no filesystem, no network
 ```
 
+[![A 28-second recording of the demo](docs/demo/forge-demo.poster.jpg)](docs/demo/forge-demo.mp4)
+*A 28-second recording of the project page's replay of a real run, not a live session. Re-record it with `node scripts/record-demo.js` (needs `playwright` and `ffmpeg`).*
+
 - **A worker cannot accept its own work.** A reported success only moves a task
   to verification. Acceptance needs checks Forge ran itself.
 - **Authority is a capability, not a request.** Each worker is given an `Exec`
