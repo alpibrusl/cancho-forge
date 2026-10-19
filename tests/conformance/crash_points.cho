@@ -1,0 +1,600 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.map;
+import std.process;
+import forge.journal;
+import forge.journal_io;
+import forge.lock;
+import forge.snapshot;
+import forge.snapshot_io;
+import forge.support;
+import forge.task;
+
+// Kill-at-every-crash-point conformance (docs/architecture.md, section 4.5).
+//
+// For each crash point k = 0, 1, 2 ... this program starts
+// tests/conformance/crash_writer.cho as a child (detached, so it leads a
+// process group), waits until the child says it has finished step k and is
+// stopped there, KILLS it (child_kill_group with KILL, then child_wait, which
+// must report the KILL signal), and then plays the restart: it takes the lock,
+// recovers the journal, loads the snapshot, and checks the invariants below
+// against the FILES, never against the child's word. The first k at which the
+// child finishes by itself ends the run; that is the count of crash points.
+//
+// Invariants checked after every kill (each is a named check; a failing one
+// prints FAIL with its name and the point):
+//   lock       while the child lives and holds the lock (k >= 1) a second
+//              writer is refused with workspace-locked; after the kill the
+//              kernel has released it and the lock is taken at once
+//   journal    recovery succeeds with no refusal, finds exactly the whole
+//              records the child had written, cuts a torn tail iff the child
+//              was inside a record, leaves the file exactly as long as its
+//              valid bytes, and a second recovery cuts nothing
+//   states     the projection has the states those records imply (a table
+//              written here by hand, not computed by the code under test)
+//   snapshot   absent iff none was published; else snapshot.json is a whole,
+//              valid snapshot (never a half one: the rename is atomic), its
+//              `last_seq` is the one published, it is used, and the table
+//              recovered through it, strict and not, equals the full replay
+//   tmp        a leftover snapshot.json.tmp is never read by recovery
+//   continue   the journal goes on: the next record appends, replays, and a
+//              new snapshot saved over the leftover tmp is used
+//
+// What a process kill does not test, said plainly: power loss. A killed
+// process leaves its page cache, so bytes written and not synced are still in
+// the file; whether an fsync really reached the platter is not observable
+// here (docs/file-writes.md section 6). The kill proves the protocol's
+// ordering and atomicity against a crash of the PROCESS: a record is whole or
+// a torn tail, a snapshot is whole or absent or the previous one, and the
+// lock does not outlive its holder.
+//
+// The child binary is built by scripts/gate.sh into
+// /tmp/forge-crash-bin (a literal: `narrow` takes only literals, cancho #534).
+// Usage: crash_points <existing dir>.
+
+// The number of crash points crash_writer.cho has (its header lists them). A
+// change to the writer's sequence changes this and the documentation together.
+fn expected_points() -> [] int {
+    return 25;
+}
+
+// ---- reading the child's lines ----------------------------------------------
+
+// The offset of the first COMPLETE line of `data` that starts with `prefix`,
+// or -1.
+fn find_line[&d, &p](data: &d [byte], prefix: &p [byte]) -> [] int {
+    var start = 0;
+    var k = 0;
+    while k < len(data) {
+        if int_of(data[k]) == 10 {
+            if k - start >= len(prefix) && bytes.equal(data[start..start + len(prefix)], prefix) {
+                return start;
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// The line starting at `at`, without its newline.
+fn line_at[&d](data: &d [byte], at: int) -> [] &d [byte] {
+    var end = at;
+    while end < len(data) && int_of(data[end]) != 10 {
+        end = end + 1;
+    }
+    return data[at..end];
+}
+
+// The number after `key` (e.g. "records=") in `line`, or -1.
+fn num_after[&l, &k](line: &l [byte], key: &k [byte]) -> [] int {
+    var at = 0;
+    while at + len(key) <= len(line) {
+        if bytes.equal(line[at..at + len(key)], key) {
+            var n = 0;
+            var p = at + len(key);
+            var digits = 0;
+            while p < len(line) && int_of(line[p]) >= 48 && int_of(line[p]) <= 57 {
+                n = n * 10 + (int_of(line[p]) - 48);
+                p = p + 1;
+                digits = digits + 1;
+            }
+            if digits == 0 {
+                return 0 - 1;
+            }
+            return n;
+        }
+        at = at + 1;
+    }
+    return 0 - 1;
+}
+
+// 1: the line "at <k> " arrived; 2: the child said `done`; 3: end of output;
+// 4: the child printed an error line; 5: the deadline passed.
+fn await_line[&h, &c, &p, &w](heap: &!h Heap, clock: &c Clock, from: &!p Pipe, want: &w [byte], timeout: int) -> [heap, clock, poll, pipe_read] (buffer.Buffer, int) {
+    var out = buffer.empty(heap, 1024);
+    let deadline = clock_ms(clock) + timeout;
+    var status = 0;
+    match poller_new() {
+        Polling::Failed(e) => {
+            return (out, 3);
+        }
+        Polling::Ok(made) => {
+            var poller = made;
+            let scratch = box_slice(heap, 4096, byte_of(0));
+            let events = box_slice(heap, 16, 0);
+            pipe_nonblocking(from);
+            borrow mut poller as &!ph in {
+                poller_add_pipe(ph, from, 1, 1);
+                borrow mut scratch as &!sw in {
+                    borrow mut events as &!eb in {
+                        while status == 0 {
+                            let left = deadline - clock_ms(clock);
+                            if left <= 0 {
+                                status = 5;
+                            } else {
+                                poller_wait(ph, contents(eb), left);
+                                var reading = true;
+                                while reading {
+                                    match pipe_read(from, contents(sw)) {
+                                        Received::Data(n) => {
+                                            out = buffer.append(heap, out, contents(sw)[0..n]);
+                                        }
+                                        Received::Again => {
+                                            reading = false;
+                                        }
+                                        Received::End => {
+                                            reading = false;
+                                            status = 3;
+                                        }
+                                        Received::Failed(e) => {
+                                            reading = false;
+                                            status = 3;
+                                        }
+                                    }
+                                }
+                                borrow out as &ob in {
+                                    let text = buffer.bytes(ob);
+                                    if find_line(text, "error") >= 0 {
+                                        status = 4;
+                                    } else if find_line(text, want) >= 0 {
+                                        status = 1;
+                                    } else if find_line(text, "done") >= 0 {
+                                        status = 2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, scratch);
+            unbox_slice(heap, events);
+            poller_close(poller);
+            return (out, status);
+        }
+    }
+}
+
+// ---- the check ledger ------------------------------------------------------
+
+// A check: counts it, and on failure prints FAIL with the point and name.
+struct Tally {
+    checks: int,
+    failed: int,
+}
+
+fn check[&i, &n](io: &!i Io, tally: Tally, point: int, held: bool, name: &n [byte]) -> [io_write] Tally {
+    if held {
+        return Tally { checks: tally.checks + 1, failed: tally.failed };
+    }
+    io.write_all(io, "FAIL point ");
+    io.print_int(io, point);
+    io.write_all(io, ": ");
+    io.write_all(io, name);
+    io.newline(io);
+    return Tally { checks: tally.checks + 1, failed: tally.failed + 1 };
+}
+
+// ---- what recovery must find, written by hand -------------------------------
+
+// The state code of t-1 and t-2 after the first n records of the writer's
+// session (task.cho: 1 proposed, 2 approved).
+fn expect_t1(n: int) -> [] int {
+    if n >= 3 {
+        return 2;
+    }
+    if n >= 1 {
+        return 1;
+    }
+    return 0;
+}
+
+fn expect_t2(n: int) -> [] int {
+    if n >= 4 {
+        return 2;
+    }
+    if n >= 2 {
+        return 1;
+    }
+    return 0;
+}
+
+struct Seen {
+    rule: int,
+    records: int,
+    cut: int,
+    errno: int,
+    t1: int,
+    t2: int,
+    file: int,
+}
+
+fn seen_journal[&h, &f, &j](heap: &!h Heap, fs: &f Fs(""), jpath: &j [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] Seen {
+    let (table, report, done) = journal_io.recover(heap, fs, jpath);
+    var t1 = 0;
+    var t2 = 0;
+    borrow table as &tb in {
+        t1 = journal.state_of(tb, "t-1");
+        t2 = journal.state_of(tb, "t-2");
+    }
+    map.drop(heap, table);
+    return Seen { rule: report.rule, records: report.records, cut: done.cut, errno: done.errno, t1: t1, t2: t2, file: report.valid_bytes };
+}
+
+fn seen_snapshot[&h, &f, &j, &s](heap: &!h Heap, fs: &f Fs(""), jpath: &j [byte], spath: &s [byte], strict: bool) -> [heap, fs_read(""), fs_write(""), file_read, file_write] (Seen, snapshot.Outcome) {
+    let (table, report, done, outcome) = snapshot_io.recover(heap, fs, jpath, spath, strict);
+    var t1 = 0;
+    var t2 = 0;
+    borrow table as &tb in {
+        t1 = journal.state_of(tb, "t-1");
+        t2 = journal.state_of(tb, "t-2");
+    }
+    map.drop(heap, table);
+    return (Seen { rule: report.rule, records: report.records, cut: done.cut, errno: done.errno, t1: t1, t2: t2, file: report.valid_bytes }, outcome);
+}
+
+fn is_held(l: lock.Lock) -> [] bool {
+    match l {
+        lock.Lock::Held(file) => {
+            lock.let_go(file);
+            return true;
+        }
+        lock.Lock::Refused(rule) => {
+            return false;
+        }
+        lock.Lock::Failed(e) => {
+            return false;
+        }
+    }
+}
+
+fn is_refused_as_locked(l: lock.Lock) -> [] bool {
+    match l {
+        lock.Lock::Held(file) => {
+            lock.let_go(file);
+            return false;
+        }
+        lock.Lock::Refused(rule) => {
+            return bytes.equal(task.rule_code_name(rule), "workspace-locked");
+        }
+        lock.Lock::Failed(e) => {
+            return false;
+        }
+    }
+}
+
+// ---- the restart after a kill ----------------------------------------------
+
+// All the invariants for one point. `n`, `torn` and `snap` are the child's
+// claims; the files must agree with them.
+fn verify[&h, &f, &i, &s](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, stem: &s [byte], k: int, n: int, torn: int, snap: int, tally_in: Tally) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] Tally {
+    var tally = tally_in;
+    var jp = buffer.append(heap, buffer.empty(heap, 128), stem);
+    jp = buffer.append(heap, jp, ".journal.jsonl");
+    var sp = buffer.append(heap, buffer.empty(heap, 128), stem);
+    sp = buffer.append(heap, sp, ".snapshot.json");
+    var tp = buffer.append(heap, buffer.empty(heap, 128), stem);
+    tp = buffer.append(heap, tp, ".snapshot.json.tmp");
+    var lp = buffer.append(heap, buffer.empty(heap, 128), stem);
+    lp = buffer.append(heap, lp, ".lock");
+    borrow jp as &jb in {
+        borrow sp as &sb in {
+            borrow tp as &tb in {
+                borrow lp as &lb in {
+                    let journal_path = buffer.bytes(jb);
+                    let snap_path = buffer.bytes(sb);
+                    let tmp_path = buffer.bytes(tb);
+                    // lock: the kernel let it go with the process
+                    tally = check(io, tally, k, is_held(lock.acquire(fs, buffer.bytes(lb))), "lock: free after the kill");
+
+                    // journal
+                    let size_before = support.size_of(heap, fs, journal_path);
+                    let first = seen_journal(heap, fs, journal_path);
+                    tally = check(io, tally, k, first.errno == 0 && first.rule == 0, "journal: recovery succeeds with no refusal");
+                    tally = check(io, tally, k, first.records == n, "journal: exactly the records the child wrote are found");
+                    tally = check(io, tally, k, first.cut > 0 == (torn == 1), "journal: a torn tail is cut iff the child was inside a record");
+                    tally = check(io, tally, k, support.size_of(heap, fs, journal_path) == first.file && size_before == first.file + first.cut, "journal: the file is exactly its valid bytes after recovery");
+                    let second = seen_journal(heap, fs, journal_path);
+                    tally = check(io, tally, k, second.cut == 0 && second.records == n && second.rule == 0 && second.errno == 0, "journal: a second recovery cuts nothing");
+                    tally = check(io, tally, k, first.t1 == expect_t1(n) && first.t2 == expect_t2(n), "states: the projection is what those records imply");
+
+                    // snapshot
+                    let present = support.exists(fs, snap_path);
+                    tally = check(io, tally, k, present == snap > 0, "snapshot: present iff one was published");
+                    if present {
+                        let (lax, lo) = seen_snapshot(heap, fs, journal_path, snap_path, false);
+                        let (strict, so) = seen_snapshot(heap, fs, journal_path, snap_path, true);
+                        tally = check(io, tally, k, lo.used && lo.rule == 0 && lo.last_seq == snap, "snapshot: whole, valid, used, and it is the published one (cheap mode)");
+                        tally = check(io, tally, k, so.used && so.rule == 0 && so.last_seq == snap, "snapshot: whole, valid, used, and it is the published one (strict mode)");
+                        tally = check(io, tally, k, lax.records == n && lax.t1 == first.t1 && lax.t2 == first.t2 && lax.rule == 0, "snapshot: snapshot + tail equals the full replay (cheap mode)");
+                        tally = check(io, tally, k, strict.records == n && strict.t1 == first.t1 && strict.t2 == first.t2 && strict.rule == 0, "snapshot: snapshot + tail equals the full replay (strict mode)");
+                    } else {
+                        let (none, no) = seen_snapshot(heap, fs, journal_path, snap_path, true);
+                        tally = check(io, tally, k, no.used == false && no.rule == 0 && none.records == n, "snapshot: none is a full replay, not a refusal");
+                    }
+
+                    // continue: the journal goes on, and a new snapshot replaces the leftover tmp
+                    let (table, report, done) = journal_io.recover(heap, fs, journal_path);
+                    let (next, record, rule) = journal.submit(heap, table, report.records + 1, "t-9", task.State::Proposed, task.Actor::Human, false);
+                    var appended = 0 - 100;
+                    borrow record as &rb in {
+                        appended = journal_io.append(fs, journal_path, buffer.bytes(rb), report.records == 0);
+                    }
+                    buffer.drop(heap, record);
+                    map.drop(heap, next);
+                    let after = seen_journal(heap, fs, journal_path);
+                    tally = check(io, tally, k, rule == 0 && appended == 0 && after.records == n + 1 && after.rule == 0 && after.cut == 0, "continue: the next record appends and replays");
+                    let (data, errno) = support.contents_of(heap, fs, journal_path);
+                    var saved = 0 - 100;
+                    borrow data as &db in {
+                        let (t2, r2) = journal.replay(heap, buffer.bytes(db));
+                        borrow t2 as &t2b in {
+                            let fresh = snapshot.encode(heap, t2b, r2.records, r2.valid_bytes, buffer.bytes(db));
+                            borrow fresh as &fb in {
+                                saved = snapshot_io.save(fs, tmp_path, snap_path, buffer.bytes(fb));
+                            }
+                            buffer.drop(heap, fresh);
+                        }
+                        map.drop(heap, t2);
+                    }
+                    buffer.drop(heap, data);
+                    let (last, lo) = seen_snapshot(heap, fs, journal_path, snap_path, true);
+                    tally = check(io, tally, k, saved == 0 && support.exists(fs, tmp_path) == false && lo.used && lo.last_seq == n + 1 && last.records == n + 1, "continue: a new snapshot over the leftover tmp is saved, renamed and used");
+                }
+            }
+        }
+    }
+    buffer.drop(heap, jp);
+    buffer.drop(heap, sp);
+    buffer.drop(heap, tp);
+    buffer.drop(heap, lp);
+    return tally;
+}
+
+// ---- one crash point ---------------------------------------------------------
+
+// The args string of exec: "<stem>\0<k>\0".
+fn args_of[&h, &s](heap: &!h Heap, stem: &s [byte], k: int) -> [heap] buffer.Buffer {
+    var a = buffer.append(heap, buffer.empty(heap, 128), stem);
+    a = buffer.push(heap, a, byte_of(0));
+    a = buffer.push_nat(heap, a, k);
+    a = buffer.push(heap, a, byte_of(0));
+    return a;
+}
+
+// Run the child to crash point k (or to its end), kill it, verify. Answers
+// the tally and whether the child ran to its end (k is then past the last
+// point).
+fn point[&h, &f, &x, &c, &i, &d](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec("/tmp/forge-crash-bin"), clock: &c Clock, io: &!i Io, dir: &d [byte], k: int, tally_in: Tally) -> [heap, fs_read(""), fs_write(""), file_read, file_write, exec("/tmp/forge-crash-bin"), exec_detached, child_signal, clock, poll, pipe_read, io_write] (Tally, bool) {
+    var tally = tally_in;
+    var stem = buffer.append(heap, buffer.empty(heap, 128), dir);
+    stem = buffer.append(heap, stem, "/cp-");
+    stem = buffer.push_nat(heap, stem, k);
+    var finished = false;
+    borrow stem as &sb in {
+        match process.channels() {
+            process.Channels::Failed(e) => {
+                tally = check(io, tally, k, false, "harness: channels");
+            }
+            process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+                let args = args_of(heap, buffer.bytes(sb), k);
+                borrow args as &ab in {
+                    match exec_spawn_detached(exec, "/tmp/forge-crash-bin/crash_writer", buffer.bytes(ab), "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                        Spawned::Failed(e) => {
+                            process.close(to_child, from_child);
+                            tally = check(io, tally, k, false, "harness: spawn crash_writer");
+                        }
+                        Spawned::Ok(child) => {
+                            pipe_close(to_child);
+                            var reader = from_child;
+                            var want = buffer.append(heap, buffer.empty(heap, 16), "at ");
+                            want = buffer.push_nat(heap, want, k);
+                            want = buffer.append(heap, want, " ");
+                            var out = buffer.empty(heap, 0);
+                            var status = 0;
+                            borrow want as &wb in {
+                                borrow mut reader as &!rp in {
+                                    buffer.drop(heap, out);
+                                    let (o, st) = await_line(heap, clock, rp, buffer.bytes(wb), 15000);
+                                    out = o;
+                                    status = st;
+                                }
+                            }
+                            buffer.drop(heap, want);
+                            if status == 1 {
+                                var claims_n = 0 - 1;
+                                var claims_torn = 0 - 1;
+                                var claims_snap = 0 - 1;
+                                var label_ok = false;
+                                var shown = buffer.empty(heap, 0);
+                                borrow out as &ob in {
+                                    let text = buffer.bytes(ob);
+                                    var prefix = buffer.append(heap, buffer.empty(heap, 16), "at ");
+                                    prefix = buffer.push_nat(heap, prefix, k);
+                                    prefix = buffer.append(heap, prefix, " ");
+                                    borrow prefix as &pb in {
+                                        let at = find_line(text, buffer.bytes(pb));
+                                        if at >= 0 {
+                                            let line = line_at(text, at);
+                                            claims_n = num_after(line, "records=");
+                                            claims_torn = num_after(line, "torn=");
+                                            claims_snap = num_after(line, "snap=");
+                                            label_ok = true;
+                                            buffer.drop(heap, shown);
+                                            shown = buffer.append(heap, buffer.empty(heap, 96), line);
+                                        }
+                                    }
+                                    buffer.drop(heap, prefix);
+                                }
+                                tally = check(io, tally, k, label_ok && claims_n >= 0 && claims_torn >= 0 && claims_snap >= 0, "harness: the child's line for this point parses");
+                                // the child is alive and holds the lock: a second writer is refused
+                                var lp = buffer.append(heap, buffer.empty(heap, 128), buffer.bytes(sb));
+                                lp = buffer.append(heap, lp, ".lock");
+                                if k >= 1 {
+                                    borrow lp as &lb in {
+                                        tally = check(io, tally, k, is_refused_as_locked(lock.acquire(fs, buffer.bytes(lb))), "lock: refused with workspace-locked while the child lives");
+                                    }
+                                } else {
+                                    borrow lp as &lb in {
+                                        tally = check(io, tally, k, is_held(lock.acquire(fs, buffer.bytes(lb))), "lock: free before the child takes it (point 0)");
+                                    }
+                                }
+                                buffer.drop(heap, lp);
+                                // the kill, to the whole group; then reap
+                                var rc = 0 - 1;
+                                borrow child as &ch in {
+                                    rc = child_kill_group(ch, 256);
+                                }
+                                tally = check(io, tally, k, rc == 0, "harness: child_kill_group answered 0");
+                                match child_wait(child) {
+                                    Exited::Signaled(sig) => {
+                                        tally = check(io, tally, k, sig == 256, "harness: the child ended by the KILL signal");
+                                    }
+                                    Exited::Code(code) => {
+                                        tally = check(io, tally, k, false, "harness: the child ended by the KILL signal");
+                                    }
+                                    Exited::Failed(e) => {
+                                        tally = check(io, tally, k, false, "harness: the child ended by the KILL signal");
+                                    }
+                                }
+                                let failed_before = tally.failed;
+                                tally = verify(heap, fs, io, buffer.bytes(sb), k, claims_n, claims_torn, claims_snap, tally);
+                                if tally.failed == failed_before {
+                                    io.write_all(io, "ok   killed after: ");
+                                } else {
+                                    io.write_all(io, "FAIL killed after: ");
+                                }
+                                borrow shown as &shb in {
+                                    io.write_all(io, buffer.bytes(shb));
+                                }
+                                io.newline(io);
+                                buffer.drop(heap, shown);
+                            } else if status == 2 {
+                                finished = true;
+                                match child_wait(child) {
+                                    Exited::Code(code) => {
+                                        tally = check(io, tally, k, code == 0, "end: the writer ran to its end and exited 0");
+                                        io.write_all(io, "ok   the writer then ran to its end by itself (exit code ");
+                                        io.print_int(io, code);
+                                        io.write_all(io, ") and the finished session verified too\n");
+                                    }
+                                    Exited::Signaled(sig) => {
+                                        tally = check(io, tally, k, false, "end: the writer ran to its end and exited 0");
+                                    }
+                                    Exited::Failed(e) => {
+                                        tally = check(io, tally, k, false, "end: the writer ran to its end and exited 0");
+                                    }
+                                }
+                                // the finished session: 4 records, snapshot at 4, lock free
+                                tally = verify(heap, fs, io, buffer.bytes(sb), k, 4, 0, 4, tally);
+                            } else {
+                                tally = check(io, tally, k, false, "harness: the child reached the point (got an error, an end of output or a timeout)");
+                                borrow child as &ch in {
+                                    child_kill_group(ch, 256);
+                                }
+                                child_wait(child);
+                            }
+                            buffer.drop(heap, out);
+                            pipe_close(reader);
+                        }
+                    }
+                }
+                buffer.drop(heap, args);
+            }
+        }
+    }
+    buffer.drop(heap, stem);
+    return (tally, finished);
+}
+
+fn run[&h, &f, &x, &c, &i, &d](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec("/tmp/forge-crash-bin"), clock: &c Clock, io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, exec("/tmp/forge-crash-bin"), exec_detached, child_signal, clock, poll, pipe_read, io_write] int {
+    var tally = Tally { checks: 0, failed: 0 };
+    var k = 0;
+    var finished = false;
+    while finished == false && k < 60 {
+        let (next, done) = point(heap, fs, exec, clock, io, dir, k, tally);
+        tally = next;
+        finished = done;
+        k = k + 1;
+    }
+    var failed = tally.failed;
+    if finished == false || k - 1 != expected_points() {
+        io.write_all(io, "FAIL the writer has a different number of crash points than the documented ");
+        io.print_int(io, expected_points());
+        io.newline(io);
+        failed = failed + 1;
+    }
+    io.write_all(io, "crash points exercised: ");
+    io.print_int(io, k - 1);
+    io.write_all(io, ", checks run: ");
+    io.print_int(io, tally.checks);
+    io.write_all(io, ", failed: ");
+    io.print_int(io, failed);
+    io.newline(io);
+    if failed == 0 {
+        io.write_all(io, "ok   every crash point held\n");
+    } else {
+        io.write_all(io, "FAIL some crash point did not hold\n");
+    }
+    return failed;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    let bin = narrow(exec, "/tmp/forge-crash-bin");
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow bin as &x in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        borrow args as &g in {
+                            if arg_count(g) == 2 {
+                                status = run(h, f, x, c, i, arg(g, 1));
+                            } else {
+                                io.error_all(i, "usage: crash_points <existing directory>\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(bin);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

@@ -51,6 +51,27 @@ for prog in journal_files snapshot_files; do
 done
 echo "conformance cases held: $held"
 
+echo "== conformance (kill at every crash point)"
+# crash_points starts crash_writer as a child and kills it at each step of
+# append, sync, snapshot and rename. `narrow` takes only a literal (cancho
+# #534, gap G1), so the child is built into the literal directory the parent
+# is narrowed to. Both are checked, built and run here.
+crash_bin=/tmp/forge-crash-bin
+mkdir -p "$crash_bin" || exit 1
+for prog in crash_writer crash_points; do
+  $C check tests/conformance/$prog.cho tests/conformance/support.cho $libs --std || fail=1
+done
+mkdir "$scratch/crash_points" || exit 1
+if $C build tests/conformance/crash_writer.cho tests/conformance/support.cho $libs --std -o "$crash_bin/crash_writer" \
+  && $C build tests/conformance/crash_points.cho tests/conformance/support.cho $libs --std -o "$scratch/crash_points.bin"; then
+  "$scratch/crash_points.bin" "$scratch/crash_points" > "$scratch/crash_points.out" || fail=1
+  cat "$scratch/crash_points.out"
+  if grep -q '^FAIL ' "$scratch/crash_points.out"; then fail=1; fi
+else
+  echo "conformance: crash_points did not build"
+  fail=1
+fi
+
 echo "== file budget (2000 lines)"
 for f in $(find src tests spike -name '*.cho'); do
   n=$(wc -l < "$f")

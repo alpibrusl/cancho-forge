@@ -95,3 +95,21 @@ pub fn put_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte])
         }
     }
 }
+
+// The non-negative number written in `text` (digits only, at most 9), or -1.
+pub fn nat_of[&t](text: &t [byte]) -> [] int {
+    if len(text) < 1 || len(text) > 9 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - 48);
+        k = k + 1;
+    }
+    return n;
+}
