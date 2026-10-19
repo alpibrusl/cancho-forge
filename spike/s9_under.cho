@@ -1,0 +1,83 @@
+edition 9;
+
+import std.io;
+
+// Spike 9: gap G1 and G2 together (cancho #534, #535; `docs/processes.md` 4.13 and 4.14). The workers directory is not
+// a literal in the program: it is argv[1], opened once as a `Dir`. A worker is started beneath it with
+// `exec_spawn_under` under `Exec("")`, after the guard has asked `exec_covers` and checked the half of the name rule
+// the capability leaves to the caller (not empty, not rooted).
+//   argv[1]  the workers directory
+//   argv[2]  the worker's name, relative to it
+// Prints `refused` (a name the guard would not pass; the spawn is never attempted, so nothing traps), `failed errno N`
+// or `exited N`.
+
+fn name_ok[&x, &p](exec: &x Exec(""), name: &p [byte]) -> [] bool {
+    return len(name) > 0 && int_of(name[0]) != 47 && exec_covers(exec, name);
+}
+
+fn start[&x, &d, &i, &p](exec: &x Exec(""), dir: &d Dir, io: &!i Io, name: &p [byte]) -> [exec_under, io_write] int {
+    if name_ok(exec, name) == false {
+        io.write_all(io, "refused\n");
+        return 1;
+    }
+    match exec_spawn_under(exec, dir, name, "", "", Stdio::Null, Stdio::Null, Stdio::Null) {
+        Spawned::Failed(e) => {
+            io.write_all(io, "failed errno ");
+            io.print_int(io, e);
+            io.newline(io);
+        }
+        Spawned::Ok(child) => {
+            match child_wait(child) {
+                Exited::Code(n) => {
+                    io.write_all(io, "exited ");
+                    io.print_int(io, n);
+                    io.newline(io);
+                }
+                Exited::Signaled(s) => {
+                    io.write_all(io, "signaled\n");
+                }
+                Exited::Failed(e) => {
+                    io.write_all(io, "wait failed\n");
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(heap);
+    release(net);
+    release(clock);
+    release(signals);
+    release(tty);
+    var console = io;
+    var status = 2;
+    borrow fs as &f in {
+        borrow args as &g in {
+            match open_dir(f, arg(g, 1)) {
+                DirOpened::Ok(d) => {
+                    var workers = d;
+                    borrow workers as &w in {
+                        borrow exec as &x in {
+                            borrow mut console as &!i in {
+                                status = start(x, w, i, arg(g, 2));
+                            }
+                        }
+                    }
+                    dir_close(workers);
+                }
+                DirOpened::Failed(e) => {
+                    status = 3;
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(console);
+    release(args);
+    return status;
+}

@@ -65,7 +65,7 @@ pub fn exists[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] bool {
 // Make the file at `path` hold exactly `bytes` (create or truncate, one write).
 // 0 or an errno.
 pub fn put_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
-    if journal_io.path_ok(path) == false {
+    if journal_io.path_ok(fs, path) == false {
         return 0 - 2;
     }
     match open_write(fs, path) {

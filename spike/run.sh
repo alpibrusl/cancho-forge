@@ -13,7 +13,7 @@ say() { printf '\n=== %s\n' "$*"; }
 
 say "gate: fmt, check"
 $C fmt --check .. && echo "fmt: ok"
-for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild mock_worker; do
+for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under mock_worker; do
   $C check $f.cho --std && echo "check $f: ok"
 done
 
@@ -60,3 +60,16 @@ for m in p g k; do
   ps -eo pid,pgid,stat,args | awk '$4 == "sleep" && $5 == "77" { print "  " $1, $2, $3, $4, $5 }'
   pkill -f '^sleep 77$' 2>/dev/null || true
 done
+
+say "S8 Forge's old path rule against fs_covers (the capability traps on what the old rule let through)"
+$C build s8_covers.cho --std -o "$D/s8" || exit 1
+for p in /tmp/x/journal.jsonl /tmp/a..b/j /tmp/a/../b; do
+  printf -- '--- %s\n' "$p"; "$D/s8" v "$p"; "$D/s8" e "$p"; echo "exit=$?"
+done 2>&1
+
+say "S9 a worker started beneath a directory given at run time, guard first"
+$C build s9_under.cho --std -o "$D/s9" || exit 1
+$C authority s9_under.cho --std | sed -n '/^performs/,/^never/p'
+for n in mock_worker ./mock_worker nope /bin/echo ../x a..b ""; do
+  printf -- '--- [%s]: ' "$n"; "$D/s9" "$D/bin" "$n"
+done 2>&1

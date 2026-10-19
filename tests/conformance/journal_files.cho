@@ -134,15 +134,15 @@ fn run[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]
     var failed = 0;
 
     // ---- the path rule: refused before the capability could trap ----------
-    failed = failed + verdict(io, journal_io.path_ok("/tmp/x/journal.jsonl"), "path: an absolute path is ok");
-    failed = failed + verdict(io, journal_io.path_ok("/a/..b/c..") && journal_io.path_ok("/a/b.."), "path: dots inside a name are ok");
-    failed = failed + verdict(io, journal_io.path_ok("") == false && journal_io.path_ok("/") == false && journal_io.path_ok("rel/x") == false, "path: empty, root and relative are refused");
-    failed = failed + verdict(io, journal_io.path_ok("/a/../b") == false && journal_io.path_ok("/..") == false && journal_io.path_ok("/a/b/..") == false && journal_io.path_ok("/../a") == false, "path: a .. component is refused");
+    failed = failed + verdict(io, journal_io.path_ok(fs, "/tmp/x/journal.jsonl"), "path: an absolute path is ok");
+    failed = failed + verdict(io, journal_io.path_ok(fs, "/a/..b/c..") == false && journal_io.path_ok(fs, "/a/b..") == false && journal_io.path_ok(fs, "/a/b.c/d.e"), "path: two dots in a row are refused wherever they are (the capability traps on the byte pair, spike S8); single dots are ok");
+    failed = failed + verdict(io, journal_io.path_ok(fs, "") == false && journal_io.path_ok(fs, "/") == false && journal_io.path_ok(fs, "rel/x") == false, "path: empty, root and relative are refused");
+    failed = failed + verdict(io, journal_io.path_ok(fs, "/a/../b") == false && journal_io.path_ok(fs, "/..") == false && journal_io.path_ok(fs, "/a/b/..") == false && journal_io.path_ok(fs, "/../a") == false, "path: a .. component is refused");
     var withnul = buffer.append(heap, buffer.empty(heap, 16), "/a/b");
     withnul = buffer.push(heap, withnul, byte_of(0));
     withnul = buffer.append(heap, withnul, "c");
     borrow withnul as &wb in {
-        failed = failed + verdict(io, journal_io.path_ok(buffer.bytes(wb)) == false, "path: a NUL is refused");
+        failed = failed + verdict(io, journal_io.path_ok(fs, buffer.bytes(wb)) == false, "path: a NUL is refused");
     }
     buffer.drop(heap, withnul);
 
@@ -153,6 +153,16 @@ fn run[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]
         failed = failed + verdict(io, journal_io.append(fs, buffer.bytes(pb), "x\n", true) == 0 - 2, "append: a .. path is refused (-2), not a trap");
     }
     buffer.drop(heap, dotted);
+
+    // The path the first version of `path_ok` accepted and the capability trapped on (spike S8).
+    var inname = under(heap, dir, "a..b/journal.jsonl");
+    borrow inname as &nb in {
+        let o = recover_of(heap, fs, buffer.bytes(nb), "t-1");
+        failed = failed + verdict(io, named(o.rule, "path-invalid") && o.errno == 0, "recover: a name with .. inside is path-invalid, not a trap");
+        failed = failed + verdict(io, journal_io.append(fs, buffer.bytes(nb), "x\n", true) == 0 - 2, "append: a name with .. inside is refused (-2), not a trap");
+        failed = failed + verdict(io, journal_io.exists(fs, buffer.bytes(nb)) == false, "exists: a name with .. inside is not a trap");
+    }
+    buffer.drop(heap, inname);
 
     // ---- a missing file is an empty journal --------------------------------
     var missing = under(heap, dir, "missing.jsonl");
