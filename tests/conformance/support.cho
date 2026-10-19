@@ -57,21 +57,9 @@ pub fn unchanged[&h, &f, &p, &b](heap: &!h Heap, fs: &f Fs(""), path: &p [byte],
     return same && errno == 0;
 }
 
-// Does a file or directory exist at `path`? (A name that cannot be opened for
-// any reason other than "not found" counts as existing.)
+// Does a file or directory exist at `path`? (journal_io.exists)
 pub fn exists[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] bool {
-    if journal_io.path_ok(path) == false {
-        return false;
-    }
-    match open_read(fs, path) {
-        Opened::Failed(e) => {
-            return e != 2;
-        }
-        Opened::Ok(opened) => {
-            file_close(opened);
-            return true;
-        }
-    }
+    return journal_io.exists(fs, path);
 }
 
 // Make the file at `path` hold exactly `bytes` (create or truncate, one write).

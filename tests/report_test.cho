@@ -1,0 +1,206 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.event;
+import forge.journal;
+import std.map;
+import forge.report;
+import forge.snapshot;
+import forge.task;
+
+// Unit tests for src/report.cho, what `forge status` and `forge history`
+// print. The text is compared whole: it is the operator's interface.
+
+fn add[&h, &a, &b, &c, &d](heap: &!h Heap, journal: buffer.Buffer, seq: int, kind: &a [byte], id: &b [byte], actor: &c [byte], basis: &d [byte]) -> [heap] buffer.Buffer {
+    let r = event.transition(heap, seq, kind, id, actor, basis);
+    var out = journal;
+    borrow r as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, r);
+    return out;
+}
+
+// a: proposed, approved, ready; b: proposed, cancelled; then a refusal of a
+// worker's claim that a is accepted.
+fn sample[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var j = buffer.empty(heap, 1024);
+    j = add(heap, j, 1, "task.proposed", "a", "human", "");
+    j = add(heap, j, 2, "task.proposed", "b", "human", "");
+    j = add(heap, j, 3, "task.approved", "a", "human", "");
+    j = add(heap, j, 4, "task.cancelled", "b", "human", "");
+    j = add(heap, j, 5, "task.ready", "a", "forge", "");
+    let r = event.refusal(heap, 6, "a", "accept-unverified");
+    borrow r as &rb in {
+        j = buffer.append(heap, j, buffer.bytes(rb));
+    }
+    buffer.drop(heap, r);
+    return j;
+}
+
+// Does `text` end with `tail`?
+fn ends_with[&t, &e](text: &t [byte], tail: &e [byte]) -> [] bool {
+    return len(text) >= len(tail) && bytes.equal(text[len(text) - len(tail)..len(text)], tail);
+}
+
+fn starts_with[&t, &e](text: &t [byte], head: &e [byte]) -> [] bool {
+    return len(text) >= len(head) && bytes.equal(text[0..len(head)], head);
+}
+
+fn status_text[&h, &d, &s](heap: &!h Heap, data: &d [byte], snap: &s [byte]) -> [heap] buffer.Buffer {
+    let (text, rule) = report.status(heap, data, snap);
+    return text;
+}
+
+fn test_status_of_a_journal_with_no_snapshot[&h](heap: &!h Heap) -> [heap] int {
+    let j = sample(heap);
+    borrow j as &jb in {
+        let text = status_text(heap, buffer.bytes(jb), "");
+        borrow text as &tb in {
+            test.assert(bytes.equal(buffer.bytes(tb), "records: 6\nbytes: 399\ntorn tail bytes: 0\ntasks: 2\n  ready: 1\n  cancelled: 1\nsnapshot: none\n"));
+        }
+        buffer.drop(heap, text);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_status_names_a_snapshot_it_used_and_one_it_refused[&h](heap: &!h Heap) -> [heap] int {
+    let j = sample(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        // a snapshot after the first 3 records
+        var cut = 0;
+        var seen = 0;
+        while seen < 3 {
+            if int_of(data[cut]) == 10 {
+                seen = seen + 1;
+            }
+            cut = cut + 1;
+        }
+        let (table, preport) = journal.replay(heap, data[0..cut]);
+        borrow table as &tb in {
+            let snap = snapshot.encode(heap, tb, preport.records, preport.valid_bytes, data);
+            borrow snap as &sb in {
+                let used = status_text(heap, data, buffer.bytes(sb));
+                borrow used as &ub in {
+                    test.assert(ends_with(buffer.bytes(ub), "snapshot: used, covers 3 records\n"));
+                }
+                buffer.drop(heap, used);
+            }
+            buffer.drop(heap, snap);
+        }
+        map.drop(heap, table);
+        let refused = status_text(heap, data, "not a snapshot\n");
+        borrow refused as &rb in {
+            let text = buffer.bytes(rb);
+            test.assert(ends_with(text, "snapshot: refused (snapshot-invalid), the journal alone was replayed\n"));
+        }
+        buffer.drop(heap, refused);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_status_shows_a_torn_tail_without_cutting_anything[&h](heap: &!h Heap) -> [heap] int {
+    var j = sample(heap);
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":7,\"ki");
+    borrow j as &jb in {
+        let text = status_text(heap, buffer.bytes(jb), "");
+        borrow text as &tb in {
+            let t = buffer.bytes(tb);
+            test.assert(starts_with(t, "records: 6\nbytes: 417\ntorn tail bytes: 18\n"));
+        }
+        buffer.drop(heap, text);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_status_of_a_refused_journal_names_the_rule_and_the_line[&h](heap: &!h Heap) -> [heap] int {
+    var j = sample(heap);
+    j = buffer.append(heap, j, "garbage\n");
+    borrow j as &jb in {
+        let (text, rule) = report.status(heap, buffer.bytes(jb), "");
+        test.assert(bytes.equal(task.rule_code_name(rule), "journal-corrupt"));
+        borrow text as &tb in {
+            let t = buffer.bytes(tb);
+            test.assert(ends_with(t, "journal: refused (journal-corrupt) at line 7\n"));
+        }
+        buffer.drop(heap, text);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_history_lists_every_record_in_order[&h](heap: &!h Heap) -> [heap] int {
+    let j = sample(heap);
+    borrow j as &jb in {
+        let (text, rule) = report.history(heap, buffer.bytes(jb), "");
+        test.assert_eq(rule, 0);
+        borrow text as &tb in {
+            test.assert(bytes.equal(buffer.bytes(tb), "#1 kind=task.proposed task=a actor=human\n#2 kind=task.proposed task=b actor=human\n#3 kind=task.approved task=a actor=human\n#4 kind=task.cancelled task=b actor=human\n#5 kind=task.ready task=a actor=forge\n#6 kind=refusal task=a rule=accept-unverified\n"));
+        }
+        buffer.drop(heap, text);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_history_of_one_task_and_of_none[&h](heap: &!h Heap) -> [heap] int {
+    let j = sample(heap);
+    borrow j as &jb in {
+        let (text, rule) = report.history(heap, buffer.bytes(jb), "b");
+        borrow text as &tb in {
+            test.assert(bytes.equal(buffer.bytes(tb), "#2 kind=task.proposed task=b actor=human\n#4 kind=task.cancelled task=b actor=human\n"));
+        }
+        buffer.drop(heap, text);
+        let (none, r2) = report.history(heap, buffer.bytes(jb), "nobody");
+        borrow none as &nb in {
+            test.assert_eq(buffer.size(nb), 0);
+        }
+        buffer.drop(heap, none);
+        test.assert_eq(r2, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_history_shows_an_observed_basis_and_stops_at_a_refusal[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, 1, "task.proposed", "a", "human", "");
+    j = add(heap, j, 2, "task.approved", "a", "human", "");
+    j = add(heap, j, 3, "task.ready", "a", "forge", "");
+    j = add(heap, j, 4, "task.running", "a", "forge", "");
+    j = add(heap, j, 5, "task.verification", "a", "forge", "");
+    j = add(heap, j, 6, "task.accepted", "a", "forge", "observed");
+    j = add(heap, j, 7, "task.running", "a", "forge", "");
+    borrow j as &jb in {
+        let (text, rule) = report.history(heap, buffer.bytes(jb), "");
+        test.assert(bytes.equal(task.rule_code_name(rule), "transition-invalid"));
+        borrow text as &tb in {
+            let t = buffer.bytes(tb);
+            test.assert(ends_with(t, "#6 kind=task.accepted task=a actor=forge basis=observed\njournal: refused (transition-invalid) at line 7\n"));
+        }
+        buffer.drop(heap, text);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_the_text_of_an_empty_journal[&h](heap: &!h Heap) -> [heap] int {
+    let (text, rule) = report.status(heap, "", "");
+    test.assert_eq(rule, 0);
+    borrow text as &tb in {
+        test.assert(bytes.equal(buffer.bytes(tb), "records: 0\nbytes: 0\ntorn tail bytes: 0\ntasks: 0\nsnapshot: none\n"));
+    }
+    buffer.drop(heap, text);
+    let (h, r2) = report.history(heap, "", "");
+    borrow h as &hb in {
+        test.assert_eq(buffer.size(hb), 0);
+    }
+    buffer.drop(heap, h);
+    return 0;
+}

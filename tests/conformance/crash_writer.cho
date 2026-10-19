@@ -39,7 +39,7 @@ import forge.task;
 // that is NOT the product's is the half-write: the product writes a record
 // with a single write (a process kill cannot split one), so the writer
 // splits it in two to put a kill inside a record, as a kernel that wrote a
-// short count would. That is stated plainly in docs/architecture.md 4.5.
+// short count would. That is stated plainly in docs/architecture.md 4.8.
 //
 // The sequence (25 points, k = 0 to 24):
 //   0 start   1 locked

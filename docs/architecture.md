@@ -174,7 +174,8 @@ and the policy version that decided it *(designed)*.
    and exits with rule `journal-sync-failed`; it does not retry.
 6. One writer: `file_lock` on `lock`. A second open file description in
    the same process is refused with errno 11 *(measured, S5)*, so a second
-   Forge process on the same workspace is too.
+   Forge process on the same workspace is too. **Built in M1**
+   (`src/lock.cho`, section 4.7).
 
 On macOS `fsync` does not flush the drive's cache (`docs/file-writes.md`
 section 6). Not measured here; M1 states the durability promise per
@@ -196,14 +197,15 @@ line:
   3 bad lines and left all 420 bytes alone. The first version of the
   spike truncated them (it treated "not valid" as "torn"); that bug is why
   the two cases are separate here.
-* Then rebuild projections by replaying from the last snapshot whose
-  `last_seq` is not beyond the journal.
+* Then rebuild projections by replaying from the snapshot, if it agrees
+  with the journal (section 4.6), and from the start if it does not.
 
 **As built in M1** *(measured: `tests/journal_test.cho`, 25 cases, and
 `tests/conformance/journal_files.cho`, 24 cases against real files)*: the pure
-core is `src/journal.cho` (`replay` over a byte slice into the state of every
-task, `recovery_cut`, `submit`), the file layer `src/journal_io.cho`
-(`read_all`, `append`, `recover`). Details that the paragraph above leaves to
+core is `src/journal.cho` (`replay` and `replay_from` over a byte slice into
+the state of every task, `recovery_cut`, `submit`), the file layer
+`src/journal_io.cho` (`read_all`, `append` and the steps it is made of,
+`recover`). Details that the paragraph above leaves to
 the reader:
 
 * A complete line the *state machine* refuses (say a `task.running` for a task
@@ -249,6 +251,205 @@ carry `{"ref":"executions/<id>/patch.diff","sha256":"...","bytes":N}`.
 Refs are relative, contain no `..`, and are resolved by Forge against the
 one execution directory (`docs/worker-contract.md`, section 7). The
 journal never contains file contents or secrets.
+
+### 4.6 Snapshots *(built in M1; measured: S5, `tests/snapshot_test.cho`, `tests/conformance/snapshot_files.cho`, `tests/conformance/crash_points.cho`)*
+
+A snapshot is a **cache**: the projection of the journal at record N, so that
+start-up replays only the tail. It is never authoritative, and it is never
+trusted on its own word. One line, one newline, in `snapshot.json`:
+
+```json
+{"v":1,"last_seq":3,"journal_bytes":204,"journal_sha256":"6c09...","tasks":{"t-1":"approved","t-2":"proposed"}}
+```
+
+`last_seq` is how many records it covers, `journal_bytes` the length of that
+prefix of the journal (a record boundary), `journal_sha256` the SHA-256 of
+exactly those bytes, `tasks` the projection (task id to state name). The hash
+is what ties a snapshot to *this* journal: a snapshot made for another
+history, or for a journal that has since been cut or rewritten, does not match
+(`snapshot.cho`, 18 unit tests).
+
+**Write protocol** *(`snapshot_io.save`; the steps are public so the crash
+test runs the same ones)*, as spike S5 measured it:
+1. open `snapshot.json.tmp` for writing (create or truncate),
+2. one write of the whole line,
+3. `file_sync` that handle,
+4. `fs_rename` the tmp over `snapshot.json`,
+5. sync the directory.
+
+A kill before 4 leaves `snapshot.json` as it was (absent, or the previous
+snapshot) and a `.tmp` that no recovery reads and the next save truncates; a
+kill after 4 leaves the new one. `save` checks both paths before opening
+anything (a test found that the first version opened the tmp before noticing a
+bad final path; corrected) and refuses an empty snapshot (-3), which is what
+`snapshot.encode` answers to arguments that describe no prefix of the journal.
+
+**Recovery** *(`snapshot.recover_with`, `snapshot_io.recover`)*:
+* no snapshot, or an empty file: a full replay; not a refusal.
+* a snapshot that checks out: its projection, then only the journal *after*
+  `journal_bytes` is replayed (`journal.replay_from`). **The property**, tested
+  for a snapshot after every prefix 0..10 of a ten-record journal, with and
+  without a torn tail, in both modes, and again at 25 crash points on real
+  files: *snapshot + tail equals the full replay*, the projection and the whole
+  report (`records`, `valid_bytes`, `torn_bytes`, `tasks`, `rule`, `line`).
+* a snapshot that is refused: not used, left on disk untouched for the
+  operator, the journal untouched, and the projection is a **full replay**.
+  The journal decides; a bad cache costs time, never correctness.
+
+Two refusals, new tags (section 7):
+* `snapshot-invalid`: not one JSON line this build reads (no newline, torn,
+  not an object, wrong or missing field, unknown `v`, a state no state has, a
+  task id outside the closed set, a duplicate task id, trailing text).
+* `snapshot-mismatch`: well formed but it disagrees with the journal: it
+  covers more than the journal holds, `journal_bytes` is not a record
+  boundary, the prefix holds a different number of records than `last_seq`, the
+  prefix hashes differently, a snapshot of zero records that lists tasks, or,
+  **in strict mode**, replaying the prefix does not give its `tasks`.
+
+**What the cheap mode cannot see, stated as a test**
+(`test_cheap_mode_does_not_catch_that_and_the_docs_say_so`): a snapshot written
+from a wrong table under the right hash passes the cheap checks, and only
+`strict` (which replays the covered prefix too, so it saves no replay time)
+refuses it. Forge uses `strict` until a measurement shows replay is too slow;
+**no such measurement exists**, the journals are tiny. Until then the snapshot
+buys the protocol and the invariants, not speed. Not built: segments and
+rotation (one `journal.jsonl`), a snapshot cadence, deleting old snapshots.
+
+### 4.7 The single-writer lock *(built in M1)*
+
+`src/lock.cho`: `acquire(fs, path)` opens `<workspace>/lock` (created if
+missing, never written) and takes `file_lock` (`flock(LOCK_EX|LOCK_NB)`) on
+that handle; the handle is held for the life of the process. Answers
+`Held(file)`, `Refused(rule)` or `Failed(errno)`:
+* another holder, `EWOULDBLOCK` (11 on Linux, 35 on macOS): `workspace-locked`;
+* a path with `..`, relative or with a NUL: `path-invalid`, nothing opened;
+* anything else (a missing directory: ENOENT): `Failed(errno)`, which is an I/O
+  error and not a refusal by Forge.
+
+The lock is a **separate file** from the journal, so reading or recovering the
+journal never touches it, and the kernel drops it when the holder dies, however
+it dies: no stale lock, no human. That last claim is *measured*, not read: the
+crash test kills the holder at 24 points (every one after it took the lock) and
+the parent takes the lock at once each time. While the holder lives, at the same
+24 points, a second writer in another process is refused with `workspace-locked`.
+Advisory only: a process that does not call `flock` is not stopped (honest
+mistakes, not hostility). Not measured: macOS (the 35 is documented, not run).
+
+### 4.8 Crash points *(built in M1; measured: `tests/conformance/crash_points.cho`)*
+
+This replaces the earlier simulation (append half a record and call recovery),
+which tested the recovery function and never a crash. The test is
+`crash_writer.cho` (a child) and `crash_points.cho` (the parent).
+
+The child is a Forge writer that does its writes **one protocol step at a time**
+and, after each, prints where it is, flushes (stdout is a stdio buffer: without
+`flush_out` the lines appear only at exit, which strace showed) and stops until
+killed. The steps are the product's own (`journal_io.open_appender`,
+`write_all`, `sync_file`, `sync_parent`; `snapshot_io.open_tmp`, `publish`),
+which `append` and `save` are made of, so the sequence that is killed is the
+sequence Forge runs. The parent starts it under `exec_spawn_detached` (the child
+leads a group), waits for the line for crash point k, takes the lock to check it
+is refused, kills with `child_kill_group(KILL)`, `child_wait`s (it must report
+the KILL signal), and then plays the restart: lock, recovery, snapshot, one more
+record, one more snapshot, checking the **files**, never the child's claims.
+
+The **25 crash points** (k = 0..24):
+
+| k | after |
+|---|---|
+| 0, 1 | start (nothing done), lock taken |
+| 2-5 | record 1 (a new file): half written, written, synced, directory synced |
+| 6-8, 9-11 | records 2 and 3: half, written, synced |
+| 12-16 | snapshot at 3: tmp half written, tmp written, tmp synced, renamed, directory synced |
+| 17-19 | record 4: half, written, synced |
+| 20-24 | snapshot at 4 (replacing the first): the same five |
+
+and k = 25 is the writer finishing by itself (exit 0), verified too. After each
+kill, 15 to 18 named checks (15 before the first snapshot is published, 18 after): the lock is free; journal recovery succeeds with no
+refusal, finds exactly the whole records the child had written, cuts a torn
+tail iff the child was inside a record, leaves the file exactly its valid bytes,
+and a second recovery cuts nothing; the projection has the states those records
+imply (a table written by hand in the test); the snapshot is present iff one was
+published, whole, used, and `snapshot + tail` equals the full replay in both
+modes; the journal continues (the next record appends and replays) and a new
+snapshot over the leftover tmp is saved, renamed and used. **Measured: 25 crash
+points exercised, 420 checks, 0 failed, 0.9 s.**
+
+What this does **not** test, plainly:
+* **Power loss.** A killed process leaves its page cache, so bytes written and
+  not synced are still in the file. Whether `fsync` reached the platter is not
+  observable here (`docs/file-writes.md` section 6). The kill proves ordering
+  and atomicity against a crash of the *process*: a record is whole or a torn
+  tail, a snapshot is whole or absent or the previous one, a lock does not
+  outlive its holder. Consequently a `file_sync` that did nothing is a mutant
+  the kill test could not kill, and none is claimed killed (the attempt to build
+  it was refused anyway: row exactness says a `sync_file` that no longer
+  performs `file_write` does not compile).
+* **A torn record by the kernel.** The product writes a record with one
+  `write`, which a process kill cannot split. The child therefore *splits it in
+  two* (the half-write points) to put a kill inside a record, as a short write
+  would. That fault injection is the child's, not the product's.
+* **Mutants killed** (each built, run to a red test, reverted): recovery never
+  cutting a torn tail (21 FAIL lines); `publish` renaming to the wrong name (63);
+  a failed `file_lock` ignored (24, the lock-refused check at every point);
+  snapshot `last_seq` off by one (74); tail replay from offset 0 (33);
+  `open_tmp` appending instead of truncating (13). And in the unit tests, the
+  snapshot checks one by one (hash, boundary, record count, duplicate ids, id
+  closure, strict compare, replay offset, replay record base).
+* The child binary is built into the literal `/tmp/forge-crash-bin`, because
+  `narrow` takes only literals (cancho #534); two gates run at once on one
+  machine would collide there.
+
+### 4.9 The operator CLI *(built in M1)*
+
+`forge status <dir>` and `forge history <dir> [task-id]` (`src/main.cho`,
+`src/report.cho`), read-only. `<dir>` is an absolute path holding
+`journal.jsonl` and, if there is one, `snapshot.json`. Looking changes nothing:
+no torn tail is cut, no snapshot written, the lock not taken (a writer may be
+running, and a record it is in the middle of writing shows as `torn tail
+bytes`). Recovery for `status` is strict (section 4.6). Output, from the
+finished crash-writer session in the gate:
+
+```
+records: 4
+bytes: 272
+torn tail bytes: 0
+tasks: 2
+  approved: 2
+snapshot: used, covers 4 records
+```
+
+`history` prints `#<seq> kind=... task=... actor=... basis=... rule=...`, the
+fields each record has, for every valid record (refusals included), or for one
+task. Exit status: 0 clean; 1 the journal is refused (the output ends with
+`journal: refused (<rule>) at line N`, after the valid records); 2 usage or a
+directory that is not absolute or has `..`; 3 no `journal.jsonl` there, or an
+I/O error. Measured by 8 unit tests of the text (`tests/report_test.cho`) and 13
+cases run on the built binary by the gate (exact text, every exit code, and that
+the journal is byte-identical after looking at a corrupt one).
+
+**Authority**, checked into `docs/authority.txt` and compared by the gate:
+
+```
+performs
+    args
+    err_write
+    file_read
+    fs_read("")
+    heap
+    io_write
+never touches
+    the network
+    signals
+    other programs
+    foreign code
+```
+
+This is the first widening of the `forge` binary beyond `heap` and `io_write`
+(M0's `main` released everything): it can **read** any file, because a library
+cannot be generic in the `Fs` prefix (G9, cancho #534) and the file layer holds
+`Fs("")`. It performs no `fs_write` and no `exec`; the crash tests, which write,
+are separate programs that are not shipped.
 
 ## 5. Authority model
 
@@ -451,6 +652,9 @@ ones by `tests/conformance/journal_files.cho`):
 | `event-malformed` | a task event with no or non-string `task` / `actor`, an `actor` that is not forge / worker / human, a `basis` that is not a string, or a task id outside the closed set | `test_malformed_task_events_are_refused`, `test_submit_with_a_bad_id_is_recorded_against_no_task` |
 | `event-unknown` | a kind that is neither a `task.*` kind nor in a namespace M1 records (`refusal`, `execution.`, `approval.`, `budget.`, `policy.`, `company.`) | `test_unknown_kinds_are_refused` |
 | `journal-corrupt` | a complete journal line that is not the next record: not JSON, not an object, unknown `v`, `seq` not exactly next (gap, duplicate, not starting at 1), wrong types | `test_garbage_in_the_middle_...`, `test_a_duplicated_run_of_seqs_...`, `test_a_gap_in_seq_is_corrupt`, `test_lines_that_are_not_records_are_corrupt`, conformance `duplicate:` and `garbage + torn:` |
+| `snapshot-invalid` | a snapshot file that is not one JSON line this build reads (section 4.6); the journal is used instead | `test_unreadable_snapshots_are_snapshot_invalid`, `test_a_snapshot_without_its_newline_or_empty_of_content_is_snapshot_invalid`, conformance `refused: a half snapshot`, `refused: garbage` |
+| `snapshot-mismatch` | a well-formed snapshot that disagrees with the journal (beyond it, off a boundary, wrong count, wrong hash, a lying projection under strict); the journal is used instead | `test_a_snapshot_with_the_wrong_hash_is_a_mismatch`, `..._of_another_history_...`, `..._beyond_the_journal_...`, `..._off_a_record_boundary_...`, `..._of_no_records_with_tasks_...`, `test_strict_mode_catches_...`, conformance `refused: a snapshot beyond the journal` |
+| `workspace-locked` | another Forge holds the workspace lock (section 4.7) | conformance `lock: a second writer is refused`, and `crash_points` at 24 points across processes |
 | `path-invalid` | a journal path that is not absolute, has a `..` component, a NUL, or is longer than 512 bytes: refused before the file capability (which traps on `..`) is reached | conformance `path:`, `recover: a .. path`, `append: a .. path` |
 
 Designed, not implemented (no test reaches them yet; they are not claims):
@@ -466,7 +670,6 @@ Designed, not implemented (no test reaches them yet; they are not claims):
 | `worker-timeout`, `worker-output-overflow`, `worker-crashed`, `worker-error`, `worker-unavailable` | observed ending of a worker process (section 5 of the worker contract; the Cancho Code binding adds how an exit code is read, section 9.4) |
 | `evidence-ref-invalid` | a path outside the execution directory, or a hash that does not match |
 | `journal-sync-failed` | `fsync` failed; contents unknown; Forge stops (the file layer returns the errno today; the stop is M2) |
-| `workspace-locked` | another Forge holds the lock |
 
 The contract and the roadmap may add rules; none ships without its row
 here and a test.

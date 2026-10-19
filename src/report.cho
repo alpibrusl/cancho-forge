@@ -1,0 +1,148 @@
+edition 9;
+module forge.report;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.map;
+import forge.journal;
+import forge.snapshot;
+import forge.task;
+
+// What the operator CLI prints (src/main.cho): `forge status` and
+// `forge history`, built from journal bytes alone. Pure: the rows are `[heap]`,
+// so nothing here can touch a file; main reads the files and hands bytes in.
+//
+// Both answer the text and a rule code: 0 when the journal replayed cleanly,
+// else the `task.rule_code` of the refusal that ended the replay, and the text
+// then says so on its last line (what was valid before it is still shown, and
+// nothing is ever cut or repaired by looking).
+
+fn number_line[&h, &l](heap: &!h Heap, out: buffer.Buffer, label: &l [byte], n: int) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, out, label);
+    b = buffer.push_nat(heap, b, n);
+    return buffer.push(heap, b, byte_of(10));
+}
+
+// `forge status`: records, bytes, torn tail, tasks by state, and what became
+// of the snapshot (`snap` is its file's bytes, empty when there is none).
+// Recovery is strict (docs/architecture.md section 4.6).
+pub fn status[&h, &d, &s](heap: &!h Heap, data: &d [byte], snap: &s [byte]) -> [heap] (buffer.Buffer, int) {
+    let (table, report, outcome) = snapshot.recover_with(heap, snap, data, true);
+    var out = buffer.empty(heap, 256);
+    out = number_line(heap, out, "records: ", report.records);
+    out = number_line(heap, out, "bytes: ", report.total_bytes);
+    out = number_line(heap, out, "torn tail bytes: ", report.torn_bytes);
+    out = number_line(heap, out, "tasks: ", report.tasks);
+    var code = 1;
+    while code <= 9 {
+        var n = 0;
+        borrow table as &tb in {
+            var e = 0;
+            while e < map.entries(tb) {
+                if map.is_live(tb, e) && map.value_at(tb, e) == code {
+                    n = n + 1;
+                }
+                e = e + 1;
+            }
+        }
+        if n > 0 {
+            out = buffer.append(heap, out, "  ");
+            out = buffer.append(heap, out, task.code_name(code));
+            out = buffer.append(heap, out, ": ");
+            out = buffer.push_nat(heap, out, n);
+            out = buffer.push(heap, out, byte_of(10));
+        }
+        code = code + 1;
+    }
+    map.drop(heap, table);
+    if len(snap) == 0 {
+        out = buffer.append(heap, out, "snapshot: none\n");
+    } else if outcome.used {
+        out = buffer.append(heap, out, "snapshot: used, covers ");
+        out = buffer.push_nat(heap, out, outcome.last_seq);
+        out = buffer.append(heap, out, " records\n");
+    } else {
+        out = buffer.append(heap, out, "snapshot: refused (");
+        out = buffer.append(heap, out, task.rule_code_name(outcome.rule));
+        out = buffer.append(heap, out, "), the journal alone was replayed\n");
+    }
+    if report.rule != 0 {
+        out = buffer.append(heap, out, "journal: refused (");
+        out = buffer.append(heap, out, task.rule_code_name(report.rule));
+        out = buffer.append(heap, out, ") at line ");
+        out = buffer.push_nat(heap, out, report.line);
+        out = buffer.push(heap, out, byte_of(10));
+    }
+    return (out, report.rule);
+}
+
+// One field of a record as ` name=value`, when the record has it as a string.
+fn field[&h, &l, &t, &n](heap: &!h Heap, out: buffer.Buffer, line: &l [byte], tape: &t [int], name: &n [byte]) -> [heap] buffer.Buffer {
+    let node = json.get(line, tape, 0, name);
+    if node < 0 || json.is_string(tape, node) == false {
+        return out;
+    }
+    var b = buffer.push(heap, out, byte_of(32));
+    b = buffer.append(heap, b, name);
+    b = buffer.push(heap, b, byte_of(61));
+    return buffer.append(heap, b, json.string_view(line, tape, node));
+}
+
+// Append the history line of one validated record. A record that does not
+// match `only` (a task id; empty means every record) is skipped.
+fn describe[&h, &l, &o](heap: &!h Heap, out: buffer.Buffer, line: &l [byte], only: &o [byte]) -> [heap] buffer.Buffer {
+    var b = out;
+    let tape = box_slice(heap, json.tape_len(line), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(line, tp) > 0 && json.is_object(tp, 0) {
+            let seqn = json.get(line, tp, 0, "seq");
+            let taskn = json.get(line, tp, 0, "task");
+            var wanted = len(only) == 0;
+            if wanted == false && taskn >= 0 && json.is_string(tp, taskn) {
+                wanted = bytes.equal(json.string_view(line, tp, taskn), only);
+            }
+            if wanted {
+                b = buffer.push(heap, b, byte_of(35));
+                b = buffer.push_nat(heap, b, json.to_int(line, tp, seqn));
+                b = field(heap, b, line, tp, "kind");
+                b = field(heap, b, line, tp, "task");
+                b = field(heap, b, line, tp, "actor");
+                b = field(heap, b, line, tp, "basis");
+                b = field(heap, b, line, tp, "rule");
+                b = buffer.push(heap, b, byte_of(10));
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return b;
+}
+
+// `forge history`: every valid record of the journal, in order, one line each
+// (`#<seq> kind=... task=... actor=... basis=... rule=...`, the fields the
+// record has), or only those of task `only` (empty: all). Refusals are
+// records like the rest. If the replay was refused, the records before the
+// bad line are shown and the last line names the rule and the line.
+pub fn history[&h, &d, &o](heap: &!h Heap, data: &d [byte], only: &o [byte]) -> [heap] (buffer.Buffer, int) {
+    let (table, report) = journal.replay(heap, data);
+    map.drop(heap, table);
+    var out = buffer.empty(heap, 256);
+    var start = 0;
+    var k = 0;
+    while k < report.valid_bytes {
+        if int_of(data[k]) == 10 {
+            out = describe(heap, out, data[start..k], only);
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    if report.rule != 0 {
+        out = buffer.append(heap, out, "journal: refused (");
+        out = buffer.append(heap, out, task.rule_code_name(report.rule));
+        out = buffer.append(heap, out, ") at line ");
+        out = buffer.push_nat(heap, out, report.line);
+        out = buffer.push(heap, out, byte_of(10));
+    }
+    return (out, report.rule);
+}

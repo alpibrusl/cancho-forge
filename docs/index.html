@@ -158,10 +158,11 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
     <div class="num"><b>1000 B</b><span>output bound: a runaway <code>yes</code> stopped at exactly the limit</span></div>
     <div class="num"><b>165 → 140</b><span>bytes: a torn journal tail is cut, and a second recovery changes nothing</span></div>
     <div class="num"><b>5 / 5</b><span>worker endings classified: normal, failed, garbage, exit 3, hang</span></div>
-    <div class="num"><b>56 / 56</b><span>tests pass under <code>cancho test</code> (journal record, task state machine, journal replay), and 24 / 24 file cases of the conformance program</span></div>
+    <div class="num"><b>82 / 82</b><span>tests pass under <code>cancho test</code> (journal record, task state machine, journal replay, snapshots, the CLI&#39;s text), and 62 / 62 file cases of the two conformance programs</span></div>
+    <div class="num"><b>25</b><span>crash points: a writer killed with <code>child_kill_group</code> after each step of append, sync, snapshot and rename, then recovered; 420 checks, 0 failed</span></div>
     <div class="num"><b>0</b><span>files the dispatcher can read or write</span></div>
   </div>
-  <p class="fine">Linux x86_64 only, one compiler revision (pinned in <code>cancho.toml</code>), a mock worker. The 56 tests and 24 file cases are Milestone 1's core, added after the spikes. Not measured: macOS, a real Cancho Code run with a model (its interface was audited against a stand-in agent, <a href="https://github.com/alpibrusl/cancho-forge/blob/main/docs/cancho-code-audit.md">docs/cancho-code-audit.md</a>), several workers at once, power loss. Commands and verbatim output: <a href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">spike/RESULTS.md</a>.</p>
+  <p class="fine">Linux x86_64 only, one compiler revision (pinned in <code>cancho.toml</code>), a mock worker. The 82 tests, 62 file cases and 25 crash points are Milestone 1's core, added after the spikes (a process kill leaves the page cache, so none of them tests power loss). Not measured: macOS, a real Cancho Code run with a model (its interface was audited against a stand-in agent, <a href="https://github.com/alpibrusl/cancho-forge/blob/main/docs/cancho-code-audit.md">docs/cancho-code-audit.md</a>), several workers at once, power loss. Commands and verbatim output: <a href="https://github.com/alpibrusl/cancho-forge/blob/main/spike/RESULTS.md">spike/RESULTS.md</a>.</p>
 </div></section>
 
 <section class="alt" id="gaps"><div class="wrap">
@@ -169,7 +170,7 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
   <p class="lead">Written down before any of it is built around.</p>
   <div class="cards">
     <div class="card"><h3>Grants fixed at build time</h3><p><code>narrow</code> takes literals, so a per-task bound cannot be chosen at run time.</p></div>
-    <div class="card"><h3>A kill reaches one pid</h3><p>A worker's own subprocesses survive it. A process-group kill works, but widens the <code>Exec</code> bound.</p></div>
+    <div class="card"><h3>Grants fixed at build time, bounds that trap</h3><p>Filed upstream as cancho #534 and #535, both open. A worker's subprocesses used to survive a kill; cancho #533 (<code>child_kill_group</code>) fixed that and the spike now passes with no <code>/bin/kill</code> in the <code>Exec</code> bound.</p></div>
     <div class="card"><h3>Contract is provisional</h3><p>The real Cancho Code interface has not been audited yet, so <code>forge-worker/1</code> will change in M2.</p></div>
   </div>
 </div></section>
@@ -195,7 +196,7 @@ footer { border-top: 1px solid var(--line); padding: 1.5rem 0 2rem; color: var(-
 4. Prove the install works. This needs no network, no key and no model. Start from the parent directory:
    cd cancho-forge
    sh scripts/gate.sh        # must end with: gate: PASS
-   The gate runs `cancho fmt --check`, `cancho check`, `cancho test`, a 24-case file conformance program and a 2,000-line file budget.
+   The gate runs `cancho fmt --check`, `cancho check`, `cancho test`, two file conformance programs, a kill-at-every-crash-point program, the `forge` CLI cases, the authority report and a 2,000-line file budget.
 
 5. Run the Milestone 0 spikes. They start real child processes and write under /tmp/cancho-forge-spike (about 15 seconds):
    sh spike/run.sh

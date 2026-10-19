@@ -48,7 +48,8 @@ The file-budget check moves from `scripts/gate.sh` into a `cancho test`
 that walks the tree (`std.dirs`), so the gate is cancho-only.
 
 *Exit:* state survives a kill at every instrumented crash point (before
-write, after write before sync, after sync, mid-record, mid-snapshot);
+write, after write before sync, after sync, mid-record, mid-snapshot; **met for
+a process kill, 25 points, architecture 4.8**);
 invalid transitions are refused with `transition-invalid`; every transition
 is a queryable event; duplicate and torn-record tests pass.
 
@@ -57,22 +58,35 @@ is a queryable event; duplicate and torn-record tests pass.
 layer holds `Fs("")` and guards paths itself).
 
 **Status of M1 (what exists, honestly).** Built and in the gate:
-`src/task.cho` (the state machine, 18 edges, the decision order, nine rule
-tags), `src/journal.cho` (replay, torn-tail planning, refuse-on-corrupt,
-`submit`, the write path that records refusals), `src/journal_io.cho` (read,
-append with sync, recover), `src/event.cho` extended (`transition`,
-`refusal`); 56 tests under `cancho test` and 24 file cases in
-`tests/conformance/journal_files.cho`. **Not built:** the `schemas/`, objective
-/ execution / artifact / decision records, projections beyond task state,
-snapshots with `last_seq`, segments and rotation, the lock in the runtime
-(spike S5 measured the primitive), the operator CLI, the checked-in authority
-report for `forge`, the file-budget check as a `cancho test`, and the exit
-test "state survives a kill at every instrumented crash point" (the
-conformance program simulates a torn write by appending half a record; it does
-not kill a process). Note the exit criterion names `transition-invalid`; it
-now has company: `accept-unverified`, `actor-not-allowed`, `task-unknown`,
+`src/task.cho` (the state machine, 18 edges, the decision order, twelve rule
+tags), `src/journal.cho` (replay, replay from an offset, torn-tail planning,
+refuse-on-corrupt, `submit`, the write path that records refusals),
+`src/journal_io.cho` (read, append with sync and the steps it is made of,
+recover), `src/snapshot.cho` and `src/snapshot_io.cho` (a snapshot with the
+journal's prefix hash, written tmp / sync / rename / sync-dir, recovered as
+snapshot + tail, refused when invalid or when it disagrees), `src/lock.cho`
+(the single-writer lock, `workspace-locked`), `src/report.cho` and
+`src/main.cho` (the read-only operator CLI: `forge status <dir>`, `forge
+history <dir> [task]`), `src/event.cho` extended (`transition`, `refusal`).
+Measured: **82 tests** under `cancho test` (9 event, 22 task, 25 journal, 18
+snapshot, 8 report), **62 file cases** in two conformance programs, **25 crash
+points** (a child writer killed with `child_kill_group` after each step of
+append, sync, snapshot and rename, then recovered, 420 checks, 0 failed), 13 CLI
+cases and the checked-in authority report (`docs/authority.txt`) in the gate.
+The exit test "state survives a kill at every instrumented crash point" is
+therefore **met for a crash of the process**; it is *not* met for power loss,
+which a process kill cannot simulate (a killed process leaves its page cache;
+architecture section 4.8). **Not built:** the `schemas/`, objective /
+execution / artifact / decision records, projections beyond task state,
+segments and rotation, a snapshot cadence, the file-budget check as a `cancho
+test`, and the rule `journal-sync-failed` (the file layer returns the errno;
+the stop is M2). `forge` is read-only: it takes no lock and cuts nothing, and
+its authority is `fs_read("")` with no write, process or network
+(architecture section 4.9). Note the exit criterion names `transition-invalid`;
+it now has company: `accept-unverified`, `actor-not-allowed`, `task-unknown`,
 `task-duplicate`, `event-malformed`, `event-unknown`, `journal-corrupt`,
-`path-invalid` (architecture section 7).
+`path-invalid`, `snapshot-invalid`, `snapshot-mismatch`, `workspace-locked`
+(architecture section 7).
 
 ## M2 -- Worker contract and Cancho Code adapter
 

@@ -9,7 +9,7 @@ import forge.journal_io;
 import forge.snapshot;
 import forge.task;
 
-// The snapshot's file layer (docs/architecture.md, section 4.4). A snapshot
+// The snapshot's file layer (docs/architecture.md, section 4.6). A snapshot
 // is replaced atomically and never edited in place; the protocol is the one
 // spike S5 measured:
 //

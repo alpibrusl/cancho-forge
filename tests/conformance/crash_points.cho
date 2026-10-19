@@ -13,7 +13,7 @@ import forge.snapshot_io;
 import forge.support;
 import forge.task;
 
-// Kill-at-every-crash-point conformance (docs/architecture.md, section 4.5).
+// Kill-at-every-crash-point conformance (docs/architecture.md, section 4.8).
 //
 // For each crash point k = 0, 1, 2 ... this program starts
 // tests/conformance/crash_writer.cho as a child (detached, so it leads a

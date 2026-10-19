@@ -9,7 +9,7 @@ import std.map;
 import forge.journal;
 import forge.task;
 
-// The snapshot's pure core (docs/architecture.md, section 4.4): encode the
+// The snapshot's pure core (docs/architecture.md, section 4.6): encode the
 // projection of a replayed journal as one JSON line, and recover from it
 // without replaying the whole journal. A snapshot is a CACHE, never
 // authoritative: whatever it says, the journal decides. It rides in a file

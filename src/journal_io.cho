@@ -62,6 +62,24 @@ fn parent_of[&p](path: &p [byte]) -> [] &p [byte] {
     return path[0..k - 1];
 }
 
+// Does a file (or directory) exist at `path`? A name that cannot be opened for
+// any reason but "not found" counts as existing. A path that is not ok does
+// not exist.
+pub fn exists[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] bool {
+    if path_ok(path) == false {
+        return false;
+    }
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            return e != 2;
+        }
+        Opened::Ok(opened) => {
+            file_close(opened);
+            return true;
+        }
+    }
+}
+
 // What reading the journal produced: its bytes, and 0 or an errno. A file
 // that does not exist is an empty journal (errno 2 is not an error here).
 pub fn read_all[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {

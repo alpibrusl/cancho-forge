@@ -16,8 +16,10 @@ says so.
 Every `.cho` file in the repository passes `cancho fmt --check` and
 `cancho check <file> --std` (the gate prints `gate: PASS`); `cancho test`
 runs the 6 tests of `tests/event_test.cho` and they pass. (Corrected after
-M1: `cancho test` now runs 56 tests in three sets and the gate also runs a
-24-case file conformance program; see "M1 findings".)
+M1: `cancho test` now runs 82 tests in five sets; the gate also runs two file
+conformance programs (62 cases), a kill-at-every-crash-point program (25 crash
+points, 420 checks), 13 CLI cases and the authority-report check; see "M1
+findings".)
 
 ## Summary
 
@@ -382,6 +384,44 @@ performed"), so a mutation of that kind has to keep the row honest.
 
 **Names.** `join` is a builtin and cannot be redefined (`under` is used
 instead).
+
+### M1, second part: snapshots, the lock, kills, the CLI
+
+Counts at the commit that added them: `cancho test` 82 (9 event, 22 task, 25
+journal, 18 snapshot, 8 report); conformance 62 cases (24 journal, 38 snapshot
+and lock); 25 crash points, 420 checks, 0 failed, 0.9 s; 13 CLI cases. What
+building them found:
+
+* **Stdout is a stdio buffer, and a child's markers do not reach its parent
+  until it exits.** The first kill-at-a-point harness hung for the 15 s
+  deadline at every point and printed nothing; `strace -f` showed the child
+  writing all its lines in one `write(1, ..., 1133)` at exit. `flush_out`
+  (edition 5, cancho `docs/checked-output.md`, a builtin) after each marker
+  fixed it. Anything that uses a child's stdout as a progress channel needs it.
+* **A test found a real bug in `snapshot_io.save`**: with a good tmp path and a
+  `..` final path it opened and wrote the tmp, then refused at the rename,
+  leaving a stray file. Both paths are now checked first; the case that found
+  it (`save: a .. path on either side is refused (-2) before anything is
+  opened`) stays.
+* **`sync` on a second handle is not the same promise.** The first plan was to
+  split `append` into write, sync and dir-sync steps that each open the file
+  (so the crash test could pause between them). Dropped: on Linux a writeback
+  error is reported to descriptors opened before it, so an `fsync` on a handle
+  opened after the write may miss it. The steps take the one open handle
+  instead (`write_all`, `sync_file`).
+* **Row exactness again.** A mutant that makes `sync_file` a no-op does not
+  build ("declared but not performed"), and a process kill could not see it
+  anyway (the page cache survives). The mutants that did run, and what killed
+  them, are in `docs/architecture.md` section 4.8.
+* **`narrow` takes a literal (G1, cancho #534), and it showed up in the test
+  harness**: the parent can only start a child from a literal directory, so
+  the gate builds `crash_writer` into `/tmp/forge-crash-bin`.
+* **Process kill is not power loss.** Stated in the architecture and in the
+  README: the 25 points prove ordering and atomicity against a crash of the
+  process; nothing here shows an `fsync` reached the platter.
+* **The `forge` binary's authority widened**, from `heap`/`io_write` to
+  `fs_read("")` and `file_read` (no write, no exec, no network); checked in as
+  `docs/authority.txt` and compared by the gate.
 
 ## Gaps
 

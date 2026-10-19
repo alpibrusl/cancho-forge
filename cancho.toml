@@ -26,3 +26,8 @@ std = true
 name = "snapshot"
 sources = ["tests/snapshot_test.cho", "src/snapshot.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
 std = true
+
+[[test]]
+name = "report"
+sources = ["tests/report_test.cho", "src/report.cho", "src/snapshot.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true

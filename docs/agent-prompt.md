@@ -14,7 +14,7 @@ Install cancho-forge and check it on this machine. Work in a new empty directory
 4. Prove the install works. This needs no network, no key and no model. Start from the parent directory:
    cd cancho-forge
    sh scripts/gate.sh        # must end with: gate: PASS
-   The gate runs `cancho fmt --check`, `cancho check`, `cancho test`, a 24-case file conformance program and a 2,000-line file budget.
+   The gate runs `cancho fmt --check`, `cancho check`, `cancho test`, two file conformance programs, a kill-at-every-crash-point program, the `forge` CLI cases, the authority report and a 2,000-line file budget.
 
 5. Run the Milestone 0 spikes. They start real child processes and write under /tmp/cancho-forge-spike (about 15 seconds):
    sh spike/run.sh
