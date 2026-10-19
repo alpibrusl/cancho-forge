@@ -1,0 +1,298 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.map;
+import forge.journal;
+import forge.journal_io;
+import forge.lock;
+import forge.snapshot;
+import forge.snapshot_io;
+import forge.support;
+import forge.task;
+
+// The child of tests/conformance/crash_points.cho: a Forge writer that does
+// its writes one protocol step at a time and, after each step, says where it
+// is and (when asked to) stops there until it is killed.
+//
+//   crash_writer <stem> <stop>
+//
+// <stem> is a path prefix: the files are <stem>.journal.jsonl,
+// <stem>.snapshot.json, <stem>.snapshot.json.tmp and <stem>.lock. <stop> is the
+// crash point (0, 1, 2 ...) to stop at; a number past the last one lets the
+// writer run to the end, print `done` and exit 0.
+//
+// After each step it prints one line on stdout, in one write:
+//
+//   at <k> <label> records=<n> torn=<0|1> snap=<seq>
+//
+//   records  whole records the writer has written to the journal file
+//   torn     1 while the record being written is only half there
+//   snap     last_seq of the snapshot.json the writer has published (0: none)
+//
+// These are the writer's CLAIMS about the files, made after the step they
+// describe; the parent never takes them for the truth, it checks them against
+// the files (which is why a process kill, not the writer's word, is the
+// subject of the test). Each step is the product's own: `journal_io`'s
+// open_appender / write_all / sync_file / sync_parent and `snapshot_io`'s
+// open_tmp / publish, which `append` and `save` are made of. The one thing
+// that is NOT the product's is the half-write: the product writes a record
+// with a single write (a process kill cannot split one), so the writer
+// splits it in two to put a kill inside a record, as a kernel that wrote a
+// short count would. That is stated plainly in docs/architecture.md 4.8.
+//
+// The sequence (25 points, k = 0 to 24):
+//   0 start   1 locked
+//   record 1: 2 half  3 written  4 synced  5 dir-synced
+//   record 2: 6 half  7 written  8 synced
+//   record 3: 9 half 10 written 11 synced
+//   snapshot at 3: 12 half 13 written 14 synced 15 renamed 16 dir-synced
+//   record 4: 17 half 18 written 19 synced
+//   snapshot at 4 (replaces): 20 half 21 written 22 synced 23 renamed 24 dir-synced
+
+struct Ctx {
+    stop: int,
+    k: int,
+    records: int,
+    torn: int,
+    snap: int,
+}
+
+// Stay here until killed (at most 100 s, so an orphan cannot last).
+fn block[&h](heap: &!h Heap) -> [heap, poll] int {
+    match poller_new() {
+        Polling::Failed(e) => {
+            return e;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            let events = box_slice(heap, 16, 0);
+            var rounds = 0;
+            borrow mut poller as &!ph in {
+                borrow mut events as &!eb in {
+                    while rounds < 10 {
+                        poller_wait(ph, contents(eb), 10000);
+                        rounds = rounds + 1;
+                    }
+                }
+            }
+            unbox_slice(heap, events);
+            poller_close(poller);
+            return 0;
+        }
+    }
+}
+
+fn point[&h, &i, &l](heap: &!h Heap, io: &!i Io, ctx: Ctx, label: &l [byte]) -> [heap, io_write, poll] Ctx {
+    var line = buffer.append(heap, buffer.empty(heap, 96), "at ");
+    line = buffer.push_nat(heap, line, ctx.k);
+    line = buffer.append(heap, line, " ");
+    line = buffer.append(heap, line, label);
+    line = buffer.append(heap, line, " records=");
+    line = buffer.push_nat(heap, line, ctx.records);
+    line = buffer.append(heap, line, " torn=");
+    line = buffer.push_nat(heap, line, ctx.torn);
+    line = buffer.append(heap, line, " snap=");
+    line = buffer.push_nat(heap, line, ctx.snap);
+    line = buffer.push(heap, line, byte_of(10));
+    borrow line as &lb in {
+        io.write_all(io, buffer.bytes(lb));
+    }
+    buffer.drop(heap, line);
+    // stdout is a stdio buffer: without this the line stays in the writer's
+    // memory until exit and the parent never sees the point (measured:
+    // strace shows one write of every line at exit).
+    flush_out(io);
+    if ctx.k == ctx.stop {
+        block(heap);
+    }
+    return Ctx { stop: ctx.stop, k: ctx.k + 1, records: ctx.records, torn: ctx.torn, snap: ctx.snap };
+}
+
+// Append record `r` (the bytes `record`) in steps. `first`: the file is new,
+// so its directory is synced too. A failure of any step is `bad` = 1.
+fn append_steps[&h, &f, &i, &p, &b](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, path: &p [byte], record: &b [byte], first: bool, ctx: Ctx) -> [heap, fs_read(""), fs_write(""), file_write, io_write, poll] Ctx {
+    var c = ctx;
+    let half = len(record) / 2;
+    match journal_io.open_appender(fs, path) {
+        Opened::Failed(e) => {
+            io.write_all(io, "error open_appender\n");
+            return Ctx { stop: 0 - 1, k: c.k, records: c.records, torn: c.torn, snap: c.snap };
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                journal_io.write_all(x, record[0..half]);
+                c = Ctx { stop: c.stop, k: c.k, records: c.records, torn: 1, snap: c.snap };
+                c = point(heap, io, c, "record-half");
+                journal_io.write_all(x, record[half..len(record)]);
+                c = Ctx { stop: c.stop, k: c.k, records: c.records + 1, torn: 0, snap: c.snap };
+                c = point(heap, io, c, "record-written");
+                journal_io.sync_file(x);
+                c = point(heap, io, c, "record-synced");
+            }
+            file_close(file);
+        }
+    }
+    if first {
+        journal_io.sync_parent(fs, path);
+        c = point(heap, io, c, "journal-dir-synced");
+    }
+    return c;
+}
+
+// Snapshot of the journal at `path` (which holds exactly `records` whole
+// records): the five steps of snapshot_io.save, a point after each.
+fn snapshot_steps[&h, &f, &i, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], spath: &s [byte], tpath: &t [byte], ctx: Ctx) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write, poll] Ctx {
+    var c = ctx;
+    let (data, errno) = journal_io.read_all(heap, fs, jpath);
+    borrow data as &db in {
+        let bytes = buffer.bytes(db);
+        let (table, report) = journal.replay(heap, bytes);
+        borrow table as &tb in {
+            let snap = snapshot.encode(heap, tb, report.records, report.valid_bytes, bytes);
+            borrow snap as &sb in {
+                let text = buffer.bytes(sb);
+                let half = len(text) / 2;
+                match snapshot_io.open_tmp(fs, tpath) {
+                    Opened::Failed(e) => {
+                        io.write_all(io, "error open_tmp\n");
+                        c = Ctx { stop: 0 - 1, k: c.k, records: c.records, torn: c.torn, snap: c.snap };
+                    }
+                    Opened::Ok(opened) => {
+                        var file = opened;
+                        borrow mut file as &!x in {
+                            journal_io.write_all(x, text[0..half]);
+                            c = point(heap, io, c, "snapshot-tmp-half");
+                            journal_io.write_all(x, text[half..len(text)]);
+                            c = point(heap, io, c, "snapshot-tmp-written");
+                            journal_io.sync_file(x);
+                            c = point(heap, io, c, "snapshot-tmp-synced");
+                        }
+                        file_close(file);
+                        snapshot_io.publish(fs, tpath, spath);
+                        c = Ctx { stop: c.stop, k: c.k, records: c.records, torn: c.torn, snap: report.records };
+                        c = point(heap, io, c, "snapshot-renamed");
+                        journal_io.sync_parent(fs, spath);
+                        c = point(heap, io, c, "snapshot-dir-synced");
+                    }
+                }
+            }
+            buffer.drop(heap, snap);
+        }
+        map.drop(heap, table);
+    }
+    buffer.drop(heap, data);
+    return c;
+}
+
+// Propose-and-record one move: the record's bytes come from journal.submit,
+// exactly as the runtime builds them.
+fn next_record[&h, &i](heap: &!h Heap, table: map.Map[int], seq: int, id: &i [byte], target: task.State) -> [heap] (map.Map[int], buffer.Buffer) {
+    let (next, record, rule) = journal.submit(heap, table, seq, id, target, task.Actor::Human, false);
+    return (next, record);
+}
+
+fn session[&h, &f, &i, &s](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, stem: &s [byte], stop: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write, poll] int {
+    var jp = buffer.append(heap, buffer.empty(heap, 128), stem);
+    jp = buffer.append(heap, jp, ".journal.jsonl");
+    var sp = buffer.append(heap, buffer.empty(heap, 128), stem);
+    sp = buffer.append(heap, sp, ".snapshot.json");
+    var tp = buffer.append(heap, buffer.empty(heap, 128), stem);
+    tp = buffer.append(heap, tp, ".snapshot.json.tmp");
+    var lp = buffer.append(heap, buffer.empty(heap, 128), stem);
+    lp = buffer.append(heap, lp, ".lock");
+    var ctx = Ctx { stop: stop, k: 0, records: 0, torn: 0, snap: 0 };
+    var status = 0;
+    ctx = point(heap, io, ctx, "start");
+    borrow jp as &jb in {
+        borrow sp as &sb in {
+            borrow tp as &tb in {
+                borrow lp as &lb in {
+                    match lock.acquire(fs, buffer.bytes(lb)) {
+                        lock.Lock::Held(held) => {
+                            ctx = point(heap, io, ctx, "locked");
+                            var table = map.empty(heap, 16, 0, 0);
+                            let (t1, r1) = next_record(heap, table, 1, "t-1", task.State::Proposed);
+                            borrow r1 as &r1b in {
+                                ctx = append_steps(heap, fs, io, buffer.bytes(jb), buffer.bytes(r1b), true, ctx);
+                            }
+                            buffer.drop(heap, r1);
+                            let (t2, r2) = next_record(heap, t1, 2, "t-2", task.State::Proposed);
+                            borrow r2 as &r2b in {
+                                ctx = append_steps(heap, fs, io, buffer.bytes(jb), buffer.bytes(r2b), false, ctx);
+                            }
+                            buffer.drop(heap, r2);
+                            let (t3, r3) = next_record(heap, t2, 3, "t-1", task.State::Approved);
+                            borrow r3 as &r3b in {
+                                ctx = append_steps(heap, fs, io, buffer.bytes(jb), buffer.bytes(r3b), false, ctx);
+                            }
+                            buffer.drop(heap, r3);
+                            ctx = snapshot_steps(heap, fs, io, buffer.bytes(jb), buffer.bytes(sb), buffer.bytes(tb), ctx);
+                            let (t4, r4) = next_record(heap, t3, 4, "t-2", task.State::Approved);
+                            borrow r4 as &r4b in {
+                                ctx = append_steps(heap, fs, io, buffer.bytes(jb), buffer.bytes(r4b), false, ctx);
+                            }
+                            buffer.drop(heap, r4);
+                            ctx = snapshot_steps(heap, fs, io, buffer.bytes(jb), buffer.bytes(sb), buffer.bytes(tb), ctx);
+                            map.drop(heap, t4);
+                            lock.let_go(held);
+                            io.write_all(io, "done\n");
+                        }
+                        lock.Lock::Refused(rule) => {
+                            io.write_all(io, "error refused ");
+                            io.write_all(io, task.rule_code_name(rule));
+                            io.newline(io);
+                            status = 4;
+                        }
+                        lock.Lock::Failed(e) => {
+                            io.write_all(io, "error lock failed\n");
+                            status = 3;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, jp);
+    buffer.drop(heap, sp);
+    buffer.drop(heap, tp);
+    buffer.drop(heap, lp);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow mut console as &!i in {
+            borrow mut memory as &!h in {
+                borrow args as &g in {
+                    if arg_count(g) == 3 {
+                        let stop = support.nat_of(arg(g, 2));
+                        if stop >= 0 {
+                            status = session(h, f, i, arg(g, 1), stop);
+                        } else {
+                            io.error_all(i, "crash_writer: <stop> is not a number\n");
+                        }
+                    } else {
+                        io.error_all(i, "usage: crash_writer <stem> <stop>\n");
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

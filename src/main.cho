@@ -2,16 +2,115 @@ edition 9;
 
 import std.buffer;
 import std.io;
-import forge.event;
+import forge.journal_io;
+import forge.report;
 
-// Milestone 0 has no runtime. This binary prints one journal record, so the
-// event module is linked, checked and run by the same gate as everything else.
+// The operator's view of a workspace, read-only (docs/architecture.md section
+// 4.9):
+//
+//   forge status  <dir>            records, tasks by state, the snapshot's fate
+//   forge history <dir> [task-id]  every record in order, or one task's
+//
+// <dir> is an absolute path holding `journal.jsonl` (and, if there is one,
+// `snapshot.json`). Looking changes nothing: no tail is cut, no snapshot is
+// written, the lock is not taken (a writer may be running; a record it is in
+// the middle of writing shows as a torn tail).
+//
+// Exit status: 0 the journal replayed cleanly; 1 the journal is refused (the
+// output names the rule and the line); 2 bad usage or a path that is not
+// absolute or has a `..`; 3 no journal there, or an I/O error.
+//
+// Its authority is `fs_read("")` and `file_read`, nothing else: no write, no
+// process, no network, no clock (`cancho authority src/*.cho --std` prints it
+// and docs/architecture.md section 4.9 records it). The prefix is empty
+// because a library cannot be generic in it (gap G9, cancho #534).
+
+fn concat[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    return buffer.append(heap, b, name);
+}
+
+fn show[&i, &h](io: &!i Io, heap: &!h Heap, text: buffer.Buffer) -> [heap, io_write] int {
+    borrow text as &tb in {
+        buffer.write(io, tb);
+    }
+    buffer.drop(heap, text);
+    return 0;
+}
+
+fn usage[&i](io: &!i Io) -> [err_write] int {
+    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id]\n  <dir> is an absolute path holding journal.jsonl\n");
+    return 2;
+}
+
+fn run[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), file_read, io_write, err_write] int {
+    let count = arg_count(args);
+    if count < 3 || count > 4 {
+        return usage(io);
+    }
+    let verb = arg(args, 1);
+    let dir = arg(args, 2);
+    let status_verb = len(verb) == 6 && int_of(verb[0]) == 115 && int_of(verb[1]) == 116 && int_of(verb[2]) == 97 && int_of(verb[3]) == 116 && int_of(verb[4]) == 117 && int_of(verb[5]) == 115;
+    let history_verb = len(verb) == 7 && int_of(verb[0]) == 104 && int_of(verb[1]) == 105 && int_of(verb[2]) == 115 && int_of(verb[3]) == 116 && int_of(verb[4]) == 111 && int_of(verb[5]) == 114 && int_of(verb[6]) == 121;
+    if status_verb == false && history_verb == false {
+        return usage(io);
+    }
+    if status_verb && count != 3 {
+        return usage(io);
+    }
+    let jpath = concat(heap, dir, "/journal.jsonl");
+    let spath = concat(heap, dir, "/snapshot.json");
+    var code = 0;
+    borrow jpath as &jb in {
+        borrow spath as &sb in {
+            if journal_io.path_ok(buffer.bytes(jb)) == false {
+                io.error_all(io, "forge: path-invalid: <dir> must be absolute, with no .. component\n");
+                code = 2;
+            } else if journal_io.exists(fs, buffer.bytes(jb)) == false {
+                io.error_all(io, "forge: no journal.jsonl in that directory\n");
+                code = 3;
+            } else {
+                let (data, errno) = journal_io.read_all(heap, fs, buffer.bytes(jb));
+                let (snap, snap_errno) = journal_io.read_all(heap, fs, buffer.bytes(sb));
+                if errno != 0 || snap_errno != 0 {
+                    io.error_all(io, "forge: cannot read the workspace files\n");
+                    code = 3;
+                } else if status_verb {
+                    borrow data as &db in {
+                        borrow snap as &snb in {
+                            let (text, rule) = report.status(heap, buffer.bytes(db), buffer.bytes(snb));
+                            show(io, heap, text);
+                            if rule != 0 {
+                                code = 1;
+                            }
+                        }
+                    }
+                } else {
+                    var only = "";
+                    if count == 4 {
+                        only = arg(args, 3);
+                    }
+                    borrow data as &db in {
+                        let (text, rule) = report.history(heap, buffer.bytes(db), only);
+                        show(io, heap, text);
+                        if rule != 0 {
+                            code = 1;
+                        }
+                    }
+                }
+                buffer.drop(heap, data);
+                buffer.drop(heap, snap);
+            }
+        }
+    }
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, spath);
+    return code;
+}
 
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
     release(ffi);
-    release(fs);
-    release(args);
     release(net);
     release(clock);
     release(signals);
@@ -19,16 +118,19 @@ fn main(world: World) -> [] int {
     release(tty);
     var console = io;
     var memory = heap;
-    borrow mut console as &!i in {
-        borrow mut memory as &!h in {
-            let sample = event.record(h, 1, "company.created", "none");
-            borrow sample as &b in {
-                buffer.write(i, b);
+    var status = 2;
+    borrow fs as &f in {
+        borrow mut console as &!i in {
+            borrow mut memory as &!h in {
+                borrow args as &g in {
+                    status = run(h, f, i, g);
+                }
             }
-            buffer.drop(h, sample);
         }
     }
+    release(fs);
     release(console);
     release(memory);
-    return 0;
+    release(args);
+    return status;
 }

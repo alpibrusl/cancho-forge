@@ -1,0 +1,602 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.map;
+import std.test;
+import forge.event;
+import forge.journal;
+import forge.snapshot;
+import forge.task;
+
+// Unit tests for src/snapshot.cho. The property that matters is the first
+// group: recovering from a snapshot taken after ANY prefix of a journal, plus
+// the journal's tail, gives exactly what a full replay gives (the table and
+// the whole report), in both modes, with and without a torn tail. The rest
+// reaches every refusal (`snapshot-invalid`, `snapshot-mismatch`) and shows
+// that a refused snapshot never changes the answer: the journal decides.
+// Pure: no file is touched; the file layer is in tests/conformance.
+
+// ---- helpers ------------------------------------------------------------
+
+fn add[&h, &a, &b, &c, &d](heap: &!h Heap, journal: buffer.Buffer, seq: int, kind: &a [byte], id: &b [byte], actor: &c [byte], basis: &d [byte]) -> [heap] buffer.Buffer {
+    let r = event.transition(heap, seq, kind, id, actor, basis);
+    var out = journal;
+    borrow r as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, r);
+    return out;
+}
+
+// Ten records over three tasks, ending with a is accepted and c proposed.
+fn ten[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var j = buffer.empty(heap, 1024);
+    j = add(heap, j, 1, "task.proposed", "a", "human", "");
+    j = add(heap, j, 2, "task.proposed", "b", "human", "");
+    j = add(heap, j, 3, "task.approved", "a", "human", "");
+    j = add(heap, j, 4, "task.ready", "a", "forge", "");
+    j = add(heap, j, 5, "task.approved", "b", "human", "");
+    j = add(heap, j, 6, "task.running", "a", "forge", "");
+    j = add(heap, j, 7, "task.cancelled", "b", "human", "");
+    j = add(heap, j, 8, "task.verification", "a", "forge", "");
+    j = add(heap, j, 9, "task.accepted", "a", "forge", "observed");
+    j = add(heap, j, 10, "task.proposed", "c", "human", "");
+    return j;
+}
+
+// The offset just after the `n`th newline (0 for n = 0).
+fn end_of[&d](data: &d [byte], n: int) -> [] int {
+    var seen = 0;
+    var k = 0;
+    if n == 0 {
+        return 0;
+    }
+    while k < len(data) {
+        if int_of(data[k]) == 10 {
+            seen = seen + 1;
+            if seen == n {
+                return k + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return len(data);
+}
+
+// The snapshot a Forge would write after the first `n` records of `data`.
+fn snapshot_after[&h, &d](heap: &!h Heap, data: &d [byte], n: int) -> [heap] buffer.Buffer {
+    let cut = end_of(data, n);
+    let (table, report) = journal.replay(heap, data[0..cut]);
+    var snap = buffer.empty(heap, 0);
+    borrow table as &tb in {
+        buffer.drop(heap, snap);
+        snap = snapshot.encode(heap, tb, report.records, report.valid_bytes, data);
+    }
+    map.drop(heap, table);
+    return snap;
+}
+
+fn same_report(a: journal.Report, b: journal.Report) -> [] bool {
+    return a.records == b.records && a.valid_bytes == b.valid_bytes && a.total_bytes == b.total_bytes && a.torn_bytes == b.torn_bytes && a.tasks == b.tasks && a.rule == b.rule && a.line == b.line;
+}
+
+// Recover `data` with `snap` in the given mode and compare with a full
+// replay: the same projection, the same report.
+fn equals_full[&h, &s, &d](heap: &!h Heap, snap: &s [byte], data: &d [byte], strict: bool) -> [heap] bool {
+    let (full, freport) = journal.replay(heap, data);
+    let (via, vreport, outcome) = snapshot.recover_with(heap, snap, data, strict);
+    var same = false;
+    borrow full as &fb in {
+        borrow via as &vb in {
+            same = snapshot.same_tables(fb, vb) && same_report(freport, vreport);
+        }
+    }
+    map.drop(heap, full);
+    map.drop(heap, via);
+    return same;
+}
+
+// The rule name `recover_with` reports for `snap` (strict or not) over `data`,
+// "none" when the snapshot was accepted or absent.
+fn refused_with[&h, &s, &d](heap: &!h Heap, snap: &s [byte], data: &d [byte], strict: bool) -> [heap] &static [byte] {
+    let (table, report, outcome) = snapshot.recover_with(heap, snap, data, strict);
+    map.drop(heap, table);
+    return task.rule_code_name(outcome.rule);
+}
+
+fn used[&h, &s, &d](heap: &!h Heap, snap: &s [byte], data: &d [byte], strict: bool) -> [heap] bool {
+    let (table, report, outcome) = snapshot.recover_with(heap, snap, data, strict);
+    map.drop(heap, table);
+    return outcome.used;
+}
+
+// `text` followed by a newline, as a snapshot file would hold it.
+fn line_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] buffer.Buffer {
+    return buffer.push(heap, buffer.append(heap, buffer.empty(heap, 64), text), byte_of(10));
+}
+
+// ---- the property: snapshot + tail == full replay -----------------------
+
+fn test_a_snapshot_after_any_prefix_recovers_to_the_full_replay[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        var n = 0;
+        while n <= 10 {
+            let snap = snapshot_after(heap, data, n);
+            borrow snap as &sb in {
+                test.assert(buffer.size(sb) > 0);
+                test.assert(equals_full(heap, buffer.bytes(sb), data, false));
+                test.assert(equals_full(heap, buffer.bytes(sb), data, true));
+                test.assert(used(heap, buffer.bytes(sb), data, false));
+                test.assert(used(heap, buffer.bytes(sb), data, true));
+            }
+            buffer.drop(heap, snap);
+            n = n + 1;
+        }
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_the_same_holds_with_a_torn_tail_after_the_snapshot[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    var torn = buffer.append(heap, buffer.empty(heap, 1024), "");
+    borrow j as &jb in {
+        torn = buffer.append(heap, torn, buffer.bytes(jb));
+    }
+    torn = buffer.append(heap, torn, "{\"v\":1,\"seq\":11,\"kind\":\"task.ru");
+    borrow torn as &tb in {
+        let data = buffer.bytes(tb);
+        var n = 0;
+        while n <= 10 {
+            let snap = snapshot_after(heap, data, n);
+            borrow snap as &sb in {
+                test.assert(equals_full(heap, buffer.bytes(sb), data, false));
+                test.assert(equals_full(heap, buffer.bytes(sb), data, true));
+            }
+            buffer.drop(heap, snap);
+            n = n + 1;
+        }
+        let (table, report) = journal.replay(heap, data);
+        map.drop(heap, table);
+        test.assert(report.torn_bytes > 0);
+        test.assert_eq(report.records, 10);
+    }
+    buffer.drop(heap, torn);
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_refusal_in_the_tail_is_reported_at_its_line_in_the_whole_file[&h](heap: &!h Heap) -> [heap] int {
+    // Records 1-4 are covered by the snapshot; record 5 repeats seq 4, so the
+    // replay of the tail must stop at line 5 with journal-corrupt, exactly as
+    // a full replay does.
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, 1, "task.proposed", "a", "human", "");
+    j = add(heap, j, 2, "task.approved", "a", "human", "");
+    j = add(heap, j, 3, "task.ready", "a", "forge", "");
+    j = add(heap, j, 4, "task.running", "a", "forge", "");
+    j = add(heap, j, 4, "task.verification", "a", "forge", "");
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let snap = snapshot_after(heap, data, 4);
+        borrow snap as &sb in {
+            test.assert(equals_full(heap, buffer.bytes(sb), data, false));
+            test.assert(equals_full(heap, buffer.bytes(sb), data, true));
+            let (table, report, outcome) = snapshot.recover_with(heap, buffer.bytes(sb), data, false);
+            map.drop(heap, table);
+            test.assert(outcome.used);
+            test.assert_eq(report.line, 5);
+            test.assert_eq(report.records, 4);
+            test.assert(bytes.equal(task.rule_code_name(report.rule), "journal-corrupt"));
+        }
+        buffer.drop(heap, snap);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_an_absent_snapshot_is_a_full_replay_and_not_a_refusal[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    borrow j as &jb in {
+        let (table, report, outcome) = snapshot.recover_with(heap, "", buffer.bytes(jb), true);
+        map.drop(heap, table);
+        test.assert(outcome.used == false);
+        test.assert_eq(outcome.rule, 0);
+        test.assert_eq(report.records, 10);
+        test.assert(equals_full(heap, "", buffer.bytes(jb), false));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_snapshot_names_what_it_covers[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let snap = snapshot_after(heap, data, 6);
+        borrow snap as &sb in {
+            let text = buffer.bytes(sb);
+            test.assert_eq(int_of(text[len(text) - 1]), 10);
+            let (table, report, outcome) = snapshot.recover_with(heap, text, data, false);
+            map.drop(heap, table);
+            test.assert_eq(outcome.last_seq, 6);
+            test.assert_eq(report.records, 10);
+        }
+        buffer.drop(heap, snap);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- snapshot-invalid ---------------------------------------------------
+
+fn rule_of_text[&h, &t](heap: &!h Heap, text: &t [byte], strict: bool) -> [heap] &static [byte] {
+    let j = ten(heap);
+    let snap = line_of(heap, text);
+    var name = "";
+    borrow j as &jb in {
+        borrow snap as &sb in {
+            name = refused_with(heap, buffer.bytes(sb), buffer.bytes(jb), strict);
+        }
+    }
+    buffer.drop(heap, snap);
+    buffer.drop(heap, j);
+    return name;
+}
+
+fn test_unreadable_snapshots_are_snapshot_invalid[&h](heap: &!h Heap) -> [heap] int {
+    let inv = "snapshot-invalid";
+    test.assert(bytes.equal(rule_of_text(heap, "not json", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "[1,2]", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":2,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":\"0\",\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":-1,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":0,\"journal_bytes\":-5,\"journal_sha256\":\"x\",\"tasks\":{}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":7,\"tasks\":{}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":[]}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":99999999999999999999,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{\"a\":\"flying\"}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{\"a\":3}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{\"../a\":\"ready\"}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{\"a\":\"ready\",\"a\":\"ready\"}}", false), inv));
+    test.assert(bytes.equal(rule_of_text(heap, "{\"v\":1,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":\"x\",\"tasks\":{}} trailing", false), inv));
+    return 0;
+}
+
+fn test_a_snapshot_without_its_newline_or_empty_of_content_is_snapshot_invalid[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let snap = snapshot_after(heap, data, 4);
+        borrow snap as &sb in {
+            let text = buffer.bytes(sb);
+            // the line without its newline: a torn snapshot file
+            test.assert(bytes.equal(refused_with(heap, text[0..len(text) - 1], data, false), "snapshot-invalid"));
+            // cut in half
+            test.assert(bytes.equal(refused_with(heap, text[0..len(text) / 2], data, false), "snapshot-invalid"));
+            // every proper prefix is refused, none traps
+            var n = 1;
+            while n < len(text) {
+                test.assert(bytes.equal(task.rule_code_name(0), "none"));
+                let (table, report, outcome) = snapshot.recover_with(heap, text[0..n], data, true);
+                map.drop(heap, table);
+                test.assert(outcome.used == false);
+                test.assert(outcome.rule != 0);
+                test.assert_eq(report.records, 10);
+                n = n + 1;
+            }
+        }
+        buffer.drop(heap, snap);
+        // a lone newline
+        test.assert(bytes.equal(refused_with(heap, "\n", data, false), "snapshot-invalid"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- snapshot-mismatch --------------------------------------------------
+
+fn test_a_snapshot_with_the_wrong_hash_is_a_mismatch[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let flipped = flip_digest(heap, snapshot_after(heap, data, 4));
+        borrow flipped as &fb in {
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(fb), data, false), "snapshot-mismatch"));
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(fb), data, true), "snapshot-mismatch"));
+            test.assert(equals_full(heap, buffer.bytes(fb), data, false));
+        }
+        buffer.drop(heap, flipped);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// `snap` with the first character of its digest changed ('0' becomes '1',
+// anything else becomes '0'). Consumes `snap`.
+fn flip_digest[&h](heap: &!h Heap, snap: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    borrow snap as &sb in {
+        let text = buffer.bytes(sb);
+        var at = 0;
+        var k = 0;
+        while k + 16 < len(text) && at == 0 {
+            if bytes.equal(text[k..k + 16], "journal_sha256\":") {
+                at = k + 18;
+            }
+            k = k + 1;
+        }
+        out = buffer.append(heap, out, text[0..at]);
+        if int_of(text[at]) == 48 {
+            out = buffer.push(heap, out, byte_of(49));
+        } else {
+            out = buffer.push(heap, out, byte_of(48));
+        }
+        out = buffer.append(heap, out, text[at + 1..len(text)]);
+    }
+    buffer.drop(heap, snap);
+    return out;
+}
+
+fn test_a_snapshot_of_another_history_is_a_mismatch[&h](heap: &!h Heap) -> [heap] int {
+    // Same length, same seqs, different content: task ids a/b/c against x/y/z.
+    let j = ten(heap);
+    var other = buffer.empty(heap, 1024);
+    other = add(heap, other, 1, "task.proposed", "x", "human", "");
+    other = add(heap, other, 2, "task.proposed", "y", "human", "");
+    other = add(heap, other, 3, "task.approved", "x", "human", "");
+    other = add(heap, other, 4, "task.ready", "x", "forge", "");
+    borrow j as &jb in {
+        borrow other as &ob in {
+            let snap = snapshot_after(heap, buffer.bytes(jb), 4);
+            borrow snap as &sb in {
+                test.assert(bytes.equal(refused_with(heap, buffer.bytes(sb), buffer.bytes(ob), false), "snapshot-mismatch"));
+                test.assert(equals_full(heap, buffer.bytes(sb), buffer.bytes(ob), false));
+                test.assert(equals_full(heap, buffer.bytes(sb), buffer.bytes(ob), true));
+            }
+            buffer.drop(heap, snap);
+        }
+    }
+    buffer.drop(heap, other);
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_snapshot_beyond_the_journal_is_a_mismatch[&h](heap: &!h Heap) -> [heap] int {
+    // The snapshot covers 10 records; the journal was cut back to 6.
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let snap = snapshot_after(heap, data, 10);
+        borrow snap as &sb in {
+            let cut = data[0..end_of(data, 6)];
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(sb), cut, false), "snapshot-mismatch"));
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(sb), cut, true), "snapshot-mismatch"));
+            test.assert(equals_full(heap, buffer.bytes(sb), cut, false));
+            // and against an empty journal
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(sb), "", false), "snapshot-mismatch"));
+            // and a journal cut in the middle of the record the snapshot ends on
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(sb), data[0..end_of(data, 10) - 3], false), "snapshot-mismatch"));
+        }
+        buffer.drop(heap, snap);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_snapshot_off_a_record_boundary_or_with_a_wrong_count_is_a_mismatch[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let at4 = end_of(data, 4);
+        // a hand-made snapshot with a consistent hash of a prefix that does not
+        // end on a newline
+        let mid = at4 - 5;
+        let digest = snapshot.hex_digest(heap, data[0..mid]);
+        var text = buffer.append(heap, buffer.empty(heap, 256), "{\"v\":1,\"last_seq\":4,\"journal_bytes\":");
+        text = buffer.push_nat(heap, text, mid);
+        text = buffer.append(heap, text, ",\"journal_sha256\":\"");
+        borrow digest as &db in {
+            text = buffer.append(heap, text, buffer.bytes(db));
+        }
+        text = buffer.append(heap, text, "\",\"tasks\":{}}\n");
+        borrow text as &tb in {
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(tb), data, false), "snapshot-mismatch"));
+        }
+        buffer.drop(heap, text);
+        buffer.drop(heap, digest);
+        // the same, but the offset runs 5 bytes into record 5 (a count of
+        // newlines that still says 4)
+        let over = at4 + 5;
+        let digest2 = snapshot.hex_digest(heap, data[0..over]);
+        var text2 = buffer.append(heap, buffer.empty(heap, 256), "{\"v\":1,\"last_seq\":4,\"journal_bytes\":");
+        text2 = buffer.push_nat(heap, text2, over);
+        text2 = buffer.append(heap, text2, ",\"journal_sha256\":\"");
+        borrow digest2 as &db2 in {
+            text2 = buffer.append(heap, text2, buffer.bytes(db2));
+        }
+        text2 = buffer.append(heap, text2, "\",\"tasks\":{}}\n");
+        borrow text2 as &tb2 in {
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(tb2), data, false), "snapshot-mismatch"));
+        }
+        buffer.drop(heap, text2);
+        buffer.drop(heap, digest2);
+        // a right offset and hash with the wrong record count (5 for 4)
+        let good = snapshot_after(heap, data, 4);
+        borrow good as &gb in {
+            let t = buffer.bytes(gb);
+            var wrong = buffer.empty(heap, 256);
+            var k = 0;
+            while k < len(t) {
+                if k + 11 < len(t) && bytes.equal(t[k..k + 11], "\"last_seq\":") {
+                    wrong = buffer.append(heap, wrong, t[0..k + 11]);
+                    wrong = buffer.push(heap, wrong, byte_of(53));
+                    wrong = buffer.append(heap, wrong, t[k + 12..len(t)]);
+                    k = len(t);
+                }
+                k = k + 1;
+            }
+            borrow wrong as &wb in {
+                test.assert(bytes.equal(refused_with(heap, buffer.bytes(wb), data, false), "snapshot-mismatch"));
+            }
+            buffer.drop(heap, wrong);
+        }
+        buffer.drop(heap, good);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_snapshot_of_no_records_with_tasks_is_a_mismatch[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    let empty_hash = snapshot.hex_digest(heap, "");
+    var text = buffer.append(heap, buffer.empty(heap, 256), "{\"v\":1,\"last_seq\":0,\"journal_bytes\":0,\"journal_sha256\":\"");
+    borrow empty_hash as &eb in {
+        text = buffer.append(heap, text, buffer.bytes(eb));
+    }
+    text = buffer.append(heap, text, "\",\"tasks\":{\"ghost\":\"running\"}}\n");
+    borrow j as &jb in {
+        borrow text as &tb in {
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(tb), buffer.bytes(jb), false), "snapshot-mismatch"));
+            test.assert(equals_full(heap, buffer.bytes(tb), buffer.bytes(jb), false));
+        }
+    }
+    buffer.drop(heap, text);
+    buffer.drop(heap, empty_hash);
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- strict versus cheap ------------------------------------------------
+
+// A snapshot whose hash and offset are right but whose projection lies: the
+// state of task a is "proposed" where the journal's first four records make
+// it "ready". Only the strict check can see it.
+fn lying_snapshot[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer {
+    let cut = end_of(data, 4);
+    let digest = snapshot.hex_digest(heap, data[0..cut]);
+    var text = buffer.append(heap, buffer.empty(heap, 256), "{\"v\":1,\"last_seq\":4,\"journal_bytes\":");
+    text = buffer.push_nat(heap, text, cut);
+    text = buffer.append(heap, text, ",\"journal_sha256\":\"");
+    borrow digest as &db in {
+        text = buffer.append(heap, text, buffer.bytes(db));
+    }
+    text = buffer.append(heap, text, "\",\"tasks\":{\"a\":\"proposed\",\"b\":\"proposed\"}}\n");
+    buffer.drop(heap, digest);
+    return text;
+}
+
+fn test_strict_mode_catches_a_projection_that_lies_under_a_right_hash[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let lie = lying_snapshot(heap, data);
+        borrow lie as &lb in {
+            test.assert(bytes.equal(refused_with(heap, buffer.bytes(lb), data, true), "snapshot-mismatch"));
+            test.assert(used(heap, buffer.bytes(lb), data, true) == false);
+            test.assert(equals_full(heap, buffer.bytes(lb), data, true));
+        }
+        buffer.drop(heap, lie);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_cheap_mode_does_not_catch_that_and_the_docs_say_so[&h](heap: &!h Heap) -> [heap] int {
+    // The limit, stated as a test: without `strict` a lying projection under
+    // a right hash is trusted, and the answer differs from the full replay.
+    // docs/architecture.md section 4.4 says to recover with `strict` unless a
+    // measurement shows replay is too slow.
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let lie = lying_snapshot(heap, data);
+        borrow lie as &lb in {
+            test.assert(used(heap, buffer.bytes(lb), data, false));
+            test.assert(equals_full(heap, buffer.bytes(lb), data, false) == false);
+        }
+        buffer.drop(heap, lie);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- no trap on the edges ----------------------------------------------
+
+fn test_replay_from_an_offset_outside_the_data_is_journal_corrupt_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let (t1, r1) = journal.replay_from(heap, data, map.empty(heap, 4, 0, 0), 3, len(data) + 1);
+        map.drop(heap, t1);
+        test.assert(bytes.equal(task.rule_code_name(r1.rule), "journal-corrupt"));
+        test.assert_eq(r1.line, 0);
+        let (t2, r2) = journal.replay_from(heap, data, map.empty(heap, 4, 0, 0), 3, 0 - 1);
+        map.drop(heap, t2);
+        test.assert(bytes.equal(task.rule_code_name(r2.rule), "journal-corrupt"));
+        let (t3, r3) = journal.replay_from(heap, data, map.empty(heap, 4, 0, 0), 0 - 1, 0);
+        map.drop(heap, t3);
+        test.assert(bytes.equal(task.rule_code_name(r3.rule), "journal-corrupt"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_encode_of_an_inconsistent_prefix_is_empty_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    let j = ten(heap);
+    let table = map.empty(heap, 4, 0, 0);
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        borrow table as &tb in {
+            let a = snapshot.encode(heap, tb, 3, len(data) + 1, data);
+            let b = snapshot.encode(heap, tb, 3, 0 - 1, data);
+            let c = snapshot.encode(heap, tb, 0 - 1, 0, data);
+            borrow a as &ab in {
+                test.assert_eq(buffer.size(ab), 0);
+            }
+            borrow b as &bb in {
+                test.assert_eq(buffer.size(bb), 0);
+            }
+            borrow c as &cb in {
+                test.assert_eq(buffer.size(cb), 0);
+            }
+            buffer.drop(heap, a);
+            buffer.drop(heap, b);
+            buffer.drop(heap, c);
+        }
+    }
+    map.drop(heap, table);
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_state_names_round_trip_through_code_of_name() -> [] int {
+    var code = 1;
+    while code <= 9 {
+        test.assert_eq(task.code_of_name(task.code_name(code)), code);
+        code = code + 1;
+    }
+    test.assert_eq(task.code_of_name("none"), 0);
+    test.assert_eq(task.code_of_name(""), 0);
+    test.assert_eq(task.code_of_name("Ready"), 0);
+    return 0;
+}
+
+fn test_the_digest_is_sha256_in_lower_hex[&h](heap: &!h Heap) -> [heap] int {
+    // FIPS 180-2 test vectors: "" and "abc".
+    let a = snapshot.hex_digest(heap, "");
+    let b = snapshot.hex_digest(heap, "abc");
+    borrow a as &ab in {
+        test.assert(bytes.equal(buffer.bytes(ab), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    }
+    borrow b as &bb in {
+        test.assert(bytes.equal(buffer.bytes(bb), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    }
+    buffer.drop(heap, a);
+    buffer.drop(heap, b);
+    return 0;
+}

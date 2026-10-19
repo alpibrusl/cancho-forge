@@ -24,7 +24,7 @@ atomic rename and locking. The gate (`scripts/gate.sh`) passes.
 | License and dependency review | **Done for Cancho Code and cancho** (both EUPL-1.2, same holder, nothing vendored; what may be reused and on what terms: audit section 9). **Still owed for `lex-loom`** and for any provider's terms for model output, which were not reviewed. |
 | MVP acceptance-test plan | the nine success criteria exist (design doc section 7); mapping each to a test is M1's first task |
 | One golden-path scenario fully specified | sketched in the design document; a sample repository and one objectively testable change must be chosen |
-| Filing the cancho issues for G1-G5 | none were found or filed in M0 |
+| Filing the cancho issues for G1-G5 | **Done after M0**: G1/G9 #534, G2 #535, G3 #533 (built), G6 #536 (fixed); G4 is a row of cancho's `docs/processes.md` section 9; G5 not filed |
 
 **Exit criteria (revised, status):** the above audits written (Cancho Code
 done, `lex-loom` open); the golden path
@@ -48,7 +48,8 @@ The file-budget check moves from `scripts/gate.sh` into a `cancho test`
 that walks the tree (`std.dirs`), so the gate is cancho-only.
 
 *Exit:* state survives a kill at every instrumented crash point (before
-write, after write before sync, after sync, mid-record, mid-snapshot);
+write, after write before sync, after sync, mid-record, mid-snapshot; **met for
+a process kill, 25 points, architecture 4.8**);
 invalid transitions are refused with `transition-invalid`; every transition
 is a queryable event; duplicate and torn-record tests pass.
 
@@ -57,22 +58,35 @@ is a queryable event; duplicate and torn-record tests pass.
 layer holds `Fs("")` and guards paths itself).
 
 **Status of M1 (what exists, honestly).** Built and in the gate:
-`src/task.cho` (the state machine, 18 edges, the decision order, nine rule
-tags), `src/journal.cho` (replay, torn-tail planning, refuse-on-corrupt,
-`submit`, the write path that records refusals), `src/journal_io.cho` (read,
-append with sync, recover), `src/event.cho` extended (`transition`,
-`refusal`); 56 tests under `cancho test` and 24 file cases in
-`tests/conformance/journal_files.cho`. **Not built:** the `schemas/`, objective
-/ execution / artifact / decision records, projections beyond task state,
-snapshots with `last_seq`, segments and rotation, the lock in the runtime
-(spike S5 measured the primitive), the operator CLI, the checked-in authority
-report for `forge`, the file-budget check as a `cancho test`, and the exit
-test "state survives a kill at every instrumented crash point" (the
-conformance program simulates a torn write by appending half a record; it does
-not kill a process). Note the exit criterion names `transition-invalid`; it
-now has company: `accept-unverified`, `actor-not-allowed`, `task-unknown`,
+`src/task.cho` (the state machine, 18 edges, the decision order, twelve rule
+tags), `src/journal.cho` (replay, replay from an offset, torn-tail planning,
+refuse-on-corrupt, `submit`, the write path that records refusals),
+`src/journal_io.cho` (read, append with sync and the steps it is made of,
+recover), `src/snapshot.cho` and `src/snapshot_io.cho` (a snapshot with the
+journal's prefix hash, written tmp / sync / rename / sync-dir, recovered as
+snapshot + tail, refused when invalid or when it disagrees), `src/lock.cho`
+(the single-writer lock, `workspace-locked`), `src/report.cho` and
+`src/main.cho` (the read-only operator CLI: `forge status <dir>`, `forge
+history <dir> [task]`), `src/event.cho` extended (`transition`, `refusal`).
+Measured: **82 tests** under `cancho test` (9 event, 22 task, 25 journal, 18
+snapshot, 8 report), **62 file cases** in two conformance programs, **25 crash
+points** (a child writer killed with `child_kill_group` after each step of
+append, sync, snapshot and rename, then recovered, 420 checks, 0 failed), 13 CLI
+cases and the checked-in authority report (`docs/authority.txt`) in the gate.
+The exit test "state survives a kill at every instrumented crash point" is
+therefore **met for a crash of the process**; it is *not* met for power loss,
+which a process kill cannot simulate (a killed process leaves its page cache;
+architecture section 4.8). **Not built:** the `schemas/`, objective /
+execution / artifact / decision records, projections beyond task state,
+segments and rotation, a snapshot cadence, the file-budget check as a `cancho
+test`, and the rule `journal-sync-failed` (the file layer returns the errno;
+the stop is M2). `forge` is read-only: it takes no lock and cuts nothing, and
+its authority is `fs_read("")` with no write, process or network
+(architecture section 4.9). Note the exit criterion names `transition-invalid`;
+it now has company: `accept-unverified`, `actor-not-allowed`, `task-unknown`,
 `task-duplicate`, `event-malformed`, `event-unknown`, `journal-corrupt`,
-`path-invalid` (architecture section 7).
+`path-invalid`, `snapshot-invalid`, `snapshot-mismatch`, `workspace-locked`
+(architecture section 7).
 
 ## M2 -- Worker contract and Cancho Code adapter
 
@@ -86,15 +100,15 @@ worker rewritten to the contract (request-driven failure injection); a
 contract-test suite run against mock and, then, the adapter; the adapter
 (`src/worker.cho`) normalising the endings of contract section 5; execution
 directories; evidence refs with recomputed hashes; workers started
-detached with group kill (S7) so a timeout does not leak a compiler.
+detached with group kill (S7, `child_kill_group`) so a timeout does not leak a compiler.
 
 *Exit:* the same contract tests pass against mock and real; a worker
 failure cannot leave a task falsely complete; adapter failures are visible
 and recoverable after a restart (intent without outcome becomes
 `execution.lost`).
 
-*Gaps in play:* **G3** (group kill; works today at the price of `/bin/kill`
-in the `Exec` bound), **G4** (orphan after Forge crash), **G1** (the
+*Gaps in play:* ~~G3~~ (group kill: **built**, cancho #533, S7 passes with
+no `/bin/kill` in the `Exec` bound), **G4** (orphan after Forge crash), **G1** (the
 workers directory is a compile-time literal: ship Forge built for a
 workspace, or hold `Exec("")` and rely on layer 2 -- decide in M2 and
 record it).
@@ -166,9 +180,9 @@ the pilot's journal size and replay time.
 
 | need | milestone | status in cancho |
 |---|---|---|
-| run-time-chosen `narrow` for `Fs`/`Exec` (G1) | M2 decide, M4 depend | open row in `docs/processes.md` section 9 |
-| non-trapping bound violation (G2) | M4 | not requested anywhere found; by design a trap |
-| group kill for a detached child (G3) | M2 | workable today through `/bin/kill` |
+| run-time-chosen `narrow` for `Fs`/`Exec` (G1, G9) | M2 decide, M4 depend | open: cancho #534 |
+| non-trapping bound violation (G2) | M4 | open: cancho #535 |
+| group kill for a detached child (G3) | M2 | **built** (cancho #533, `child_kill_group`, edition 9; S7) |
 | kill-by-pid capability, parent-death cleanup (G4) | M2 | open rows in `docs/processes.md` section 9 |
 | `F_FULLFSYNC` on macOS (G5) | M1 | noted in `docs/file-writes.md` section 6 |
-| header of `docs/processes.md` out of date (G6) | any | correction in cancho repository |
+| header of `docs/processes.md` out of date (G6) | any | **fixed** (cancho #536, closed) |

@@ -62,6 +62,24 @@ fn parent_of[&p](path: &p [byte]) -> [] &p [byte] {
     return path[0..k - 1];
 }
 
+// Does a file (or directory) exist at `path`? A name that cannot be opened for
+// any reason but "not found" counts as existing. A path that is not ok does
+// not exist.
+pub fn exists[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] bool {
+    if path_ok(path) == false {
+        return false;
+    }
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            return e != 2;
+        }
+        Opened::Ok(opened) => {
+            file_close(opened);
+            return true;
+        }
+    }
+}
+
 // What reading the journal produced: its bytes, and 0 or an errno. A file
 // that does not exist is an empty journal (errno 2 is not an error here).
 pub fn read_all[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
@@ -106,75 +124,109 @@ pub fn read_all[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [
     }
 }
 
-// Append `record` (one or more whole records, newline included) with ONE
-// write on an append handle and make it durable with `file_sync`; with
-// `new_file`, also sync the directory so the file's existence is durable.
-// 0, or an errno, or -1 for a short write, or -2 for a path that is not ok.
-// Forge stops on any non-zero answer: after a failed sync the file's
-// contents are unknown (docs/file-writes.md, section 5.1).
-pub fn append[&f, &p, &r](fs: &f Fs(""), path: &p [byte], record: &r [byte], new_file: bool) -> [fs_read(""), fs_write(""), file_write] int {
+// ---- the steps of a durable write ---------------------------------------
+//
+// `append` and `snapshot_io.save` are compositions of these, and nothing
+// else: the crash-point program (tests/conformance/crash_points.cho) runs the
+// SAME steps one at a time with a pause between each and kills the process
+// there, so the sequence it kills is the sequence Forge runs. A step answers
+// 0, an errno, -1 for a short write, or -2 for a path that is not ok.
+
+// Open `path` for appending (created if missing). A path that is not ok is
+// `Failed(-2)` and nothing is opened.
+pub fn open_appender[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_write("")] Opened {
+    if path_ok(path) == false {
+        return Opened::Failed(0 - 2);
+    }
+    return open_append(fs, path);
+}
+
+// ONE `file_write` of all of `record` on an open handle.
+pub fn write_all[&x, &r](file: &!x File, record: &r [byte]) -> [file_write] int {
+    match file_write(file, record) {
+        Done::Ok(n) => {
+            if n != len(record) {
+                return 0 - 1;
+            }
+            return 0;
+        }
+        Done::Failed(e) => {
+            return e;
+        }
+    }
+}
+
+// `file_sync` on an open handle: the bytes written through it are durable
+// when this answers 0. After a non-zero answer the file's contents are
+// unknown (docs/file-writes.md, section 5.1) and Forge stops.
+pub fn sync_file[&x](file: &!x File) -> [file_write] int {
+    match file_sync(file) {
+        Done::Ok(n) => {
+            return 0;
+        }
+        Done::Failed(e) => {
+            return e;
+        }
+    }
+}
+
+// Make the existence of the file at `path` durable: sync its directory.
+pub fn sync_parent[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read(""), file_write] int {
     if path_ok(path) == false {
         return 0 - 2;
     }
     var status = 0;
-    match open_append(fs, path) {
+    match open_read(fs, parent_of(path)) {
+        Opened::Failed(e) => {
+            status = e;
+        }
+        Opened::Ok(dir) => {
+            var handle = dir;
+            borrow mut handle as &!d in {
+                status = sync_file(d);
+            }
+            file_close(handle);
+        }
+    }
+    return status;
+}
+
+// Append `record` (one or more whole records, newline included) with ONE
+// write on an append handle and make it durable with `file_sync` on the same
+// handle (a sync on another handle would not report a write error that
+// happened before it was opened); with `new_file`, also sync the directory
+// so the file's existence is durable. 0, or an errno, or -1 for a short
+// write, or -2 for a path that is not ok. Forge stops on any non-zero answer.
+pub fn append[&f, &p, &r](fs: &f Fs(""), path: &p [byte], record: &r [byte], new_file: bool) -> [fs_read(""), fs_write(""), file_write] int {
+    var status = 0;
+    match open_appender(fs, path) {
         Opened::Failed(e) => {
             status = e;
         }
         Opened::Ok(opened) => {
             var file = opened;
             borrow mut file as &!x in {
-                match file_write(x, record) {
-                    Done::Ok(n) => {
-                        if n != len(record) {
-                            status = 0 - 1;
-                        }
-                    }
-                    Done::Failed(e) => {
-                        status = e;
-                    }
-                }
+                status = write_all(x, record);
                 if status == 0 {
-                    match file_sync(x) {
-                        Done::Ok(n) => {
-                            status = 0;
-                        }
-                        Done::Failed(e) => {
-                            status = e;
-                        }
-                    }
+                    status = sync_file(x);
                 }
             }
             file_close(file);
         }
     }
     if status == 0 && new_file {
-        match open_read(fs, parent_of(path)) {
-            Opened::Failed(e) => {
-                status = e;
-            }
-            Opened::Ok(dir) => {
-                var handle = dir;
-                borrow mut handle as &!d in {
-                    match file_sync(d) {
-                        Done::Ok(n) => {
-                            status = 0;
-                        }
-                        Done::Failed(e) => {
-                            status = e;
-                        }
-                    }
-                }
-                file_close(handle);
-            }
-        }
+        status = sync_parent(fs, path);
     }
     return status;
 }
 
-// Cut the journal to `length` bytes and sync. 0 or an errno. Only
-// `recover` calls this, and only with a length `journal.recovery_cut` offered.
-fn cut_to[&f, &p](fs: &f Fs(""), path: &p [byte], length: int) -> [fs_read(""), fs_write(""), file_write] int {
+// Cut the journal to `length` bytes and sync. 0, an errno, or -2 for a path
+// that is not ok. Only the recovery functions call this, and only with a
+// length `journal.recovery_cut` offered (the end of the last whole record).
+pub fn cut_torn_tail[&f, &p](fs: &f Fs(""), path: &p [byte], length: int) -> [fs_read(""), fs_write(""), file_write] int {
+    if path_ok(path) == false || length < 0 {
+        return 0 - 2;
+    }
     var status = 0;
     match open_rw(fs, path) {
         Opened::Failed(e) => {
@@ -242,7 +294,7 @@ pub fn recover[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [h
         report = r;
         let to = journal.recovery_cut(r);
         if to >= 0 {
-            failure = cut_to(fs, path, to);
+            failure = cut_torn_tail(fs, path, to);
             if failure == 0 {
                 cut = r.total_bytes - to;
             }

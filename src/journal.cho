@@ -130,13 +130,32 @@ fn apply[&h, &l](heap: &!h Heap, tasks: map.Map[int], line: &l [byte], expect: i
 // to `task.state_code`). On a refusal the table holds what replayed before
 // the failing line and must not be trusted: the report says so (`rule`).
 pub fn replay[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] (map.Map[int], Report) {
-    var table = map.empty(heap, 16, 0, 0);
-    var records = 0;
-    var good = 0;
-    var start = 0;
+    return replay_from(heap, data, map.empty(heap, 16, 0, 0), 0, 0);
+}
+
+// Replay the tail of `data` that starts at byte `offset`, with `tasks` as the
+// state after the first `records` records (a snapshot, snapshot.cho). The
+// caller vouches that `offset` is the end of record number `records`; this
+// function only refuses an offset outside the data (`journal-corrupt`, line
+// 0, and `tasks` returned as given). The report counts from the start of the
+// journal: `records` and `valid_bytes` include what the snapshot covered, and
+// a refusal's `line` is the 1-based line number in the whole file. With the
+// empty table, 0 and 0 this is `replay`.
+pub fn replay_from[&h, &d](heap: &!h Heap, data: &d [byte], tasks: map.Map[int], records_before: int, offset: int) -> [heap] (map.Map[int], Report) {
+    var table = tasks;
+    if offset < 0 || offset > len(data) || records_before < 0 {
+        var held = 0;
+        borrow table as &tb in {
+            held = map.size(tb);
+        }
+        return (table, Report { records: records_before, valid_bytes: offset, total_bytes: len(data), torn_bytes: 0, tasks: held, rule: task.rule_code(task.Rule::JournalCorrupt), line: 0 });
+    }
+    var records = records_before;
+    var good = offset;
+    var start = offset;
     var rule = 0;
     var bad_line = 0;
-    var k = 0;
+    var k = offset;
     while k < len(data) && rule == 0 {
         if int_of(data[k]) == 10 {
             let (next, r) = apply(heap, table, data[start..k], records + 1);

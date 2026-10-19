@@ -14,6 +14,10 @@
 > table; `retry` goes through `ready`), section 7 (the rules M1 implements and
 > tests), section 8, and section 9 (G9: a library cannot be generic in the
 > `Fs` prefix). Each is marked where it changed.
+>
+> **Corrected after the pin bump** to rev `8411e9a` (cancho #533, #536): the
+> spikes below were measured at `2aa83b2`; all were re-run at `8411e9a`, and
+> only S7 changed (group kill is built; G3, section 5.4 and section 9).
 
 ---
 
@@ -110,7 +114,7 @@ what is used. Nothing in the right-hand column is a Forge feature yet.
 | Company state, task graph, event records (6.1, 6.2, 10) | An append-only JSONL journal; projections rebuilt by replay; `std.json` for records, `enum` + exhaustive `match` for the task state machine | S4, S5; `src/event.cho` and its tests |
 | Durable storage, restart recovery | `open_append`, `file_write`, `file_sync`, directory sync, `file_truncate`, `fs_rename`, `file_lock` under one narrowed `Fs` (`docs/file-writes.md`) | S5 |
 | Worker interface (6.3) | `std.process` over `exec_spawn`: `channels`, `capture` (stdin written while stdout is read, size bound, deadline, reap on every path), `capture_both` for stderr; `Argv` for the `\0` argument list | S1, S2, S6 |
-| Bounded execution: timeout, output cap, cancellation (6.2, 6.6) | `Clock` + `Poller` deadline inside `capture`; `child_kill`; `Signals` narrowed to `INT,TERM` to stop Forge itself | S2, S6; signals designed (`docs/signals.md`), not spiked |
+| Bounded execution: timeout, output cap, cancellation (6.2, 6.6) | `Clock` + `Poller` deadline inside `capture`; `child_kill`; `child_kill_group` for a worker started `exec_spawn_detached` (which `capture` calls itself on its kill paths); `Signals` narrowed to `INT,TERM` to stop Forge itself | S2, S6, S7; signals designed (`docs/signals.md`), not spiked |
 | Policy and authority (6.4) | Pure cancho functions over a policy document (parsed with `std.json`) called before every effect; the narrowed capabilities are the second, structural layer (section 5) | S3 (bounds); policy module designed |
 | Budgets and resource limits (6.6) | Integers in the journal: reservation, usage and release events; the same replay that rebuilds state rebuilds the remaining budget | designed |
 | Approval gates (6.2, 7) | `approval.requested` / `approval.granted` events; an operator CLI reads `Args`/`Io`, writes events. Approvals are journal facts, so they survive restarts | designed |
@@ -170,7 +174,8 @@ and the policy version that decided it *(designed)*.
    and exits with rule `journal-sync-failed`; it does not retry.
 6. One writer: `file_lock` on `lock`. A second open file description in
    the same process is refused with errno 11 *(measured, S5)*, so a second
-   Forge process on the same workspace is too.
+   Forge process on the same workspace is too. **Built in M1**
+   (`src/lock.cho`, section 4.7).
 
 On macOS `fsync` does not flush the drive's cache (`docs/file-writes.md`
 section 6). Not measured here; M1 states the durability promise per
@@ -192,14 +197,15 @@ line:
   3 bad lines and left all 420 bytes alone. The first version of the
   spike truncated them (it treated "not valid" as "torn"); that bug is why
   the two cases are separate here.
-* Then rebuild projections by replaying from the last snapshot whose
-  `last_seq` is not beyond the journal.
+* Then rebuild projections by replaying from the snapshot, if it agrees
+  with the journal (section 4.6), and from the start if it does not.
 
 **As built in M1** *(measured: `tests/journal_test.cho`, 25 cases, and
 `tests/conformance/journal_files.cho`, 24 cases against real files)*: the pure
-core is `src/journal.cho` (`replay` over a byte slice into the state of every
-task, `recovery_cut`, `submit`), the file layer `src/journal_io.cho`
-(`read_all`, `append`, `recover`). Details that the paragraph above leaves to
+core is `src/journal.cho` (`replay` and `replay_from` over a byte slice into
+the state of every task, `recovery_cut`, `submit`), the file layer
+`src/journal_io.cho` (`read_all`, `append` and the steps it is made of,
+`recover`). Details that the paragraph above leaves to
 the reader:
 
 * A complete line the *state machine* refuses (say a `task.running` for a task
@@ -235,7 +241,8 @@ bounded**:
   recorded in the intent. Today a still-running worker survives its
   parent *(documented, `docs/processes.md` section 4.7; not measured
   here)*, and killing it by pid needs `/bin/kill` under an `Exec`
-  (gap G4).
+  (gap G4, still open: `child_kill_group` needs the `Child`, which died
+  with the crashed Forge).
 
 ### 4.5 Artifacts
 
@@ -244,6 +251,205 @@ carry `{"ref":"executions/<id>/patch.diff","sha256":"...","bytes":N}`.
 Refs are relative, contain no `..`, and are resolved by Forge against the
 one execution directory (`docs/worker-contract.md`, section 7). The
 journal never contains file contents or secrets.
+
+### 4.6 Snapshots *(built in M1; measured: S5, `tests/snapshot_test.cho`, `tests/conformance/snapshot_files.cho`, `tests/conformance/crash_points.cho`)*
+
+A snapshot is a **cache**: the projection of the journal at record N, so that
+start-up replays only the tail. It is never authoritative, and it is never
+trusted on its own word. One line, one newline, in `snapshot.json`:
+
+```json
+{"v":1,"last_seq":3,"journal_bytes":204,"journal_sha256":"6c09...","tasks":{"t-1":"approved","t-2":"proposed"}}
+```
+
+`last_seq` is how many records it covers, `journal_bytes` the length of that
+prefix of the journal (a record boundary), `journal_sha256` the SHA-256 of
+exactly those bytes, `tasks` the projection (task id to state name). The hash
+is what ties a snapshot to *this* journal: a snapshot made for another
+history, or for a journal that has since been cut or rewritten, does not match
+(`snapshot.cho`, 18 unit tests).
+
+**Write protocol** *(`snapshot_io.save`; the steps are public so the crash
+test runs the same ones)*, as spike S5 measured it:
+1. open `snapshot.json.tmp` for writing (create or truncate),
+2. one write of the whole line,
+3. `file_sync` that handle,
+4. `fs_rename` the tmp over `snapshot.json`,
+5. sync the directory.
+
+A kill before 4 leaves `snapshot.json` as it was (absent, or the previous
+snapshot) and a `.tmp` that no recovery reads and the next save truncates; a
+kill after 4 leaves the new one. `save` checks both paths before opening
+anything (a test found that the first version opened the tmp before noticing a
+bad final path; corrected) and refuses an empty snapshot (-3), which is what
+`snapshot.encode` answers to arguments that describe no prefix of the journal.
+
+**Recovery** *(`snapshot.recover_with`, `snapshot_io.recover`)*:
+* no snapshot, or an empty file: a full replay; not a refusal.
+* a snapshot that checks out: its projection, then only the journal *after*
+  `journal_bytes` is replayed (`journal.replay_from`). **The property**, tested
+  for a snapshot after every prefix 0..10 of a ten-record journal, with and
+  without a torn tail, in both modes, and again at 25 crash points on real
+  files: *snapshot + tail equals the full replay*, the projection and the whole
+  report (`records`, `valid_bytes`, `torn_bytes`, `tasks`, `rule`, `line`).
+* a snapshot that is refused: not used, left on disk untouched for the
+  operator, the journal untouched, and the projection is a **full replay**.
+  The journal decides; a bad cache costs time, never correctness.
+
+Two refusals, new tags (section 7):
+* `snapshot-invalid`: not one JSON line this build reads (no newline, torn,
+  not an object, wrong or missing field, unknown `v`, a state no state has, a
+  task id outside the closed set, a duplicate task id, trailing text).
+* `snapshot-mismatch`: well formed but it disagrees with the journal: it
+  covers more than the journal holds, `journal_bytes` is not a record
+  boundary, the prefix holds a different number of records than `last_seq`, the
+  prefix hashes differently, a snapshot of zero records that lists tasks, or,
+  **in strict mode**, replaying the prefix does not give its `tasks`.
+
+**What the cheap mode cannot see, stated as a test**
+(`test_cheap_mode_does_not_catch_that_and_the_docs_say_so`): a snapshot written
+from a wrong table under the right hash passes the cheap checks, and only
+`strict` (which replays the covered prefix too, so it saves no replay time)
+refuses it. Forge uses `strict` until a measurement shows replay is too slow;
+**no such measurement exists**, the journals are tiny. Until then the snapshot
+buys the protocol and the invariants, not speed. Not built: segments and
+rotation (one `journal.jsonl`), a snapshot cadence, deleting old snapshots.
+
+### 4.7 The single-writer lock *(built in M1)*
+
+`src/lock.cho`: `acquire(fs, path)` opens `<workspace>/lock` (created if
+missing, never written) and takes `file_lock` (`flock(LOCK_EX|LOCK_NB)`) on
+that handle; the handle is held for the life of the process. Answers
+`Held(file)`, `Refused(rule)` or `Failed(errno)`:
+* another holder, `EWOULDBLOCK` (11 on Linux, 35 on macOS): `workspace-locked`;
+* a path with `..`, relative or with a NUL: `path-invalid`, nothing opened;
+* anything else (a missing directory: ENOENT): `Failed(errno)`, which is an I/O
+  error and not a refusal by Forge.
+
+The lock is a **separate file** from the journal, so reading or recovering the
+journal never touches it, and the kernel drops it when the holder dies, however
+it dies: no stale lock, no human. That last claim is *measured*, not read: the
+crash test kills the holder at 24 points (every one after it took the lock) and
+the parent takes the lock at once each time. While the holder lives, at the same
+24 points, a second writer in another process is refused with `workspace-locked`.
+Advisory only: a process that does not call `flock` is not stopped (honest
+mistakes, not hostility). Not measured: macOS (the 35 is documented, not run).
+
+### 4.8 Crash points *(built in M1; measured: `tests/conformance/crash_points.cho`)*
+
+This replaces the earlier simulation (append half a record and call recovery),
+which tested the recovery function and never a crash. The test is
+`crash_writer.cho` (a child) and `crash_points.cho` (the parent).
+
+The child is a Forge writer that does its writes **one protocol step at a time**
+and, after each, prints where it is, flushes (stdout is a stdio buffer: without
+`flush_out` the lines appear only at exit, which strace showed) and stops until
+killed. The steps are the product's own (`journal_io.open_appender`,
+`write_all`, `sync_file`, `sync_parent`; `snapshot_io.open_tmp`, `publish`),
+which `append` and `save` are made of, so the sequence that is killed is the
+sequence Forge runs. The parent starts it under `exec_spawn_detached` (the child
+leads a group), waits for the line for crash point k, takes the lock to check it
+is refused, kills with `child_kill_group(KILL)`, `child_wait`s (it must report
+the KILL signal), and then plays the restart: lock, recovery, snapshot, one more
+record, one more snapshot, checking the **files**, never the child's claims.
+
+The **25 crash points** (k = 0..24):
+
+| k | after |
+|---|---|
+| 0, 1 | start (nothing done), lock taken |
+| 2-5 | record 1 (a new file): half written, written, synced, directory synced |
+| 6-8, 9-11 | records 2 and 3: half, written, synced |
+| 12-16 | snapshot at 3: tmp half written, tmp written, tmp synced, renamed, directory synced |
+| 17-19 | record 4: half, written, synced |
+| 20-24 | snapshot at 4 (replacing the first): the same five |
+
+and k = 25 is the writer finishing by itself (exit 0), verified too. After each
+kill, 15 to 18 named checks (15 before the first snapshot is published, 18 after): the lock is free; journal recovery succeeds with no
+refusal, finds exactly the whole records the child had written, cuts a torn
+tail iff the child was inside a record, leaves the file exactly its valid bytes,
+and a second recovery cuts nothing; the projection has the states those records
+imply (a table written by hand in the test); the snapshot is present iff one was
+published, whole, used, and `snapshot + tail` equals the full replay in both
+modes; the journal continues (the next record appends and replays) and a new
+snapshot over the leftover tmp is saved, renamed and used. **Measured: 25 crash
+points exercised, 420 checks, 0 failed, 0.9 s.**
+
+What this does **not** test, plainly:
+* **Power loss.** A killed process leaves its page cache, so bytes written and
+  not synced are still in the file. Whether `fsync` reached the platter is not
+  observable here (`docs/file-writes.md` section 6). The kill proves ordering
+  and atomicity against a crash of the *process*: a record is whole or a torn
+  tail, a snapshot is whole or absent or the previous one, a lock does not
+  outlive its holder. Consequently a `file_sync` that did nothing is a mutant
+  the kill test could not kill, and none is claimed killed (the attempt to build
+  it was refused anyway: row exactness says a `sync_file` that no longer
+  performs `file_write` does not compile).
+* **A torn record by the kernel.** The product writes a record with one
+  `write`, which a process kill cannot split. The child therefore *splits it in
+  two* (the half-write points) to put a kill inside a record, as a short write
+  would. That fault injection is the child's, not the product's.
+* **Mutants killed** (each built, run to a red test, reverted): recovery never
+  cutting a torn tail (21 FAIL lines); `publish` renaming to the wrong name (63);
+  a failed `file_lock` ignored (24, the lock-refused check at every point);
+  snapshot `last_seq` off by one (74); tail replay from offset 0 (33);
+  `open_tmp` appending instead of truncating (13). And in the unit tests, the
+  snapshot checks one by one (hash, boundary, record count, duplicate ids, id
+  closure, strict compare, replay offset, replay record base).
+* The child binary is built into the literal `/tmp/forge-crash-bin`, because
+  `narrow` takes only literals (cancho #534); two gates run at once on one
+  machine would collide there.
+
+### 4.9 The operator CLI *(built in M1)*
+
+`forge status <dir>` and `forge history <dir> [task-id]` (`src/main.cho`,
+`src/report.cho`), read-only. `<dir>` is an absolute path holding
+`journal.jsonl` and, if there is one, `snapshot.json`. Looking changes nothing:
+no torn tail is cut, no snapshot written, the lock not taken (a writer may be
+running, and a record it is in the middle of writing shows as `torn tail
+bytes`). Recovery for `status` is strict (section 4.6). Output, from the
+finished crash-writer session in the gate:
+
+```
+records: 4
+bytes: 272
+torn tail bytes: 0
+tasks: 2
+  approved: 2
+snapshot: used, covers 4 records
+```
+
+`history` prints `#<seq> kind=... task=... actor=... basis=... rule=...`, the
+fields each record has, for every valid record (refusals included), or for one
+task. Exit status: 0 clean; 1 the journal is refused (the output ends with
+`journal: refused (<rule>) at line N`, after the valid records); 2 usage or a
+directory that is not absolute or has `..`; 3 no `journal.jsonl` there, or an
+I/O error. Measured by 8 unit tests of the text (`tests/report_test.cho`) and 13
+cases run on the built binary by the gate (exact text, every exit code, and that
+the journal is byte-identical after looking at a corrupt one).
+
+**Authority**, checked into `docs/authority.txt` and compared by the gate:
+
+```
+performs
+    args
+    err_write
+    file_read
+    fs_read("")
+    heap
+    io_write
+never touches
+    the network
+    signals
+    other programs
+    foreign code
+```
+
+This is the first widening of the `forge` binary beyond `heap` and `io_write`
+(M0's `main` released everything): it can **read** any file, because a library
+cannot be generic in the `Fs` prefix (G9, cancho #534) and the file layer holds
+`Fs("")`. It performs no `fs_write` and no `exec`; the crash tests, which write,
+are separate programs that are not shipped.
 
 ## 5. Authority model
 
@@ -340,10 +546,20 @@ Stated now so nobody discovers it later (each is expanded in
   A worker that is a cancho program has a `cancho authority` report Forge
   can read and compare to what it granted; any other worker needs an OS
   sandbox (`lex-os`), which is outside M1-M5.
-* **G3. Killing a worker does not kill its children.** Measured, S7: a
-  killed worker's grandchild kept running. With `exec_spawn_detached`
-  and `/bin/kill -KILL -- -<pid>` through the same `Exec`, the group
-  dies. This costs `/bin/kill` in the `Exec` bound.
+* **G3. ~~Killing a worker does not kill its children.~~ Built (cancho
+  #533, merged; corrected in place after the pin bump to `8411e9a`).**
+  Measured, S7: a plain `exec_spawn` worker's grandchild still survives a
+  kill (the control). A worker started with `exec_spawn_detached` leads
+  its own process group, and `child_kill_group(&Child, signal)` (edition
+  9, cancho `docs/processes.md` 4.12) signals that group; `std.process.capture`
+  does it itself, before the pid's kill, on its deadline, output-bound
+  and watch-failure paths. No `/bin/kill`: the dispatcher's `Exec` is
+  narrowed to the worker alone and the authority report has no
+  `exec("/bin")` (S7 prints it). Residual, from cancho's document: a
+  descendant that calls `setsid`/`setpgid` leaves the group; a worker that
+  exits by itself and leaves a subprocess behind is not killed by
+  `capture` (the dispatcher calls `child_kill_group` before `child_wait`
+  to cover it); after a Forge *crash* there is no `Child` to hold (G4).
 
 ## 6. The task state machine
 
@@ -436,6 +652,9 @@ ones by `tests/conformance/journal_files.cho`):
 | `event-malformed` | a task event with no or non-string `task` / `actor`, an `actor` that is not forge / worker / human, a `basis` that is not a string, or a task id outside the closed set | `test_malformed_task_events_are_refused`, `test_submit_with_a_bad_id_is_recorded_against_no_task` |
 | `event-unknown` | a kind that is neither a `task.*` kind nor in a namespace M1 records (`refusal`, `execution.`, `approval.`, `budget.`, `policy.`, `company.`) | `test_unknown_kinds_are_refused` |
 | `journal-corrupt` | a complete journal line that is not the next record: not JSON, not an object, unknown `v`, `seq` not exactly next (gap, duplicate, not starting at 1), wrong types | `test_garbage_in_the_middle_...`, `test_a_duplicated_run_of_seqs_...`, `test_a_gap_in_seq_is_corrupt`, `test_lines_that_are_not_records_are_corrupt`, conformance `duplicate:` and `garbage + torn:` |
+| `snapshot-invalid` | a snapshot file that is not one JSON line this build reads (section 4.6); the journal is used instead | `test_unreadable_snapshots_are_snapshot_invalid`, `test_a_snapshot_without_its_newline_or_empty_of_content_is_snapshot_invalid`, conformance `refused: a half snapshot`, `refused: garbage` |
+| `snapshot-mismatch` | a well-formed snapshot that disagrees with the journal (beyond it, off a boundary, wrong count, wrong hash, a lying projection under strict); the journal is used instead | `test_a_snapshot_with_the_wrong_hash_is_a_mismatch`, `..._of_another_history_...`, `..._beyond_the_journal_...`, `..._off_a_record_boundary_...`, `..._of_no_records_with_tasks_...`, `test_strict_mode_catches_...`, conformance `refused: a snapshot beyond the journal` |
+| `workspace-locked` | another Forge holds the workspace lock (section 4.7) | conformance `lock: a second writer is refused`, and `crash_points` at 24 points across processes |
 | `path-invalid` | a journal path that is not absolute, has a `..` component, a NUL, or is longer than 512 bytes: refused before the file capability (which traps on `..`) is reached | conformance `path:`, `recover: a .. path`, `append: a .. path` |
 
 Designed, not implemented (no test reaches them yet; they are not claims):
@@ -451,7 +670,6 @@ Designed, not implemented (no test reaches them yet; they are not claims):
 | `worker-timeout`, `worker-output-overflow`, `worker-crashed`, `worker-error`, `worker-unavailable` | observed ending of a worker process (section 5 of the worker contract; the Cancho Code binding adds how an exit code is read, section 9.4) |
 | `evidence-ref-invalid` | a path outside the execution directory, or a hash that does not match |
 | `journal-sync-failed` | `fsync` failed; contents unknown; Forge stops (the file layer returns the errno today; the stop is M2) |
-| `workspace-locked` | another Forge holds the lock |
 
 The contract and the roadmap may add rules; none ships without its row
 here and a test.
@@ -468,13 +686,15 @@ worker contract was corrected by it.)
 Collected from the spike; each says what cancho feature would remove it.
 No cancho issue for any of them was found or filed in M0 (the one
 reference is an existing open row in `docs/processes.md` section 9).
+**Corrected after M0, in place:** the gaps were searched for and filed
+upstream; the status of each is in its row below.
 
 | # | Gap | Effect on Forge | Needed from cancho |
 |---|---|---|---|
-| G1 | `narrow` takes only literals | No run-time scoped grants; workers and workspace directories are fixed at build | A way to narrow to a value chosen at deployment (`docs/processes.md` section 9, "A bound chosen at deployment"; same question for `Fs`) |
-| G2 | Out-of-bound spawn traps | Policy must pre-check; a policy bug is a crash | Either accepted as designed, or a checked variant that answers `Failed(EPERM)` |
-| G3 | Kill reaches only the pid | A timed-out worker can leave a compiler or test runner running | A group-kill on a detached child (today: `/bin/kill` under `Exec`, measured to work) |
-| G4 | No kill-by-pid capability; parent death does not kill children | Restart cannot cleanly stop an orphaned worker | `docs/processes.md` section 9: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` on Linux only |
+| G1 | **Open: [cancho #534](https://github.com/alpibrusl/cancho/issues/534).** `narrow` takes only literals | No run-time scoped grants; workers and workspace directories are fixed at build | A way to narrow to a value chosen at deployment (`docs/processes.md` section 9, "A bound chosen at deployment"; same question for `Fs`) |
+| G2 | **Open: [cancho #535](https://github.com/alpibrusl/cancho/issues/535).** Out-of-bound spawn traps | Policy must pre-check; a policy bug is a crash | Either accepted as designed, or a checked variant that answers `Failed(EPERM)` |
+| G3 | **Built: [cancho #533](https://github.com/alpibrusl/cancho/issues/533), merged** (`child_kill_group`, rev `8411e9a`; S7 re-run, no `/bin/kill`). Was: kill reaches only the pid | Nothing now; workers that start subprocesses are started detached | None. Residual: a descendant that leaves the group; the orphan after a Forge crash (G4) |
+| G4 | **Open, no issue; `docs/processes.md` section 9** (narrowed by #533 for a live supervisor only). No kill-by-pid capability; parent death does not kill children | Restart cannot cleanly stop an orphaned worker | `docs/processes.md` section 9: kill-by-pid with its own capability; `PR_SET_PDEATHSIG` on Linux only |
 | G5 | `fsync` durability on macOS is weaker | Durability promise differs per platform | `F_FULLFSYNC` (`docs/file-writes.md` section 6) |
-| G6 | Header of `docs/processes.md` says slices 3 and 4 are "designed, not built"; its own slice table and `std/process.cho` say built | Misleading; S1-S2, S6, S7 use `std.process.capture` successfully | Correct the header in the cancho repository |
-| G9 | A library function over `Fs` cannot be generic in the prefix: `Fs("/x")` is not accepted where a function declares `Fs("")` *(measured, M1; see `spike/RESULTS.md`, "M1 findings")* | `src/journal_io.cho` is written against `Fs("")` and guards the path itself (`path-invalid`); a binary that links it reports `fs_read("")`, `fs_write("")`. The production `forge` binary links it in M2, and that widening is a visible diff in `cancho authority` and says so in its commit | The same run-time-chosen-bound question as G1, for `Fs`; or a way to declare a function generic in a capability's prefix |
+| G6 | **Fixed: [cancho #536](https://github.com/alpibrusl/cancho/issues/536) (closed; in `8411e9a`).** Header of `docs/processes.md` says slices 3 and 4 are "designed, not built"; its own slice table and `std/process.cho` say built | Misleading; S1-S2, S6, S7 use `std.process.capture` successfully | Correct the header in the cancho repository |
+| G9 | **Open: [cancho #534](https://github.com/alpibrusl/cancho/issues/534)** (with G1). A library function over `Fs` cannot be generic in the prefix: `Fs("/x")` is not accepted where a function declares `Fs("")` *(measured, M1; see `spike/RESULTS.md`, "M1 findings")* | `src/journal_io.cho` is written against `Fs("")` and guards the path itself (`path-invalid`); a binary that links it reports `fs_read("")`, `fs_write("")`. The production `forge` binary links it in M2, and that widening is a visible diff in `cancho authority` and says so in its commit | The same run-time-chosen-bound question as G1, for `Fs`; or a way to declare a function generic in a capability's prefix |

@@ -1,0 +1,298 @@
+edition 9;
+module forge.snapshot;
+
+import std.buffer;
+import std.bytes;
+import std.crypto;
+import std.json;
+import std.map;
+import forge.journal;
+import forge.task;
+
+// The snapshot's pure core (docs/architecture.md, section 4.6): encode the
+// projection of a replayed journal as one JSON line, and recover from it
+// without replaying the whole journal. A snapshot is a CACHE, never
+// authoritative: whatever it says, the journal decides. It rides in a file
+// the file layer replaces atomically (`forge.snapshot_io`).
+//
+// One line, one newline:
+//
+//   {"v":1,"last_seq":3,"journal_bytes":140,"journal_sha256":"<64 hex>",
+//    "tasks":{"t-1":"running","t-2":"proposed"}}
+//
+//   last_seq        how many records the snapshot covers
+//   journal_bytes   the length of that prefix of the journal, a record
+//                   boundary (0 only with last_seq 0)
+//   journal_sha256  SHA-256 of exactly those bytes, so a snapshot made for a
+//                   different history (a journal rewritten, truncated or
+//                   replaced) cannot be mistaken for this one
+//   tasks           the projection: task id to state name
+//
+// Two refusals, both leave every file untouched and neither is fatal, because
+// the journal alone is enough: the table comes from a full replay and the
+// report says which rule refused the snapshot.
+//
+//   snapshot-invalid   the bytes are not a snapshot this build reads: not one
+//                      JSON line, a field missing or of the wrong type, an
+//                      unknown `v`, a state name no state has, a task id
+//                      outside the closed set, a duplicate task id
+//   snapshot-mismatch  a well-formed snapshot that disagrees with the
+//                      journal: it covers more than the journal holds, its
+//                      `journal_bytes` is not a record boundary, the record
+//                      count of that prefix is not `last_seq`, the prefix
+//                      hashes differently, or (in strict mode) replaying the
+//                      prefix does not give its `tasks`
+//
+// Every function takes bytes and answers values; the rows are `[heap]` at
+// most. No input reaches a trap: a slice is cut only after its bounds are
+// checked, and an unreadable snapshot is a rule.
+
+pub fn schema_version() -> [] int {
+    return 1;
+}
+
+fn hex_digit(n: int) -> [] byte {
+    if n < 10 {
+        return byte_of(48 + n);
+    }
+    return byte_of(87 + n);
+}
+
+// SHA-256 of `data` as 64 lower-case hex digits.
+pub fn hex_digest[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer {
+    let raw = box_slice(heap, 32, byte_of(0));
+    var out = buffer.empty(heap, 64);
+    borrow mut raw as &!rw in {
+        crypto.sha256(data, contents(rw));
+        let digest = contents(rw);
+        var k = 0;
+        while k < 32 {
+            let b = int_of(digest[k]);
+            out = buffer.push(heap, out, hex_digit(b / 16));
+            out = buffer.push(heap, out, hex_digit(b % 16));
+            k = k + 1;
+        }
+    }
+    unbox_slice(heap, raw);
+    return out;
+}
+
+// How many newline-ended records `data` holds.
+fn lines_in[&d](data: &d [byte]) -> [] int {
+    var n = 0;
+    var k = 0;
+    while k < len(data) {
+        if int_of(data[k]) == 10 {
+            n = n + 1;
+        }
+        k = k + 1;
+    }
+    return n;
+}
+
+// The snapshot for a journal `data` whose first `records` records end at byte
+// `valid_bytes` (a clean `journal.Report`: `records` and `valid_bytes`), with
+// the projection `tasks` they replay to. Answers the line and its newline, or
+// an EMPTY buffer when the arguments cannot describe a prefix of `data` (a
+// count below zero, or an offset outside the data): the caller must treat
+// that as "no snapshot" and write nothing.
+pub fn encode[&h, &m, &d](heap: &!h Heap, tasks: &m map.Map[int], records: int, valid_bytes: int, data: &d [byte]) -> [heap] buffer.Buffer {
+    if records < 0 || valid_bytes < 0 || valid_bytes > len(data) {
+        return buffer.empty(heap, 0);
+    }
+    let digest = hex_digest(heap, data[0..valid_bytes]);
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "v");
+    w = json.put_int(heap, w, schema_version());
+    w = json.put_key(heap, w, "last_seq");
+    w = json.put_int(heap, w, records);
+    w = json.put_key(heap, w, "journal_bytes");
+    w = json.put_int(heap, w, valid_bytes);
+    w = json.put_key(heap, w, "journal_sha256");
+    borrow digest as &db in {
+        w = json.put_string(heap, w, buffer.bytes(db));
+    }
+    buffer.drop(heap, digest);
+    w = json.put_key(heap, w, "tasks");
+    w = json.begin_object(heap, w);
+    var e = 0;
+    while e < map.entries(tasks) {
+        if map.is_live(tasks, e) {
+            w = json.put_key(heap, w, map.key_at(tasks, e));
+            w = json.put_string(heap, w, task.code_name(map.value_at(tasks, e)));
+        }
+        e = e + 1;
+    }
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}
+
+// Do two projections hold the same tasks in the same states?
+pub fn same_tables[&a, &b](left: &a map.Map[int], right: &b map.Map[int]) -> [] bool {
+    if map.size(left) != map.size(right) {
+        return false;
+    }
+    var e = 0;
+    while e < map.entries(left) {
+        if map.is_live(left, e) {
+            if map.get(right, map.key_at(left, e), 0 - 1) != map.value_at(left, e) {
+                return false;
+            }
+        }
+        e = e + 1;
+    }
+    return true;
+}
+
+// What was done with a snapshot. `used`: the table was built from it and the
+// journal's tail. `rule` is 0, or the rule that refused it (and `used` is
+// false: the table came from a full replay). An absent snapshot is rule 0 and
+// not used. `last_seq` is the records it covered when used, else 0.
+pub struct Outcome {
+    used: bool,
+    rule: int,
+    last_seq: int,
+}
+
+// Parse and check `snap` against `data`. Answers the projection the snapshot
+// holds, the offset and record count it covers, and 0 or a rule code. The
+// table is empty whenever the rule is not 0.
+struct Checked {
+    table: map.Map[int],
+    offset: int,
+    records: int,
+    rule: int,
+}
+
+fn check[&h, &s, &d](heap: &!h Heap, snap: &s [byte], data: &d [byte]) -> [heap] Checked {
+    var table = map.empty(heap, 16, 0, 0);
+    let invalid = task.rule_code(task.Rule::SnapshotInvalid);
+    let mismatch = task.rule_code(task.Rule::SnapshotMismatch);
+    if len(snap) < 2 || int_of(snap[len(snap) - 1]) != 10 {
+        return Checked { table: table, offset: 0, records: 0, rule: invalid };
+    }
+    let line = snap[0..len(snap) - 1];
+    let tape = box_slice(heap, json.tape_len(line), 0);
+    var rule = 0;
+    var offset = 0;
+    var records = 0;
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(line, tp) > 0 && json.is_object(tp, 0) {
+            let version = json.get(line, tp, 0, "v");
+            let seqn = json.get(line, tp, 0, "last_seq");
+            let bytesn = json.get(line, tp, 0, "journal_bytes");
+            let shan = json.get(line, tp, 0, "journal_sha256");
+            let tasksn = json.get(line, tp, 0, "tasks");
+            let shaped = json.is_int(tp, version) && json.is_int(tp, seqn) && json.is_int(tp, bytesn) && json.is_string(tp, shan) && json.is_object(tp, tasksn);
+            if shaped == false {
+                rule = invalid;
+            } else if json.to_int(line, tp, version) != schema_version() || json.fits_int(line, tp, seqn) == false || json.fits_int(line, tp, bytesn) == false {
+                rule = invalid;
+            } else {
+                records = json.to_int(line, tp, seqn);
+                offset = json.to_int(line, tp, bytesn);
+                if records < 0 || offset < 0 {
+                    rule = invalid;
+                }
+            }
+            if rule == 0 {
+                // The projection: every key a task id, every value a state name.
+                var j = tasksn + 1;
+                var left = json.count(tp, tasksn);
+                while left > 0 && rule == 0 {
+                    if json.is_string(tp, j + 1) == false {
+                        rule = invalid;
+                    } else {
+                        let id = json.string_view(line, tp, j);
+                        let code = task.code_of_name(json.string_view(line, tp, j + 1));
+                        if task.id_ok(id) == false || code == 0 {
+                            rule = invalid;
+                        } else {
+                            table = map.put(heap, table, id, code);
+                        }
+                    }
+                    j = json.skip(tp, j + 1);
+                    left = left - 1;
+                }
+                borrow table as &tb in {
+                    if rule == 0 && map.size(tb) != json.count(tp, tasksn) {
+                        rule = invalid;
+                    }
+                }
+            }
+            if rule == 0 {
+                // Against the journal: the prefix it names must exist, end on a
+                // record boundary, hold `last_seq` records and hash the same.
+                var held = 0;
+                borrow table as &tb in {
+                    held = map.size(tb);
+                }
+                if offset > len(data) || records == 0 && offset != 0 || records != 0 && offset == 0 || records == 0 && held != 0 {
+                    rule = mismatch;
+                } else if offset > 0 && int_of(data[offset - 1]) != 10 {
+                    rule = mismatch;
+                } else if lines_in(data[0..offset]) != records {
+                    rule = mismatch;
+                } else {
+                    let digest = hex_digest(heap, data[0..offset]);
+                    borrow digest as &db in {
+                        if json.string_equals(line, tp, shan, buffer.bytes(db)) == false {
+                            rule = mismatch;
+                        }
+                    }
+                    buffer.drop(heap, digest);
+                }
+            }
+        } else {
+            rule = invalid;
+        }
+    }
+    unbox_slice(heap, tape);
+    return Checked { table: table, offset: offset, records: records, rule: rule };
+}
+
+// Recover the projection of `data`, the whole journal, using `snap`, the
+// bytes of the snapshot file (empty: there is none).
+//
+//   * no snapshot: a full replay, `Outcome` unused with rule 0
+//   * a snapshot that checks out: its projection, then only the journal after
+//     the bytes it covers is replayed
+//   * a snapshot that is invalid or disagrees: refused (rule in `Outcome`),
+//     not used, and the table is a full replay
+//
+// `strict` also replays the covered prefix and requires the same projection:
+// slower, it is what catches a snapshot written from a wrong table under the
+// right hash. The report is the replay's, counting from the journal's start,
+// so it equals the full replay's report whenever the snapshot is used (that
+// equality is the property tests/snapshot_test.cho and the crash-point
+// program test).
+pub fn recover_with[&h, &s, &d](heap: &!h Heap, snap: &s [byte], data: &d [byte], strict: bool) -> [heap] (map.Map[int], journal.Report, Outcome) {
+    if len(snap) == 0 {
+        let (table, report) = journal.replay(heap, data);
+        return (table, report, Outcome { used: false, rule: 0, last_seq: 0 });
+    }
+    let checked = check(heap, snap, data);
+    let Checked { table, offset, records, rule } = checked;
+    var refused = rule;
+    if refused == 0 && strict {
+        let (prefix, preport) = journal.replay(heap, data[0..offset]);
+        borrow table as &tb in {
+            borrow prefix as &pb in {
+                if preport.rule != 0 || preport.records != records || same_tables(tb, pb) == false {
+                    refused = task.rule_code(task.Rule::SnapshotMismatch);
+                }
+            }
+        }
+        map.drop(heap, prefix);
+    }
+    if refused != 0 {
+        map.drop(heap, table);
+        let (full, report) = journal.replay(heap, data);
+        return (full, report, Outcome { used: false, rule: refused, last_seq: 0 });
+    }
+    let (next, report) = journal.replay_from(heap, data, table, records, offset);
+    return (next, report, Outcome { used: true, rule: 0, last_seq: records });
+}

@@ -52,6 +52,9 @@ pub enum Rule {
     EventUnknown,
     JournalCorrupt,
     PathInvalid,
+    SnapshotInvalid,
+    SnapshotMismatch,
+    WorkspaceLocked,
 }
 
 // What an event does to a task: it moves to a state, or it is refused.
@@ -159,6 +162,18 @@ pub fn state_of_code(code: int) -> [] option.Option[State] {
     return option.Option::None;
 }
 
+// The code of the state called `name`, or 0 when no state has that name.
+pub fn code_of_name[&n](name: &n [byte]) -> [] int {
+    var code = 1;
+    while code <= 9 {
+        if bytes.equal(code_name(code), name) {
+            return code;
+        }
+        code = code + 1;
+    }
+    return 0;
+}
+
 // The name of the state a stored code names; "none" for 0 or an unknown code.
 pub fn code_name(code: int) -> [] &static [byte] {
     match state_of_code(code) {
@@ -200,6 +215,15 @@ pub fn rule_code(r: Rule) -> [] int {
         Rule::PathInvalid => {
             return 9;
         }
+        Rule::SnapshotInvalid => {
+            return 10;
+        }
+        Rule::SnapshotMismatch => {
+            return 11;
+        }
+        Rule::WorkspaceLocked => {
+            return 12;
+        }
     }
 }
 
@@ -233,6 +257,15 @@ pub fn rule_name(r: Rule) -> [] &static [byte] {
         Rule::PathInvalid => {
             return "path-invalid";
         }
+        Rule::SnapshotInvalid => {
+            return "snapshot-invalid";
+        }
+        Rule::SnapshotMismatch => {
+            return "snapshot-mismatch";
+        }
+        Rule::WorkspaceLocked => {
+            return "workspace-locked";
+        }
     }
 }
 
@@ -264,6 +297,15 @@ pub fn rule_code_name(code: int) -> [] &static [byte] {
     }
     if code == 9 {
         return rule_name(Rule::PathInvalid);
+    }
+    if code == 10 {
+        return rule_name(Rule::SnapshotInvalid);
+    }
+    if code == 11 {
+        return rule_name(Rule::SnapshotMismatch);
+    }
+    if code == 12 {
+        return rule_name(Rule::WorkspaceLocked);
     }
     return "none";
 }

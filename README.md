@@ -36,12 +36,16 @@ proposes and executes.
   nothing; five ways of a worker ending were each classified. Conditions and
   caveats: [`spike/RESULTS.md`](spike/RESULTS.md).
 - **What exists now (Milestone 1's core, nothing more).** A task state
-  machine with 18 legal edges and nine named refusals; a journal that replays
+  machine with 18 legal edges and twelve named refusals; a journal that replays
   into task state, cuts only a torn tail, and refuses (changing nothing) on a
-  corrupt complete line; 56 unit tests and 24 file cases, all in the gate.
-  Not done: a CLI over it, snapshots, the lock in the runtime, kill-at-every-
-  crash-point tests, objectives and artifacts, any worker adapter, policy,
-  budgets, verification. **Nothing here runs a company yet.** Not measured:
+  corrupt complete line; snapshots that agree with the journal or are refused
+  (snapshot plus tail equals a full replay, tested after every prefix); the
+  single-writer lock; a read-only `forge status` and `forge history`; 82 unit
+  tests, 62 file cases, and a program that kills a writer with
+  `child_kill_group` at each of 25 crash points of append, sync, snapshot and
+  rename and recovers (420 checks), all in the gate. A process kill is not a
+  power loss: that is not tested. Not done: objectives and artifacts, segments,
+  any worker adapter, policy, budgets, verification. **Nothing here runs a company yet.** Not measured:
   macOS, a real cancho-code run with a model, several workers at once, power
   loss. The Cancho Code interface was audited, not exercised with a model:
   [`docs/cancho-code-audit.md`](docs/cancho-code-audit.md).
@@ -64,13 +68,15 @@ revision named in `cancho.toml`, and `clang`.
 ```sh
 git clone https://github.com/alpibrusl/cancho-forge.git && cd cancho-forge
 export CANCHO=<path-to-the-cancho-binary>
-scripts/gate.sh        # fmt --check, check, test, file conformance, file budget  ->  gate: PASS
+scripts/gate.sh        # fmt --check, check, test, file conformance, kill at every crash point, CLI, authority, file budget  ->  gate: PASS
 spike/run.sh           # re-runs every spike and prints the evidence
 ```
 
 Read [`spike/RESULTS.md`](spike/RESULTS.md) first: it lists what cancho cannot
-do yet that shapes the later milestones (grants fixed at build time, a kill
-that reaches one pid, orphaned workers after a crash).
+do yet that shapes the later milestones (grants fixed at build time, cancho
+#534; a bound violation that traps, #535; orphaned workers after a crash). A
+kill that reached one pid was one of them: it is built (cancho #533) and the
+spike now passes without `/bin/kill`.
 
 ## More
 

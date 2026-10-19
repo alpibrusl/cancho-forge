@@ -1,6 +1,6 @@
 [package]
 name = "cancho-forge"
-cancho = "2aa83b23dd3d9ea0f4551098597bc7b51dc2aecd"
+cancho = "8411e9ade1805eedec64b8a217610efb0cd0cd4c"
 
 [[bin]]
 name = "forge"
@@ -20,4 +20,14 @@ std = true
 [[test]]
 name = "journal"
 sources = ["tests/journal_test.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true
+
+[[test]]
+name = "snapshot"
+sources = ["tests/snapshot_test.cho", "src/snapshot.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true
+
+[[test]]
+name = "report"
+sources = ["tests/report_test.cho", "src/report.cho", "src/snapshot.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
 std = true
