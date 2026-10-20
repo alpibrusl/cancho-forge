@@ -1,0 +1,176 @@
+edition 9;
+module forge.dispatch;
+
+import std.process;
+import forge.response;
+
+// How a worker's run ended, and what Forge makes of it (docs/worker-contract.md, section 5). A pure function of what
+// the supervisor observed: `std.process.capture` answers how the child ended and the bytes it wrote, and this reads
+// them. It starts nothing and opens no file; the process half (spawning beneath the workers directory under a
+// deadline) is the caller's, so every row of the table is testable without a child.
+//
+// Forge classifies how the process ended whatever the worker says. A worker that exits 0 and says `succeeded` has made
+// a claim: `Verification`, never acceptance (section 3.2).
+
+pub enum Ending {
+    // The worker could not be started (an errno): row 1.
+    Unavailable(int),
+    // The deadline passed; the child was killed and reaped: row 2.
+    Timeout,
+    // Stdout went past the cap; the child was killed: row 3.
+    Overflow,
+    // Ended by a signal (the number `capture` reported): row 4.
+    Crashed(int),
+    // A non-zero exit status (stdio binding): row 5.
+    Error(int),
+    // Exit 0: the verdict on what it wrote (rows 6 and 7, and the states of section 3.2).
+    Reply(response.Verdict),
+}
+
+// What Forge does about it, before any budget or policy is asked.
+pub enum Consequence {
+    // Operator action; the task is blocked.
+    Blocked,
+    // Retry under the budget, else failed.
+    RetryOrFail,
+    // Failed; never retried automatically.
+    Failed,
+    // The worker's `succeeded`: a claim, so the task goes to verification.
+    Verification,
+    // The worker says it failed or got part of the way: retry per its own `retryable` (read from the response).
+    WorkerSaid,
+    // The worker stopped because it was asked to.
+    Cancelled,
+    // An `async` worker took the job; poll.
+    Poll,
+}
+
+// The run of a worker that produced `out` and ended as `ran`, for request `request_id` about task `task_id`.
+pub fn classify[&h, &b, &r, &k](heap: &!h Heap, ran: process.Ran, out: &b [byte], request_id: &r [byte], task_id: &k [byte], is_async: bool) -> [heap] Ending {
+    match ran {
+        process.Ran::Failed(e) => {
+            return Ending::Unavailable(e);
+        }
+        process.Ran::TimedOut => {
+            return Ending::Timeout;
+        }
+        process.Ran::TooMuch => {
+            return Ending::Overflow;
+        }
+        process.Ran::Signaled(s) => {
+            return Ending::Crashed(s);
+        }
+        process.Ran::Code(n) => {
+            if n != 0 {
+                return Ending::Error(n);
+            }
+            return Ending::Reply(response.validate(heap, out, request_id, task_id, is_async));
+        }
+    }
+}
+
+// The rule tag of an ending that is a refusal (docs/architecture.md, section 7), or "" for a reply that is valid.
+pub fn rule_tag(e: Ending) -> [] &static [byte] {
+    match e {
+        Ending::Unavailable(errno) => {
+            return "worker-unavailable";
+        }
+        Ending::Timeout => {
+            return "worker-timeout";
+        }
+        Ending::Overflow => {
+            return "worker-output-overflow";
+        }
+        Ending::Crashed(signal) => {
+            return "worker-crashed";
+        }
+        Ending::Error(code) => {
+            return "worker-error";
+        }
+        Ending::Reply(verdict) => {
+            match verdict {
+                response.Verdict::Refused(rule, reason) => {
+                    return response.rule_name(rule);
+                }
+                response.Verdict::Valid(state) => {
+                    return "";
+                }
+            }
+        }
+    }
+}
+
+// What the ending means for the task.
+pub fn consequence(e: Ending) -> [] Consequence {
+    match e {
+        Ending::Unavailable(errno) => {
+            return Consequence::Blocked;
+        }
+        Ending::Timeout => {
+            return Consequence::RetryOrFail;
+        }
+        Ending::Overflow => {
+            return Consequence::Failed;
+        }
+        Ending::Crashed(signal) => {
+            return Consequence::RetryOrFail;
+        }
+        Ending::Error(code) => {
+            return Consequence::RetryOrFail;
+        }
+        Ending::Reply(verdict) => {
+            match verdict {
+                // Not valid for the contract: never retried blindly.
+                response.Verdict::Refused(rule, reason) => {
+                    return Consequence::Failed;
+                }
+                response.Verdict::Valid(state) => {
+                    match state {
+                        response.State::Succeeded => {
+                            return Consequence::Verification;
+                        }
+                        response.State::Failed => {
+                            return Consequence::WorkerSaid;
+                        }
+                        response.State::Partial => {
+                            return Consequence::WorkerSaid;
+                        }
+                        response.State::Cancelled => {
+                            return Consequence::Cancelled;
+                        }
+                        response.State::Accepted => {
+                            return Consequence::Poll;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A name for a consequence, for the journal and the tests.
+pub fn consequence_name(c: Consequence) -> [] &static [byte] {
+    match c {
+        Consequence::Blocked => {
+            return "blocked";
+        }
+        Consequence::RetryOrFail => {
+            return "retry-or-fail";
+        }
+        Consequence::Failed => {
+            return "failed";
+        }
+        Consequence::Verification => {
+            return "verification";
+        }
+        Consequence::WorkerSaid => {
+            return "worker-said";
+        }
+        Consequence::Cancelled => {
+            return "cancelled";
+        }
+        Consequence::Poll => {
+            return "poll";
+        }
+    }
+}
