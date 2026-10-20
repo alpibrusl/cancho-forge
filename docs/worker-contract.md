@@ -342,15 +342,15 @@ output it relays (`threat-model.md`):
 | `capabilities`, `cancel`, `status`, `result`, `async` level | | designed |
 | contract tests run against mock and the real adapter | `tests/contract/` (M2) | not started |
 | the response of `execute` against section 2, 3.2 and 4 (the shape, the closed sets, the ref and hash syntax, the bounds), as a pure function | `src/response.cho`; `tests/response_test.cho` (19 tests, among them every prefix and every single-byte change of a valid response), and `scripts/mutate_response.py` (32 deliberate breaks, all killed) | **built** (rows 6, 9 and 10 of section 5 are reached by it) |
-| how a run ended (section 5) to a rule tag and a consequence, as a pure function of what `capture` observed and the bytes it captured | `src/dispatch.cho` (`classify`, `rule_tag`, `consequence`); `tests/dispatch_test.cho` (13 tests: every row, and that the ending wins over what the worker wrote), `scripts/mutate_dispatch.py` (26 deliberate breaks, all killed) | **built**. Not built: the half that spawns beneath the workers directory under a deadline and feeds `classify`; reading `error.retryable` for the `worker-said` consequence |
+| how a run ended (section 5) to a rule tag and a consequence, as a pure function of what `capture` observed and the bytes it captured | `src/dispatch.cho` (`classify`, `rule_tag`, `consequence`); `tests/dispatch_test.cho` (14 tests: every row, and that the ending wins over what the worker wrote), `scripts/mutate_dispatch.py` (28 deliberate breaks, all killed) | **built**. Not built: the half that spawns beneath the workers directory under a deadline and feeds `classify`; reading `error.retryable` for the `worker-said` consequence |
+| the process half: build the `execute` request, start the worker beneath a run-time `Dir` under a deadline and an output cap, classify, recompute the evidence, one function | `src/worker.cho` (`build_execute`, `run`, `execute`); `tests/contract/mock_worker.cho` (driven only by its request: `task.input.inject`); `tests/conformance/worker_contract.cho` (19 cases, real child processes, one per way a run can end); `scripts/mutate_contract.py` (15 deliberate breaks, all killed); the gate checks no mock outlives the run | **built, against the mock**. The same table is what the Cancho Code adapter must pass. Not built: `capabilities`, `cancel`, `status`, `result` and the `async` level; `error.retryable`. **Gap G10** (architecture section 9): a worker started this way is not a process-group leader |
 | evidence hash and size recomputed against the file, a symlink not followed | `src/evidence_io.cho`; `tests/conformance/evidence_files.cho` (24 cases against real files, the links made by the gate), `scripts/mutate_evidence.py` (16 deliberate breaks, all killed); spike S10 | **built** (section 4.1). Not yet called by a worker adapter: `src/main.cho` does not link it, so `cancho authority` for `forge` is unchanged; the call widens it by `dir_read` and says so |
 | the real Cancho Code interface | [`cancho-code-audit.md`](cancho-code-audit.md): source read, both offline gates run (`scripts/test-build.sh`, `scripts/test-mcp.sh`), a stand-in run, a TERM, a resume, an `env -i` run | **done in M0; corrected sections marked above. Not done: a run with a real model** |
 | the Cancho Code binding of section 9 as an adapter | `src/worker.cho` (M2) | designed from the audit; not built |
 
-The mock worker (`spike/mock_worker.cho`) implements `execute` only, and
-selects its behaviour from an argument for failure injection. The M2
-version will read the injected behaviour from the request instead, so the
-adapter under test is called exactly as production calls it.
+The S6 mock worker (`spike/mock_worker.cho`) selected its behaviour from an argument. The M2 mock
+(`tests/contract/mock_worker.cho`) reads it from the request instead (`task.input.inject`), so the adapter under test is called
+exactly as production calls it, and refuses a request that is not an `execute` of this contract.
 
 **Where the spike and this document differ.** The S6 mock predates the
 envelope: it answers `{"v":1,"state":...,"task_id":...,"evidence":[...]}`

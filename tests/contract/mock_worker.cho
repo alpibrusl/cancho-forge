@@ -1,0 +1,220 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.json;
+import forge.support;
+
+// The mock worker of docs/worker-contract.md, section 8: one `execute` request on stdin, one response on stdout, exit
+// 0. It does what the request tells it to, the way a real worker would be driven: `task.input.inject` names the
+// behaviour, so the adapter under test is called exactly as production calls it (no argument, no environment).
+//
+//   inject        what the mock does
+//   ok            writes `out.txt` ("abc") in `grants.execution_dir` and answers `succeeded` with it as evidence
+//   fail          answers `failed` with an `error` (retryable)
+//   partial       answers `partial`, with `out.txt` and an `error`
+//   hang          never answers
+//   garbage       exits 0 having written something that is not JSON
+//   exit3         exits 3 having written nothing
+//   crash         traps (an out-of-bounds read): ended by a signal
+//   overflow      writes far more than any cap the tests set
+//   wrong_id      answers for another `request_id`
+//   bad_hash      evidence whose hash is not the file's
+//   bad_size      evidence whose size is not the file's
+//   missing       evidence naming a file that is not there
+//   link          evidence naming `link`, which the gate made a symlink to a file outside the directory
+//   dotdot        evidence whose ref has two dots
+//
+// It holds `Fs` (to write its evidence), `Io` and `Heap`: no `Net`, no `Exec`.
+
+fn abc_sha() -> [] &static [byte] {
+    return "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+}
+
+fn empty_sha() -> [] &static [byte] {
+    return "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+}
+
+fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] buffer.Buffer {
+    var all = buffer.empty(heap, 256);
+    var c = getchar(io);
+    while c >= 0 {
+        all = buffer.push(heap, all, byte_of(c));
+        c = getchar(io);
+    }
+    return all;
+}
+
+fn is[&s, &t](src: &s [byte], tape: &t [int], node: int, text: &static [byte]) -> [] bool {
+    return json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+// The response, written to stdout. `entry` says whether there is one evidence entry, with this `ref`, hash and size.
+fn answer[&h, &i, &r, &k, &p](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], state: &static [byte], entry: bool, path: &p [byte], sha: &static [byte], size: int, failing: bool) -> [heap, io_write] int {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "state");
+    w = json.put_string(heap, w, state);
+    w = json.put_key(heap, w, "task_id");
+    w = json.put_string(heap, w, task_id);
+    w = json.put_key(heap, w, "summary");
+    w = json.put_string(heap, w, "mock");
+    w = json.put_key(heap, w, "evidence");
+    w = json.begin_array(heap, w);
+    if entry {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "id");
+        w = json.put_string(heap, w, "ev-1");
+        w = json.put_key(heap, w, "kind");
+        w = json.put_string(heap, w, "file");
+        w = json.put_key(heap, w, "ref");
+        w = json.put_string(heap, w, path);
+        w = json.put_key(heap, w, "sha256");
+        w = json.put_string(heap, w, sha);
+        w = json.put_key(heap, w, "bytes");
+        w = json.put_int(heap, w, size);
+        w = json.end_object(heap, w);
+    }
+    w = json.end_array(heap, w);
+    w = json.put_key(heap, w, "error");
+    if failing {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "code");
+        w = json.put_string(heap, w, "mock-failed");
+        w = json.put_key(heap, w, "message");
+        w = json.put_string(heap, w, "injected");
+        w = json.put_key(heap, w, "retryable");
+        w = json.put_bool(heap, w, true);
+        w = json.end_object(heap, w);
+    } else {
+        w = json.put_null(heap, w);
+    }
+    w = json.end_object(heap, w);
+    let out = json.finish(w);
+    borrow out as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, out);
+    return 0;
+}
+
+fn serve[&h, &i, &f, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), g: &g Args) -> [heap, io_read, io_write, args, fs_write(""), file_write] int {
+    let request = read_request(heap, io);
+    var code = 0;
+    borrow request as &rb in {
+        let src = buffer.bytes(rb);
+        let tape = box_slice(heap, json.tape_len(src), 0);
+        borrow mut tape as &!t in {
+            let tp = contents(t);
+            if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                let task = json.get(src, tp, 0, "task");
+                let inject = json.get(src, tp, json.get(src, tp, task, "input"), "inject");
+                let rid = json.string_view(src, tp, json.get(src, tp, 0, "request_id"));
+                let tid = json.string_view(src, tp, json.get(src, tp, task, "id"));
+                let dir = json.string_view(src, tp, json.get(src, tp, json.get(src, tp, 0, "grants"), "execution_dir"));
+                let target = support.under(heap, dir, "out.txt");
+                // A request that is not an `execute` of this contract is not served.
+                var serving = true;
+                if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") {
+                    code = 4;
+                    serving = false;
+                }
+                if serving {
+                    if is(src, tp, inject, "ok") || is(src, tp, inject, "partial") || is(src, tp, inject, "bad_hash") || is(src, tp, inject, "bad_size") {
+                        borrow target as &tb in {
+                            support.put_file(fs, buffer.bytes(tb), "abc");
+                        }
+                    }
+                    if is(src, tp, inject, "ok") {
+                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", abc_sha(), 3, false);
+                    }
+                    if is(src, tp, inject, "partial") {
+                        answer(heap, io, rid, tid, "partial", true, "out.txt", abc_sha(), 3, true);
+                    }
+                    if is(src, tp, inject, "fail") {
+                        answer(heap, io, rid, tid, "failed", false, "", abc_sha(), 0, true);
+                    }
+                    if is(src, tp, inject, "wrong_id") {
+                        answer(heap, io, "r-other", tid, "succeeded", false, "", abc_sha(), 0, false);
+                    }
+                    if is(src, tp, inject, "bad_hash") {
+                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", empty_sha(), 3, false);
+                    }
+                    if is(src, tp, inject, "bad_size") {
+                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", abc_sha(), 4, false);
+                    }
+                    if is(src, tp, inject, "missing") {
+                        answer(heap, io, rid, tid, "succeeded", true, "gone.txt", abc_sha(), 3, false);
+                    }
+                    if is(src, tp, inject, "link") {
+                        answer(heap, io, rid, tid, "succeeded", true, "link", abc_sha(), 7, false);
+                    }
+                    if is(src, tp, inject, "dotdot") {
+                        answer(heap, io, rid, tid, "succeeded", true, "../x", abc_sha(), 3, false);
+                    }
+                    if is(src, tp, inject, "garbage") {
+                        io.write_all(io, "this is not json\n");
+                    }
+                    if is(src, tp, inject, "exit3") {
+                        code = 3;
+                    }
+                    if is(src, tp, inject, "overflow") {
+                        var n = 0;
+                        while n < 20000 {
+                            io.write_all(io, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+                            n = n + 1;
+                        }
+                    }
+                    if is(src, tp, inject, "crash") {
+                        // An index that is out of bounds traps: the worker ends by a signal.
+                        code = int_of(arg(g, 7)[0]);
+                    }
+                    if is(src, tp, inject, "hang") {
+                        var c = getchar(io);
+                        while c >= 0 || c < 0 {
+                            c = getchar(io);
+                        }
+                    }
+                }
+                buffer.drop(heap, target);
+            } else {
+                io.write_all(io, "this is not json\n");
+            }
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, request);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow fs as &f in {
+        borrow mut console as &!i in {
+            borrow mut memory as &!h in {
+                borrow args as &g in {
+                    code = serve(h, i, f, g);
+                }
+            }
+        }
+    }
+    release(fs);
+    release(console);
+    release(memory);
+    release(args);
+    return code;
+}

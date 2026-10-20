@@ -23,6 +23,9 @@ pub enum Ending {
     Crashed(int),
     // A non-zero exit status (stdio binding): row 5.
     Error(int),
+    // Forge cannot use the execution directory (an errno, or -2 for a path that is not ok): the worker is not at fault,
+    // so its reply is not judged. Reached by `forge.worker.execute`, never by `classify`.
+    Setup(int),
     // Exit 0: the verdict on what it wrote (rows 6 and 7, and the states of section 3.2).
     Reply(response.Verdict),
 }
@@ -87,6 +90,9 @@ pub fn rule_tag(e: Ending) -> [] &static [byte] {
         Ending::Error(code) => {
             return "worker-error";
         }
+        Ending::Setup(errno) => {
+            return "path-invalid";
+        }
         Ending::Reply(verdict) => {
             match verdict {
                 response.Verdict::Refused(rule, reason) => {
@@ -117,6 +123,9 @@ pub fn consequence(e: Ending) -> [] Consequence {
         }
         Ending::Error(code) => {
             return Consequence::RetryOrFail;
+        }
+        Ending::Setup(errno) => {
+            return Consequence::Blocked;
         }
         Ending::Reply(verdict) => {
             match verdict {

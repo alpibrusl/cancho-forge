@@ -61,6 +61,27 @@ for prog in journal_files snapshot_files evidence_files; do
 done
 echo "conformance cases held: $held"
 
+echo "== worker contract (the mock worker, real child processes)"
+# tests/contract/mock_worker.cho is built into a workers directory made here; worker_contract starts it beneath that
+# directory (exec_spawn_under) once per way a run can end and checks the rule tag and consequence of each. The gate
+# makes the execution directory with the symlink the language cannot make, and checks no mock outlives the run.
+wdir="$scratch/workers"; edir="$scratch/contract-ev"
+mkdir "$wdir" "$edir" "$scratch/contract-outside" || exit 1
+echo secret > "$scratch/contract-outside/s.txt"
+ln -s "$scratch/contract-outside/s.txt" "$edir/link" || exit 1
+$C check tests/contract/mock_worker.cho tests/conformance/support.cho $libs --std || fail=1
+$C check tests/conformance/worker_contract.cho tests/conformance/support.cho $libs --std || fail=1
+if $C build tests/contract/mock_worker.cho tests/conformance/support.cho $libs --std -o "$wdir/mock_worker" \
+  && $C build tests/conformance/worker_contract.cho tests/conformance/support.cho $libs --std -o "$scratch/worker_contract"; then
+  "$scratch/worker_contract" "$wdir" "$edir" > "$scratch/worker_contract.out" || fail=1
+  cat "$scratch/worker_contract.out"
+  if grep -q '^FAIL ' "$scratch/worker_contract.out"; then fail=1; fi
+  if pgrep -x mock_worker > /dev/null; then echo "FAIL a mock worker outlived the run"; fail=1; fi
+else
+  echo "worker contract: did not build"
+  fail=1
+fi
+
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of
 # append, sync, snapshot and rename. `narrow` takes only a literal (cancho

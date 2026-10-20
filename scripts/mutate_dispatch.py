@@ -40,6 +40,8 @@ M = [
     ("tag-crashed", "return \"worker-crashed\";", "return \"worker-error\";", "a crash is tagged as an error"),
     ("valid-tag", "                response.Verdict::Valid(state) => {\n                    return \"\";", "                response.Verdict::Valid(state) => {\n                    return \"worker-protocol\";", "a valid reply carries a refusal tag"),
     ("refused-tag", "return response.rule_name(rule);", "return \"worker-protocol\";", "an invalid evidence ref is tagged as a protocol error"),
+    ("setup-tag", "        Ending::Setup(errno) => {\n            return \"path-invalid\";", "        Ending::Setup(errno) => {\n            return \"worker-error\";", "an unusable execution directory is tagged as a worker error"),
+    ("setup-consequence", "        Ending::Setup(errno) => {\n            return Consequence::Blocked;", "        Ending::Setup(errno) => {\n            return Consequence::RetryOrFail;", "an unusable execution directory is retried"),
     ("timeout-arm", "        process.Ran::TimedOut => {\n            return Ending::Timeout;", "        process.Ran::TimedOut => {\n            return Ending::Overflow;", "a deadline is read as an overflow"),
     ("overflow-arm", "        process.Ran::TooMuch => {\n            return Ending::Overflow;", "        process.Ran::TooMuch => {\n            return Ending::Timeout;", "an overflow is read as a deadline"),
     ("signal-value", "return Ending::Crashed(s);", "return Ending::Crashed(0);", "the signal number is lost"),

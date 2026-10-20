@@ -1,0 +1,137 @@
+edition 9;
+module forge.worker;
+
+import std.buffer;
+import std.json;
+import std.process;
+import forge.dispatch;
+import forge.evidence_io;
+import forge.response;
+
+// Running a worker (docs/worker-contract.md, sections 3.2, 5 and 8): build the `execute` request, start the worker
+// beneath the workers directory under a deadline and an output cap, and turn how it ended, and what it wrote, into an
+// `Ending` (`forge.dispatch`) with its evidence checked against the files (`forge.evidence_io`). This is the
+// process-and-file half of the adapter; which worker, which limits and what the ending does to a task are decisions
+// made elsewhere.
+//
+// The authority it needs is the sum of its parts: `Exec("")` and a `Dir` for the workers (the program is a name beneath
+// the directory, `exec_spawn_under`, so the report names no path), a `Clock` for the deadline, and the `Fs` and a `Dir`
+// of its own for the evidence. A worker is started with `exec_spawn_under`, which does NOT make it a process-group
+// leader: a worker's own subprocesses survive its kill (gap G10, docs/architecture.md; spike S7 measured it for the
+// plain start). The mock worker has none; the Cancho Code adapter cannot ship until `exec_spawn_detached` has a `Dir`
+// form.
+
+// Is `name` one the capability will take? Not empty, not rooted, and what `exec_covers` accepts: no two dots in a row
+// and under 4096 bytes. A name that is not ok would trap, so the caller is told instead (`Failed(-2)`).
+pub fn name_ok[&x, &p](exec: &x Exec(""), name: &p [byte]) -> [] bool {
+    return len(name) > 0 && int_of(name[0]) != 47 && exec_covers(exec, name);
+}
+
+// The `execute` request of section 3.2. `input` is the task's input as JSON text (opaque to Forge), put in as it is.
+pub fn build_execute[&h, &a, &t, &y, &i, &w, &e](heap: &!h Heap, request_id: &a [byte], attempt: int, task_id: &t [byte], task_type: &y [byte], input: &i [byte], timeout_ms: int, max_output_bytes: int, workspace: &w [byte], execution_dir: &e [byte]) -> [heap] buffer.Buffer {
+    var w2 = json.writer(heap, 256);
+    w2 = json.begin_object(heap, w2);
+    w2 = json.put_key(heap, w2, "contract");
+    w2 = json.put_string(heap, w2, "forge-worker/1");
+    w2 = json.put_key(heap, w2, "verb");
+    w2 = json.put_string(heap, w2, "execute");
+    w2 = json.put_key(heap, w2, "request_id");
+    w2 = json.put_string(heap, w2, request_id);
+    w2 = json.put_key(heap, w2, "attempt");
+    w2 = json.put_int(heap, w2, attempt);
+    w2 = json.put_key(heap, w2, "task");
+    w2 = json.begin_object(heap, w2);
+    w2 = json.put_key(heap, w2, "id");
+    w2 = json.put_string(heap, w2, task_id);
+    w2 = json.put_key(heap, w2, "type");
+    w2 = json.put_string(heap, w2, task_type);
+    w2 = json.put_key(heap, w2, "input");
+    w2 = json.put_fragment(heap, w2, input);
+    w2 = json.end_object(heap, w2);
+    w2 = json.put_key(heap, w2, "limits");
+    w2 = json.begin_object(heap, w2);
+    w2 = json.put_key(heap, w2, "timeout_ms");
+    w2 = json.put_int(heap, w2, timeout_ms);
+    w2 = json.put_key(heap, w2, "max_output_bytes");
+    w2 = json.put_int(heap, w2, max_output_bytes);
+    w2 = json.end_object(heap, w2);
+    w2 = json.put_key(heap, w2, "grants");
+    w2 = json.begin_object(heap, w2);
+    w2 = json.put_key(heap, w2, "workspace");
+    w2 = json.put_string(heap, w2, workspace);
+    w2 = json.put_key(heap, w2, "execution_dir");
+    w2 = json.put_string(heap, w2, execution_dir);
+    w2 = json.end_object(heap, w2);
+    w2 = json.end_object(heap, w2);
+    return json.finish(w2);
+}
+
+// Start the worker `name` beneath `workers`, write `request` to its input, and capture its output under `most` bytes
+// and `timeout_ms` milliseconds. The ending (`Failed` for a spawn that did not happen: an errno, or -2 for a name that
+// is not ok, in which case nothing was started) and what the worker wrote.
+pub fn run[&h, &x, &d, &c, &n, &q](heap: &!h Heap, exec: &x Exec(""), workers: &d Dir, clock: &c Clock, name: &n [byte], request: &q [byte], most: int, timeout_ms: int) -> [heap, exec_under, clock, poll] (buffer.Buffer, process.Ran) {
+    if !name_ok(exec, name) {
+        return (buffer.empty(heap, 1), process.Ran::Failed(0 - 2));
+    }
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            return (buffer.empty(heap, 1), process.Ran::Failed(e));
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match exec_spawn_under(exec, workers, name, "", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    return (buffer.empty(heap, 1), process.Ran::Failed(e));
+                }
+                Spawned::Ok(child) => {
+                    return process.capture(heap, clock, child, to_child, from_child, request, most, timeout_ms);
+                }
+            }
+        }
+    }
+}
+
+// `run`, classified, and the evidence of a reply that is valid recomputed against the files beneath `execution_dir`:
+// a mismatch makes the reply `evidence-ref-invalid`, whatever state the worker claimed. An execution directory Forge
+// cannot open is `Setup`, not a verdict on the worker.
+pub fn execute[&h, &x, &w, &f, &c, &n, &q, &r, &k, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, name: &n [byte], request: &q [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte], most: int, timeout_ms: int, is_async: bool) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read] dispatch.Ending {
+    let (out, ran) = run(heap, exec, workers, clock, name, request, most, timeout_ms);
+    var ending = dispatch.Ending::Timeout;
+    borrow out as &ob in {
+        ending = dispatch.classify(heap, ran, buffer.bytes(ob), request_id, task_id, is_async);
+        match ending {
+            dispatch.Ending::Reply(verdict) => {
+                match verdict {
+                    response.Verdict::Valid(state) => {
+                        match evidence_io.verify(heap, fs, buffer.bytes(ob), execution_dir) {
+                            evidence_io.Checked::Held => {
+                            }
+                            evidence_io.Checked::Refused(rule, reason) => {
+                                ending = dispatch.Ending::Reply(response.Verdict::Refused(rule, reason));
+                            }
+                            evidence_io.Checked::NoDirectory(errno) => {
+                                ending = dispatch.Ending::Setup(errno);
+                            }
+                        }
+                    }
+                    response.Verdict::Refused(rule, reason) => {
+                    }
+                }
+            }
+            dispatch.Ending::Unavailable(errno) => {
+            }
+            dispatch.Ending::Timeout => {
+            }
+            dispatch.Ending::Overflow => {
+            }
+            dispatch.Ending::Crashed(signal) => {
+            }
+            dispatch.Ending::Error(code) => {
+            }
+            dispatch.Ending::Setup(errno) => {
+            }
+        }
+    }
+    buffer.drop(heap, out);
+    return ending;
+}
