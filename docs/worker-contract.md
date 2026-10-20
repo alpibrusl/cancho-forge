@@ -195,7 +195,7 @@ tokens only (`usage.jsonl`), never money (audit 3.4).
 | `cancelled` | the worker stopped because it was asked to |
 | `accepted` (`async` only, from `execute`) | the worker took the job; poll `status` / `result` |
 
-Any other value is `worker-protocol`. `error` is `{"code": "<worker-defined,
+Any other value is `worker-protocol`. *(Added by the validator, section 8: a response has at most 256 evidence entries; a `succeeded` response carries no `error`; `failed` and `partial` carry one; `cost.amount` is an integer, 0 or more.)* `error` is `{"code": "<worker-defined,
 kebab-case>", "message": "<text>", "retryable": true|false}`; the code is
 recorded, never interpreted as an instruction. `summary` and `message` are
 **untrusted text**: stored, shown to a human, never executed or used as
@@ -245,11 +245,11 @@ Evidence is **by reference**. The journal does not hold file contents.
 
 | field | rule |
 |---|---|
-| `id` | unique within the response |
+| `id` | unique within the response, 1 to 128 bytes, written without JSON escapes |
 | `kind` | `patch`, `log`, `report`, `test_output`, `file`, `other` |
-| `ref` | a **relative** path inside `execution_dir`: no leading `/`, no `..` component, no NUL, at most 512 bytes. Anything else is `evidence-ref-invalid` |
-| `sha256` | lowercase hex of the file as the worker wrote it |
-| `bytes` | length |
+| `ref` | a **relative** path inside `execution_dir`: not empty, no leading `/`, no NUL, at most 512 bytes, and no two dots in a row anywhere. Anything else is `evidence-ref-invalid`. *(Corrected: this said "no `..` component". The file capability traps on the byte pair wherever it falls, so `a..b` is refused too, as journal paths are, spike S8. A JSON escape in a `ref` is refused as well: refs are written plain.)* |
+| `sha256` | exactly 64 digits of `0-9a-f`: the hash of the file as the worker wrote it. A hash of another shape is `evidence-ref-invalid` |
+| `bytes` | length: an integer, 0 or more (negative is `evidence-ref-invalid`, not an integer is `worker-protocol`) |
 
 Forge **recomputes** the hash and size itself when it receives the response,
 before the artifact is referenced by any event. A mismatch is
@@ -317,7 +317,8 @@ output it relays (`threat-model.md`):
 | a worker's subprocesses are killed with it | S7 | **measured: not for a plain start; yes for a detached start, killed by `capture` or by `child_kill_group`, with no `/bin/kill`** (corrected after cancho #533) |
 | `capabilities`, `cancel`, `status`, `result`, `async` level | | designed |
 | contract tests run against mock and the real adapter | `tests/contract/` (M2) | not started |
-| evidence hash recomputation | `std.crypto.sha256` exists | not spiked |
+| the response of `execute` against section 2, 3.2 and 4 (the shape, the closed sets, the ref and hash syntax, the bounds), as a pure function | `src/response.cho`; `tests/response_test.cho` (19 tests, among them every prefix and every single-byte change of a valid response), and `scripts/mutate_response.py` (32 deliberate breaks, all killed) | **built** (rows 6, 9 and 10 of section 5 are reached by it) |
+| evidence hash recomputation | `std.crypto.sha256` exists; needs the execution directory, so it belongs to the adapter | not spiked |
 | the real Cancho Code interface | [`cancho-code-audit.md`](cancho-code-audit.md): source read, both offline gates run (`scripts/test-build.sh`, `scripts/test-mcp.sh`), a stand-in run, a TERM, a resume, an `env -i` run | **done in M0; corrected sections marked above. Not done: a run with a real model** |
 | the Cancho Code binding of section 9 as an adapter | `src/worker.cho` (M2) | designed from the audit; not built |
 

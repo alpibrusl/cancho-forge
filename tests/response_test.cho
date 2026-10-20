@@ -1,0 +1,433 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.response;
+
+// Unit tests for src/response.cho (docs/worker-contract.md, sections 2 to 4 and 7). Run with `cancho test`.
+// An outcome is (class, reason): class 1 `worker-protocol`, 2 `evidence-ref-invalid`, 100 + n a valid state.
+
+fn outcome[&h, &b](heap: &!h Heap, body: &b [byte], is_async: bool) -> [heap] (int, int) {
+    match response.validate(heap, body, "r-1", "t-1", is_async) {
+        response.Verdict::Valid(s) => {
+            match s {
+                response.State::Succeeded => {
+                    return (100, 0);
+                }
+                response.State::Failed => {
+                    return (101, 0);
+                }
+                response.State::Partial => {
+                    return (102, 0);
+                }
+                response.State::Cancelled => {
+                    return (103, 0);
+                }
+                response.State::Accepted => {
+                    return (104, 0);
+                }
+            }
+        }
+        response.Verdict::Refused(rule, reason) => {
+            match rule {
+                response.Rule::WorkerProtocol => {
+                    return (1, reason);
+                }
+                response.Rule::EvidenceRefInvalid => {
+                    return (2, reason);
+                }
+            }
+        }
+    }
+}
+
+fn sha() -> [] &static [byte] {
+    return "9f2c0000000000000000000000000000000000000000000000000000000000e1";
+}
+
+// A whole response: `head` up to and including `"evidence":[`, the entries, then `tail`.
+fn doc[&h, &a, &b, &c](heap: &!h Heap, head: &a [byte], entries: &b [byte], tail: &c [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 256), head);
+    o = buffer.append(heap, o, entries);
+    return buffer.append(heap, o, tail);
+}
+
+fn head() -> [] &static [byte] {
+    return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"summary\":\"done\",\"evidence\":[";
+}
+
+fn tail() -> [] &static [byte] {
+    return "],\"error\":null}";
+}
+
+fn entry() -> [] &static [byte] {
+    return "{\"id\":\"ev-1\",\"kind\":\"patch\",\"ref\":\"patch.diff\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":2210}";
+}
+
+// The outcome of `head + entries + tail`.
+fn with_entries[&h, &e](heap: &!h Heap, entries: &e [byte]) -> [heap] (int, int) {
+    let d = doc(heap, head(), entries, tail());
+    var got = (0, 0);
+    borrow d as &b in {
+        got = outcome(heap, buffer.bytes(b), false);
+    }
+    buffer.drop(heap, d);
+    return got;
+}
+
+// An entry with its `ref` replaced.
+fn entry_ref[&h, &r](heap: &!h Heap, path: &r [byte]) -> [heap] (int, int) {
+    var e = buffer.append(heap, buffer.empty(heap, 200), "{\"id\":\"ev-1\",\"kind\":\"log\",\"ref\":");
+    e = buffer.append(heap, e, path);
+    e = buffer.append(heap, e, ",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}");
+    var got = (0, 0);
+    borrow e as &b in {
+        got = with_entries(heap, buffer.bytes(b));
+    }
+    buffer.drop(heap, e);
+    return got;
+}
+
+fn same(got: (int, int), class: int, reason: int) -> [] int {
+    let (c, r) = got;
+    test.assert_eq(c, class);
+    test.assert_eq(r, reason);
+    return 0;
+}
+
+fn test_a_well_formed_success_is_a_claim_and_nothing_more[&h](heap: &!h Heap) -> [heap] int {
+    same(with_entries(heap, entry()), 100, 0);
+    same(with_entries(heap, ""), 100, 0);
+    return 0;
+}
+
+fn test_every_kind_and_extra_fields_are_accepted[&h](heap: &!h Heap) -> [heap] int {
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"patch\",\"ref\":\"p\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":0,\"note\":[1,{\"x\":null}]},{\"id\":\"b\",\"kind\":\"log\",\"ref\":\"logs/l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1},{\"id\":\"c\",\"kind\":\"report\",\"ref\":\"r.md\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1},{\"id\":\"d\",\"kind\":\"test_output\",\"ref\":\"t\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1},{\"id\":\"e\",\"kind\":\"file\",\"ref\":\"f\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1},{\"id\":\"f\",\"kind\":\"other\",\"ref\":\"o\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}"), 100, 0);
+    return 0;
+}
+
+fn test_the_other_states_and_the_rule_about_error[&h](heap: &!h Heap) -> [heap] int {
+    let failed = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"no-tests\",\"message\":\"x\",\"retryable\":false}}";
+    same(outcome(heap, failed, false), 101, 0);
+    let partial = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"partial\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"half\",\"message\":\"x\",\"retryable\":true}}";
+    same(outcome(heap, partial, false), 102, 0);
+    let cancelled = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"task_id\":\"t-1\",\"evidence\":[]}";
+    same(outcome(heap, cancelled, false), 103, 0);
+    // a failure that gives no reason, a partial that does not say what is missing, a success that carries an error
+    let failed_bare = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":null}";
+    same(outcome(heap, failed_bare, false), 1, response.r_error());
+    let failed_missing = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[]}";
+    same(outcome(heap, failed_missing, false), 1, response.r_error());
+    let partial_bare = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"partial\",\"task_id\":\"t-1\",\"evidence\":[]}";
+    same(outcome(heap, partial_bare, false), 1, response.r_error());
+    let success_with_error = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"c\",\"message\":\"m\",\"retryable\":false}}";
+    same(outcome(heap, success_with_error, false), 1, response.r_error());
+    return 0;
+}
+
+fn test_accepted_is_the_answer_of_an_async_worker_only[&h](heap: &!h Heap) -> [heap] int {
+    let accepted = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"accepted\",\"task_id\":\"t-1\",\"evidence\":[]}";
+    same(outcome(heap, accepted, true), 104, 0);
+    same(outcome(heap, accepted, false), 1, response.r_state());
+    return 0;
+}
+
+fn test_what_is_not_a_json_object_is_refused_as_a_value[&h](heap: &!h Heap) -> [heap] int {
+    same(outcome(heap, "", false), 1, response.r_not_json());
+    same(outcome(heap, "not json", false), 1, response.r_not_json());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\"", false), 1, response.r_not_json());
+    same(outcome(heap, "{} trailing", false), 1, response.r_not_json());
+    same(outcome(heap, "[1,2,3]", false), 1, response.r_not_object());
+    same(outcome(heap, "\"forge-worker/1\"", false), 1, response.r_not_object());
+    same(outcome(heap, "null", false), 1, response.r_not_object());
+    return 0;
+}
+
+fn test_deep_nesting_and_a_long_run_of_brackets_are_values_not_traps[&h](heap: &!h Heap) -> [heap] int {
+    var deep = buffer.empty(heap, 4096);
+    var i = 0;
+    while i < 3000 {
+        deep = buffer.append(heap, deep, "[");
+        i = i + 1;
+    }
+    var got = (0, 0);
+    borrow deep as &b in {
+        got = outcome(heap, buffer.bytes(b), false);
+    }
+    buffer.drop(heap, deep);
+    let (c, r) = got;
+    test.assert_eq(c, 1);
+    test.assert(r == response.r_not_json() || r == response.r_not_object());
+    return 0;
+}
+
+fn test_the_envelope_is_checked_field_by_field[&h](heap: &!h Heap) -> [heap] int {
+    same(outcome(heap, "{\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_contract());
+    same(outcome(heap, "{\"contract\":\"forge-worker/2\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_contract());
+    same(outcome(heap, "{\"contract\":1,\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_contract());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-2\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_request_id());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_request_id());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":1,\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_request_id());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"done\",\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_state());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":true,\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_state());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"task_id\":\"t-1\",\"evidence\":[]}", false), 1, response.r_state());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-2\",\"evidence\":[]}", false), 1, response.r_task_id());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"evidence\":[]}", false), 1, response.r_task_id());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"summary\":7,\"evidence\":[]}", false), 1, response.r_summary());
+    return 0;
+}
+
+fn test_evidence_must_be_a_bounded_array_of_objects[&h](heap: &!h Heap) -> [heap] int {
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\"}", false), 1, response.r_evidence());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":{}}", false), 1, response.r_evidence());
+    same(with_entries(heap, "7"), 1, response.r_evidence_entry());
+    same(with_entries(heap, "null"), 1, response.r_evidence_entry());
+    // 256 entries are accepted; 257 are not
+    var many = buffer.empty(heap, 40000);
+    var i = 0;
+    while i < 257 {
+        if i > 0 {
+            many = buffer.push(heap, many, byte_of(','));
+        }
+        many = buffer.append(heap, many, "{\"id\":\"e");
+        many = buffer.push_nat(heap, many, i);
+        many = buffer.append(heap, many, "\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}");
+        i = i + 1;
+        if i == 256 {
+            borrow many as &b in {
+                same(with_entries(heap, buffer.bytes(b)), 100, 0);
+            }
+        }
+    }
+    borrow many as &b2 in {
+        same(with_entries(heap, buffer.bytes(b2)), 1, response.r_evidence_count());
+    }
+    buffer.drop(heap, many);
+    return 0;
+}
+
+fn test_evidence_ids_are_non_empty_bounded_plain_and_unique[&h](heap: &!h Heap) -> [heap] int {
+    let tail = "\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}";
+    var e = buffer.append(heap, buffer.empty(heap, 200), "{\"id\":\"\",");
+    e = buffer.append(heap, e, tail);
+    borrow e as &b1 in {
+        same(with_entries(heap, buffer.bytes(b1)), 1, response.r_evidence_id());
+    }
+    buffer.drop(heap, e);
+    var missing = buffer.append(heap, buffer.empty(heap, 200), "{");
+    missing = buffer.append(heap, missing, tail);
+    borrow missing as &b2 in {
+        same(with_entries(heap, buffer.bytes(b2)), 1, response.r_evidence_id());
+    }
+    buffer.drop(heap, missing);
+    var escaped = buffer.append(heap, buffer.empty(heap, 200), "{\"id\":\"a\\u0062\",");
+    escaped = buffer.append(heap, escaped, tail);
+    borrow escaped as &b3 in {
+        same(with_entries(heap, buffer.bytes(b3)), 1, response.r_evidence_id());
+    }
+    buffer.drop(heap, escaped);
+    var long = buffer.append(heap, buffer.empty(heap, 400), "{\"id\":\"");
+    var i = 0;
+    while i < 129 {
+        long = buffer.push(heap, long, byte_of('x'));
+        i = i + 1;
+    }
+    long = buffer.append(heap, long, "\",");
+    long = buffer.append(heap, long, tail);
+    borrow long as &b4 in {
+        same(with_entries(heap, buffer.bytes(b4)), 1, response.r_evidence_id());
+    }
+    buffer.drop(heap, long);
+    var edge = buffer.append(heap, buffer.empty(heap, 400), "{\"id\":\"");
+    i = 0;
+    while i < 128 {
+        edge = buffer.push(heap, edge, byte_of('x'));
+        i = i + 1;
+    }
+    edge = buffer.append(heap, edge, "\",");
+    edge = buffer.append(heap, edge, tail);
+    borrow edge as &b5 in {
+        same(with_entries(heap, buffer.bytes(b5)), 100, 0);
+    }
+    buffer.drop(heap, edge);
+    var twice = buffer.append(heap, buffer.empty(heap, 400), "{\"id\":\"a\",");
+    twice = buffer.append(heap, twice, tail);
+    twice = buffer.append(heap, twice, ",{\"id\":\"a\",");
+    twice = buffer.append(heap, twice, tail);
+    borrow twice as &b6 in {
+        same(with_entries(heap, buffer.bytes(b6)), 1, response.r_evidence_id());
+    }
+    buffer.drop(heap, twice);
+    return 0;
+}
+
+fn test_a_kind_outside_the_closed_set_is_a_protocol_error[&h](heap: &!h Heap) -> [heap] int {
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"video\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}"), 1, response.r_evidence_kind());
+    same(with_entries(heap, "{\"id\":\"a\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}"), 1, response.r_evidence_kind());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":3,\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}"), 1, response.r_evidence_kind());
+    return 0;
+}
+
+fn test_a_reference_that_leaves_the_execution_directory_is_evidence_ref_invalid[&h](heap: &!h Heap) -> [heap] int {
+    same(entry_ref(heap, "\"logs/test.txt\""), 100, 0);
+    same(entry_ref(heap, "\"/etc/passwd\""), 2, response.r_evidence_ref());
+    same(entry_ref(heap, "\"../x\""), 2, response.r_evidence_ref());
+    same(entry_ref(heap, "\"a/../x\""), 2, response.r_evidence_ref());
+    same(entry_ref(heap, "\"a..b\""), 2, response.r_evidence_ref());
+    same(entry_ref(heap, "\"\""), 2, response.r_evidence_ref());
+    same(entry_ref(heap, "\"a\\u0000b\""), 2, response.r_evidence_ref());
+    same(entry_ref(heap, "\"a\\/b\""), 2, response.r_evidence_ref());
+    same(entry_ref(heap, "7"), 1, response.r_evidence_ref());
+    same(entry_ref(heap, "null"), 1, response.r_evidence_ref());
+    return 0;
+}
+
+fn test_a_reference_is_at_most_512_bytes[&h](heap: &!h Heap) -> [heap] int {
+    var edge = buffer.push(heap, buffer.empty(heap, 600), byte_of('"'));
+    var i = 0;
+    while i < 512 {
+        edge = buffer.push(heap, edge, byte_of('a'));
+        i = i + 1;
+    }
+    edge = buffer.push(heap, edge, byte_of('"'));
+    borrow edge as &b in {
+        same(entry_ref(heap, buffer.bytes(b)), 100, 0);
+    }
+    buffer.drop(heap, edge);
+    var over = buffer.push(heap, buffer.empty(heap, 600), byte_of('"'));
+    i = 0;
+    while i < 513 {
+        over = buffer.push(heap, over, byte_of('a'));
+        i = i + 1;
+    }
+    over = buffer.push(heap, over, byte_of('"'));
+    borrow over as &b2 in {
+        same(entry_ref(heap, buffer.bytes(b2)), 2, response.r_evidence_ref());
+    }
+    buffer.drop(heap, over);
+    return 0;
+}
+
+fn test_a_hash_is_64_lower_case_hex_digits[&h](heap: &!h Heap) -> [heap] int {
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9F2C0000000000000000000000000000000000000000000000000000000000E1\",\"bytes\":1}"), 2, response.r_evidence_sha256());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c\",\"bytes\":1}"), 2, response.r_evidence_sha256());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"zf2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}"), 2, response.r_evidence_sha256());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c00000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}"), 2, response.r_evidence_sha256());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":12,\"bytes\":1}"), 1, response.r_evidence_sha256());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"bytes\":1}"), 1, response.r_evidence_sha256());
+    return 0;
+}
+
+fn test_a_size_is_a_non_negative_integer[&h](heap: &!h Heap) -> [heap] int {
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":-1}"), 2, response.r_evidence_bytes());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":\"5\"}"), 1, response.r_evidence_bytes());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1.5}"), 1, response.r_evidence_bytes());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":99999999999999999999}"), 1, response.r_evidence_bytes());
+    same(with_entries(heap, "{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"l\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\"}"), 1, response.r_evidence_bytes());
+    return 0;
+}
+
+fn test_cost_and_error_have_their_shapes[&h](heap: &!h Heap) -> [heap] int {
+    let c = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"cost\":";
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"cost\":{\"unit\":\"usd_cents\",\"amount\":37,\"source\":\"worker-reported\"}}", false), 100, 0);
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"cost\":{\"unit\":\"tokens\",\"amount\":0,\"source\":\"derived-from-tokens\"}}", false), 100, 0);
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"cost\":{\"unit\":\"tokens\",\"amount\":5,\"source\":\"forge-measured\"}}", false), 100, 0);
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"cost\":{\"unit\":\"tokens\",\"amount\":-5,\"source\":\"forge-measured\"}}", false), 1, response.r_cost());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"cost\":{\"unit\":\"tokens\",\"amount\":5,\"source\":\"trust-me\"}}", false), 1, response.r_cost());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"cost\":{\"unit\":\"tokens\",\"amount\":5}}", false), 1, response.r_cost());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"cost\":12}", false), 1, response.r_cost());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"c\",\"message\":\"m\"}}", false), 1, response.r_error());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":1,\"message\":\"m\",\"retryable\":true}}", false), 1, response.r_error());
+    same(outcome(heap, "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":\"boom\"}", false), 1, response.r_error());
+    return 0;
+}
+
+fn test_ref_ok_and_sha256_ok_directly() -> [] int {
+    test.assert(response.ref_ok("a/b.txt"));
+    test.assert(response.ref_ok("a.b"));
+    test.assert(response.ref_ok(".hidden"));
+    test.assert(!response.ref_ok(""));
+    test.assert(!response.ref_ok("/a"));
+    test.assert(!response.ref_ok("a/.."));
+    test.assert(!response.ref_ok("..a"));
+    test.assert(response.sha256_ok("0000000000000000000000000000000000000000000000000000000000000000"));
+    test.assert(!response.sha256_ok(""));
+    test.assert(!response.sha256_ok("0000000000000000000000000000000000000000000000000000000000000000 "));
+    test.assert_eq(len(response.rule_name(response.Rule::WorkerProtocol)), 15);
+    test.assert_eq(len(response.state_name(response.State::Partial)), 7);
+    test.assert_eq(len(response.reason_name(response.r_evidence_sha256())), 15);
+    test.assert_eq(len(response.reason_name(99)), 7);
+    return 0;
+}
+
+// A valid response, every prefix of it, and every position changed to each of eight bytes: each is a verdict (a
+// value), never a trap, and no prefix is accepted.
+fn test_every_truncation_and_every_single_byte_change_is_a_verdict[&h](heap: &!h Heap) -> [heap] int {
+    let whole = doc(heap, head(), entry(), tail());
+    var prefixes_refused = 0;
+    var changed = 0;
+    borrow whole as &wb in {
+        let text = buffer.bytes(wb);
+        let n = len(text);
+        var cut = 0;
+        while cut < n {
+            let (c, r) = outcome(heap, text[0..cut], false);
+            test.assert_eq(c, 1);
+            prefixes_refused = prefixes_refused + 1;
+            cut = cut + 1;
+        }
+        let swaps = "\"{}[:,x";
+        var at = 0;
+        while at < n {
+            var k = 0;
+            while k < len(swaps) {
+                var copy = buffer.empty(heap, n + 1);
+                var j = 0;
+                while j < n {
+                    if j == at {
+                        copy = buffer.push(heap, copy, swaps[k]);
+                    } else {
+                        copy = buffer.push(heap, copy, text[j]);
+                    }
+                    j = j + 1;
+                }
+                borrow copy as &cb in {
+                    let (c, r) = outcome(heap, buffer.bytes(cb), false);
+                    test.assert(c == 1 || c == 2 || c >= 100);
+                    changed = changed + 1;
+                }
+                buffer.drop(heap, copy);
+                k = k + 1;
+            }
+            at = at + 1;
+        }
+    }
+    buffer.drop(heap, whole);
+    test.assert(prefixes_refused > 100);
+    test.assert(changed > 1000);
+    return 0;
+}
+
+fn test_the_request_id_and_task_id_asked_for_are_the_ones_checked[&h](heap: &!h Heap) -> [heap] int {
+    let body = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-9\",\"state\":\"succeeded\",\"task_id\":\"t-9\",\"evidence\":[]}";
+    match response.validate(heap, body, "r-9", "t-9", false) {
+        response.Verdict::Valid(s) => {
+            test.assert_eq(len(response.state_name(s)), 9);
+        }
+        response.Verdict::Refused(rule, reason) => {
+            test.assert_eq(reason, 0 - 1);
+        }
+    }
+    same(outcome(heap, body, false), 1, response.r_request_id());
+    return 0;
+}
+
+fn test_a_nul_in_a_reference_is_refused_by_the_path_rule_itself[&h](heap: &!h Heap) -> [heap] int {
+    let path = buffer.push(heap, buffer.append(heap, buffer.empty(heap, 8), "a"), byte_of(0));
+    borrow path as &b in {
+        test.assert(!response.ref_ok(buffer.bytes(b)));
+    }
+    buffer.drop(heap, path);
+    return 0;
+}

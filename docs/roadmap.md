@@ -90,6 +90,8 @@ it now has company: `accept-unverified`, `actor-not-allowed`, `task-unknown`,
 
 ## M2 -- Worker contract and Cancho Code adapter
 
+**Status of M2 (what exists).** `src/response.cho` validates an `execute` response against the contract: a pure function, `worker-protocol` and the syntactic half of `evidence-ref-invalid` as rules with reasons, 19 tests and 32 mutants all killed (`scripts/mutate_response.py`). **Not built:** the mock worker brought up to the envelope, the dispatcher, the adapter (`src/worker.cho`), hash recomputation, the Cancho Code binding, the contract-test suite against mock and real, `capabilities`/`cancel`/`status`/`result`.
+
 *Leans on:* `std.process`, `Exec`. *Justified by:* S1, S2, S3, S6.
 
 Work: ~~audit Cancho Code first and correct `worker-contract.md`~~ (done,

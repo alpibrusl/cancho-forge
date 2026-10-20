@@ -659,6 +659,8 @@ ones by `tests/conformance/journal_files.cho`):
 | `snapshot-invalid` | a snapshot file that is not one JSON line this build reads (section 4.6); the journal is used instead | `test_unreadable_snapshots_are_snapshot_invalid`, `test_a_snapshot_without_its_newline_or_empty_of_content_is_snapshot_invalid`, conformance `refused: a half snapshot`, `refused: garbage` |
 | `snapshot-mismatch` | a well-formed snapshot that disagrees with the journal (beyond it, off a boundary, wrong count, wrong hash, a lying projection under strict); the journal is used instead | `test_a_snapshot_with_the_wrong_hash_is_a_mismatch`, `..._of_another_history_...`, `..._beyond_the_journal_...`, `..._off_a_record_boundary_...`, `..._of_no_records_with_tasks_...`, `test_strict_mode_catches_...`, conformance `refused: a snapshot beyond the journal` |
 | `workspace-locked` | another Forge holds the workspace lock (section 4.7) | conformance `lock: a second writer is refused`, and `crash_points` at 24 points across processes |
+| `worker-protocol` | a worker's reply that is not valid for the contract: not JSON, not an object, a wrong `contract`, `request_id` or `task_id`, an unknown `state` or evidence `kind`, a missing or mistyped field, more than 256 evidence entries, a duplicate or escaped evidence id, a `failed` or `partial` response with no `error`, a `succeeded` one with an error. The reason is a code (`response.reason_name`) | `tests/response_test.cho`: one test per group of reasons, and the sweep of every prefix and single-byte change |
+| `evidence-ref-invalid` | an evidence `ref` that is empty, absolute, longer than 512 bytes, escaped, holds a NUL or two dots in a row; a `sha256` that is not 64 lower-case hex digits; a negative `bytes`. (A hash that does not match the file is the adapter's, not built.) | `test_a_reference_that_leaves_the_execution_directory_is_evidence_ref_invalid`, `..._at_most_512_bytes`, `..._a_hash_is_64_lower_case_hex_digits`, `..._a_size_is_a_non_negative_integer` |
 | `path-invalid` | a journal path that is not absolute, has two dots in a row anywhere (`..` as a component or inside a name), a NUL, or is longer than 512 bytes: refused before the file capability (which traps on the byte pair) is reached. *Corrected after spike S8: this row said "a `..` component", which is what Forge's hand-written check tested and the capability does not: `/a/..b` passed the check and trapped.* | conformance `path:` (two cases), `recover: a .. path`, `append: a .. path`, `recover/append/exists: a name with .. inside` |
 
 Designed, not implemented (no test reaches them yet; they are not claims):
@@ -669,10 +671,9 @@ Designed, not implemented (no test reaches them yet; they are not claims):
 | `policy-missing` | no policy loaded or it did not parse (fail closed) |
 | `approval-missing` | a protected action without a granted approval |
 | `budget-exhausted` | a reservation would exceed a limit |
-| `worker-protocol` | worker reply is not valid for the contract |
 | `worker-contract-version` | no common contract version |
 | `worker-timeout`, `worker-output-overflow`, `worker-crashed`, `worker-error`, `worker-unavailable` | observed ending of a worker process (section 5 of the worker contract; the Cancho Code binding adds how an exit code is read, section 9.4) |
-| `evidence-ref-invalid` | a path outside the execution directory, or a hash that does not match |
+| `evidence-ref-invalid` (the mismatch half) | a hash or size that does not match the file Forge recomputes: needs the execution directory, so it is the adapter's |
 | `journal-sync-failed` | `fsync` failed; contents unknown; Forge stops (the file layer returns the errno today; the stop is M2) |
 
 The contract and the roadmap may add rules; none ships without its row

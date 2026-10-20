@@ -1,0 +1,453 @@
+edition 9;
+module forge.response;
+
+import std.bytes;
+import std.json;
+
+// The validation of a worker's `execute` response (docs/worker-contract.md, sections 2, 3.2, 4 and 7). A pure
+// function of the bytes the worker wrote and of what Forge asked for: it opens no file, so it cannot hash the
+// evidence (that needs the execution directory; the adapter recomputes the hash and size and answers
+// `evidence-ref-invalid` on a mismatch). Every field is checked before any is used, a parse error is a value,
+// and nothing here reads `summary` or `error.message` except to see that it is text.
+
+// The rules this module answers (docs/architecture.md, section 7).
+pub enum Rule {
+    WorkerProtocol,
+    EvidenceRefInvalid,
+}
+
+// What the worker said it did. `Succeeded` is a claim; nothing here moves a task.
+pub enum State {
+    Succeeded,
+    Failed,
+    Partial,
+    Cancelled,
+    Accepted,
+}
+
+pub enum Verdict {
+    Valid(State),
+    // The rule, and a reason code (`reason_name`) that says which check failed, for the journal and the tests.
+    Refused(Rule, int),
+}
+
+pub fn rule_name(r: Rule) -> [] &static [byte] {
+    match r {
+        Rule::WorkerProtocol => {
+            return "worker-protocol";
+        }
+        Rule::EvidenceRefInvalid => {
+            return "evidence-ref-invalid";
+        }
+    }
+}
+
+pub fn state_name(s: State) -> [] &static [byte] {
+    match s {
+        State::Succeeded => {
+            return "succeeded";
+        }
+        State::Failed => {
+            return "failed";
+        }
+        State::Partial => {
+            return "partial";
+        }
+        State::Cancelled => {
+            return "cancelled";
+        }
+        State::Accepted => {
+            return "accepted";
+        }
+    }
+}
+
+// Reason codes, one per check, in the order the checks run.
+pub fn r_not_json() -> [] int {
+    return 1;
+}
+
+pub fn r_not_object() -> [] int {
+    return 2;
+}
+
+pub fn r_contract() -> [] int {
+    return 3;
+}
+
+pub fn r_request_id() -> [] int {
+    return 4;
+}
+
+pub fn r_state() -> [] int {
+    return 5;
+}
+
+pub fn r_task_id() -> [] int {
+    return 6;
+}
+
+pub fn r_summary() -> [] int {
+    return 7;
+}
+
+pub fn r_evidence() -> [] int {
+    return 8;
+}
+
+pub fn r_evidence_count() -> [] int {
+    return 9;
+}
+
+pub fn r_evidence_entry() -> [] int {
+    return 10;
+}
+
+pub fn r_evidence_id() -> [] int {
+    return 11;
+}
+
+pub fn r_evidence_kind() -> [] int {
+    return 12;
+}
+
+pub fn r_evidence_ref() -> [] int {
+    return 13;
+}
+
+pub fn r_evidence_sha256() -> [] int {
+    return 14;
+}
+
+pub fn r_evidence_bytes() -> [] int {
+    return 15;
+}
+
+pub fn r_cost() -> [] int {
+    return 16;
+}
+
+pub fn r_error() -> [] int {
+    return 17;
+}
+
+pub fn reason_name(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "not-json";
+    }
+    if code == 2 {
+        return "not-an-object";
+    }
+    if code == 3 {
+        return "contract";
+    }
+    if code == 4 {
+        return "request-id";
+    }
+    if code == 5 {
+        return "state";
+    }
+    if code == 6 {
+        return "task-id";
+    }
+    if code == 7 {
+        return "summary";
+    }
+    if code == 8 {
+        return "evidence";
+    }
+    if code == 9 {
+        return "evidence-count";
+    }
+    if code == 10 {
+        return "evidence-entry";
+    }
+    if code == 11 {
+        return "evidence-id";
+    }
+    if code == 12 {
+        return "evidence-kind";
+    }
+    if code == 13 {
+        return "evidence-ref";
+    }
+    if code == 14 {
+        return "evidence-sha256";
+    }
+    if code == 15 {
+        return "evidence-bytes";
+    }
+    if code == 16 {
+        return "cost";
+    }
+    if code == 17 {
+        return "error";
+    }
+    return "unknown";
+}
+
+// More evidence than this in one response is a protocol error: the tape and the checks are bounded by it.
+pub fn max_evidence() -> [] int {
+    return 256;
+}
+
+pub fn max_id_bytes() -> [] int {
+    return 128;
+}
+
+pub fn max_ref_bytes() -> [] int {
+    return 512;
+}
+
+// ---- the path of an evidence reference ---------------------------------------------------------------------
+
+// A reference is a relative path inside the execution directory (section 4): not empty, at most 512 bytes, no
+// leading `/`, no NUL, and no two dots in a row anywhere. The contract said "no `..` component"; the file
+// capability traps on the byte pair wherever it falls (spike S8, `journal_io.path_ok`), so `a..b` is refused too.
+// This is the first layer. Opening the file goes through a capability that holds the execution directory.
+pub fn ref_ok[&r](path: &r [byte]) -> [] bool {
+    let n = len(path);
+    if n == 0 || n > max_ref_bytes() || int_of(path[0]) == '/' {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        let c = int_of(path[i]);
+        if c == 0 {
+            return false;
+        }
+        if c == '.' && i + 1 < n && int_of(path[i + 1]) == '.' {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Lowercase hex of a SHA-256: exactly 64 digits of 0-9a-f.
+pub fn sha256_ok[&r](text: &r [byte]) -> [] bool {
+    if len(text) != 64 {
+        return false;
+    }
+    var i = 0;
+    while i < 64 {
+        let c = int_of(text[i]);
+        if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- the response ------------------------------------------------------------------------------------------
+
+fn refuse(rule: Rule, reason: int) -> [] Verdict {
+    return Verdict::Refused(rule, reason);
+}
+
+fn protocol(reason: int) -> [] Verdict {
+    return Verdict::Refused(Rule::WorkerProtocol, reason);
+}
+
+// A string node whose value is `text`.
+fn is_text[&s, &t, &k](src: &s [byte], tape: &t [int], node: int, text: &k [byte]) -> [] bool {
+    return json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+fn kind_known[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] bool {
+    return is_text(src, tape, node, "patch") || is_text(src, tape, node, "log") || is_text(src, tape, node, "report") || is_text(src, tape, node, "test_output") || is_text(src, tape, node, "file") || is_text(src, tape, node, "other");
+}
+
+// `state` as a State, or a refusal. `accepted` is the answer of an `async` worker to `execute` only.
+fn state_of[&s, &t](src: &s [byte], tape: &t [int], node: int, is_async: bool) -> [] Verdict {
+    if is_text(src, tape, node, "succeeded") {
+        return Verdict::Valid(State::Succeeded);
+    }
+    if is_text(src, tape, node, "failed") {
+        return Verdict::Valid(State::Failed);
+    }
+    if is_text(src, tape, node, "partial") {
+        return Verdict::Valid(State::Partial);
+    }
+    if is_text(src, tape, node, "cancelled") {
+        return Verdict::Valid(State::Cancelled);
+    }
+    if is_async && is_text(src, tape, node, "accepted") {
+        return Verdict::Valid(State::Accepted);
+    }
+    return protocol(r_state());
+}
+
+// `error` is null or {code: string, message: string, retryable: bool}.
+fn error_ok[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] bool {
+    if json.is_null(tape, node) {
+        return true;
+    }
+    if !json.is_object(tape, node) {
+        return false;
+    }
+    let code = json.get(src, tape, node, "code");
+    let message = json.get(src, tape, node, "message");
+    let retry = json.get(src, tape, node, "retryable");
+    return json.is_string(tape, code) && json.is_string(tape, message) && json.is_bool(tape, retry);
+}
+
+// `cost` is {unit: string, amount: int >= 0, source: worker-reported | derived-from-tokens | forge-measured}.
+fn cost_ok[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] bool {
+    if !json.is_object(tape, node) {
+        return false;
+    }
+    let unit = json.get(src, tape, node, "unit");
+    let amount = json.get(src, tape, node, "amount");
+    let source = json.get(src, tape, node, "source");
+    if !json.is_string(tape, unit) || !json.is_int(tape, amount) || !json.fits_int(src, tape, amount) || json.to_int(src, tape, amount) < 0 {
+        return false;
+    }
+    return is_text(src, tape, source, "worker-reported") || is_text(src, tape, source, "derived-from-tokens") || is_text(src, tape, source, "forge-measured");
+}
+
+// Evidence entry `entry` (a node of the tape) against the entries before it, whose ids are at `ids`.
+fn entry_check[&s, &t](src: &s [byte], tape: &t [int], evidence: int, n: int, index: int) -> [] Verdict {
+    let entry = json.at(tape, evidence, index);
+    if !json.is_object(tape, entry) {
+        return protocol(r_evidence_entry());
+    }
+    let id = json.get(src, tape, entry, "id");
+    if !json.string_plain(tape, id) || json.string_length(src, tape, id) < 1 || json.string_length(src, tape, id) > max_id_bytes() {
+        return protocol(r_evidence_id());
+    }
+    var k = 0;
+    while k < index {
+        let other = json.get(src, tape, json.at(tape, evidence, k), "id");
+        if json.string_equals(src, tape, id, json.string_view(src, tape, other)) {
+            return protocol(r_evidence_id());
+        }
+        k = k + 1;
+    }
+    if !kind_known(src, tape, json.get(src, tape, entry, "kind")) {
+        return protocol(r_evidence_kind());
+    }
+    let path = json.get(src, tape, entry, "ref");
+    if !json.is_string(tape, path) {
+        return protocol(r_evidence_ref());
+    }
+    if !json.string_plain(tape, path) || !ref_ok(json.string_view(src, tape, path)) {
+        return refuse(Rule::EvidenceRefInvalid, r_evidence_ref());
+    }
+    let sha = json.get(src, tape, entry, "sha256");
+    if !json.is_string(tape, sha) {
+        return protocol(r_evidence_sha256());
+    }
+    if !sha256_ok(json.string_view(src, tape, sha)) {
+        return refuse(Rule::EvidenceRefInvalid, r_evidence_sha256());
+    }
+    let size = json.get(src, tape, entry, "bytes");
+    if !json.is_int(tape, size) || !json.fits_int(src, tape, size) {
+        return protocol(r_evidence_bytes());
+    }
+    if json.to_int(src, tape, size) < 0 {
+        return refuse(Rule::EvidenceRefInvalid, r_evidence_bytes());
+    }
+    return Verdict::Valid(State::Succeeded);
+}
+
+// The verdict on `body`, the bytes a worker wrote to stdout for the request `request_id` about task `task_id`.
+// `is_async` says whether the worker declared level `async`.
+pub fn validate[&h, &b, &r, &k](heap: &!h Heap, body: &b [byte], request_id: &r [byte], task_id: &k [byte], is_async: bool) -> [heap] Verdict {
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    var verdict = protocol(r_not_json());
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(body, tp) > 0 {
+            verdict = judge(body, tp, request_id, task_id, is_async);
+        }
+    }
+    unbox_slice(heap, tape);
+    return verdict;
+}
+
+fn judge[&s, &t, &r, &k](src: &s [byte], tape: &t [int], request_id: &r [byte], task_id: &k [byte], is_async: bool) -> [] Verdict {
+    if !json.is_object(tape, 0) {
+        return protocol(r_not_object());
+    }
+    if !is_text(src, tape, json.get(src, tape, 0, "contract"), "forge-worker/1") {
+        return protocol(r_contract());
+    }
+    if !is_text(src, tape, json.get(src, tape, 0, "request_id"), request_id) {
+        return protocol(r_request_id());
+    }
+    let state = state_of(src, tape, json.get(src, tape, 0, "state"), is_async);
+    match state {
+        Verdict::Refused(rule, reason) => {
+            return Verdict::Refused(rule, reason);
+        }
+        Verdict::Valid(s) => {
+            return rest(src, tape, task_id, s);
+        }
+    }
+}
+
+// The fields after `state`, which is `s`.
+fn rest[&s, &t, &k](src: &s [byte], tape: &t [int], task_id: &k [byte], s: State) -> [] Verdict {
+    if !is_text(src, tape, json.get(src, tape, 0, "task_id"), task_id) {
+        return protocol(r_task_id());
+    }
+    let summary = json.get(src, tape, 0, "summary");
+    if summary >= 0 && !json.is_string(tape, summary) {
+        return protocol(r_summary());
+    }
+    let evidence = json.get(src, tape, 0, "evidence");
+    if !json.is_array(tape, evidence) {
+        return protocol(r_evidence());
+    }
+    let n = json.count(tape, evidence);
+    if n > max_evidence() {
+        return protocol(r_evidence_count());
+    }
+    var i = 0;
+    while i < n {
+        match entry_check(src, tape, evidence, n, i) {
+            Verdict::Refused(rule, reason) => {
+                return Verdict::Refused(rule, reason);
+            }
+            Verdict::Valid(ignored) => {
+                i = i + 1;
+            }
+        }
+    }
+    let cost = json.get(src, tape, 0, "cost");
+    if cost >= 0 && !cost_ok(src, tape, cost) {
+        return protocol(r_cost());
+    }
+    let error = json.get(src, tape, 0, "error");
+    if error >= 0 && !error_ok(src, tape, error) {
+        return protocol(r_error());
+    }
+    // A worker that says it failed must say why; one that says it succeeded must not have an error to give.
+    let has_error = error >= 0 && !json.is_null(tape, error);
+    match s {
+        State::Failed => {
+            if !has_error {
+                return protocol(r_error());
+            }
+        }
+        State::Succeeded => {
+            if has_error {
+                return protocol(r_error());
+            }
+        }
+        State::Partial => {
+            if !has_error {
+                return protocol(r_error());
+            }
+        }
+        State::Cancelled => {
+            return Verdict::Valid(s);
+        }
+        State::Accepted => {
+            return Verdict::Valid(s);
+        }
+    }
+    return Verdict::Valid(s);
+}
