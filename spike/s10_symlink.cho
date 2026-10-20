@@ -1,0 +1,110 @@
+edition 9;
+
+import std.dirs;
+import std.io;
+
+// Spike 10: does opening a file through the capability follow a symlink out of the directory it names?
+// An evidence `ref` is a relative path inside the execution directory (docs/worker-contract.md section 4), and a
+// worker, which is untrusted, can make a symlink there. `ref_ok` and `fs_covers` look at the bytes of a path, not at
+// the file system, so this asks what `open_read` does.
+//   argv[1]  a mode: f  open the absolute path argv[2] through the `Fs` capability
+//                    d  open the relative path argv[3] beneath the directory argv[2] with `std.dirs.open_file`
+//   argv[2]  an absolute path (the directory, in mode d)
+//   argv[3]  a relative path (mode d only)
+// Prints whether it opened (with the errno when it did not) and whether the first read returned bytes.
+
+fn yes_no[&i](io: &!i Io, label: &i [byte], value: bool) -> [io_write] int {
+    io.write_all(io, label);
+    if value {
+        io.write_all(io, " yes\n");
+    } else {
+        io.write_all(io, " no\n");
+    }
+    return 0;
+}
+
+// Read the first bytes of an opened file and say whether there were any; close it.
+fn first_read[&h, &i](heap: &!h Heap, io: &!i Io, opened: Opened) -> [heap, io_write, file_read] int {
+    match opened {
+        Opened::Failed(e) => {
+            yes_no(io, "opened        ", false);
+            yes_no(io, "ELOOP (40)    ", e == 40);
+            yes_no(io, "ENOTDIR (20)  ", e == 20);
+            yes_no(io, "ENOENT (2)    ", e == 2);
+        }
+        Opened::Ok(f) => {
+            yes_no(io, "opened        ", true);
+            var file = f;
+            borrow mut file as &!x in {
+                let scratch = box_slice(heap, 16, byte_of(0));
+                borrow mut scratch as &!sw in {
+                    match file_read(x, contents(sw)) {
+                        Read::Got(n) => {
+                            yes_no(io, "read bytes>0  ", n > 0);
+                        }
+                        Read::End => {
+                            yes_no(io, "read bytes>0  ", false);
+                        }
+                        Read::Failed(e) => {
+                            yes_no(io, "read bytes>0  ", false);
+                        }
+                    }
+                }
+                unbox_slice(heap, scratch);
+            }
+            file_close(file);
+        }
+    }
+    return 0;
+}
+
+fn go[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, g: &g Args) -> [heap, args, io_write, fs_read(""), file_read, dir_read] int {
+    let mode = int_of(arg(g, 1)[0]);
+    let path = arg(g, 2);
+    if mode == 'f' {
+        yes_no(io, "fs_covers     ", fs_covers(fs, path));
+        first_read(heap, io, open_read(fs, path));
+    }
+    if mode == 'd' {
+        match open_dir(fs, path) {
+            DirOpened::Failed(e) => {
+                yes_no(io, "dir opened    ", false);
+            }
+            DirOpened::Ok(d) => {
+                var dir = d;
+                borrow dir as &dd in {
+                    first_read(heap, io, dirs.open_file(dd, arg(g, 3)));
+                }
+                dir_close(dir);
+            }
+        }
+    }
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var hp = heap;
+    var console = io;
+    var status = 2;
+    borrow fs as &f in {
+        borrow mut console as &!i in {
+            borrow args as &g in {
+                borrow mut hp as &!hh in {
+                    status = go(hh, f, i, g);
+                }
+            }
+        }
+    }
+    release(fs);
+    release(hp);
+    release(console);
+    release(args);
+    return status;
+}

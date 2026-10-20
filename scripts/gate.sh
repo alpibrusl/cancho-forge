@@ -35,10 +35,20 @@ libs=$(ls src/*.cho | grep -v '/main\.cho$')
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/forge-conformance.XXXXXX") || exit 1
 trap 'rm -rf "$scratch"' EXIT
 held=0
-for prog in journal_files snapshot_files; do
+for prog in journal_files snapshot_files evidence_files; do
   echo "-- $prog"
   $C check tests/conformance/$prog.cho tests/conformance/support.cho $libs --std || fail=1
   mkdir "$scratch/$prog" || exit 1
+  if [ "$prog" = evidence_files ]; then
+    # What the language cannot make (spike S10): links to files and a directory outside the execution
+    # directory, a directory, and two sparse files, at the 64 MiB cap and one byte past it.
+    mkdir "$scratch/$prog/sub" "$scratch/outside" || exit 1
+    echo secret > "$scratch/outside/s.txt"
+    ln -s "$scratch/outside/s.txt" "$scratch/$prog/link" || exit 1
+    ln -s "$scratch/outside" "$scratch/$prog/dirlink" || exit 1
+    truncate -s 67108865 "$scratch/$prog/big.bin" || exit 1
+    truncate -s 67108864 "$scratch/$prog/cap.bin" || exit 1
+  fi
   if $C build tests/conformance/$prog.cho tests/conformance/support.cho $libs --std -o "$scratch/$prog.bin"; then
     "$scratch/$prog.bin" "$scratch/$prog" > "$scratch/$prog.out" || fail=1
     cat "$scratch/$prog.out"

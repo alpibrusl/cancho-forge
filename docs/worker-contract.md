@@ -258,6 +258,30 @@ before the artifact is referenced by any event. A mismatch is
 running its own checks (M3). A changed file after the first recording
 invalidates every verification that cited it.
 
+### 4.1 Recomputing the hash and the size *(built: `src/evidence_io.cho`)*
+
+`forge.response` judges the shape of a response and opens nothing. `evidence_io.verify(heap, fs, body, execution_dir)` is
+the other half: it opens the execution directory **once** as a `Dir` and opens each `ref` beneath it one component at a
+time, following no link (`std.dirs.open_file`), reads the file up to a cap of 64 MiB, and compares the size, then the
+SHA-256, with the claim. Every mismatch is `evidence-ref-invalid`, with a reason:
+
+| reason | when |
+|---|---|
+| `evidence-missing` | the file is not there (`ENOENT`) |
+| `evidence-unreadable` | it will not open or read: a symlink (to a file, or in the path), a directory, no permission |
+| `evidence-too-large` | more than 64 MiB (`evidence_io.max_file_bytes`); a file of exactly the cap is read |
+| `evidence-bytes-mismatch` | the size is not the claimed `bytes` (checked first: a hash of another length cannot match) |
+| `evidence-sha-mismatch` | the SHA-256 is not the claimed `sha256` |
+
+An execution directory Forge cannot open (not absolute, `..` in it, not there) is **not** a verdict on the worker: the
+answer is `NoDirectory(errno)`, `-2` for a path that is not ok, and the caller treats it as an adapter fault.
+
+**Why a `Dir` and not `Fs`.** Measured in spike S10: a worker is untrusted and can leave a symlink in its own
+directory; `open_read` through `Fs` follows it (`link` to a file outside, and a path through a symlinked directory, both
+opened and read), so Forge would have hashed, and in M3 might have attached as evidence, a file the worker has no
+business naming. `ref_ok` and `fs_covers` look at the bytes of a path and cannot see this. `std.dirs.open_file` refuses
+both (`ELOOP`, `ENOTDIR`), and `..` and an absolute path never reach it. The loop holds `dir_read`, not the `Fs`.
+
 ## 5. Error states Forge observes
 
 Independent of what the worker says, Forge classifies how the process
@@ -318,7 +342,7 @@ output it relays (`threat-model.md`):
 | `capabilities`, `cancel`, `status`, `result`, `async` level | | designed |
 | contract tests run against mock and the real adapter | `tests/contract/` (M2) | not started |
 | the response of `execute` against section 2, 3.2 and 4 (the shape, the closed sets, the ref and hash syntax, the bounds), as a pure function | `src/response.cho`; `tests/response_test.cho` (19 tests, among them every prefix and every single-byte change of a valid response), and `scripts/mutate_response.py` (32 deliberate breaks, all killed) | **built** (rows 6, 9 and 10 of section 5 are reached by it) |
-| evidence hash recomputation | `std.crypto.sha256` exists; needs the execution directory, so it belongs to the adapter | not spiked |
+| evidence hash and size recomputed against the file, a symlink not followed | `src/evidence_io.cho`; `tests/conformance/evidence_files.cho` (24 cases against real files, the links made by the gate), `scripts/mutate_evidence.py` (16 deliberate breaks, all killed); spike S10 | **built** (section 4.1). Not yet called by a worker adapter: `src/main.cho` does not link it, so `cancho authority` for `forge` is unchanged; the call widens it by `dir_read` and says so |
 | the real Cancho Code interface | [`cancho-code-audit.md`](cancho-code-audit.md): source read, both offline gates run (`scripts/test-build.sh`, `scripts/test-mcp.sh`), a stand-in run, a TERM, a resume, an `env -i` run | **done in M0; corrected sections marked above. Not done: a run with a real model** |
 | the Cancho Code binding of section 9 as an adapter | `src/worker.cho` (M2) | designed from the audit; not built |
 

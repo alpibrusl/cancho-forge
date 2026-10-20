@@ -1,0 +1,220 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import forge.evidence_io;
+import forge.journal_io;
+import forge.response;
+import forge.support;
+
+// Conformance for the evidence file layer (docs/worker-contract.md, section 4.1; spike S10): `evidence_io.verify`
+// against real files in a scratch directory the gate makes and removes. The gate also makes, before this runs, what
+// the language cannot: a symlink to a file outside the directory (`link`), a symlink to a directory outside it
+// (`dirlink`), a directory (`sub`) and two sparse files, one byte past the cap (`big.bin`) and exactly at it (`cap.bin`). Prints "ok   <case>" or
+// "FAIL <case>" and exits 0 only if every case held. Usage: evidence_files <existing dir>.
+
+// The SHA-256 of "abc" and of nothing (FIPS 180-2 examples; `sha256sum` agrees).
+fn abc_sha() -> [] &static [byte] {
+    return "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+}
+
+fn empty_sha() -> [] &static [byte] {
+    return "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+}
+
+// One evidence entry as JSON.
+fn entry[&h, &r, &p, &s](heap: &!h Heap, id: &r [byte], path: &p [byte], sha: &s [byte], size: int) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 128), "{\"id\":\"");
+    b = buffer.append(heap, b, id);
+    b = buffer.append(heap, b, "\",\"kind\":\"file\",\"ref\":\"");
+    b = buffer.append(heap, b, path);
+    b = buffer.append(heap, b, "\",\"sha256\":\"");
+    b = buffer.append(heap, b, sha);
+    b = buffer.append(heap, b, "\",\"bytes\":");
+    b = buffer.push_nat(heap, b, size);
+    return buffer.push(heap, b, byte_of(125));
+}
+
+// A response whose evidence is `entries` (already comma-joined).
+fn body[&h, &e](heap: &!h Heap, entries: &e [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 256), "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[");
+    b = buffer.append(heap, b, entries);
+    return buffer.append(heap, b, "]}");
+}
+
+// (class, reason): 0 held; 1 worker-protocol; 2 evidence-ref-invalid; 3 no directory (reason is the errno).
+fn outcome[&h, &f, &d, &e](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], entries: &e [byte]) -> [heap, fs_read(""), dir_read, file_read] (int, int) {
+    let b = body(heap, entries);
+    var result = (0, 0);
+    borrow b as &bb in {
+        match evidence_io.verify(heap, fs, buffer.bytes(bb), dir) {
+            evidence_io.Checked::Held => {
+                result = (0, 0);
+            }
+            evidence_io.Checked::Refused(rule, reason) => {
+                match rule {
+                    response.Rule::WorkerProtocol => {
+                        result = (1, reason);
+                    }
+                    response.Rule::EvidenceRefInvalid => {
+                        result = (2, reason);
+                    }
+                }
+            }
+            evidence_io.Checked::NoDirectory(e) => {
+                result = (3, e);
+            }
+        }
+    }
+    buffer.drop(heap, b);
+    return result;
+}
+
+// Does the check on `entries` answer (`class`, `reason`)?
+fn answers[&h, &f, &d, &e](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], entries: &e [byte], class: int, reason: int) -> [heap, fs_read(""), dir_read, file_read] bool {
+    let (c, r) = outcome(heap, fs, dir, entries);
+    return c == class && r == reason;
+}
+
+// One case: the single entry (`path`, `sha`, `size`) beneath `dir` answers (`class`, `reason`).
+fn one[&h, &f, &d, &i, &r, &p, &s](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, name: &r [byte], dir: &d [byte], path: &p [byte], sha: &s [byte], size: int, class: int, reason: int) -> [heap, fs_read(""), dir_read, file_read, io_write] int {
+    let e = entry(heap, "e1", path, sha, size);
+    var got = (0 - 1, 0 - 1);
+    borrow e as &eb in {
+        got = outcome(heap, fs, dir, buffer.bytes(eb));
+    }
+    buffer.drop(heap, e);
+    let (c, r2) = got;
+    return support.verdict(io, c == class && r2 == reason, name);
+}
+
+fn run[&h, &f, &i, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_write, dir_read, file_read, io_write] int {
+    var bad = 0;
+    // The files the program owns; the gate made the rest.
+    let a = support.under(heap, dir, "a.txt");
+    let z = support.under(heap, dir, "empty.txt");
+    let sub_b = support.under(heap, dir, "sub/b.txt");
+    borrow a as &ab in {
+        support.put_file(fs, buffer.bytes(ab), "abc");
+    }
+    borrow z as &zb in {
+        support.put_file(fs, buffer.bytes(zb), "");
+    }
+    borrow sub_b as &sb in {
+        support.put_file(fs, buffer.bytes(sb), "abc");
+    }
+    buffer.drop(heap, a);
+    buffer.drop(heap, z);
+    buffer.drop(heap, sub_b);
+
+    bad = bad + one(heap, fs, io, "a file that matches", dir, "a.txt", abc_sha(), 3, 0, 0);
+    bad = bad + one(heap, fs, io, "an empty file that matches", dir, "empty.txt", empty_sha(), 0, 0, 0);
+    bad = bad + one(heap, fs, io, "a file in a subdirectory that matches", dir, "sub/b.txt", abc_sha(), 3, 0, 0);
+    bad = bad + one(heap, fs, io, "a wrong hash is evidence-ref-invalid", dir, "a.txt", empty_sha(), 3, 2, response.r_evidence_sha_mismatch());
+    bad = bad + one(heap, fs, io, "a wrong size is evidence-ref-invalid", dir, "a.txt", abc_sha(), 4, 2, response.r_evidence_bytes_mismatch());
+    bad = bad + one(heap, fs, io, "a size of zero for a file with bytes", dir, "a.txt", abc_sha(), 0, 2, response.r_evidence_bytes_mismatch());
+    bad = bad + one(heap, fs, io, "a file that is not there", dir, "nope.txt", abc_sha(), 3, 2, response.r_evidence_missing());
+    bad = bad + one(heap, fs, io, "a file in a directory that is not there", dir, "nodir/b.txt", abc_sha(), 3, 2, response.r_evidence_missing());
+    bad = bad + one(heap, fs, io, "a symlink to a file outside is not followed", dir, "link", abc_sha(), 3, 2, response.r_evidence_unreadable());
+    bad = bad + one(heap, fs, io, "a path through a symlinked directory is not followed", dir, "dirlink/s.txt", abc_sha(), 3, 2, response.r_evidence_unreadable());
+    bad = bad + one(heap, fs, io, "a directory is not a file", dir, "sub", abc_sha(), 3, 2, response.r_evidence_unreadable());
+    bad = bad + one(heap, fs, io, "a file one byte past the cap", dir, "big.bin", abc_sha(), 3, 2, response.r_evidence_too_large());
+    bad = bad + one(heap, fs, io, "a file of exactly the cap is read, not refused as too large", dir, "cap.bin", abc_sha(), 67108864, 2, response.r_evidence_sha_mismatch());
+    bad = bad + one(heap, fs, io, "a .. in the ref is refused before any open", dir, "../x", abc_sha(), 3, 2, response.r_evidence_ref());
+    bad = bad + one(heap, fs, io, "a hash that is not 64 hex digits", dir, "a.txt", "ABC", 3, 2, response.r_evidence_sha256());
+    bad = bad + one(heap, fs, io, "an execution directory that is not there", "/nonexistent-forge-dir", "a.txt", abc_sha(), 3, 3, 2);
+    bad = bad + one(heap, fs, io, "an execution directory that is not absolute", "relative", "a.txt", abc_sha(), 3, 3, 0 - 2);
+    bad = bad + one(heap, fs, io, "an execution directory with .. in it", "/tmp/../x", "a.txt", abc_sha(), 3, 3, 0 - 2);
+
+    // No evidence at all holds; two good entries hold; a good one then a bad one is the bad one.
+    bad = bad + support.verdict(io, answers(heap, fs, dir, "", 0, 0), "no evidence holds");
+    let e1 = entry(heap, "e1", "a.txt", abc_sha(), 3);
+    let e2 = entry(heap, "e2", "sub/b.txt", abc_sha(), 3);
+    let e3 = entry(heap, "e3", "nope.txt", abc_sha(), 3);
+    var two = buffer.append(heap, buffer.empty(heap, 256), "");
+    borrow e1 as &b1 in {
+        two = buffer.append(heap, two, buffer.bytes(b1));
+    }
+    two = buffer.push(heap, two, byte_of(44));
+    borrow e2 as &b2 in {
+        two = buffer.append(heap, two, buffer.bytes(b2));
+    }
+    var three = buffer.empty(heap, 256);
+    borrow two as &tb in {
+        three = buffer.append(heap, three, buffer.bytes(tb));
+        bad = bad + support.verdict(io, answers(heap, fs, dir, buffer.bytes(tb), 0, 0), "two entries that match hold");
+    }
+    three = buffer.push(heap, three, byte_of(44));
+    borrow e3 as &b3 in {
+        three = buffer.append(heap, three, buffer.bytes(b3));
+    }
+    borrow three as &hb in {
+        bad = bad + support.verdict(io, answers(heap, fs, dir, buffer.bytes(hb), 2, response.r_evidence_missing()), "a bad entry after good ones is found");
+    }
+    // 257 entries are more than a response may hold; a negative size and a body that is not JSON are refused.
+    var many = buffer.empty(heap, 4096);
+    var k = 0;
+    while k < 257 {
+        if k > 0 {
+            many = buffer.push(heap, many, byte_of(44));
+        }
+        borrow e1 as &b1 in {
+            many = buffer.append(heap, many, buffer.bytes(b1));
+        }
+        k = k + 1;
+    }
+    borrow many as &mb in {
+        bad = bad + support.verdict(io, answers(heap, fs, dir, buffer.bytes(mb), 1, response.r_evidence_count()), "257 entries are a protocol error");
+    }
+    buffer.drop(heap, many);
+    bad = bad + support.verdict(io, answers(heap, fs, dir, "{\"id\":\"e1\",\"kind\":\"file\",\"ref\":\"a.txt\",\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"bytes\":-1}", 2, response.r_evidence_bytes()), "a negative size is evidence-ref-invalid");
+    match evidence_io.verify(heap, fs, "nope", dir) {
+        evidence_io.Checked::Refused(rule, reason) => {
+            bad = bad + support.verdict(io, reason == response.r_not_json(), "a body that is not JSON is refused");
+        }
+        evidence_io.Checked::Held => {
+            bad = bad + support.verdict(io, false, "a body that is not JSON is refused");
+        }
+        evidence_io.Checked::NoDirectory(e) => {
+            bad = bad + support.verdict(io, false, "a body that is not JSON is refused");
+        }
+    }
+    buffer.drop(heap, e1);
+    buffer.drop(heap, e2);
+    buffer.drop(heap, e3);
+    buffer.drop(heap, two);
+    buffer.drop(heap, three);
+    return bad;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow mut console as &!i in {
+            borrow mut memory as &!h in {
+                borrow args as &g in {
+                    if arg_count(g) == 2 {
+                        status = run(h, f, i, arg(g, 1));
+                    } else {
+                        io.error_all(i, "usage: evidence_files <existing directory>\n");
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

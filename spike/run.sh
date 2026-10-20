@@ -13,7 +13,7 @@ say() { printf '\n=== %s\n' "$*"; }
 
 say "gate: fmt, check"
 $C fmt --check .. && echo "fmt: ok"
-for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under mock_worker; do
+for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under s10_symlink mock_worker; do
   $C check $f.cho --std && echo "check $f: ok"
 done
 
@@ -72,4 +72,17 @@ $C build s9_under.cho --std -o "$D/s9" || exit 1
 $C authority s9_under.cho --std | sed -n '/^performs/,/^never/p'
 for n in mock_worker ./mock_worker nope /bin/echo ../x a..b ""; do
   printf -- '--- [%s]: ' "$n"; "$D/s9" "$D/bin" "$n"
+done 2>&1
+
+say "S10 a worker's symlink: the Fs capability follows it, a Dir does not"
+$C build s10_symlink.cho --std -o "$D/s10" || exit 1
+mkdir -p "$D/s10dir/exec" "$D/s10dir/outside" && echo secret > "$D/s10dir/outside/s.txt"
+echo ok > "$D/s10dir/exec/plain"
+ln -s "$D/s10dir/outside/s.txt" "$D/s10dir/exec/link"
+ln -s "$D/s10dir/outside" "$D/s10dir/exec/dirlink"
+for r in plain link dirlink/s.txt missing ../outside/s.txt; do
+  printf -- '--- Dir: %s\n' "$r"; "$D/s10" d "$D/s10dir/exec" "$r"
+done 2>&1
+for r in plain link dirlink/s.txt missing; do
+  printf -- '--- Fs: %s\n' "$r"; "$D/s10" f "$D/s10dir/exec/$r"
 done 2>&1

@@ -1,0 +1,162 @@
+edition 9;
+module forge.evidence_io;
+
+import std.buffer;
+import std.bytes;
+import std.dirs;
+import std.json;
+import forge.journal_io;
+import forge.response;
+import forge.snapshot;
+
+// Evidence by reference, checked against the file (docs/worker-contract.md, section 4.1): Forge opens each `ref`
+// beneath the execution directory, recomputes the size and the SHA-256, and compares them with what the worker
+// claimed. `forge.response` has already judged the shape of the response; this is the half that needs the file system.
+//
+// The directory is opened once as a `Dir` and every `ref` is opened beneath it one component at a time, following no
+// link (`std.dirs.open_file`, spike S10): a worker, which is untrusted, can leave a symlink in its own directory, and
+// the `Fs` capability would follow it to any file Forge can read. A link is therefore `evidence-unreadable`, not a
+// hash of somebody else's file. The loop holds `dir_read` and never the `Fs`; only opening the directory needs
+// `fs_read("")`.
+
+// What the check found.
+pub enum Checked {
+    // Every entry exists and matches.
+    Held,
+    // The worker's claim is wrong: the rule and a reason (`response.reason_name`).
+    Refused(response.Rule, int),
+    // Forge cannot open the execution directory (an errno, or -2 for a path that is not ok): not the worker's fault, so
+    // not a verdict on its evidence.
+    NoDirectory(int),
+}
+
+// The most bytes of one evidence file Forge reads to hash it. A bigger file is `evidence-too-large`, not a memory
+// exhaustion.
+pub fn max_file_bytes() -> [] int {
+    return 67108864;
+}
+
+fn refused(reason: int) -> [] Checked {
+    return Checked::Refused(response.Rule::EvidenceRefInvalid, reason);
+}
+
+// Entry `entry` of the tape, whose ref, size and hash were claimed.
+fn entry_held[&h, &d, &s, &t](heap: &!h Heap, dir: &d Dir, src: &s [byte], tape: &t [int], entry: int) -> [heap, dir_read, file_read] Checked {
+    let path = json.get(src, tape, entry, "ref");
+    let sha = json.get(src, tape, entry, "sha256");
+    let size = json.get(src, tape, entry, "bytes");
+    // `response.validate` refuses all of these first; this is for a caller that did not call it.
+    if !json.is_string(tape, path) || !json.string_plain(tape, path) || !response.ref_ok(json.string_view(src, tape, path)) {
+        return refused(response.r_evidence_ref());
+    }
+    if !json.is_string(tape, sha) || !response.sha256_ok(json.string_view(src, tape, sha)) {
+        return refused(response.r_evidence_sha256());
+    }
+    if !json.is_int(tape, size) || !json.fits_int(src, tape, size) || json.to_int(src, tape, size) < 0 {
+        return refused(response.r_evidence_bytes());
+    }
+    var verdict = Checked::Held;
+    match dirs.open_file(dir, json.string_view(src, tape, path)) {
+        Opened::Failed(e) => {
+            if e == 2 {
+                verdict = refused(response.r_evidence_missing());
+            } else {
+                verdict = refused(response.r_evidence_unreadable());
+            }
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var data = buffer.empty(heap, 256);
+            var errno = 0;
+            borrow mut file as &!x in {
+                let (got, e) = journal_io.drain(heap, x, data, max_file_bytes());
+                data = got;
+                errno = e;
+            }
+            file_close(file);
+            if errno == 0 - 3 {
+                verdict = refused(response.r_evidence_too_large());
+            } else if errno != 0 {
+                verdict = refused(response.r_evidence_unreadable());
+            } else {
+                borrow data as &db in {
+                    if buffer.size(db) != json.to_int(src, tape, size) {
+                        verdict = refused(response.r_evidence_bytes_mismatch());
+                    } else {
+                        let digest = snapshot.hex_digest(heap, buffer.bytes(db));
+                        borrow digest as &gb in {
+                            if !json.string_equals(src, tape, sha, buffer.bytes(gb)) {
+                                verdict = refused(response.r_evidence_sha_mismatch());
+                            }
+                        }
+                        buffer.drop(heap, digest);
+                    }
+                }
+            }
+            buffer.drop(heap, data);
+        }
+    }
+    return verdict;
+}
+
+fn all_held[&h, &d, &s, &t](heap: &!h Heap, dir: &d Dir, src: &s [byte], tape: &t [int]) -> [heap, dir_read, file_read] Checked {
+    if !json.is_object(tape, 0) {
+        return Checked::Refused(response.Rule::WorkerProtocol, response.r_not_object());
+    }
+    let evidence = json.get(src, tape, 0, "evidence");
+    if !json.is_array(tape, evidence) {
+        return Checked::Refused(response.Rule::WorkerProtocol, response.r_evidence());
+    }
+    let n = json.count(tape, evidence);
+    if n > response.max_evidence() {
+        return Checked::Refused(response.Rule::WorkerProtocol, response.r_evidence_count());
+    }
+    var i = 0;
+    while i < n {
+        let entry = json.at(tape, evidence, i);
+        if !json.is_object(tape, entry) {
+            return Checked::Refused(response.Rule::WorkerProtocol, response.r_evidence_entry());
+        }
+        match entry_held(heap, dir, src, tape, entry) {
+            Checked::Held => {
+                i = i + 1;
+            }
+            Checked::Refused(rule, reason) => {
+                return Checked::Refused(rule, reason);
+            }
+            Checked::NoDirectory(e) => {
+                return Checked::NoDirectory(e);
+            }
+        }
+    }
+    return Checked::Held;
+}
+
+// `body`, a response `response.validate` accepted, against the files its evidence names beneath `execution_dir` (an
+// absolute path Forge chose). Nothing is journalled here; the caller maps the answer to an event.
+pub fn verify[&h, &f, &b, &x](heap: &!h Heap, fs: &f Fs(""), body: &b [byte], execution_dir: &x [byte]) -> [heap, fs_read(""), dir_read, file_read] Checked {
+    if !journal_io.path_ok(fs, execution_dir) {
+        return Checked::NoDirectory(0 - 2);
+    }
+    match open_dir(fs, execution_dir) {
+        DirOpened::Failed(e) => {
+            return Checked::NoDirectory(e);
+        }
+        DirOpened::Ok(opened) => {
+            var dir = opened;
+            var verdict = Checked::Refused(response.Rule::WorkerProtocol, response.r_not_json());
+            let tape = box_slice(heap, json.tape_len(body), 0);
+            borrow mut tape as &!t in {
+                let tp = contents(t);
+                if json.parse(body, tp) > 0 {
+                    borrow dir as &dd in {
+                        verdict = all_held(heap, dd, body, tp);
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+            dir_close(dir);
+            return verdict;
+        }
+    }
+}
