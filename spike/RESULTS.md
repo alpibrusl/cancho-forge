@@ -35,6 +35,7 @@ findings".)
 | Kill what the child started (a grandchild) | **PASS by default for a detached worker** (`exec_spawn_detached`: `capture` kills the group at the deadline, or `child_kill_group` by hand), with `Exec` narrowed to `/bin/sh` and no `/bin/kill`; a plain `exec_spawn` worker still leaks its grandchild (the control). *Corrected after #533: M0 recorded FAIL here, PASS only with `/bin/kill` in an `Exec("/bin")` bound.* | S7 |
 | Ask whether a path is inside a bound, before a trap | **PASS** (`fs_covers`): and it found a **defect in Forge's own copy of the rule** (`/tmp/a..b/j` passed `path_ok` and killed the process), now fixed | S8 |
 | Start a worker beneath a directory chosen at deployment | **PASS** (`exec_spawn_under`, row `exec_under`, no path in the report); a name the guard refuses is never spawned | S9 |
+| Open a worker's file without following its symlink | **FAIL through `Fs`, PASS through `Dir`** (`open_read` followed a link to a file and a path through a linked directory; `std.dirs.open_file` refused both, `ELOOP` and `ENOTDIR`, and `..` is not a component it opens) | S10 |
 | Pass a narrowed `Exec` | **PASS**: allowed spawns run; outside spawn and `..` path **trap** (SIGILL, exit 132) -- a refusal-as-value does not exist | S3 |
 | `cancho authority` reports it | **PASS**: `exec("/bin/echo")`, `exec("/usr/bin")`; Forge's S6 dispatcher reports no filesystem, no network, no foreign code | S3, S6 |
 | Append + sync a journal | **PASS** | S5 |
@@ -384,6 +385,26 @@ directory pointing outside it is followed (`docs/processes.md` 4.14); nothing he
 
 ---
 
+## S10 -- a worker's symlink: `Fs` follows it, `Dir` does not
+
+`spike/s10_symlink.cho`: an evidence `ref` is a relative path inside the execution directory, and the worker that wrote the
+directory is untrusted. Mode `f` opens an absolute path through the `Fs` capability; mode `d` opens a relative path
+beneath a directory with `std.dirs.open_file`. The directory held `plain` (a file), `link` (a symlink to a file outside
+it), `dirlink` (a symlink to a directory outside it) and no `missing`.
+
+| open | `Fs` (`open_read`) | `Dir` (`std.dirs.open_file`) |
+|---|---|---|
+| `plain` | opened, read | opened, read |
+| `link` | **opened, read** (outside the directory) | refused, `ELOOP` (40) |
+| `dirlink/s.txt` | **opened, read** | refused, `ENOTDIR` (20) |
+| `missing` | not opened | not opened, `ENOENT` (2) |
+| `../outside/s.txt` | not run (the capability traps on the pair of dots, S8) | not opened; not `ELOOP`, `ENOTDIR` or `ENOENT` (`std.dirs` documents `EINVAL`, no call made) |
+
+`fs_covers` answers yes to all of the `Fs` paths: it reads the bytes of a path, not the file system. So the rule of
+`worker-contract.md` section 4 ("a relative path inside `execution_dir`") cannot be kept by `Fs` plus a path check;
+`evidence_io` opens the directory once with `open_dir` and walks every `ref` beneath it. Nothing is needed from the
+compiler: `Dir` was already there (cancho #546), unused by Forge until now.
+
 ## M1 findings -- what building the core measured
 
 Not spikes: these were found writing `src/task.cho`, `src/journal.cho`,
@@ -721,4 +742,47 @@ never touches
 --- [../x]: refused
 --- [a..b]: refused
 --- []: refused
+
+=== S10 a worker's symlink: the Fs capability follows it, a Dir does not
+--- Dir: plain
+opened         yes
+read bytes>0   yes
+--- Dir: link
+opened         no
+ELOOP (40)     yes
+ENOTDIR (20)   no
+ENOENT (2)     no
+--- Dir: dirlink/s.txt
+opened         no
+ELOOP (40)     no
+ENOTDIR (20)   yes
+ENOENT (2)     no
+--- Dir: missing
+opened         no
+ELOOP (40)     no
+ENOTDIR (20)   no
+ENOENT (2)     yes
+--- Dir: ../outside/s.txt
+opened         no
+ELOOP (40)     no
+ENOTDIR (20)   no
+ENOENT (2)     no
+--- Fs: plain
+fs_covers      yes
+opened         yes
+read bytes>0   yes
+--- Fs: link
+fs_covers      yes
+opened         yes
+read bytes>0   yes
+--- Fs: dirlink/s.txt
+fs_covers      yes
+opened         yes
+read bytes>0   yes
+--- Fs: missing
+fs_covers      yes
+opened         no
+ELOOP (40)     no
+ENOTDIR (20)   no
+ENOENT (2)     yes
 ```

@@ -431,3 +431,12 @@ fn test_a_nul_in_a_reference_is_refused_by_the_path_rule_itself[&h](heap: &!h He
     buffer.drop(heap, path);
     return 0;
 }
+
+fn test_the_reasons_the_file_layer_adds_have_names() -> [] int {
+    test.assert(bytes.equal(response.reason_name(response.r_evidence_missing()), "evidence-missing"));
+    test.assert(bytes.equal(response.reason_name(response.r_evidence_unreadable()), "evidence-unreadable"));
+    test.assert(bytes.equal(response.reason_name(response.r_evidence_too_large()), "evidence-too-large"));
+    test.assert(bytes.equal(response.reason_name(response.r_evidence_bytes_mismatch()), "evidence-bytes-mismatch"));
+    test.assert(bytes.equal(response.reason_name(response.r_evidence_sha_mismatch()), "evidence-sha-mismatch"));
+    return 0;
+}

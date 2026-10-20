@@ -89,32 +89,57 @@ pub fn read_all[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [
         }
         Opened::Ok(opened) => {
             var file = opened;
+            var data = all;
             var errno = 0;
-            let scratch = box_slice(heap, 4096, byte_of(0));
-            var more = true;
             borrow mut file as &!x in {
-                borrow mut scratch as &!sw in {
-                    while more {
-                        match file_read(x, contents(sw)) {
-                            Read::Got(n) => {
-                                all = buffer.append(heap, all, contents(sw)[0..n]);
-                            }
-                            Read::End => {
-                                more = false;
-                            }
-                            Read::Failed(e) => {
-                                errno = e;
-                                more = false;
-                            }
-                        }
-                    }
-                }
+                let (got, e) = drain(heap, x, data, 1099511627776);
+                data = got;
+                errno = e;
             }
-            unbox_slice(heap, scratch);
             file_close(file);
-            return (all, errno);
+            return (data, errno);
         }
     }
+}
+
+// Read an open file to its end into `all`, or until it holds more than `limit` bytes: the buffer so far and 0, an
+// errno, or -3 for a file past the limit (the buffer then holds the first `limit` bytes and no more). A reader of a
+// file somebody else wrote (a worker's evidence) passes a limit; the journal's own is a terabyte.
+pub fn drain[&h, &x](heap: &!h Heap, file: &!x File, all: buffer.Buffer, limit: int) -> [heap, file_read] (buffer.Buffer, int) {
+    var out = all;
+    var have = 0;
+    borrow out as &ob in {
+        have = buffer.size(ob);
+    }
+    var errno = 0;
+    var more = true;
+    let scratch = box_slice(heap, 4096, byte_of(0));
+    borrow mut scratch as &!sw in {
+        while more {
+            match file_read(file, contents(sw)) {
+                Read::Got(n) => {
+                    let room = limit - have;
+                    if n > room {
+                        out = buffer.append(heap, out, contents(sw)[0..room]);
+                        errno = 0 - 3;
+                        more = false;
+                    } else {
+                        out = buffer.append(heap, out, contents(sw)[0..n]);
+                        have = have + n;
+                    }
+                }
+                Read::End => {
+                    more = false;
+                }
+                Read::Failed(e) => {
+                    errno = e;
+                    more = false;
+                }
+            }
+        }
+    }
+    unbox_slice(heap, scratch);
+    return (out, errno);
 }
 
 // ---- the steps of a durable write ---------------------------------------
