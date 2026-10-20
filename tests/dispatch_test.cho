@@ -82,6 +82,9 @@ fn test_the_numbers_the_supervisor_saw_are_carried[&h](heap: &!h Heap) -> [heap]
         dispatch.Ending::Error(c) => {
             test.assert(false);
         }
+        dispatch.Ending::Setup(n) => {
+            test.assert(false);
+        }
         dispatch.Ending::Reply(v) => {
             test.assert(false);
         }
@@ -102,6 +105,9 @@ fn test_the_numbers_the_supervisor_saw_are_carried[&h](heap: &!h Heap) -> [heap]
         dispatch.Ending::Error(c) => {
             test.assert(false);
         }
+        dispatch.Ending::Setup(n) => {
+            test.assert(false);
+        }
         dispatch.Ending::Reply(v) => {
             test.assert(false);
         }
@@ -120,6 +126,9 @@ fn test_the_numbers_the_supervisor_saw_are_carried[&h](heap: &!h Heap) -> [heap]
             test.assert(false);
         }
         dispatch.Ending::Crashed(s) => {
+            test.assert(false);
+        }
+        dispatch.Ending::Setup(n) => {
             test.assert(false);
         }
         dispatch.Ending::Reply(v) => {
@@ -167,5 +176,12 @@ fn test_the_request_asked_about_is_the_one_checked[&h](heap: &!h Heap) -> [heap]
     test.assert(bytes.equal(dispatch.rule_tag(e), "worker-protocol"));
     let f = dispatch.classify(heap, process.Ran::Code(0), doc("succeeded"), "r-1", "t-2", false);
     test.assert(bytes.equal(dispatch.rule_tag(f), "worker-protocol"));
+    return 0;
+}
+
+fn test_an_execution_directory_forge_cannot_use_blocks_the_task_and_says_path_invalid() -> [] int {
+    let e = dispatch.Ending::Setup(2);
+    test.assert(bytes.equal(dispatch.rule_tag(e), "path-invalid"));
+    test.assert(bytes.equal(dispatch.consequence_name(dispatch.consequence(e)), "blocked"));
     return 0;
 }
