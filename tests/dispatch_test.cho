@@ -1,0 +1,171 @@
+edition 9;
+
+import std.bytes;
+import std.process;
+import std.test;
+import forge.dispatch;
+import forge.response;
+
+// Unit tests for src/dispatch.cho (docs/worker-contract.md, section 5): every row of the table, from the observed
+// ending to a rule tag and a consequence, without a child process. Run with `cancho test`.
+
+fn doc(state: &static [byte]) -> [] &static [byte] {
+    if bytes.equal(state, "succeeded") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":null}";
+    }
+    if bytes.equal(state, "failed") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"x\",\"message\":\"m\",\"retryable\":true}}";
+    }
+    if bytes.equal(state, "partial") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"partial\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"x\",\"message\":\"m\",\"retryable\":false}}";
+    }
+    if bytes.equal(state, "cancelled") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":null}";
+    }
+    if bytes.equal(state, "accepted") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"accepted\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":null}";
+    }
+    if bytes.equal(state, "badref") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"a\",\"kind\":\"log\",\"ref\":\"/etc/passwd\",\"sha256\":\"9f2c0000000000000000000000000000000000000000000000000000000000e1\",\"bytes\":1}],\"error\":null}";
+    }
+    return "this is not json";
+}
+
+fn check[&h](heap: &!h Heap, ran: process.Ran, out: &static [byte], is_async: bool, tag: &static [byte], consequence: &static [byte]) -> [heap] int {
+    let e = dispatch.classify(heap, ran, out, "r-1", "t-1", is_async);
+    test.assert(bytes.equal(dispatch.rule_tag(e), tag));
+    test.assert(bytes.equal(dispatch.consequence_name(dispatch.consequence(e)), consequence));
+    return 0;
+}
+
+fn test_a_spawn_that_failed_blocks_the_task_whatever_was_written[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Failed(2), doc("succeeded"), false, "worker-unavailable", "blocked");
+    return 0;
+}
+
+fn test_a_deadline_is_a_timeout_to_retry_under_the_budget[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::TimedOut, doc("succeeded"), false, "worker-timeout", "retry-or-fail");
+    return 0;
+}
+
+fn test_output_past_the_cap_is_failed_and_not_retried[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::TooMuch, doc("succeeded"), false, "worker-output-overflow", "failed");
+    return 0;
+}
+
+fn test_a_signal_is_a_crash_to_retry[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Signaled(9), doc("succeeded"), false, "worker-crashed", "retry-or-fail");
+    return 0;
+}
+
+fn test_a_non_zero_exit_is_an_error_even_with_a_good_reply_on_stdout[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(3), doc("succeeded"), false, "worker-error", "retry-or-fail");
+    check(heap, process.Ran::Code(1), doc("garbage"), false, "worker-error", "retry-or-fail");
+    check(heap, process.Ran::Code(0 - 1), "", false, "worker-error", "retry-or-fail");
+    return 0;
+}
+
+fn test_the_numbers_the_supervisor_saw_are_carried[&h](heap: &!h Heap) -> [heap] int {
+    match dispatch.classify(heap, process.Ran::Failed(13), "", "r-1", "t-1", false) {
+        dispatch.Ending::Unavailable(e) => {
+            test.assert_eq(e, 13);
+        }
+        dispatch.Ending::Timeout => {
+            test.assert(false);
+        }
+        dispatch.Ending::Overflow => {
+            test.assert(false);
+        }
+        dispatch.Ending::Crashed(s) => {
+            test.assert(false);
+        }
+        dispatch.Ending::Error(c) => {
+            test.assert(false);
+        }
+        dispatch.Ending::Reply(v) => {
+            test.assert(false);
+        }
+    }
+    match dispatch.classify(heap, process.Ran::Signaled(256), "", "r-1", "t-1", false) {
+        dispatch.Ending::Crashed(s) => {
+            test.assert_eq(s, 256);
+        }
+        dispatch.Ending::Unavailable(e) => {
+            test.assert(false);
+        }
+        dispatch.Ending::Timeout => {
+            test.assert(false);
+        }
+        dispatch.Ending::Overflow => {
+            test.assert(false);
+        }
+        dispatch.Ending::Error(c) => {
+            test.assert(false);
+        }
+        dispatch.Ending::Reply(v) => {
+            test.assert(false);
+        }
+    }
+    match dispatch.classify(heap, process.Ran::Code(7), "", "r-1", "t-1", false) {
+        dispatch.Ending::Error(c) => {
+            test.assert_eq(c, 7);
+        }
+        dispatch.Ending::Unavailable(e) => {
+            test.assert(false);
+        }
+        dispatch.Ending::Timeout => {
+            test.assert(false);
+        }
+        dispatch.Ending::Overflow => {
+            test.assert(false);
+        }
+        dispatch.Ending::Crashed(s) => {
+            test.assert(false);
+        }
+        dispatch.Ending::Reply(v) => {
+            test.assert(false);
+        }
+    }
+    return 0;
+}
+
+fn test_exit_zero_with_succeeded_is_a_claim_for_verification[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(0), doc("succeeded"), false, "", "verification");
+    return 0;
+}
+
+fn test_the_workers_own_failure_and_partial_are_left_to_its_retryable_flag[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(0), doc("failed"), false, "", "worker-said");
+    check(heap, process.Ran::Code(0), doc("partial"), false, "", "worker-said");
+    return 0;
+}
+
+fn test_cancelled_and_accepted_have_their_own_consequences[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(0), doc("cancelled"), false, "", "cancelled");
+    check(heap, process.Ran::Code(0), doc("accepted"), true, "", "poll");
+    return 0;
+}
+
+fn test_accepted_from_a_sync_worker_is_a_protocol_error[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(0), doc("accepted"), false, "worker-protocol", "failed");
+    return 0;
+}
+
+fn test_exit_zero_with_garbage_is_a_protocol_error_never_retried_blindly[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(0), doc("garbage"), false, "worker-protocol", "failed");
+    check(heap, process.Ran::Code(0), "", false, "worker-protocol", "failed");
+    return 0;
+}
+
+fn test_a_reference_out_of_bounds_is_evidence_ref_invalid_and_failed[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(0), doc("badref"), false, "evidence-ref-invalid", "failed");
+    return 0;
+}
+
+fn test_the_request_asked_about_is_the_one_checked[&h](heap: &!h Heap) -> [heap] int {
+    let e = dispatch.classify(heap, process.Ran::Code(0), doc("succeeded"), "r-2", "t-1", false);
+    test.assert(bytes.equal(dispatch.rule_tag(e), "worker-protocol"));
+    let f = dispatch.classify(heap, process.Ran::Code(0), doc("succeeded"), "r-1", "t-2", false);
+    test.assert(bytes.equal(dispatch.rule_tag(f), "worker-protocol"));
+    return 0;
+}
