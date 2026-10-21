@@ -1,0 +1,114 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.process;
+
+// Spike 11 (the Forge half): start the runner of `spike/s11_runner.cho` the way Forge starts a worker, and kill it at
+// the deadline. Two ways to start it, because gap G10 (cancho #562) says one of them has no group to kill:
+//
+//   argv[1] = u  `exec_spawn_under` beneath the workers directory argv[2], the program argv[3] (what `src/worker.cho`
+//                does; the runner is NOT a group leader, so `capture`'s group kill answers ESRCH and only the pid dies)
+//             d  `exec_spawn_detached` of the absolute path argv[2]/argv[3] given whole as argv[5] (the runner leads a
+//                group of its own and `capture` kills the group); under `Exec("")` that bound is the same row
+//   argv[4]   the runner's mode (p, d or l)
+//
+// The deadline is 1000 ms. Prints how the runner ended and how long it took.
+
+fn mode_args(mode: int) -> [] &static [byte] {
+    if mode == 'd' {
+        return "d\0";
+    }
+    if mode == 'l' {
+        return "l\0";
+    }
+    return "p\0";
+}
+
+fn start[&x, &w, &n, &p](exec: &x Exec(""), workers: &w Dir, how: int, name: &n [byte], full: &p [byte], mode: int, child_in: ChildEnd, child_out: ChildEnd) -> [exec(""), exec_under, exec_detached] Spawned {
+    if how == 'u' {
+        return exec_spawn_under(exec, workers, name, mode_args(mode), "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+    }
+    return exec_spawn_detached(exec, full, mode_args(mode), "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+}
+
+fn run[&h, &x, &w, &c, &i, &n, &p](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, how: int, name: &n [byte], full: &p [byte], mode: int) -> [heap, exec(""), exec_under, exec_detached, clock, poll, io_write] int {
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            io.write_all(io, "channels failed\n");
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match start(exec, workers, how, name, full, mode, child_in, child_out) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    io.write_all(io, "spawn failed errno ");
+                    io.print_int(io, e);
+                    io.newline(io);
+                }
+                Spawned::Ok(child) => {
+                    let start = clock_ms(clock);
+                    let (out, ran) = process.capture(heap, clock, child, to_child, from_child, "", 4096, 1000);
+                    buffer.drop(heap, out);
+                    match ran {
+                        process.Ran::TimedOut => {
+                            io.write_all(io, "forge: runner timed out; killed and reaped after ");
+                            io.print_int(io, clock_ms(clock) - start);
+                            io.write_all(io, " ms\n");
+                        }
+                        process.Ran::Code(n) => {
+                            io.write_all(io, "forge: runner exited ");
+                            io.print_int(io, n);
+                            io.newline(io);
+                        }
+                        _ => {
+                            io.write_all(io, "forge: other ending\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 0;
+    borrow fs as &f in {
+        borrow args as &g in {
+            match open_dir(f, arg(g, 2)) {
+                DirOpened::Ok(d) => {
+                    var workers = d;
+                    borrow workers as &w in {
+                        borrow exec as &x in {
+                            borrow clock as &c in {
+                                borrow mut console as &!i in {
+                                    borrow mut memory as &!h in {
+                                        run(h, x, w, c, i, int_of(arg(g, 1)[0]), arg(g, 3), arg(g, 5), int_of(arg(g, 4)[0]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dir_close(workers);
+                }
+                DirOpened::Failed(e) => {
+                    status = 3;
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

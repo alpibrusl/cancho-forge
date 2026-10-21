@@ -1,0 +1,85 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.process;
+
+// Spike 11 (the worker half): a stand-in for the gate runner of docs/self-hosting.md. It starts the "gate"
+// (`/bin/sh -c 'sleep 78 & wait'`: a script that starts a compiler, here `sleep`) and waits for it, the way a runner
+// waits for `scripts/gate.sh`. What is measured is whether the `sleep` outlives the runner when Forge's deadline kills
+// the runner (`spike/s11_forge.cho`); an outside `ps` looks (`spike/run.sh`).
+//
+//   argv[1] = p  plain `exec_spawn` of the gate; the runner's own deadline is far (30 s). The control.
+//             d  `exec_spawn_detached` of the gate; the runner's own deadline is 200 ms, shorter than Forge's, and
+//                `capture` kills the gate's group itself. The mitigation of docs/self-hosting.md D3.
+//             l  `exec_spawn_detached` of the gate; the runner's own deadline is far (30 s). Forge's kill is the only
+//                kill: the backstop on its own.
+
+fn begin[&x](exec: &x Exec("/bin/sh"), detached: bool, child_in: ChildEnd, child_out: ChildEnd) -> [exec("/bin/sh"), exec_detached] Spawned {
+    if detached {
+        return exec_spawn_detached(exec, "/bin/sh", "-c\0sleep 78 & wait\0", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+    }
+    return exec_spawn(exec, "/bin/sh", "-c\0sleep 78 & wait\0", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+}
+
+fn run[&h, &x, &c, &i](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, io: &!i Io, mode: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll, io_write] int {
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            io.write_all(io, "channels failed\n");
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match begin(exec, mode != 'p', child_in, child_out) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    io.write_all(io, "spawn failed\n");
+                }
+                Spawned::Ok(child) => {
+                    var deadline = 30000;
+                    if mode == 'd' {
+                        deadline = 200;
+                    }
+                    let (out, ran) = process.capture(heap, clock, child, to_child, from_child, "", 4096, deadline);
+                    buffer.drop(heap, out);
+                    match ran {
+                        process.Ran::TimedOut => {
+                            io.write_all(io, "runner: gate timed out; killed and reaped\n");
+                        }
+                        _ => {
+                            io.write_all(io, "runner: unexpected ending\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(net);
+    release(signals);
+    release(tty);
+    let sh = narrow(exec, "/bin/sh");
+    var console = io;
+    var memory = heap;
+    borrow sh as &x in {
+        borrow clock as &c in {
+            borrow mut console as &!i in {
+                borrow mut memory as &!h in {
+                    borrow args as &g in {
+                        run(h, x, c, i, int_of(arg(g, 1)[0]));
+                    }
+                }
+            }
+        }
+    }
+    release(sh);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return 0;
+}
