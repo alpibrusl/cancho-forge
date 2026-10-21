@@ -1,0 +1,50 @@
+edition 9;
+module forge.flow;
+
+import forge.dispatch;
+import forge.task;
+
+// What the ending of a worker's run does to the task that was running it (docs/worker-contract.md section 5; the rows
+// of docs/stub-llm.md section 5, now Forge's own and no longer an assumption of a test). Pure: the effect row is empty.
+//
+// A worker never moves a task by saying so. The ending is classified by `forge.dispatch`; this is the one decision that
+// follows from the classification, and no row of it is `accepted`: the only exit that carries a worker's `succeeded` is
+// `running -> verification`, and `verification -> accepted` needs a check Forge observed (architecture section 6).
+// State matches never use `_`, so a consequence that is added and not handled is refused by the compiler.
+
+// The state a task is in after a run that ended with `c`. `running` for a consequence that moves nothing.
+pub fn target_of(c: dispatch.Consequence) -> [] task.State {
+    match c {
+        // Operator action: the worker could not be started, or Forge cannot use the execution directory.
+        dispatch.Consequence::Blocked => {
+            return task.State::Blocked;
+        }
+        // A deadline, a signal or a non-zero exit: back to `ready`, where the budget and the policy are consulted again
+        // before the next dispatch (architecture section 6). The retry budget is not built (M4): the task is `ready`
+        // and nothing retries it by itself.
+        dispatch.Consequence::RetryOrFail => {
+            return task.State::Ready;
+        }
+        // Not valid for the contract, or too much output: never retried blindly. There is no `failed` state
+        // (architecture section 6: a failed execution is an event), so the task waits for an operator.
+        dispatch.Consequence::Failed => {
+            return task.State::Blocked;
+        }
+        // The worker's `succeeded` is a claim for verification.
+        dispatch.Consequence::Verification => {
+            return task.State::Verification;
+        }
+        // The worker says it failed or got part of the way: it waits on `error.retryable`, which is not read yet
+        // (issue #15), so for now an operator decides.
+        dispatch.Consequence::WorkerSaid => {
+            return task.State::Blocked;
+        }
+        dispatch.Consequence::Cancelled => {
+            return task.State::Cancelled;
+        }
+        // An `async` worker took the job: the task is still running.
+        dispatch.Consequence::Poll => {
+            return task.State::Running;
+        }
+    }
+}

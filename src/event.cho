@@ -96,3 +96,32 @@ pub fn refusal[&h, &t, &r](heap: &!h Heap, seq: int, task: &t [byte], rule: &r [
     w = json.end_object(heap, w);
     return buffer.push(heap, json.finish(w), byte_of(10));
 }
+
+// A record of the life of an execution (kind "execution.started" before the worker is started, "execution.finished"
+// after; docs/architecture.md section 4.4). `verdict` is a worker's claim about how its run went (for a gate report:
+// `pass`, `fail` or `incomplete`), and is written, with `basis` "claimed", only when it is not empty. A claim is data:
+// nothing replays it into a state (the journal passes over the `execution.` namespace), and nothing accepts on it.
+pub fn execution[&h, &k, &t, &v](heap: &!h Heap, seq: int, kind: &k [byte], task: &t [byte], verdict: &v [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "v");
+    w = json.put_int(heap, w, schema_version());
+    w = json.put_key(heap, w, "seq");
+    w = json.put_int(heap, w, seq);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, kind);
+    w = json.put_key(heap, w, "task");
+    w = json.put_string(heap, w, task);
+    w = json.put_key(heap, w, "actor");
+    if len(verdict) > 0 {
+        w = json.put_string(heap, w, "worker");
+        w = json.put_key(heap, w, "basis");
+        w = json.put_string(heap, w, "claimed");
+        w = json.put_key(heap, w, "verdict");
+        w = json.put_string(heap, w, verdict);
+    } else {
+        w = json.put_string(heap, w, "forge");
+    }
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}

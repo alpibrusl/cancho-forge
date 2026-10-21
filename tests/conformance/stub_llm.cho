@@ -8,6 +8,7 @@ import std.map;
 import std.process;
 import forge.dispatch;
 import forge.event;
+import forge.flow;
 import forge.journal;
 import forge.journal_io;
 import forge.response;
@@ -20,10 +21,10 @@ import forge.worker;
 // it decided in a journal, which is then replayed. One case is one `stub_script.json`, one prompt and one expected
 // ending, rule tag, consequence and final state of the task.
 //
-// The flow driver below (`drive`) is the shape the supervisor of M2 and M3 will take; it is test code, not Forge: the
-// mapping from a consequence to a state is documented in docs/stub-llm.md, section 5, and the supervisor that will own
-// it does not exist yet. What the journal records is Forge's own: `forge.journal.submit` for every transition and
-// `forge.event.refusal` for the rule tag of a refused ending.
+// The flow driver below is test code: it writes the four moves that dispatch a task by hand. What it records and
+// decides is Forge's own: `forge.journal.submit` for every transition, `forge.event.refusal` for the rule tag of a refused
+// ending, and `forge.flow.target_of` for the state the ending leaves the task in (the table of docs/stub-llm.md
+// section 5, which `forge gate` uses too, src/gate_run.cho).
 //
 // Usage: stub_llm <workers directory holding stub_llm> <base directory>
 // The gate makes `ev_<label>` for every label below under the base directory, and checks no stub outlives the run.
@@ -98,33 +99,6 @@ fn reason_of(e: dispatch.Ending) -> [] int {
     }
 }
 
-// The state a consequence leaves the task in, the way docs/stub-llm.md section 5 says; `running` when nothing moves it.
-fn target_of(c: dispatch.Consequence) -> [] task.State {
-    match c {
-        dispatch.Consequence::Blocked => {
-            return task.State::Blocked;
-        }
-        dispatch.Consequence::RetryOrFail => {
-            return task.State::Ready;
-        }
-        dispatch.Consequence::Failed => {
-            return task.State::Blocked;
-        }
-        dispatch.Consequence::Verification => {
-            return task.State::Verification;
-        }
-        dispatch.Consequence::WorkerSaid => {
-            return task.State::Blocked;
-        }
-        dispatch.Consequence::Cancelled => {
-            return task.State::Cancelled;
-        }
-        dispatch.Consequence::Poll => {
-            return task.State::Running;
-        }
-    }
-}
-
 // One transition of task t-1 by `actor`, written to the journal at `path`. The table and the next position; the
 // position is negative once a write failed.
 fn move_to[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], tasks: map.Map[int], seq: int, target: task.State, actor: task.Actor) -> [heap, fs_read(""), fs_write(""), file_write] (map.Map[int], int) {
@@ -176,7 +150,7 @@ fn finish[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], tasks: map
     if len(tag) > 0 {
         next = note(heap, fs, path, next, tag);
     }
-    let target = target_of(dispatch.consequence(e));
+    let target = flow.target_of(dispatch.consequence(e));
     return move_to(heap, fs, path, tasks, next, target, task.Actor::Forge);
 }
 

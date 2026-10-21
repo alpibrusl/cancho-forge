@@ -1,12 +1,20 @@
 performs
     args
+    child_signal
+    clock
+    dir_read
     err_write
+    exec_under
     file_read
+    file_write
     fs_read("")
+    fs_write("")
     heap
     io_write
+    pipe_read
+    pipe_write
+    poll
 never touches
     the network
     signals
-    other programs
     foreign code

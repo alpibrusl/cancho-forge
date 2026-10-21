@@ -108,8 +108,10 @@ kill reaches everything it has (gap G10 does not apply to a worker with no child
 | `blocked`, `failed`, `worker-said` | `blocked` | operator action; `failed` has no state of its own (architecture section 6), and `worker-said` waits on `error.retryable`, which is not read yet |
 | `cancelled`, `poll` | `cancelled`, stays `running` | not reached by the stub |
 
-**This mapping is test code, not Forge.** The supervisor that will own it (M2/M3) does not exist; the table is what the
-test assumes and is corrected here in place when the supervisor replaces it. What the test checks is Forge's own
+**This mapping is Forge's own** (`forge.flow.target_of`, `src/flow.cho`, 6 unit tests; `forge gate` uses it too,
+[`self-hosting.md`](self-hosting.md) section 3.1). It was a table in this test's first version, when no supervisor
+existed; the first self-hosted task made it Forge's, and the test now calls the same function. The flow driver in the test
+is still test code (it writes the four moves that dispatch a task by hand). What the test checks is Forge's own
 machinery: the replay is clean (no `journal-corrupt`, no torn bytes), the task is in the state above, the record count is
 exactly right, and the refusal line holds the rule tag.
 

@@ -113,3 +113,29 @@ fn test_a_hostile_task_id_is_escaped_not_spliced[&h](heap: &!h Heap) -> [heap] i
     buffer.drop(heap, r);
     return 0;
 }
+
+fn text_of_execution[&h](heap: &!h Heap, verdict: &static [byte]) -> [heap] buffer.Buffer {
+    return event.execution(heap, 5, "execution.finished", "t-1", verdict);
+}
+
+fn test_an_execution_record_without_a_claim_is_forges_and_says_nothing_of_a_verdict[&h](heap: &!h Heap) -> [heap] int {
+    let r = event.execution(heap, 5, "execution.started", "t-1", "");
+    borrow r as &b in {
+        let text = buffer.bytes(b);
+        test.assert(bytes.equal(text, "{\"v\":1,\"seq\":5,\"kind\":\"execution.started\",\"task\":\"t-1\",\"actor\":\"forge\"}\n"));
+        test.assert_eq(event.seq_of(heap, text[0..len(text) - 1]), 5);
+    }
+    buffer.drop(heap, r);
+    return 0;
+}
+
+fn test_an_execution_record_with_a_claim_is_a_workers_and_marked_claimed[&h](heap: &!h Heap) -> [heap] int {
+    let r = text_of_execution(heap, "pass");
+    borrow r as &b in {
+        let text = buffer.bytes(b);
+        test.assert(bytes.equal(text, "{\"v\":1,\"seq\":5,\"kind\":\"execution.finished\",\"task\":\"t-1\",\"actor\":\"worker\",\"basis\":\"claimed\",\"verdict\":\"pass\"}\n"));
+        test.assert_eq(event.seq_of(heap, text[0..len(text) - 1]), 5);
+    }
+    buffer.drop(heap, r);
+    return 0;
+}

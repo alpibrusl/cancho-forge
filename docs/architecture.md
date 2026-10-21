@@ -400,7 +400,7 @@ What this does **not** test, plainly:
   `narrow` takes only literals (cancho #534); two gates run at once on one
   machine would collide there.
 
-### 4.9 The operator CLI *(built in M1)*
+### 4.9 The operator CLI *(built in M1; `forge gate` added with issue #18)*
 
 `forge status <dir>` and `forge history <dir> [task-id]` (`src/main.cho`,
 `src/report.cho`), read-only. `<dir>` is an absolute path holding
@@ -428,28 +428,57 @@ I/O error. Measured by 8 unit tests of the text (`tests/report_test.cho`) and 13
 cases run on the built binary by the gate (exact text, every exit code, and that
 the journal is byte-identical after looking at a corrupt one).
 
-**Authority**, checked into `docs/authority.txt` and compared by the gate:
+**`forge gate`** *(issue #18; [`self-hosting.md`](self-hosting.md) section 3.1)* is the one verb that acts:
+`forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms]` takes the lock of the workspace
+(section 4.7), records a task and runs the gate runner on a working copy of one repository of the allow-list at one
+revision, and journals what happened. The records of one run are `task.proposed`, `task.approved` (actor human: the
+operator who ran the command), `task.ready`, `task.running`, `execution.started` (the intent, durable before the worker
+is started: section 4.4), a `refusal` record when the ending is a refusal (its rule tag), `execution.finished` with the
+runner's verdict as a **claim** (`"actor":"worker","basis":"claimed","verdict":"pass"`; the replay passes over the
+`execution.` namespace and nothing accepts on it), and the move `forge.flow.target_of` gives (`verification` for a
+worker's `succeeded`, `ready` for a lost or failed execution, `blocked` for what needs an operator; never `accepted`). A
+task that `forge.gate_task` refuses (`scope-invalid`, `revision-invalid`, `task-type-invalid`, `path-invalid`,
+`limits-invalid`) is written down with its tag and stays `approved`. Exit status: 0 a claim was recorded; 1 the task or the
+journal was refused; 2 usage or a path that is not ok; 3 the workspace is locked (`workspace-locked`), a directory
+cannot be opened, or an I/O error; 4 the run ended without a claim. Measured by 13 unit tests (`tests/flow_test.cho`,
+`tests/gate_run_test.cho`, `tests/event_test.cho`) and 29 checks run on the built binary against real git checkouts and a
+real runner process (`scripts/check_gate_run.sh`, in the gate). Not done: the recovery that turns an `execution.started`
+with no `execution.finished` into `execution.lost` (section 4.4), the retry budget, and `error.retryable`.
+
+**Authority**, checked into `docs/authority.txt` and compared by the gate. It was `args`, `err_write`, `file_read`,
+`fs_read("")`, `heap`, `io_write` for `status` and `history`; **`forge gate` widened it** (issue #18), by `fs_write("")`
+and `file_write` (the journal, the lock), `exec_under` (the gate runner is a name beneath the workers directory, so the
+report names no path), `dir_read` (that directory), `clock` and `poll` (the deadline), and `pipe_read`, `pipe_write` and
+`child_signal` (the supervisor of `std.process.capture`):
 
 ```
 performs
     args
+    child_signal
+    clock
+    dir_read
     err_write
+    exec_under
     file_read
+    file_write
     fs_read("")
+    fs_write("")
     heap
     io_write
+    pipe_read
+    pipe_write
+    poll
 never touches
     the network
     signals
-    other programs
     foreign code
 ```
 
-This is the first widening of the `forge` binary beyond `heap` and `io_write`
-(M0's `main` released everything): it can **read** any file, because a library
-cannot be generic in the `Fs` prefix (G9, cancho #534) and the file layer holds
-`Fs("")`. It performs no `fs_write` and no `exec`; the crash tests, which write,
-are separate programs that are not shipped.
+It can **read and write** any file the process may (the file layer holds `Fs("")`, gap G9, cancho #534), and **start a
+program beneath one directory it is given**; `path_ok` and `gate_task.check` refuse a path that is not absolute or has
+`..` before a capability sees it. "Other programs" left the *never touches* list: that is the widening a reviewer should
+read. It still has no network, no `signals` capability and no foreign code. The crash tests, which write, are separate
+programs that are not shipped.
 
 ## 5. Authority model
 
