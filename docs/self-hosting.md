@@ -391,8 +391,7 @@ Also measured: the first self-hosted task (`forge gate`): 13 unit tests (`tests/
 
 So for these four revisions Forge's claim equals CI's, once the operator provides the environment, and an environment that is
 not provided is no longer claimed as the project's failure. **That is four data points, not N**: each repository was
-run once, all four are passes, no revision with a failing CI was run (so "Forge says fail when CI says fail" is unmeasured
-for a real gate), and the times are one run each. The two long runs were measured on a 4-core container that was also running
+run once, all four are passes, and the times are one run each. The failing side is measured in the next paragraph, on two revisions made for the purpose. The two long runs were measured on a 4-core container that was also running
 other work (a second cargo build for most of the `cancho` run; the mutation and gate runs of this change during the
 `cancho-hdl` run), so their times are upper bounds on what Forge adds; CI's times are on GitHub's runners and are not
 comparable as a ratio. Both ended well inside the deadline given (`cancho`: 2,880,000 ms; `cancho-hdl`: 5,400,000 ms), and
@@ -402,6 +401,8 @@ it, so no change was needed. The preflight lists only `git` for `cancho-hdl`, bu
 `iverilog` and the compiler beside the checkout: the run passed because the operator provided them, and a missing one would
 have shown as a `fail` of that step, not as `incomplete`; extending `required_tools` for it is a table row and a test, not
 done here because the list of tools of that gate is the gate's own to state (it is not machine-readable today).
+
+**A gate that really fails (measured 2026-10-21, same machine, compiler `7e4088b`, one run each).** Two throw-away revisions of this repository, each one deliberate break of `d32ba13` (never pushed, so there is no CI run to compare with; the comparison is the repository's own `scripts/gate.sh` run directly on the same revision): (A) `d7d82b2`, a formatting break in `src/flow.cho` (the `fmt` step fails); (B) `aec4c3c`, a one-line change in `src/flow.cho` that makes exactly one test check in `tests/flow_test.cho` fail. Forge recorded for both: claimed **fail**, task in `verification` (never `accepted`), exit 0, report `verdict: fail`, `ending: exited`, `exit_status: 1` (A: 162 s, B: 158 s; the gate run directly: exit 1, 158 s and 147 s). The log kept by Forge ends in `gate: FAIL` and, for B, names the failing test. The same revision A with no environment is **incomplete** (`ending: environment`, exit 127, the task `blocked`, exit 4, 1 s), not `fail`. So on two real failures Forge's claim equals the gate's result, and the two are distinct from an environment that is missing. Still two data points: breaks made by hand, not failures that occurred; no comparison against a CI run of the same revision.
 
 **What measuring found, and the change it caused.** The first run without `cancho` on the `PATH` (before the preflight below)
 was still claimed `fail`: `scripts/gate.sh` runs every step, counts the failed ones and exits 1, so the shell's 127 never
@@ -414,7 +415,7 @@ is still `fail` when that tool is missing (the list is a table row to extend, wi
 
 Not measured, and not claimed:
 
-* a gate that really fails, in agreement with CI; a second run of the same revision (the time per run beyond one run) (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
+* a gate that fails in CI on a revision somebody really pushed (the two failing revisions above are made for the purpose); a second run of the same revision (the time per run beyond one run) (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
 * anything with a real worker, a real network, power loss, macOS, several
   workers at once, or a journal larger than the tests'.
 
