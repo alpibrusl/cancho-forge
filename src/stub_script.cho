@@ -1,0 +1,289 @@
+edition 9;
+module forge.stub_script;
+
+import std.bytes;
+import std.json;
+import std.option;
+
+// The script of the stub LLM worker (docs/stub-llm.md): a JSON document that says, for each prompt a task carries, what
+// the stub does. This module is the pure half: whether a script is well formed, and which of its rules a prompt picks.
+// It opens no file and starts nothing, so every decision is testable without a child; `workers/stub_llm.cho` is the
+// process half.
+//
+//   {"rules": [
+//     {"match": "add a flag", "type": "repo.change", "do": "propose", "patch": "--- a/x\n+++ b/x\n", "summary": "..."},
+//     {"match": "unsafe",     "do": "refuse", "code": "policy-refusal"},
+//     {"do": "ok", "text": "the reply for everything else"}
+//   ]}
+//
+// The rules are tried in order; the first whose `match` is a substring of the prompt (compared as written between the
+// quotes of the request, escapes undecoded) and whose `type`, when it has one, is the task's type, is the one. A rule
+// with no `match` takes every prompt, so it is the default if it is last. A prompt that no rule takes is the stub's
+// own refusal `stub-no-rule`, not a guess.
+//
+// A script is checked as a whole before any rule is used: one bad rule makes the script `stub-script-invalid`, so a
+// typo in a rule that is not reached today is found today.
+
+// What a rule makes the stub do.
+pub enum Do {
+    // Writes its `text` as `reply.md` and answers `succeeded` with it.
+    Ok,
+    // Answers `failed` with the rule's `code` (default `model-refused`), not retryable, no evidence.
+    Refuse,
+    // Exits 0 having written something that is not JSON.
+    Malformed,
+    // `succeeded`, with evidence whose SHA-256 is not the file's.
+    Liar,
+    // `succeeded`, with evidence whose size is not the file's.
+    LiarSize,
+    // A valid reply cut off in the middle, with no end.
+    Truncated,
+    // Waits `delay_ms`, then does what `ok` does. Forge's deadline decides whether it is ever heard.
+    Slow,
+    // Writes `progress.txt`, then dies by a signal.
+    CrashAfterProgress,
+    // Writes one byte more than the output cap of the request.
+    Oversize,
+    // Writes `proposal.patch` (the rule's `patch`) and `report.md`, and answers `succeeded` with both: the reply that
+    // a Stage 3 flow (docs/self-hosting.md) records as a proposal, a claim and nothing more.
+    Propose,
+}
+
+// The behaviour named `name`, or None.
+pub fn do_of[&n](name: &n [byte]) -> [] option.Option[Do] {
+    if bytes.equal(name, "ok") {
+        return option.Option::Some(Do::Ok);
+    }
+    if bytes.equal(name, "refuse") {
+        return option.Option::Some(Do::Refuse);
+    }
+    if bytes.equal(name, "malformed") {
+        return option.Option::Some(Do::Malformed);
+    }
+    if bytes.equal(name, "liar") {
+        return option.Option::Some(Do::Liar);
+    }
+    if bytes.equal(name, "liar_size") {
+        return option.Option::Some(Do::LiarSize);
+    }
+    if bytes.equal(name, "truncated") {
+        return option.Option::Some(Do::Truncated);
+    }
+    if bytes.equal(name, "slow") {
+        return option.Option::Some(Do::Slow);
+    }
+    if bytes.equal(name, "crash_after_progress") {
+        return option.Option::Some(Do::CrashAfterProgress);
+    }
+    if bytes.equal(name, "oversize") {
+        return option.Option::Some(Do::Oversize);
+    }
+    if bytes.equal(name, "propose") {
+        return option.Option::Some(Do::Propose);
+    }
+    return option.Option::None;
+}
+
+pub fn do_name(d: Do) -> [] &static [byte] {
+    match d {
+        Do::Ok => {
+            return "ok";
+        }
+        Do::Refuse => {
+            return "refuse";
+        }
+        Do::Malformed => {
+            return "malformed";
+        }
+        Do::Liar => {
+            return "liar";
+        }
+        Do::LiarSize => {
+            return "liar_size";
+        }
+        Do::Truncated => {
+            return "truncated";
+        }
+        Do::Slow => {
+            return "slow";
+        }
+        Do::CrashAfterProgress => {
+            return "crash_after_progress";
+        }
+        Do::Oversize => {
+            return "oversize";
+        }
+        Do::Propose => {
+            return "propose";
+        }
+    }
+}
+
+// The most rules a script has, the longest `match`, `code`, and decoded text, and the longest delay.
+pub fn max_rules() -> [] int {
+    return 64;
+}
+
+pub fn max_match_bytes() -> [] int {
+    return 256;
+}
+
+pub fn max_text_bytes() -> [] int {
+    return 65536;
+}
+
+pub fn max_delay_ms() -> [] int {
+    return 600000;
+}
+
+// The error codes the stub answers on its own (docs/stub-llm.md, section 4); a rule's `code` is another matter.
+pub fn code_no_rule() -> [] &static [byte] {
+    return "stub-no-rule";
+}
+
+pub fn code_script_missing() -> [] &static [byte] {
+    return "stub-script-missing";
+}
+
+pub fn code_script_invalid() -> [] &static [byte] {
+    return "stub-script-invalid";
+}
+
+pub fn code_bad_request() -> [] &static [byte] {
+    return "stub-bad-request";
+}
+
+// An error code a rule may carry: 1 to 64 bytes of `a-z`, `0-9` and `-`, not starting or ending with `-`.
+pub fn code_ok[&c](code: &c [byte]) -> [] bool {
+    if len(code) < 1 || len(code) > 64 {
+        return false;
+    }
+    if int_of(code[0]) == 45 || int_of(code[len(code) - 1]) == 45 {
+        return false;
+    }
+    var i = 0;
+    while i < len(code) {
+        let c = int_of(code[i]);
+        let lower = c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        if !lower && !digit && c != 45 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Is the value at `node` absent (-1) or a string no longer than `most` decoded bytes? `nonempty` also wants one byte.
+fn string_or_absent[&s, &t](src: &s [byte], tape: &t [int], node: int, most: int, nonempty: bool) -> [] bool {
+    if node < 0 {
+        return true;
+    }
+    if !json.is_string(tape, node) {
+        return false;
+    }
+    let n = json.string_length(src, tape, node);
+    if n < 0 || n > most {
+        return false;
+    }
+    return !nonempty || n > 0;
+}
+
+// One rule: an object with a known `do`, and only well-formed optional fields.
+fn rule_ok[&s, &t](src: &s [byte], tape: &t [int], rule: int) -> [] bool {
+    if !json.is_object(tape, rule) {
+        return false;
+    }
+    let action = json.get(src, tape, rule, "do");
+    if action < 0 || !json.is_string(tape, action) {
+        return false;
+    }
+    match do_of(json.string_view(src, tape, action)) {
+        option.Option::None => {
+            return false;
+        }
+        option.Option::Some(d) => {
+        }
+    }
+    if !string_or_absent(src, tape, json.get(src, tape, rule, "match"), max_match_bytes(), true) {
+        return false;
+    }
+    if !string_or_absent(src, tape, json.get(src, tape, rule, "type"), max_match_bytes(), true) {
+        return false;
+    }
+    if !string_or_absent(src, tape, json.get(src, tape, rule, "text"), max_text_bytes(), false) {
+        return false;
+    }
+    if !string_or_absent(src, tape, json.get(src, tape, rule, "patch"), max_text_bytes(), false) {
+        return false;
+    }
+    if !string_or_absent(src, tape, json.get(src, tape, rule, "summary"), max_match_bytes(), false) {
+        return false;
+    }
+    let code = json.get(src, tape, rule, "code");
+    if code >= 0 {
+        if !json.is_string(tape, code) || !json.string_plain(tape, code) || !code_ok(json.string_view(src, tape, code)) {
+            return false;
+        }
+    }
+    let delay = json.get(src, tape, rule, "delay_ms");
+    if delay >= 0 {
+        if !json.is_int(tape, delay) || !json.fits_int(src, tape, delay) {
+            return false;
+        }
+        let ms = json.to_int(src, tape, delay);
+        if ms < 0 || ms > max_delay_ms() {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Is the whole script well formed? `tape` is the parse of `src`; an unparsed or empty tape is the caller's to refuse
+// first.
+pub fn valid[&s, &t](src: &s [byte], tape: &t [int]) -> [] bool {
+    if !json.is_object(tape, 0) {
+        return false;
+    }
+    let rules = json.get(src, tape, 0, "rules");
+    if rules < 0 || !json.is_array(tape, rules) {
+        return false;
+    }
+    let n = json.count(tape, rules);
+    if n < 1 || n > max_rules() {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        if !rule_ok(src, tape, json.at(tape, rules, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The node of the first rule that takes `prompt` for a task of type `task_type`, or -1 for none. The script must be
+// `valid`.
+pub fn pick[&s, &t, &p, &y](src: &s [byte], tape: &t [int], prompt: &p [byte], task_type: &y [byte]) -> [] int {
+    let rules = json.get(src, tape, 0, "rules");
+    let n = json.count(tape, rules);
+    var i = 0;
+    while i < n {
+        let rule = json.at(tape, rules, i);
+        var takes = true;
+        let m = json.get(src, tape, rule, "match");
+        if m >= 0 && bytes.find(prompt, json.string_view(src, tape, m)) < 0 {
+            takes = false;
+        }
+        let ty = json.get(src, tape, rule, "type");
+        if ty >= 0 && !bytes.equal(task_type, json.string_view(src, tape, ty)) {
+            takes = false;
+        }
+        if takes {
+            return rule;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}

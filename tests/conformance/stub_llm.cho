@@ -1,0 +1,474 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import std.map;
+import std.process;
+import forge.dispatch;
+import forge.event;
+import forge.journal;
+import forge.journal_io;
+import forge.response;
+import forge.support;
+import forge.task;
+import forge.worker;
+
+// The stub LLM worker (docs/stub-llm.md) against the worker contract, and a whole flow for each way it can answer:
+// Forge dispatches a task to a real child process, validates what comes back, recomputes the evidence, and writes what
+// it decided in a journal, which is then replayed. One case is one `stub_script.json`, one prompt and one expected
+// ending, rule tag, consequence and final state of the task.
+//
+// The flow driver below (`drive`) is the shape the supervisor of M2 and M3 will take; it is test code, not Forge: the
+// mapping from a consequence to a state is documented in docs/stub-llm.md, section 5, and the supervisor that will own
+// it does not exist yet. What the journal records is Forge's own: `forge.journal.submit` for every transition and
+// `forge.event.refusal` for the rule tag of a refused ending.
+//
+// Usage: stub_llm <workers directory holding stub_llm> <base directory>
+// The gate makes `ev_<label>` for every label below under the base directory, and checks no stub outlives the run.
+
+// The reply of an answered request: has it this `state` and `error.code` (empty: `error` is null), and this many
+// evidence entries?
+fn reply_is[&h, &b](heap: &!h Heap, out: &b [byte], state: &static [byte], code: &static [byte], evidence: int, first_kind: &static [byte], second_kind: &static [byte]) -> [heap] bool {
+    var held = false;
+    let tape = box_slice(heap, json.tape_len(out), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(out, tp) > 0 && json.is_object(tp, 0) {
+            let s = json.get(out, tp, 0, "state");
+            let ev = json.get(out, tp, 0, "evidence");
+            let er = json.get(out, tp, 0, "error");
+            held = json.is_string(tp, s) && json.string_equals(out, tp, s, state) && json.is_array(tp, ev) && json.count(tp, ev) == evidence;
+            if len(code) == 0 {
+                held = held && json.is_null(tp, er);
+            } else {
+                let c = json.get(out, tp, er, "code");
+                held = held && json.is_object(tp, er) && json.is_string(tp, c) && json.string_equals(out, tp, c, code);
+                // a refusal of the stub is never worth retrying (worker-contract section 3.2)
+                let retry = json.get(out, tp, er, "retryable");
+                held = held && retry >= 0 && json.is_bool(tp, retry) && !json.to_bool(tp, retry);
+            }
+            if len(first_kind) > 0 {
+                let e0 = json.at(tp, ev, 0);
+                let k0 = json.get(out, tp, e0, "kind");
+                held = held && k0 >= 0 && json.is_string(tp, k0) && json.string_equals(out, tp, k0, first_kind);
+            }
+            if len(second_kind) > 0 {
+                let e1 = json.at(tp, ev, 1);
+                let k1 = json.get(out, tp, e1, "kind");
+                held = held && k1 >= 0 && json.is_string(tp, k1) && json.string_equals(out, tp, k1, second_kind);
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return held;
+}
+
+fn reason_of(e: dispatch.Ending) -> [] int {
+    match e {
+        dispatch.Ending::Reply(verdict) => {
+            match verdict {
+                response.Verdict::Refused(rule, reason) => {
+                    return reason;
+                }
+                response.Verdict::Valid(state) => {
+                    return 0 - 1;
+                }
+            }
+        }
+        dispatch.Ending::Unavailable(errno) => {
+            return errno;
+        }
+        dispatch.Ending::Timeout => {
+            return 0 - 1;
+        }
+        dispatch.Ending::Overflow => {
+            return 0 - 1;
+        }
+        dispatch.Ending::Crashed(signal) => {
+            return 0 - 1;
+        }
+        dispatch.Ending::Error(code) => {
+            return code;
+        }
+        dispatch.Ending::Setup(errno) => {
+            return errno;
+        }
+    }
+}
+
+// The state a consequence leaves the task in, the way docs/stub-llm.md section 5 says; `running` when nothing moves it.
+fn target_of(c: dispatch.Consequence) -> [] task.State {
+    match c {
+        dispatch.Consequence::Blocked => {
+            return task.State::Blocked;
+        }
+        dispatch.Consequence::RetryOrFail => {
+            return task.State::Ready;
+        }
+        dispatch.Consequence::Failed => {
+            return task.State::Blocked;
+        }
+        dispatch.Consequence::Verification => {
+            return task.State::Verification;
+        }
+        dispatch.Consequence::WorkerSaid => {
+            return task.State::Blocked;
+        }
+        dispatch.Consequence::Cancelled => {
+            return task.State::Cancelled;
+        }
+        dispatch.Consequence::Poll => {
+            return task.State::Running;
+        }
+    }
+}
+
+// One transition of task t-1 by `actor`, written to the journal at `path`. The table and the next position; the
+// position is negative once a write failed.
+fn move_to[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], tasks: map.Map[int], seq: int, target: task.State, actor: task.Actor) -> [heap, fs_read(""), fs_write(""), file_write] (map.Map[int], int) {
+    if seq < 0 {
+        return (tasks, seq);
+    }
+    let (table, record, rule) = journal.submit(heap, tasks, seq, "t-1", target, actor, false);
+    var status = 0 - 1;
+    borrow record as &rb in {
+        status = journal_io.append(fs, path, buffer.bytes(rb), seq == 1);
+    }
+    buffer.drop(heap, record);
+    if status != 0 || rule != 0 {
+        return (table, 0 - 1000);
+    }
+    return (table, seq + 1);
+}
+
+// The refusal of an ending, written down with its rule tag.
+fn note[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, tag: &static [byte]) -> [heap, fs_read(""), fs_write(""), file_write] int {
+    if seq < 0 {
+        return seq;
+    }
+    let record = event.refusal(heap, seq, "t-1", tag);
+    var status = 0 - 1;
+    borrow record as &rb in {
+        status = journal_io.append(fs, path, buffer.bytes(rb), false);
+    }
+    buffer.drop(heap, record);
+    if status != 0 {
+        return 0 - 1000;
+    }
+    return seq + 1;
+}
+
+// The journal of a task that is dispatched: proposed, approved, ready, running. Its position, and the table.
+fn start[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_write] (map.Map[int], int) {
+    let (empty, report) = journal.replay(heap, "");
+    let (t1, s1) = move_to(heap, fs, path, empty, 1, task.State::Proposed, task.Actor::Human);
+    let (t2, s2) = move_to(heap, fs, path, t1, s1, task.State::Approved, task.Actor::Human);
+    let (t3, s3) = move_to(heap, fs, path, t2, s2, task.State::Ready, task.Actor::Forge);
+    return move_to(heap, fs, path, t3, s3, task.State::Running, task.Actor::Forge);
+}
+
+// What the ending does to the task, in the journal: its rule tag when it is a refusal, then the move.
+fn finish[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], tasks: map.Map[int], seq: int, e: dispatch.Ending) -> [heap, fs_read(""), fs_write(""), file_write] (map.Map[int], int) {
+    var next = seq;
+    let tag = dispatch.rule_tag(e);
+    if len(tag) > 0 {
+        next = note(heap, fs, path, next, tag);
+    }
+    let target = target_of(dispatch.consequence(e));
+    return move_to(heap, fs, path, tasks, next, target, task.Actor::Forge);
+}
+
+// The journal replayed: the state code of t-1, or -1 when the journal is not clean, and how many records it has.
+fn replayed[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] (int, int) {
+    let (table, report, recovered) = journal_io.recover(heap, fs, path);
+    var state = 0 - 1;
+    if report.rule == 0 && recovered.errno == 0 && report.torn_bytes == 0 {
+        borrow table as &tb in {
+            state = journal.state_of(tb, "t-1");
+        }
+    }
+    map.drop(heap, table);
+    return (state, report.records);
+}
+
+// <base>/ev_<label>, the execution directory of a case.
+fn dir_of[&h, &b, &l](heap: &!h Heap, base: &b [byte], label: &l [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.append(heap, buffer.empty(heap, 64), base);
+    out = buffer.append(heap, out, "/ev_");
+    return buffer.append(heap, out, label);
+}
+
+// <base>/<label>.journal.jsonl, the journal of a case.
+fn journal_of[&h, &b, &l](heap: &!h Heap, base: &b [byte], label: &l [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.append(heap, buffer.empty(heap, 64), base);
+    out = buffer.push(heap, out, byte_of(47));
+    out = buffer.append(heap, out, label);
+    return buffer.append(heap, out, ".journal.jsonl");
+}
+
+// One case. The stub is run with the script `script` (not written when empty) and the task input `input`, under `most`
+// bytes and `timeout_ms`; it must end with rule tag `tag`, consequence `then` and reason `reason` (-1000: any), within
+// `within_ms`. The journal of the flow must replay clean to the state `state` (a `task.state_code`) with `records`
+// records, and, when the ending is a refusal, hold its tag.
+fn case[&h, &x, &w, &f, &c, &i, &b, &l](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, base: &b [byte], label: &l [byte], script: &static [byte], input: &static [byte], task_type: &static [byte], most: int, timeout_ms: int, tag: &static [byte], then: &static [byte], reason: int, state: int, records: int, within_ms: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write] int {
+    let dir = dir_of(heap, base, label);
+    let jpath = journal_of(heap, base, label);
+    var held = false;
+    var took = 0;
+    borrow dir as &db in {
+        borrow jpath as &jb in {
+            if len(script) > 0 {
+                let sp = support.under(heap, buffer.bytes(db), "stub_script.json");
+                borrow sp as &spb in {
+                    support.put_file(fs, buffer.bytes(spb), script);
+                }
+                buffer.drop(heap, sp);
+            }
+            let req = worker.build_execute(heap, "r-1", 1, "t-1", task_type, input, timeout_ms, most, "workspace/w", buffer.bytes(db));
+            let began = clock_ms(clock);
+            borrow req as &qb in {
+                let e = worker.execute(heap, exec, workers, fs, clock, "stub_llm", buffer.bytes(qb), "r-1", "t-1", buffer.bytes(db), most, timeout_ms, false);
+                took = clock_ms(clock) - began;
+                let (tasks, seq) = start(heap, fs, buffer.bytes(jb));
+                let (done, last) = finish(heap, fs, buffer.bytes(jb), tasks, seq, e);
+                map.drop(heap, done);
+                let (got_state, got_records) = replayed(heap, fs, buffer.bytes(jb));
+                held = bytes.equal(dispatch.rule_tag(e), tag) && bytes.equal(dispatch.consequence_name(dispatch.consequence(e)), then) && (reason == 0 - 1000 || reason_of(e) == reason) && got_state == state && got_records == records && last == records + 1;
+                if len(tag) > 0 {
+                    let (journal_text, errno) = support.contents_of(heap, fs, buffer.bytes(jb));
+                    borrow journal_text as &jt in {
+                        let wanted = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 48), "\"kind\":\"refusal\",\"task\":\"t-1\",\"rule\":\""), tag);
+                        borrow wanted as &wb in {
+                            held = held && bytes.find(buffer.bytes(jt), buffer.bytes(wb)) >= 0;
+                        }
+                        buffer.drop(heap, wanted);
+                    }
+                    buffer.drop(heap, journal_text);
+                }
+            }
+            buffer.drop(heap, req);
+        }
+    }
+    buffer.drop(heap, dir);
+    buffer.drop(heap, jpath);
+    return support.verdict(io, held && took <= within_ms, label);
+}
+
+// One request run raw: the stub must exit 0 and its reply must be `state` with error code `code` (empty: none) and
+// `evidence` entries. For the codes the stub answers on its own, which a classified ending does not carry.
+fn raw[&h, &x, &w, &f, &c, &i, &b, &l](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, base: &b [byte], label: &l [byte], script: &static [byte], input: &static [byte], exec_dir: &static [byte], state: &static [byte], code: &static [byte], evidence: int, first_kind: &static [byte], second_kind: &static [byte]) -> [heap, exec_under, clock, poll, fs_write(""), file_write, io_write] int {
+    let dir = dir_of(heap, base, label);
+    var held = false;
+    borrow dir as &db in {
+        if len(script) > 0 {
+            let sp = support.under(heap, buffer.bytes(db), "stub_script.json");
+            borrow sp as &spb in {
+                support.put_file(fs, buffer.bytes(spb), script);
+            }
+            buffer.drop(heap, sp);
+        }
+        var given = buffer.bytes(db);
+        if len(exec_dir) > 0 {
+            given = exec_dir;
+        }
+        let req = worker.build_execute(heap, "r-1", 1, "t-1", "llm.stub", input, 5000, 65536, "workspace/w", given);
+        borrow req as &qb in {
+            let (out, ran) = worker.run(heap, exec, workers, clock, "stub_llm", buffer.bytes(qb), 65536, 5000);
+            var exited_zero = false;
+            match ran {
+                process.Ran::Code(n) => {
+                    exited_zero = n == 0;
+                }
+                process.Ran::Failed(e) => {
+                }
+                process.Ran::TimedOut => {
+                }
+                process.Ran::TooMuch => {
+                }
+                process.Ran::Signaled(s) => {
+                }
+            }
+            borrow out as &ob in {
+                held = exited_zero && reply_is(heap, buffer.bytes(ob), state, code, evidence, first_kind, second_kind);
+            }
+            buffer.drop(heap, out);
+        }
+        buffer.drop(heap, req);
+    }
+    buffer.drop(heap, dir);
+    return support.verdict(io, held, label);
+}
+
+// A request written by hand, not by `build_execute`: the stub must exit with `status` having answered nothing (a
+// request it does not serve is not answered, docs/stub-llm.md section 4).
+fn exits[&h, &x, &w, &c, &i, &l](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &l [byte], request: &static [byte], status: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let (out, ran) = worker.run(heap, exec, workers, clock, "stub_llm", request, 65536, 5000);
+    var held = false;
+    var written = 0;
+    borrow out as &ob in {
+        written = buffer.size(ob);
+    }
+    match ran {
+        process.Ran::Code(n) => {
+            held = n == status && written == 0;
+        }
+        process.Ran::Failed(e) => {
+        }
+        process.Ran::TimedOut => {
+        }
+        process.Ran::TooMuch => {
+        }
+        process.Ran::Signaled(s) => {
+        }
+    }
+    buffer.drop(heap, out);
+    return support.verdict(io, held, label);
+}
+
+fn prompt_go() -> [] &static [byte] {
+    return "{\"prompt\":\"please go\"}";
+}
+
+fn script_for(which: int) -> [] &static [byte] {
+    if which == 1 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"ok\",\"text\":\"hello from the stub\\n\"}]}";
+    }
+    if which == 2 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"propose\",\"summary\":\"add a line\",\"patch\":\"--- a/f\\n+++ b/f\\n@@ -1 +1 @@\\n-old\\n+new\\n\"}]}";
+    }
+    if which == 3 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"refuse\"}]}";
+    }
+    if which == 4 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"malformed\"}]}";
+    }
+    if which == 5 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"truncated\"}]}";
+    }
+    if which == 6 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"liar\"}]}";
+    }
+    if which == 7 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"liar_size\"}]}";
+    }
+    if which == 8 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"slow\",\"delay_ms\":300}]}";
+    }
+    if which == 9 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"slow\",\"delay_ms\":30000}]}";
+    }
+    if which == 10 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"crash_after_progress\"}]}";
+    }
+    if which == 11 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"oversize\"}]}";
+    }
+    if which == 12 {
+        return "{\"rules\":[{\"match\":\"never\",\"do\":\"ok\"}]}";
+    }
+    if which == 13 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"refuse\",\"code\":\"policy-refusal\",\"summary\":\"declined\"}]}";
+    }
+    if which == 14 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"dance\"}]}";
+    }
+    if which == 16 {
+        return "{\"rules\":[{\"match\":\"go\",\"do\":\"propose\"}]}";
+    }
+    if which == 15 {
+        return "{\"rules\":[{\"match\":\"go\",\"type\":\"repo.change\",\"do\":\"malformed\"},{\"do\":\"ok\"}]}";
+    }
+    return "";
+}
+
+fn run[&h, &x, &w, &f, &c, &i, &b](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, base: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write] int {
+    var bad = 0;
+    // states: 3 ready, 5 blocked, 6 verification. records: 4 for propose, approve, ready, running; one more for the
+    // move and, for a refusal, one more again for its tag.
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "ok", script_for(1), prompt_go(), "llm.stub", 65536, 5000, "", "verification", 0 - 1000, 6, 5, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "propose", script_for(2), prompt_go(), "llm.stub", 65536, 5000, "", "verification", 0 - 1000, 6, 5, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "refuse", script_for(3), prompt_go(), "llm.stub", 65536, 5000, "", "worker-said", 0 - 1000, 5, 5, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "malformed", script_for(4), prompt_go(), "llm.stub", 65536, 5000, "worker-protocol", "failed", response.r_not_json(), 5, 6, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "truncated", script_for(5), prompt_go(), "llm.stub", 65536, 5000, "worker-protocol", "failed", response.r_not_json(), 5, 6, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "liar", script_for(6), prompt_go(), "llm.stub", 65536, 5000, "evidence-ref-invalid", "failed", response.r_evidence_sha_mismatch(), 5, 6, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "liar_size", script_for(7), prompt_go(), "llm.stub", 65536, 5000, "evidence-ref-invalid", "failed", response.r_evidence_bytes_mismatch(), 5, 6, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "slow_in_time", script_for(8), prompt_go(), "llm.stub", 65536, 5000, "", "verification", 0 - 1000, 6, 5, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "slow_past_deadline", script_for(9), prompt_go(), "llm.stub", 65536, 600, "worker-timeout", "retry-or-fail", 0 - 1000, 3, 6, 3000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "crash", script_for(10), prompt_go(), "llm.stub", 65536, 5000, "worker-crashed", "retry-or-fail", 0 - 1000, 3, 6, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "oversize", script_for(11), prompt_go(), "llm.stub", 4096, 5000, "worker-output-overflow", "failed", 0 - 1000, 5, 6, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "no_rule", script_for(12), prompt_go(), "llm.stub", 65536, 5000, "", "worker-said", 0 - 1000, 5, 5, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "no_script", "", prompt_go(), "llm.stub", 65536, 5000, "", "worker-said", 0 - 1000, 5, 5, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "type_picks_the_rule", script_for(15), prompt_go(), "repo.change", 65536, 5000, "worker-protocol", "failed", response.r_not_json(), 5, 6, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "type_skips_the_rule", script_for(15), prompt_go(), "llm.stub", 65536, 5000, "", "verification", 0 - 1000, 6, 5, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, base, "a_script_with_a_bad_rule", script_for(14), prompt_go(), "llm.stub", 65536, 5000, "", "worker-said", 0 - 1000, 5, 5, 10000);
+    // the stub's own error codes, which a classified ending does not carry
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_no_rule", script_for(12), prompt_go(), "", "failed", "stub-no-rule", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_script_missing", "", prompt_go(), "", "failed", "stub-script-missing", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_script_invalid", script_for(14), prompt_go(), "", "failed", "stub-script-invalid", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_script_not_json", "this is not json", prompt_go(), "", "failed", "stub-script-invalid", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_bad_request", script_for(1), "{}", "", "failed", "stub-bad-request", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_bad_request_prompt_not_a_string", script_for(1), "{\"prompt\":7}", "", "failed", "stub-bad-request", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_script_unreadable", "", prompt_go(), "", "failed", "stub-script-missing", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_default_refusal", script_for(3), prompt_go(), "", "failed", "model-refused", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_scripted_refusal", script_for(13), prompt_go(), "", "failed", "policy-refusal", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "code_bad_request_exec_dir", script_for(1), prompt_go(), "../x", "failed", "stub-bad-request", 0, "", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "ok_has_one_evidence", script_for(1), prompt_go(), "", "succeeded", "", 1, "report", "");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "propose_default", script_for(16), prompt_go(), "", "succeeded", "", 2, "patch", "report");
+    bad = bad + raw(heap, exec, workers, fs, clock, io, base, "propose_has_two_evidence", script_for(2), prompt_go(), "", "succeeded", "", 2, "patch", "report");
+    // requests the stub does not serve: no answer, exit 4
+    bad = bad + exits(heap, exec, workers, clock, io, "refused_not_json", "this is not json", 4);
+    bad = bad + exits(heap, exec, workers, clock, io, "refused_not_an_object", "[]", 4);
+    bad = bad + exits(heap, exec, workers, clock, io, "refused_other_verb", "{\"contract\":\"forge-worker/1\",\"verb\":\"capabilities\",\"request_id\":\"r-1\",\"task\":{\"id\":\"t-1\",\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
+    bad = bad + exits(heap, exec, workers, clock, io, "refused_other_contract", "{\"contract\":\"forge-worker/2\",\"verb\":\"execute\",\"request_id\":\"r-1\",\"task\":{\"id\":\"t-1\",\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
+    bad = bad + exits(heap, exec, workers, clock, io, "refused_no_request_id", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"task\":{\"id\":\"t-1\",\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
+    bad = bad + exits(heap, exec, workers, clock, io, "refused_no_task_id", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r-1\",\"task\":{\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
+    return bad;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow exec as &x in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        borrow args as &g in {
+                            if arg_count(g) == 3 {
+                                match open_dir(f, arg(g, 1)) {
+                                    DirOpened::Ok(d) => {
+                                        var workers = d;
+                                        borrow workers as &w in {
+                                            status = run(h, x, w, f, c, i, arg(g, 2));
+                                        }
+                                        dir_close(workers);
+                                    }
+                                    DirOpened::Failed(e) => {
+                                        io.error_all(i, "stub_llm: cannot open the workers directory\n");
+                                    }
+                                }
+                            } else {
+                                io.error_all(i, "usage: stub_llm <workers directory> <base directory>\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

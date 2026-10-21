@@ -1,0 +1,389 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.option;
+import std.test;
+import forge.stub_script;
+
+// Unit tests for src/stub_script.cho (docs/stub-llm.md, sections 3 and 4): what makes a script well formed, which rule a
+// prompt picks, and the closed set of behaviours. Run with `cancho test`.
+
+// -2 for a script that is not valid (or not JSON), -1 when no rule takes the prompt, else the first byte of the picked
+// rule's `text`.
+fn picked[&h, &s, &p, &y](heap: &!h Heap, script: &s [byte], prompt: &p [byte], task_type: &y [byte]) -> [heap] int {
+    let tape = box_slice(heap, json.tape_len(script), 0);
+    var answer = 0 - 2;
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(script, tp) > 0 && stub_script.valid(script, tp) {
+            let rule = stub_script.pick(script, tp, prompt, task_type);
+            if rule < 0 {
+                answer = 0 - 1;
+            } else {
+                let text = json.string_view(script, tp, json.get(script, tp, rule, "text"));
+                answer = int_of(text[0]);
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return answer;
+}
+
+fn is_valid[&h, &s](heap: &!h Heap, script: &s [byte]) -> [heap] bool {
+    return picked(heap, script, "x", "t") != 0 - 2;
+}
+
+fn a() -> [] int {
+    return 65;
+}
+
+fn b() -> [] int {
+    return 66;
+}
+
+fn c() -> [] int {
+    return 67;
+}
+
+fn three() -> [] &static [byte] {
+    return "{\"rules\":[{\"match\":\"alpha\",\"do\":\"ok\",\"text\":\"A\"},{\"match\":\"beta\",\"type\":\"repo.change\",\"do\":\"ok\",\"text\":\"B\"},{\"do\":\"ok\",\"text\":\"C\"}]}";
+}
+
+fn behaviour(i: int) -> [] &static [byte] {
+    if i == 0 {
+        return "ok";
+    }
+    if i == 1 {
+        return "refuse";
+    }
+    if i == 2 {
+        return "malformed";
+    }
+    if i == 3 {
+        return "liar";
+    }
+    if i == 4 {
+        return "liar_size";
+    }
+    if i == 5 {
+        return "truncated";
+    }
+    if i == 6 {
+        return "slow";
+    }
+    if i == 7 {
+        return "crash_after_progress";
+    }
+    if i == 8 {
+        return "oversize";
+    }
+    return "propose";
+}
+
+fn not_a_behaviour(i: int) -> [] &static [byte] {
+    if i == 0 {
+        return "";
+    }
+    if i == 1 {
+        return "OK";
+    }
+    if i == 2 {
+        return "Ok";
+    }
+    if i == 3 {
+        return "okk";
+    }
+    if i == 4 {
+        return "o";
+    }
+    if i == 5 {
+        return "refuse ";
+    }
+    if i == 6 {
+        return " refuse";
+    }
+    if i == 7 {
+        return "crash";
+    }
+    if i == 8 {
+        return "sleep";
+    }
+    if i == 9 {
+        return "propose\n";
+    }
+    return "liar-size";
+}
+
+fn test_the_first_rule_that_takes_the_prompt_is_the_one[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(picked(heap, three(), "an alpha prompt", "repo.change"), a());
+    test.assert_eq(picked(heap, three(), "alpha and beta", "repo.change"), a());
+    test.assert_eq(picked(heap, three(), "a beta prompt", "repo.change"), b());
+    return 0;
+}
+
+fn test_a_rule_with_a_type_takes_only_that_type[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(picked(heap, three(), "a beta prompt", "repo.gate"), c());
+    test.assert_eq(picked(heap, three(), "a beta prompt", ""), c());
+    return 0;
+}
+
+fn test_a_rule_without_a_match_takes_everything_and_is_the_default_when_last[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(picked(heap, three(), "nothing in common", "repo.change"), c());
+    test.assert_eq(picked(heap, three(), "", "repo.change"), c());
+    return 0;
+}
+
+fn test_no_rule_taking_the_prompt_is_not_a_guess[&h](heap: &!h Heap) -> [heap] int {
+    let only = "{\"rules\":[{\"match\":\"alpha\",\"do\":\"ok\",\"text\":\"A\"}]}";
+    test.assert_eq(picked(heap, only, "beta", "t"), 0 - 1);
+    test.assert_eq(picked(heap, only, "", "t"), 0 - 1);
+    test.assert_eq(picked(heap, only, "alph", "t"), 0 - 1);
+    test.assert_eq(picked(heap, only, "ALPHA", "t"), 0 - 1);
+    test.assert_eq(picked(heap, only, "xalphax", "t"), a());
+    test.assert_eq(picked(heap, only, "alpha", "t"), a());
+    return 0;
+}
+
+fn test_a_default_in_front_hides_the_rules_behind_it[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"rules\":[{\"do\":\"ok\",\"text\":\"C\"},{\"match\":\"alpha\",\"do\":\"ok\",\"text\":\"A\"}]}";
+    test.assert_eq(picked(heap, s, "alpha", "t"), c());
+    return 0;
+}
+
+fn test_a_match_is_compared_as_written_with_escapes_undecoded[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"rules\":[{\"match\":\"a\\nb\",\"do\":\"ok\",\"text\":\"A\"},{\"do\":\"ok\",\"text\":\"C\"}]}";
+    test.assert_eq(picked(heap, s, "x a\\nb y", "t"), a());
+    test.assert_eq(picked(heap, s, "a-newline-b", "t"), c());
+    return 0;
+}
+
+fn test_every_behaviour_has_a_name_and_the_name_finds_it() -> [] int {
+    var i = 0;
+    while i < 10 {
+        match stub_script.do_of(behaviour(i)) {
+            option.Option::None => {
+                test.assert(false);
+            }
+            option.Option::Some(d) => {
+                test.assert(bytes.equal(stub_script.do_name(d), behaviour(i)));
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_a_behaviour_that_is_not_in_the_set_is_none() -> [] int {
+    var i = 0;
+    while i < 11 {
+        match stub_script.do_of(not_a_behaviour(i)) {
+            option.Option::None => {
+            }
+            option.Option::Some(d) => {
+                test.assert(false);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_a_script_with_each_behaviour_is_valid[&h](heap: &!h Heap) -> [heap] int {
+    var i = 0;
+    while i < 10 {
+        var s = buffer.append(heap, buffer.empty(heap, 64), "{\"rules\":[{\"do\":\"");
+        s = buffer.append(heap, s, behaviour(i));
+        s = buffer.append(heap, s, "\",\"text\":\"A\"}]}");
+        borrow s as &sb in {
+            test.assert_eq(picked(heap, buffer.bytes(sb), "x", "t"), a());
+        }
+        buffer.drop(heap, s);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_a_script_that_is_not_well_formed_is_invalid_as_a_whole[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(is_valid(heap, three()));
+    test.assert(!is_valid(heap, ""));
+    test.assert(!is_valid(heap, "not json"));
+    test.assert(!is_valid(heap, "[]"));
+    test.assert(!is_valid(heap, "{}"));
+    test.assert(!is_valid(heap, "{\"rules\":{}}"));
+    test.assert(!is_valid(heap, "{\"rules\":[]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[1]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":1,\"text\":\"A\"}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"dance\",\"text\":\"A\"}]}"));
+    // one bad rule behind a good one makes the whole script invalid, reached or not
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\"},{\"do\":\"dance\"}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\"}"));
+    return 0;
+}
+
+fn test_the_optional_fields_are_checked_when_present[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"summary\":\"s\",\"patch\":\"p\",\"match\":\"m\",\"type\":\"t\",\"code\":\"a-b1\",\"delay_ms\":0}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":1}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"summary\":1}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"patch\":[]}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"match\":1}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"match\":\"\"}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"type\":\"\"}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"type\":1}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"code\":1}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"code\":\"Bad\"}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"code\":\"a\\u002db\"}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"delay_ms\":\"5\"}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"delay_ms\":1.5}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"delay_ms\":-1}]}"));
+    return 0;
+}
+
+fn test_the_delay_is_bounded[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(is_valid(heap, "{\"rules\":[{\"do\":\"slow\",\"text\":\"A\",\"delay_ms\":600000}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"slow\",\"text\":\"A\",\"delay_ms\":600001}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"slow\",\"text\":\"A\",\"delay_ms\":99999999999999999999}]}"));
+    return 0;
+}
+
+fn test_the_number_of_rules_is_bounded[&h](heap: &!h Heap) -> [heap] int {
+    var n = 0;
+    while n <= 65 {
+        var s = buffer.append(heap, buffer.empty(heap, 64), "{\"rules\":[");
+        var k = 0;
+        while k < n {
+            if k > 0 {
+                s = buffer.push(heap, s, byte_of(44));
+            }
+            s = buffer.append(heap, s, "{\"do\":\"ok\",\"text\":\"A\"}");
+            k = k + 1;
+        }
+        s = buffer.append(heap, s, "]}");
+        borrow s as &sb in {
+            if n == 0 || n == 65 {
+                test.assert(!is_valid(heap, buffer.bytes(sb)));
+            }
+            if n == 1 || n == 64 {
+                test.assert(is_valid(heap, buffer.bytes(sb)));
+            }
+        }
+        buffer.drop(heap, s);
+        n = n + 1;
+    }
+    return 0;
+}
+
+fn test_the_length_of_a_match_is_bounded[&h](heap: &!h Heap) -> [heap] int {
+    var n = 255;
+    while n <= 257 {
+        var s = buffer.append(heap, buffer.empty(heap, 64), "{\"rules\":[{\"do\":\"ok\",\"text\":\"A\",\"match\":\"");
+        var k = 0;
+        while k < n {
+            s = buffer.push(heap, s, byte_of(120));
+            k = k + 1;
+        }
+        s = buffer.append(heap, s, "\"}]}");
+        borrow s as &sb in {
+            if n <= 256 {
+                test.assert(is_valid(heap, buffer.bytes(sb)));
+            } else {
+                test.assert(!is_valid(heap, buffer.bytes(sb)));
+            }
+        }
+        buffer.drop(heap, s);
+        n = n + 1;
+    }
+    return 0;
+}
+
+fn test_the_error_code_a_rule_may_carry() -> [] int {
+    test.assert(stub_script.code_ok("model-refused"));
+    test.assert(stub_script.code_ok("a"));
+    test.assert(stub_script.code_ok("0"));
+    test.assert(stub_script.code_ok("a-b-c-9"));
+    test.assert(!stub_script.code_ok(""));
+    test.assert(!stub_script.code_ok("-a"));
+    test.assert(!stub_script.code_ok("a-"));
+    test.assert(!stub_script.code_ok("A"));
+    test.assert(!stub_script.code_ok("a_b"));
+    test.assert(!stub_script.code_ok("a b"));
+    test.assert(!stub_script.code_ok("a.b"));
+    test.assert(stub_script.code_ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    test.assert(!stub_script.code_ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    return 0;
+}
+
+fn test_the_stubs_own_error_codes_are_kebab_case_and_distinct() -> [] int {
+    test.assert(stub_script.code_ok(stub_script.code_no_rule()));
+    test.assert(stub_script.code_ok(stub_script.code_script_missing()));
+    test.assert(stub_script.code_ok(stub_script.code_script_invalid()));
+    test.assert(stub_script.code_ok(stub_script.code_bad_request()));
+    test.assert(!bytes.equal(stub_script.code_no_rule(), stub_script.code_script_missing()));
+    test.assert(!bytes.equal(stub_script.code_script_missing(), stub_script.code_script_invalid()));
+    test.assert(!bytes.equal(stub_script.code_script_invalid(), stub_script.code_bad_request()));
+    test.assert(bytes.equal(stub_script.code_no_rule(), "stub-no-rule"));
+    return 0;
+}
+
+// A script whose one rule has the field `key` holding a string of `n` bytes.
+fn with_long[&h](heap: &!h Heap, key: &static [byte], n: int) -> [heap] buffer.Buffer {
+    var s = buffer.append(heap, buffer.empty(heap, 64), "{\"rules\":[{\"do\":\"ok\",\"");
+    s = buffer.append(heap, s, key);
+    s = buffer.append(heap, s, "\":\"");
+    var k = 0;
+    while k < n {
+        s = buffer.push(heap, s, byte_of(120));
+        k = k + 1;
+    }
+    return buffer.append(heap, s, "\",\"text\":\"A\"}]}");
+}
+
+fn test_the_length_of_a_text_a_patch_and_a_summary_is_bounded[&h](heap: &!h Heap) -> [heap] int {
+    let t_ok = with_long(heap, "text", 65536);
+    let t_bad = with_long(heap, "text", 65537);
+    let p_ok = with_long(heap, "patch", 65536);
+    let p_bad = with_long(heap, "patch", 65537);
+    let s_ok = with_long(heap, "summary", 256);
+    let s_bad = with_long(heap, "summary", 257);
+    borrow t_ok as &a in {
+        test.assert(is_valid(heap, buffer.bytes(a)));
+    }
+    borrow t_bad as &a in {
+        test.assert(!is_valid(heap, buffer.bytes(a)));
+    }
+    borrow p_ok as &a in {
+        test.assert(is_valid(heap, buffer.bytes(a)));
+    }
+    borrow p_bad as &a in {
+        test.assert(!is_valid(heap, buffer.bytes(a)));
+    }
+    borrow s_ok as &a in {
+        test.assert(is_valid(heap, buffer.bytes(a)));
+    }
+    borrow s_bad as &a in {
+        test.assert(!is_valid(heap, buffer.bytes(a)));
+    }
+    buffer.drop(heap, t_ok);
+    buffer.drop(heap, t_bad);
+    buffer.drop(heap, p_ok);
+    buffer.drop(heap, p_bad);
+    buffer.drop(heap, s_ok);
+    buffer.drop(heap, s_bad);
+    return 0;
+}
+
+fn test_rules_that_are_not_an_array_are_invalid_even_when_they_have_members[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(!is_valid(heap, "{\"rules\":{\"a\":{\"do\":\"ok\",\"text\":\"A\"}}}"));
+    test.assert(!is_valid(heap, "{\"rules\":\"ok\"}"));
+    test.assert(!is_valid(heap, "{\"rules\":1}"));
+    return 0;
+}
+
+fn test_a_delay_that_wraps_around_64_bits_is_not_a_small_delay[&h](heap: &!h Heap) -> [heap] int {
+    // 2^64 + 5 would read as 5 if the value were not checked to fit
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"slow\",\"text\":\"A\",\"delay_ms\":18446744073709551621}]}"));
+    test.assert(!is_valid(heap, "{\"rules\":[{\"do\":\"slow\",\"text\":\"A\",\"delay_ms\":-18446744073709551611}]}"));
+    return 0;
+}
