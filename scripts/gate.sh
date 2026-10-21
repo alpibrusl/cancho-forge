@@ -3,6 +3,7 @@
 #   cancho fmt --check   every .cho file is canonical
 #   cancho check         every program type-checks, under its declared authority
 #   cancho test          every `fn test_*` passes (pure logic: tasks, journal replay)
+#   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
 #   conformance          tests/conformance/*.cho, programs that need an Fs, which
 #                        `cancho test` cannot hand a test: built, run against a
 #                        scratch directory made here and removed, exit 0 = held
@@ -85,6 +86,10 @@ fi
 echo "== gate runner (workers/gate_runner.cho against real git checkouts, real child processes)"
 mkdir "$scratch/gate-runner" || exit 1
 CANCHO="$C" sh scripts/check_gate_runner.sh "$scratch/gate-runner" || fail=1
+
+echo "== stub LLM (workers/stub_llm.cho: the contract, and a whole flow per way it can answer, journalled and replayed)"
+mkdir "$scratch/stub-llm" || exit 1
+CANCHO="$C" sh scripts/check_stub_llm.sh "$scratch/stub-llm" || fail=1
 
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of

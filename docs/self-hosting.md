@@ -161,6 +161,11 @@ as `patch` evidence. **Nothing leaves the execution directory**; a human
 reads the patch and applies it. Needs the policy decision point
 (`Allow | Deny | NeedApproval`), approvals as journal events and budgets.
 
+Until the Cancho Code adapter exists, the flows of this stage (a proposal recorded as `patch` evidence, a claim that is
+never acceptance) are tested end to end against the stub LLM ([`stub-llm.md`](stub-llm.md)): a scripted worker whose
+`propose` behaviour returns a patch, and whose failures (a refusal, a reply that lies, a reply too late, a crash) are
+the ones a model-backed worker will have.
+
 The Cancho Code worker builds a *new project from a brief* (`project.build`)
 and, later, fixes one broken file (`file.fix`); it reads no existing
 repository (audit section 2.1; contract section 9). It therefore fits Stage 3
