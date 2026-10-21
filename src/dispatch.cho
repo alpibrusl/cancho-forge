@@ -26,8 +26,12 @@ pub enum Ending {
     // Forge cannot use the execution directory (an errno, or -2 for a path that is not ok): the worker is not at fault,
     // so its reply is not judged. Reached by `forge.worker.execute`, never by `classify`.
     Setup(int),
-    // Exit 0: the verdict on what it wrote (rows 6 and 7, and the states of section 3.2).
+    // Exit 0: the verdict on what it wrote (rows 6 and 7, and the states of section 3.2), for a reply that is not a
+    // `failed` or `partial` one.
     Reply(response.Verdict),
+    // Exit 0 and a valid reply whose state is `failed` or `partial`: the state, and whether `error.retryable` says that
+    // retrying can help (row 7).
+    Said(response.State, bool),
 }
 
 // What Forge does about it, before any budget or policy is asked.
@@ -40,8 +44,12 @@ pub enum Consequence {
     Failed,
     // The worker's `succeeded`: a claim, so the task goes to verification.
     Verification,
-    // The worker says it failed or got part of the way: retry per its own `retryable` (read from the response).
+    // The worker says it failed or got part of the way, and that retrying cannot help (`retryable: false`): an operator
+    // decides.
     WorkerSaid,
+    // The same, and `retryable: true`: back to `ready`, where `forge.retry` decides whether the budget and the kind of
+    // task allow another attempt.
+    WorkerRetryable,
     // The worker stopped because it was asked to.
     Cancelled,
     // An `async` worker took the job; poll.
@@ -67,7 +75,31 @@ pub fn classify[&h, &b, &r, &k](heap: &!h Heap, ran: process.Ran, out: &b [byte]
             if n != 0 {
                 return Ending::Error(n);
             }
-            return Ending::Reply(response.validate(heap, out, request_id, task_id, is_async));
+            let verdict = response.validate(heap, out, request_id, task_id, is_async);
+            match verdict {
+                response.Verdict::Refused(rule, reason) => {
+                    return Ending::Reply(verdict);
+                }
+                response.Verdict::Valid(state) => {
+                    match state {
+                        response.State::Failed => {
+                            return Ending::Said(state, response.retryable(heap, out));
+                        }
+                        response.State::Partial => {
+                            return Ending::Said(state, response.retryable(heap, out));
+                        }
+                        response.State::Succeeded => {
+                            return Ending::Reply(verdict);
+                        }
+                        response.State::Cancelled => {
+                            return Ending::Reply(verdict);
+                        }
+                        response.State::Accepted => {
+                            return Ending::Reply(verdict);
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -92,6 +124,9 @@ pub fn rule_tag(e: Ending) -> [] &static [byte] {
         }
         Ending::Setup(errno) => {
             return "path-invalid";
+        }
+        Ending::Said(state, retry) => {
+            return "";
         }
         Ending::Reply(verdict) => {
             match verdict {
@@ -126,6 +161,12 @@ pub fn consequence(e: Ending) -> [] Consequence {
         }
         Ending::Setup(errno) => {
             return Consequence::Blocked;
+        }
+        Ending::Said(state, retry) => {
+            if retry {
+                return Consequence::WorkerRetryable;
+            }
+            return Consequence::WorkerSaid;
         }
         Ending::Reply(verdict) => {
             match verdict {
@@ -174,6 +215,9 @@ pub fn consequence_name(c: Consequence) -> [] &static [byte] {
         }
         Consequence::WorkerSaid => {
             return "worker-said";
+        }
+        Consequence::WorkerRetryable => {
+            return "worker-retryable";
         }
         Consequence::Cancelled => {
             return "cancelled";

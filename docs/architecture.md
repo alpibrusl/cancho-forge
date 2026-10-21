@@ -435,15 +435,15 @@ revision, and journals what happened. The records of one run are `task.proposed`
 operator who ran the command), `task.ready`, `task.running`, `execution.started` (the intent, durable before the worker
 is started: section 4.4), a `refusal` record when the ending is a refusal (its rule tag), `execution.finished` with the
 runner's verdict as a **claim** (`"actor":"worker","basis":"claimed","verdict":"pass"`; the replay passes over the
-`execution.` namespace and nothing accepts on it), and the move `forge.flow.target_of` gives (`verification` for a
-worker's `succeeded`, `ready` for a lost or failed execution, `blocked` for what needs an operator; never `accepted`). A
+`execution.` namespace and nothing accepts on it), and the move `forge.retry.target_after` gives (`verification` for a
+worker's `succeeded`, `ready` for a lost or failed execution, `blocked` for what needs an operator; never `accepted`). **Retries** (issue #15): a worker that answers `failed` or `partial` with `error.retryable: true` is started again, `running -> ready -> running`, at most `retry.max_attempts()` (3) times in all; each retry is an `execution.retry` record (actor forge, the attempt that failed) written before the move, and each attempt has its own `execution.started` and its own request id (`r-<task>` for the first, `r-<task>-<n>` after). Only that case is retried: a deadline, a signal or a non-zero exit leaves the task `ready` for an operator, and a gate that fails is a claim in `verification`, not a retry. After the third failure the task is `blocked` with a `retry-exhausted` refusal; a task that writes is never retried by default (`retry-write-refused`; no task type writes today, so the branch is reached by unit tests only). The output names `attempts: n` when there was more than one. A
 task that `forge.gate_task` refuses (`scope-invalid`, `revision-invalid`, `task-type-invalid`, `path-invalid`,
 `limits-invalid`, `env-invalid`) is written down with its tag and stays `approved`. Exit status: 0 a claim was recorded; 1 the task or the
 journal was refused; 2 usage or a path that is not ok; 3 the workspace is locked (`workspace-locked`), a directory
 cannot be opened, or an I/O error; 4 the run ended without a claim. Measured by 13 unit tests (`tests/flow_test.cho`,
-`tests/gate_run_test.cho`, `tests/event_test.cho`) and 29 checks run on the built binary against real git checkouts and a
+`tests/gate_run_test.cho`, `tests/event_test.cho`) and 56 checks run on the built binary against real git checkouts and a
 real runner process (`scripts/check_gate_run.sh`, in the gate). Not done: the recovery that turns an `execution.started`
-with no `execution.finished` into `execution.lost` (section 4.4), the retry budget, and `error.retryable`.
+with no `execution.finished` into `execution.lost` (section 4.4).
 
 **Authority**, checked into `docs/authority.txt` and compared by the gate. It was `args`, `err_write`, `file_read`,
 `fs_read("")`, `heap`, `io_write` for `status` and `history`; **`forge gate` widened it** (issue #18), by `fs_write("")`
@@ -710,6 +710,7 @@ Designed, not implemented (no test reaches them yet; they are not claims):
 | `approval-missing` | a protected action without a granted approval |
 | `budget-exhausted` | a reservation would exceed a limit |
 | `worker-timeout`, `worker-output-overflow`, `worker-crashed`, `worker-error`, `worker-unavailable` | observed ending of a worker process (section 5 of the worker contract; the Cancho Code binding adds how an exit code is read, section 9.4) |
+| `retry-exhausted`, `retry-write-refused` | `forge.retry`: a worker said its failure is retryable (`error.retryable: true`) and no other attempt is made: the three allowed are used (`retry-exhausted`), or the task writes (`retry-write-refused`). The task is `blocked`. Reached by `tests/retry_test.cho` and, for the first, by `scripts/check_gate_run.sh` |
 | `evidence-ref-invalid` (the file half) | `forge.evidence_io` opens each `ref` beneath the execution directory following no link and recomputes size and SHA-256: reasons `evidence-missing`, `evidence-unreadable` (a link, a directory), `evidence-too-large` (past 64 MiB), `evidence-bytes-mismatch`, `evidence-sha-mismatch` (`docs/worker-contract.md` 4.1; `tests/conformance/evidence_files.cho`, 24 cases; spike S10) |
 | `journal-sync-failed` | `fsync` failed; contents unknown; Forge stops (the file layer returns the errno today; the stop is M2) |
 

@@ -1,0 +1,84 @@
+edition 9;
+
+import std.bytes;
+import std.test;
+import forge.dispatch;
+import forge.retry;
+import forge.task;
+
+// Unit tests for src/retry.cho (docs/worker-contract.md section 5; issue #15): whether another attempt is made after a
+// run that ended with a consequence, and where the task is when it is not. Run with `cancho test`.
+
+fn again(d: retry.Decision) -> [] bool {
+    match d {
+        retry.Decision::Again => {
+            return true;
+        }
+        retry.Decision::NotRetryable => {
+            return false;
+        }
+        retry.Decision::Exhausted => {
+            return false;
+        }
+        retry.Decision::WriteRefused => {
+            return false;
+        }
+    }
+}
+
+fn tag(c: dispatch.Consequence, attempt: int, read_only: bool) -> [] &static [byte] {
+    return retry.rule_tag(retry.decide(c, attempt, read_only));
+}
+
+fn test_a_retryable_failure_of_a_read_only_task_is_retried_until_the_attempts_are_used() -> [] int {
+    test.assert_eq(retry.max_attempts(), 3);
+    test.assert(again(retry.decide(dispatch.Consequence::WorkerRetryable, 1, true)));
+    test.assert(again(retry.decide(dispatch.Consequence::WorkerRetryable, 2, true)));
+    test.assert(!again(retry.decide(dispatch.Consequence::WorkerRetryable, 3, true)));
+    test.assert(bytes.equal(tag(dispatch.Consequence::WorkerRetryable, 3, true), "retry-exhausted"));
+    test.assert(bytes.equal(tag(dispatch.Consequence::WorkerRetryable, 4, true), "retry-exhausted"));
+    return 0;
+}
+
+fn test_a_task_that_writes_is_never_retried_even_on_its_first_attempt() -> [] int {
+    test.assert(bytes.equal(tag(dispatch.Consequence::WorkerRetryable, 1, false), "retry-write-refused"));
+    test.assert(bytes.equal(tag(dispatch.Consequence::WorkerRetryable, 2, false), "retry-write-refused"));
+    return 0;
+}
+
+fn test_no_other_consequence_is_retried_whatever_the_attempt_or_the_kind_of_task() -> [] int {
+    test.assert(!again(retry.decide(dispatch.Consequence::Blocked, 1, true)));
+    test.assert(!again(retry.decide(dispatch.Consequence::RetryOrFail, 1, true)));
+    test.assert(!again(retry.decide(dispatch.Consequence::Failed, 1, true)));
+    test.assert(!again(retry.decide(dispatch.Consequence::Verification, 1, true)));
+    test.assert(!again(retry.decide(dispatch.Consequence::WorkerSaid, 1, true)));
+    test.assert(!again(retry.decide(dispatch.Consequence::Cancelled, 1, true)));
+    test.assert(!again(retry.decide(dispatch.Consequence::Poll, 1, true)));
+    test.assert(bytes.equal(tag(dispatch.Consequence::RetryOrFail, 1, true), ""));
+    test.assert(bytes.equal(tag(dispatch.Consequence::WorkerSaid, 1, false), ""));
+    test.assert(bytes.equal(tag(dispatch.Consequence::Verification, 1, false), ""));
+    return 0;
+}
+
+fn state_after(c: dispatch.Consequence, attempt: int, read_only: bool) -> [] int {
+    return task.state_code(retry.target_after(c, retry.decide(c, attempt, read_only)));
+}
+
+fn test_the_state_after_is_the_flows_unless_a_retry_was_refused() -> [] int {
+    test.assert_eq(state_after(dispatch.Consequence::Verification, 1, true), task.state_code(task.State::Verification));
+    test.assert_eq(state_after(dispatch.Consequence::RetryOrFail, 1, true), task.state_code(task.State::Ready));
+    test.assert_eq(state_after(dispatch.Consequence::WorkerSaid, 1, true), task.state_code(task.State::Blocked));
+    test.assert_eq(state_after(dispatch.Consequence::Cancelled, 1, true), task.state_code(task.State::Cancelled));
+    test.assert_eq(state_after(dispatch.Consequence::WorkerRetryable, 1, true), task.state_code(task.State::Ready));
+    test.assert_eq(state_after(dispatch.Consequence::WorkerRetryable, 3, true), task.state_code(task.State::Blocked));
+    test.assert_eq(state_after(dispatch.Consequence::WorkerRetryable, 1, false), task.state_code(task.State::Blocked));
+    return 0;
+}
+
+fn test_a_retry_never_accepts() -> [] int {
+    let accepted = task.state_code(task.State::Accepted);
+    test.assert(state_after(dispatch.Consequence::WorkerRetryable, 1, true) != accepted);
+    test.assert(state_after(dispatch.Consequence::WorkerRetryable, 3, true) != accepted);
+    test.assert(state_after(dispatch.Consequence::WorkerRetryable, 1, false) != accepted);
+    return 0;
+}

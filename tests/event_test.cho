@@ -139,3 +139,14 @@ fn test_an_execution_record_with_a_claim_is_a_workers_and_marked_claimed[&h](hea
     buffer.drop(heap, r);
     return 0;
 }
+
+fn test_a_retry_record_is_forges_names_the_attempt_and_reads_back[&h](heap: &!h Heap) -> [heap] int {
+    let r = event.retry(heap, 9, "t-1", 2);
+    borrow r as &b in {
+        let text = buffer.bytes(b);
+        test.assert(bytes.equal(text, "{\"v\":1,\"seq\":9,\"kind\":\"execution.retry\",\"task\":\"t-1\",\"actor\":\"forge\",\"attempt\":2}\n"));
+        test.assert_eq(event.seq_of(heap, text[0..len(text) - 1]), 9);
+    }
+    buffer.drop(heap, r);
+    return 0;
+}

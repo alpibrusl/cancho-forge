@@ -28,6 +28,9 @@ fn reason_of(e: dispatch.Ending) -> [] int {
                 }
             }
         }
+        dispatch.Ending::Said(state, retry) => {
+            return 0 - 1;
+        }
         dispatch.Ending::Unavailable(errno) => {
             return errno;
         }
@@ -77,8 +80,9 @@ fn case[&h, &x, &w, &f, &c, &i, &d, &r](heap: &!h Heap, exec: &x Exec(""), worke
 fn run[&h, &x, &w, &f, &c, &i, &d](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, exec_dir: &d [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read, io_write] int {
     var bad = 0;
     bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "ok: succeeded is a claim for verification", "mock_worker", "ok", 65536, 5000, "", "verification", 0 - 1000, 10000);
-    bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "fail: the worker's own failure is left to its retryable flag", "mock_worker", "fail", 65536, 5000, "", "worker-said", 0 - 1000, 10000);
-    bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "partial: left to the worker's error", "mock_worker", "partial", 65536, 5000, "", "worker-said", 0 - 1000, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "fail: the worker's own failure that says retryable goes back to ready", "mock_worker", "fail", 65536, 5000, "", "worker-retryable", 0 - 1000, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "partial: the mock says it is retryable", "mock_worker", "partial", 65536, 5000, "", "worker-retryable", 0 - 1000, 10000);
+    bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "fail_final: a failure the worker says cannot be helped waits for an operator", "mock_worker", "fail_final", 65536, 5000, "", "worker-said", 0 - 1000, 10000);
     bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "hang: killed at the deadline", "mock_worker", "hang", 65536, 500, "worker-timeout", "retry-or-fail", 0 - 1000, 2000);
     bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "garbage: exit 0 and not JSON", "mock_worker", "garbage", 65536, 5000, "worker-protocol", "failed", response.r_not_json(), 10000);
     bad = bad + case(heap, exec, workers, fs, clock, io, exec_dir, "exit3: a non-zero exit", "mock_worker", "exit3", 65536, 5000, "worker-error", "retry-or-fail", 3, 10000);

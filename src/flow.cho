@@ -34,10 +34,14 @@ pub fn target_of(c: dispatch.Consequence) -> [] task.State {
         dispatch.Consequence::Verification => {
             return task.State::Verification;
         }
-        // The worker says it failed or got part of the way: it waits on `error.retryable`, which is not read yet
-        // (issue #15), so for now an operator decides.
+        // The worker says it failed or got part of the way, and that retrying cannot help (`error.retryable` false):
+        // an operator decides.
         dispatch.Consequence::WorkerSaid => {
             return task.State::Blocked;
+        }
+        // The same, and retrying can help: back to `ready`; `forge.retry` decides whether the budget allows it.
+        dispatch.Consequence::WorkerRetryable => {
+            return task.State::Ready;
         }
         dispatch.Consequence::Cancelled => {
             return task.State::Cancelled;

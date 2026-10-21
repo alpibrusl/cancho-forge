@@ -16,6 +16,18 @@ fn doc(state: &static [byte]) -> [] &static [byte] {
     if bytes.equal(state, "failed") {
         return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"x\",\"message\":\"m\",\"retryable\":true}}";
     }
+    if bytes.equal(state, "failed-final") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"x\",\"message\":\"m\",\"retryable\":false}}";
+    }
+    if bytes.equal(state, "partial-retry") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"partial\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"x\",\"message\":\"m\",\"retryable\":true}}";
+    }
+    if bytes.equal(state, "failed-no-flag") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"x\",\"message\":\"m\"}}";
+    }
+    if bytes.equal(state, "failed-string-flag") {
+        return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"x\",\"message\":\"m\",\"retryable\":\"yes\"}}";
+    }
     if bytes.equal(state, "partial") {
         return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"partial\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"x\",\"message\":\"m\",\"retryable\":false}}";
     }
@@ -85,6 +97,9 @@ fn test_the_numbers_the_supervisor_saw_are_carried[&h](heap: &!h Heap) -> [heap]
         dispatch.Ending::Setup(n) => {
             test.assert(false);
         }
+        dispatch.Ending::Said(st, retry) => {
+            test.assert(false);
+        }
         dispatch.Ending::Reply(v) => {
             test.assert(false);
         }
@@ -106,6 +121,9 @@ fn test_the_numbers_the_supervisor_saw_are_carried[&h](heap: &!h Heap) -> [heap]
             test.assert(false);
         }
         dispatch.Ending::Setup(n) => {
+            test.assert(false);
+        }
+        dispatch.Ending::Said(st, retry) => {
             test.assert(false);
         }
         dispatch.Ending::Reply(v) => {
@@ -131,6 +149,9 @@ fn test_the_numbers_the_supervisor_saw_are_carried[&h](heap: &!h Heap) -> [heap]
         dispatch.Ending::Setup(n) => {
             test.assert(false);
         }
+        dispatch.Ending::Said(st, retry) => {
+            test.assert(false);
+        }
         dispatch.Ending::Reply(v) => {
             test.assert(false);
         }
@@ -143,9 +164,23 @@ fn test_exit_zero_with_succeeded_is_a_claim_for_verification[&h](heap: &!h Heap)
     return 0;
 }
 
-fn test_the_workers_own_failure_and_partial_are_left_to_its_retryable_flag[&h](heap: &!h Heap) -> [heap] int {
-    check(heap, process.Ran::Code(0), doc("failed"), false, "", "worker-said");
+fn test_a_failure_the_worker_calls_retryable_goes_back_to_ready_and_one_it_does_not_waits_for_an_operator[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(0), doc("failed"), false, "", "worker-retryable");
+    check(heap, process.Ran::Code(0), doc("partial-retry"), false, "", "worker-retryable");
+    check(heap, process.Ran::Code(0), doc("failed-final"), false, "", "worker-said");
     check(heap, process.Ran::Code(0), doc("partial"), false, "", "worker-said");
+    return 0;
+}
+
+fn test_a_failure_with_no_retryable_flag_or_one_that_is_not_a_boolean_is_a_protocol_error_not_a_default[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(0), doc("failed-no-flag"), false, "worker-protocol", "failed");
+    check(heap, process.Ran::Code(0), doc("failed-string-flag"), false, "worker-protocol", "failed");
+    return 0;
+}
+
+fn test_the_exit_status_wins_over_a_retryable_reply[&h](heap: &!h Heap) -> [heap] int {
+    check(heap, process.Ran::Code(3), doc("failed"), false, "worker-error", "retry-or-fail");
+    check(heap, process.Ran::TimedOut, doc("failed"), false, "worker-timeout", "retry-or-fail");
     return 0;
 }
 

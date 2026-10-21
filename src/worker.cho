@@ -103,6 +103,22 @@ pub fn run[&h, &x, &d, &c, &n, &q](heap: &!h Heap, exec: &x Exec(""), workers: &
     }
 }
 
+// The ending of a valid reply, with its evidence recomputed against the files beneath `execution_dir`: unchanged when
+// they hold, `evidence-ref-invalid` when they do not, `Setup` when the directory cannot be opened.
+fn recheck[&h, &f, &b, &e](heap: &!h Heap, fs: &f Fs(""), ending: dispatch.Ending, body: &b [byte], execution_dir: &e [byte]) -> [heap, fs_read(""), dir_read, file_read] dispatch.Ending {
+    match evidence_io.verify(heap, fs, body, execution_dir) {
+        evidence_io.Checked::Held => {
+            return ending;
+        }
+        evidence_io.Checked::Refused(rule, reason) => {
+            return dispatch.Ending::Reply(response.Verdict::Refused(rule, reason));
+        }
+        evidence_io.Checked::NoDirectory(errno) => {
+            return dispatch.Ending::Setup(errno);
+        }
+    }
+}
+
 // `run`, classified, and the evidence of a reply that is valid recomputed against the files beneath `execution_dir`:
 // a mismatch makes the reply `evidence-ref-invalid`, whatever state the worker claimed. An execution directory Forge
 // cannot open is `Setup`, not a verdict on the worker.
@@ -115,20 +131,14 @@ pub fn execute[&h, &x, &w, &f, &c, &n, &q, &r, &k, &e](heap: &!h Heap, exec: &x 
             dispatch.Ending::Reply(verdict) => {
                 match verdict {
                     response.Verdict::Valid(state) => {
-                        match evidence_io.verify(heap, fs, buffer.bytes(ob), execution_dir) {
-                            evidence_io.Checked::Held => {
-                            }
-                            evidence_io.Checked::Refused(rule, reason) => {
-                                ending = dispatch.Ending::Reply(response.Verdict::Refused(rule, reason));
-                            }
-                            evidence_io.Checked::NoDirectory(errno) => {
-                                ending = dispatch.Ending::Setup(errno);
-                            }
-                        }
+                        ending = recheck(heap, fs, ending, buffer.bytes(ob), execution_dir);
                     }
                     response.Verdict::Refused(rule, reason) => {
                     }
                 }
+            }
+            dispatch.Ending::Said(state, retry) => {
+                ending = recheck(heap, fs, ending, buffer.bytes(ob), execution_dir);
             }
             dispatch.Ending::Unavailable(errno) => {
             }

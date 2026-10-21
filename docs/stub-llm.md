@@ -105,7 +105,8 @@ kill reaches everything it has (gap G10 does not apply to a worker with no child
 |---|---|---|
 | `verification` | `verification` | the worker's `succeeded` is a claim; **never `accepted`** |
 | `retry-or-fail` | `ready` | a lost or failed execution returns to `ready` within the retry budget (architecture section 6); **the budget is not built**, so the flow takes the first retry |
-| `blocked`, `failed`, `worker-said` | `blocked` | operator action; `failed` has no state of its own (architecture section 6), and `worker-said` waits on `error.retryable`, which is not read yet |
+| `blocked`, `failed`, `worker-said` | `blocked` | operator action; `failed` has no state of its own (architecture section 6), and `worker-said` is a failure the worker said cannot be helped (`retryable: false`; the stub always says so) |
+| `worker-retryable` | `ready` | a failure the worker said can be helped; `forge.retry` decides whether another attempt is made (the stub never says it: a rule cannot choose `retryable`) |
 | `cancelled`, `poll` | `cancelled`, stays `running` | not reached by the stub |
 
 **This mapping is Forge's own** (`forge.flow.target_of`, `src/flow.cho`, 6 unit tests; `forge gate` uses it too,
@@ -172,5 +173,5 @@ nothing in `main` links the stub.
 ## 10. Not done
 
 `capabilities` is answered (`repo.change`, `sync`; worker-contract section 3.6), but Forge does not call it at registration yet; the `async`
-verbs, `error.retryable` (a rule cannot choose it; it is always `false`), a script that reacts to the attempt number
+verbs, a rule that chooses `error.retryable` (Forge reads it now, `forge.retry`; the stub always says `false`, so only the mock worker and the sh oracle of `scripts/check_gate_run.sh` reach the retry), a script that reacts to the attempt number
 (a flaky worker that fails twice and then succeeds, for the retry budget of M4), and the Cancho Code binding.
