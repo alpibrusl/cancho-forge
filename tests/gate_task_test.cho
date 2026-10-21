@@ -222,11 +222,30 @@ fn test_the_shell_text_changes_to_the_workspace_and_asks_git[&h](heap: &!h Heap)
 }
 
 fn test_the_gate_text_joins_both_streams_and_runs_the_row_in_the_workspace[&h](heap: &!h Heap) -> [heap] int {
-    let script = gate_task.gate_script(heap, "/work/forge", gate_task.gate_command("alpibrusl/cancho-forge"));
+    let script = gate_task.gate_script(heap, "/work/forge", "", gate_task.gate_command("alpibrusl/cancho-forge"));
     borrow script as &sb in {
         test.assert(bytes.equal(buffer.bytes(sb), "exec 2>&1; cd /work/forge && scripts/gate.sh; exit $?"));
     }
     buffer.drop(heap, script);
+    return 0;
+}
+
+fn test_the_gate_text_first_checks_each_required_tool_and_ends_127_for_a_missing_one[&h](heap: &!h Heap) -> [heap] int {
+    let script = gate_task.gate_script(heap, "/work/forge", gate_task.required_tools("alpibrusl/cancho-forge"), gate_task.gate_command("alpibrusl/cancho-forge"));
+    borrow script as &sb in {
+        test.assert(bytes.equal(buffer.bytes(sb), "exec 2>&1; for t in cancho git; do command -v \"$t\" > /dev/null 2>&1 || { echo \"gate-environment: the gate needs $t, which is not on PATH\"; exit 127; }; done; cd /work/forge && scripts/gate.sh; exit $?"));
+    }
+    buffer.drop(heap, script);
+    return 0;
+}
+
+fn test_every_repository_names_the_tools_its_gate_cannot_run_without() -> [] int {
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho-forge"), "cancho git"));
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho-hdl"), "git"));
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho"), "cargo"));
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho-ui"), "cargo"));
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho-mqtt"), ""));
+    test.assert(bytes.equal(gate_task.required_tools(""), ""));
     return 0;
 }
 

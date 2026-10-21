@@ -330,7 +330,7 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &q, &l, &w, &e, &v](heap: &!h Heap, 
     if remaining < 1 {
         remaining = 1;
     }
-    let script = gate_task.gate_script(heap, workspace, gate_task.gate_command(repo));
+    let script = gate_task.gate_script(heap, workspace, gate_task.required_tools(repo), gate_task.gate_command(repo));
     var verdict = "incomplete";
     var ending = "not-started";
     var code = "gate-unavailable";

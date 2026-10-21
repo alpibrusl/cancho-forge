@@ -10,7 +10,7 @@ import forge.support;
 import forge.worker;
 
 // The gate runner against real repositories and real child processes (docs/self-hosting.md 3.1, worker-contract 10).
-// `scripts/gate.sh` builds git checkouts whose `scripts/gate.sh` do one thing each (pass, fail, hang, write too much,
+// `scripts/gate.sh` builds git checkouts whose `scripts/gate_cancho.sh` do one thing each (pass, fail, hang, write too much,
 // kill their shell), starts this program, and then looks at the evidence files itself (the oracle is outside the
 // programs). This program checks what only it can see: the worker's reply (its state and error code), the time it took,
 // and that Forge's own path (`forge.worker.execute`) accepts a good run's evidence.
@@ -18,8 +18,11 @@ import forge.worker;
 // Usage: gate_runner <workers directory holding gate_runner> <scratch directory> <revision of each of ws_pass ws_fail
 //        ws_hang ws_noisy ws_sig ws_env ws_127 ws_126>. Execution directories `ev_*` exist under the scratch directory.
 
+// The repository the fixtures stand for: the row of `cancho-hdl` runs `scripts/gate_cancho.sh` and needs only `git`, which
+// the runner needs anyway; the row of `cancho-forge` also needs `cancho`, which these fixtures do not have (the checks of
+// it are in scripts/check_gate_run.sh).
 fn forge_repo() -> [] &static [byte] {
-    return "alpibrusl/cancho-forge";
+    return "alpibrusl/cancho-hdl";
 }
 
 fn a_revision() -> [] &static [byte] {

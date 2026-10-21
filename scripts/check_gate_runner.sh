@@ -1,7 +1,7 @@
 #!/bin/sh
 # The gate runner against real git checkouts and real child processes (docs/self-hosting.md 3.1, worker-contract 10).
 # workers/gate_runner.cho is built into a workers directory; tests/conformance/gate_runner.cho starts it beneath that
-# directory once per way a run can end, against checkouts made here whose scripts/gate.sh each do one thing; the oracle
+# directory once per way a run can end, against checkouts made here whose scripts/gate_cancho.sh each do one thing; the oracle
 # for what the runner wrote is outside the programs (grep, cmp, pgrep on the files and the process table). Prints
 # `ok ...` / `FAIL ...` lines; exit 1 if any FAIL or a build failed.
 # Used by scripts/gate.sh and by scripts/mutate_gate_runner.py (which runs it on a copy of the tree with one break).
@@ -13,12 +13,12 @@ scratch=$1
 fail=0
 libs=$(ls src/*.cho | grep -v '/main\.cho$')
 # The runner is built into a workers directory made here; gate_runner (the conformance program) starts it beneath that
-# directory once per way a run can end, against checkouts made here whose scripts/gate.sh each do one thing. The
+# directory once per way a run can end, against checkouts made here whose scripts/gate_cancho.sh each do one thing. The
 # oracle for what the runner wrote is outside the programs: grep, cmp and pgrep on the files and the process table.
 gr="$scratch/gr"; mkdir "$gr" "$gr/workers" || exit 1
 git_in() { dir=$1; shift; git -C "$dir" -c user.email=forge@example.invalid -c user.name=forge -c commit.gpgsign=false "$@"; }
-mkfix() { # name, body of scripts/gate.sh
-  mkdir -p "$gr/$1/scripts" && printf '#!/bin/sh\n%s\n' "$2" > "$gr/$1/scripts/gate.sh" && chmod +x "$gr/$1/scripts/gate.sh" \
+mkfix() { # name, body of scripts/gate_cancho.sh (the gate of the row of alpibrusl/cancho-hdl, which stands for any repository here)
+  mkdir -p "$gr/$1/scripts" && printf '#!/bin/sh\n%s\n' "$2" > "$gr/$1/scripts/gate_cancho.sh" && chmod +x "$gr/$1/scripts/gate_cancho.sh" \
     && git init -q "$gr/$1" && git_in "$gr/$1" add -A && git_in "$gr/$1" commit -q -m fixture || exit 1
 }
 mkfix ws_pass 'echo hello gate; echo "path=$PATH"; echo "home=${HOME-unset}"; echo warn >&2; exit 0'
