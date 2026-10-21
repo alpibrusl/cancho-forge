@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.." || exit 1
 fail=0
 
 echo "== cancho fmt --check"
-$C fmt --check src tests spike || fail=1
+$C fmt --check src tests spike workers || fail=1
 
 echo "== cancho check"
 # A library has no `main`, so the program is checked as a whole (src/*.cho);
@@ -81,6 +81,10 @@ else
   echo "worker contract: did not build"
   fail=1
 fi
+
+echo "== gate runner (workers/gate_runner.cho against real git checkouts, real child processes)"
+mkdir "$scratch/gate-runner" || exit 1
+CANCHO="$C" sh scripts/check_gate_runner.sh "$scratch/gate-runner" || fail=1
 
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of
@@ -171,7 +175,7 @@ else
 fi
 
 echo "== file budget (2000 lines)"
-for f in $(find src tests spike -name '*.cho'); do
+for f in $(find src tests spike workers -name '*.cho'); do
   n=$(wc -l < "$f")
   if [ "$n" -gt 2000 ]; then
     echo "$f: $n lines, over the 2000-line budget"

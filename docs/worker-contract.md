@@ -345,6 +345,7 @@ output it relays (`threat-model.md`):
 | how a run ended (section 5) to a rule tag and a consequence, as a pure function of what `capture` observed and the bytes it captured | `src/dispatch.cho` (`classify`, `rule_tag`, `consequence`); `tests/dispatch_test.cho` (14 tests: every row, and that the ending wins over what the worker wrote), `scripts/mutate_dispatch.py` (28 deliberate breaks, all killed) | **built**. Not built: the half that spawns beneath the workers directory under a deadline and feeds `classify`; reading `error.retryable` for the `worker-said` consequence |
 | the process half: build the `execute` request, start the worker beneath a run-time `Dir` under a deadline and an output cap, classify, recompute the evidence, one function | `src/worker.cho` (`build_execute`, `run`, `execute`); `tests/contract/mock_worker.cho` (driven only by its request: `task.input.inject`); `tests/conformance/worker_contract.cho` (19 cases, real child processes, one per way a run can end); `scripts/mutate_contract.py` (15 deliberate breaks, all killed); the gate checks no mock outlives the run | **built, against the mock**. The same table is what the Cancho Code adapter must pass. Not built: `capabilities`, `cancel`, `status`, `result` and the `async` level; `error.retryable`. **Gap G10** (architecture section 9): a worker started this way is not a process-group leader |
 | evidence hash and size recomputed against the file, a symlink not followed | `src/evidence_io.cho`; `tests/conformance/evidence_files.cho` (24 cases against real files, the links made by the gate), `scripts/mutate_evidence.py` (16 deliberate breaks, all killed); spike S10 | **built** (section 4.1). Not yet called by a worker adapter: `src/main.cho` does not link it, so `cancho authority` for `forge` is unchanged; the call widens it by `dir_read` and says so |
+| the gate runner, a real `sync` worker of task type `repo.gate` (section 10): pure validation and shell text, the process half, the evidence | `src/gate_task.cho` (`tests/gate_task_test.cho`, 17 tests; `scripts/mutate_gate_task.py`, 60 breaks); `workers/gate_runner.cho`; `tests/conformance/gate_runner.cho` and `scripts/check_gate_runner.sh` (real git checkouts, real child processes, outside oracles; 38 checks); `scripts/mutate_gate_runner.py` (27 breaks, 26 killed; the survivor, the shell running the gate in its own place, is unobservable with dash as `/bin/sh` and is killed by the unit test); `docs/authority-gate-runner.txt`; spike S11 | **built**. Not run on a real repository's gate (self-hosting D7); not wired into `main` (#17) |
 | the real Cancho Code interface | [`cancho-code-audit.md`](cancho-code-audit.md): source read, both offline gates run (`scripts/test-build.sh`, `scripts/test-mcp.sh`), a stand-in run, a TERM, a resume, an `env -i` run | **done in M0; corrected sections marked above. Not done: a run with a real model** |
 | the Cancho Code binding of section 9 as an adapter | `src/worker.cho` (M2) | designed from the audit; not built |
 
@@ -431,3 +432,77 @@ A run with a real model: its latency, token use, cost and the share of runs
 that end `done` have **not** been measured by Forge; the numbers in Cancho
 Code's own README are its claims. The MCP front door is an alternative
 binding (audit 5) and has not been spiked from a cancho client.
+
+---
+
+## 10. The gate runner: task type `repo.gate` *(built: `workers/gate_runner.cho`)*
+
+The first real worker (issue #20, `docs/self-hosting.md` section 3.1). It speaks the **stdio binding** (section 1) at the
+`sync` level and implements `execute` only: `capabilities`, `cancel`, `status` and `result` are not built (#14), and a
+request with any other verb is not answered (exit 4, nothing on stdout). It is a cancho program; no foreign code.
+
+### 10.1 The task
+
+```json
+"task":   {"id": "t-1", "type": "repo.gate", "input": {"repo": "alpibrusl/cancho-forge", "revision": "<40 lower-case hex>"}},
+"limits": {"timeout_ms": 600000, "max_output_bytes": 1048576},
+"grants": {"workspace": "/abs/checkout", "execution_dir": "/abs/executions/e-1"}
+```
+
+* `repo` is a key of the allow-list in `forge.gate_task` (`alpibrusl/cancho`, `cancho-ui`, `cancho-hdl`, `cancho-forge`).
+  **The command the gate runs is the row of that table for the key**, never text from the task (section 9.1): the task
+  says which repository, not what to run.
+* `workspace` is a checkout that the **operator** placed (self-hosting D1: how a checkout gets there is open). The runner
+  first asks git for its revision (`cd <workspace> && git rev-parse HEAD`) and runs nothing unless it equals `revision`.
+* Both paths must be absolute, 2 to 512 bytes of letters, digits and `._/-`, with no two dots in a row and no component
+  that starts with a dot or a dash: they are put in a shell command, and this is the whole of the quoting.
+* `timeout_ms` is 2 000 to 86 400 000.
+
+### 10.2 What it does, and its deadline
+
+1. Validate (`gate_task.check`; the first fault, in the order type, repository, revision, paths, limits, is the one named).
+2. Check the revision (a tenth of the runner's time, at most 10 s). 3. Run the gate under `/bin/sh -c`, both streams to one
+   log, **started detached** (a group of its own). 4. Write the evidence. 5. Answer.
+
+**The runner's own deadline is four fifths of `limits.timeout_ms`** (`gate_task.runner_deadline_ms`). When it passes, the
+runner kills the gate's group and answers. This is not a courtesy: spike S11 measured that Forge's deadline kills only the
+runner's pid and that a detached gate outlives it, so the runner must be the one that ends the gate; Forge's deadline is
+the last resort and leaks. The conformance case `a gate that hangs` asserts the answer arrives before Forge's deadline and
+the oracle asserts no process the gate started is left.
+
+### 10.3 The reply
+
+`state: succeeded` whenever the runner produced a report, **whatever the gate said**: a failing gate is the project telling
+the truth, not a worker error, and the verdict is a claim in `report.json` (Forge records it as `claimed`, section 4).
+`state: failed` with `error.code` (worker-defined, `retryable: false`) when no verdict could be had:
+
+| `error.code` | when | evidence |
+|---|---|---|
+| `task-type-invalid`, `scope-invalid`, `revision-invalid`, `path-invalid`, `limits-invalid` | the task was refused before anything ran (the rule tags of architecture section 7) | none; nothing is written |
+| `revision-mismatch` | the checkout is at another revision | none |
+| `workspace-unusable` | the workspace cannot be entered or is not a git checkout | none |
+| `head-timeout` | the revision check passed its deadline | none |
+| `gate-unavailable` | a shell could not be started (for the revision check: nothing written; for the gate: the empty log and the report) | none, or the log and the report |
+| `gate-timeout` | the gate did not finish inside the runner's deadline; its group was killed | `gate.log` (what it wrote) and `report.json` (`verdict: incomplete`) |
+| `gate-output-overflow` | the gate wrote more than 8 MiB; its group was killed | the log, truncated at exactly 8 MiB, and the report |
+| `evidence-unwritable` | a file could not be written in `execution_dir` | none |
+
+Evidence (`kind`, `ref`, both under `execution_dir`): `log` `gate.log`, and `report` `report.json`:
+`{"schema":"forge-gate-report/1","repo","revision","verdict":"pass"|"fail"|"incomplete","ending":"exited"|"signaled"|"timeout"|"output-overflow"|"not-started","exit_status","signal","duration_ms","log_bytes"}`.
+`signal` is the number `std.process` reports (256 for KILL, spike S7), not the POSIX one. A request that is not an
+`execute` of this contract, or names no request or task id, or is not JSON, or is over 1 MiB, is **not answered**: exit 4,
+which Forge classifies `worker-error`.
+
+### 10.4 Authority and environment
+
+`cancho authority workers/gate_runner.cho` (checked in as `docs/authority-gate-runner.txt`, compared by the gate): `exec`
+narrowed to `/bin/sh` plus `exec_detached`, `fs_write("")` for the evidence, a clock, the heap, stdio; no network, no
+signals, no foreign code, no read of any file. What the gate does once started is the gate's authority (G2). It runs with
+a fixed `PATH=/usr/local/bin:/usr/bin:/bin` and nothing else; what a real gate needs beyond that is self-hosting D7.
+
+### 10.5 Not done
+
+`capabilities`/`cancel`/`status`/`result`; running a gate of a real repository (D7); a gate that starts a descendant that
+leaves the gate's group (`setsid`: not reached by the group kill, cancho `docs/processes.md` section 9); a runner that
+dies in the middle of a gate (its detached gate is orphaned: spike S11, G4); the `exec`-in-place case (a shell that runs the gate's last command in its own process: dash does not, bash may; the trailing `exit $?` is there for it and only the unit test sees it); several runners at once; macOS.
+

@@ -1,0 +1,472 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import std.process;
+import forge.gate_task;
+import forge.journal_io;
+import forge.snapshot;
+
+// The gate runner (docs/self-hosting.md section 3.1; issue #20): a `sync` worker of the contract
+// (docs/worker-contract.md, section 10). One `execute` request on stdin, one response on stdout, exit 0. The task is
+// `repo.gate`: it names a repository of the allow-list and a 40-hex revision, and the runner checks that the checkout in
+// `grants.workspace` is at that revision, runs the repository's gate there, and writes what happened as evidence in
+// `grants.execution_dir`:
+//
+//   gate.log     kind `log`     both streams of the gate, up to 8 MiB
+//   report.json  kind `report`  the verdict and how the gate ended
+//
+// The verdict is a CLAIM (Forge recomputes the evidence and does not accept on it): `state` is `succeeded` whenever the
+// runner produced a report, even if the gate failed (a failing gate is the project telling the truth, not a runner
+// error), and `failed` when no verdict could be had (a refusal of the task, a checkout at another revision, the
+// deadline, an output past the cap).
+//
+// Its deadline is four fifths of the one Forge gave it (`gate_task.runner_deadline_ms`), and it starts the gate
+// detached so that it can kill the gate's whole group when that deadline passes: spike S11 measured that Forge's own
+// kill reaches only the runner, and that a detached gate outlives it. This is the only clean path.
+//
+// Authority (`cancho authority`): `Exec` narrowed to `/bin/sh`; `Fs("")` for the evidence (the path has passed
+// `gate_task.path_ok` and `journal_io.path_ok`); a clock; no network. What the gate does once started is the gate's
+// authority, not the runner's (docs/architecture.md, G2).
+
+fn log_cap() -> [] int {
+    return 8388608;
+}
+
+// The gate's environment: a fixed PATH and nothing else (docs/self-hosting.md, D7).
+fn gate_env() -> [] &static [byte] {
+    return "PATH=/usr/local/bin:/usr/bin:/bin\0";
+}
+
+fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] (buffer.Buffer, bool) {
+    var all = buffer.empty(heap, 1024);
+    var c = getchar(io);
+    var n = 0;
+    while c >= 0 {
+        if n >= 1048576 {
+            return (all, false);
+        }
+        all = buffer.push(heap, all, byte_of(c));
+        n = n + 1;
+        c = getchar(io);
+    }
+    return (all, true);
+}
+
+fn shell_args[&h, &s](heap: &!h Heap, script: &s [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), "-c");
+    b = buffer.push(heap, b, byte_of(0));
+    b = buffer.append(heap, b, script);
+    return buffer.push(heap, b, byte_of(0));
+}
+
+fn begin[&x, &a](exec: &x Exec("/bin/sh"), detached: bool, args: &a [byte], child_in: ChildEnd, child_out: ChildEnd) -> [exec("/bin/sh"), exec_detached] Spawned {
+    if detached {
+        return exec_spawn_detached(exec, "/bin/sh", args, gate_env(), Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+    }
+    return exec_spawn(exec, "/bin/sh", args, gate_env(), Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+}
+
+// `/bin/sh -c script`, its stdout (the script joins stderr to it) captured under `most` bytes and `deadline_ms`
+// milliseconds. Detached means the shell leads a group of its own, and the deadline kills the group.
+fn run_sh[&h, &x, &c, &s](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, script: &s [byte], detached: bool, most: int, deadline_ms: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll] (buffer.Buffer, process.Ran) {
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            return (buffer.empty(heap, 1), process.Ran::Failed(e));
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            let args = shell_args(heap, script);
+            var out = buffer.empty(heap, 1);
+            var ended = process.Ran::Failed(0 - 1);
+            borrow args as &ab in {
+                match begin(exec, detached, buffer.bytes(ab), child_in, child_out) {
+                    Spawned::Failed(e) => {
+                        process.close(to_child, from_child);
+                        ended = process.Ran::Failed(e);
+                    }
+                    Spawned::Ok(child) => {
+                        let (got, ran) = process.capture(heap, clock, child, to_child, from_child, "", most, deadline_ms);
+                        buffer.drop(heap, out);
+                        out = got;
+                        ended = ran;
+                    }
+                }
+            }
+            buffer.drop(heap, args);
+            return (out, ended);
+        }
+    }
+}
+
+fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
+    if journal_io.path_ok(fs, path) == false {
+        return 0 - 2;
+    }
+    match open_write(fs, path) {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, contents);
+            }
+            file_close(file);
+            return rc;
+        }
+    }
+}
+
+fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of(47));
+    return buffer.append(heap, b, name);
+}
+
+// The report: what was run, at what revision, how it ended.
+fn report_json[&h, &r, &v](heap: &!h Heap, repo: &r [byte], revision: &v [byte], verdict: &static [byte], ending: &static [byte], exit_status: int, signal: int, duration_ms: int, log_bytes: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "schema");
+    w = json.put_string(heap, w, "forge-gate-report/1");
+    w = json.put_key(heap, w, "repo");
+    w = json.put_string(heap, w, repo);
+    w = json.put_key(heap, w, "revision");
+    w = json.put_string(heap, w, revision);
+    w = json.put_key(heap, w, "verdict");
+    w = json.put_string(heap, w, verdict);
+    w = json.put_key(heap, w, "ending");
+    w = json.put_string(heap, w, ending);
+    w = json.put_key(heap, w, "exit_status");
+    w = json.put_int(heap, w, exit_status);
+    w = json.put_key(heap, w, "signal");
+    w = json.put_int(heap, w, signal);
+    w = json.put_key(heap, w, "duration_ms");
+    w = json.put_int(heap, w, duration_ms);
+    w = json.put_key(heap, w, "log_bytes");
+    w = json.put_int(heap, w, log_bytes);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+fn entry[&h, &p, &s](heap: &!h Heap, w: json.Writer, id: &static [byte], kind: &static [byte], path: &p [byte], sha: &s [byte], size: int) -> [heap] json.Writer {
+    var x = json.begin_object(heap, w);
+    x = json.put_key(heap, x, "id");
+    x = json.put_string(heap, x, id);
+    x = json.put_key(heap, x, "kind");
+    x = json.put_string(heap, x, kind);
+    x = json.put_key(heap, x, "ref");
+    x = json.put_string(heap, x, path);
+    x = json.put_key(heap, x, "sha256");
+    x = json.put_string(heap, x, sha);
+    x = json.put_key(heap, x, "bytes");
+    x = json.put_int(heap, x, size);
+    return json.end_object(heap, x);
+}
+
+// The response. `code` empty means `succeeded`; otherwise `failed` with that error code. The two evidence entries are
+// present when `evidence` is true.
+fn answer[&h, &i, &r, &k, &a, &b](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], code: &static [byte], message: &static [byte], evidence: bool, log_sha: &a [byte], log_size: int, report_sha: &b [byte], report_size: int) -> [heap, io_write] int {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "state");
+    if len(code) == 0 {
+        w = json.put_string(heap, w, "succeeded");
+    } else {
+        w = json.put_string(heap, w, "failed");
+    }
+    w = json.put_key(heap, w, "task_id");
+    w = json.put_string(heap, w, task_id);
+    w = json.put_key(heap, w, "summary");
+    if len(code) == 0 {
+        w = json.put_string(heap, w, "gate report; the verdict is in report.json");
+    } else {
+        w = json.put_string(heap, w, message);
+    }
+    w = json.put_key(heap, w, "evidence");
+    w = json.begin_array(heap, w);
+    if evidence {
+        w = entry(heap, w, "ev-1", "log", "gate.log", log_sha, log_size);
+        w = entry(heap, w, "ev-2", "report", "report.json", report_sha, report_size);
+    }
+    w = json.end_array(heap, w);
+    w = json.put_key(heap, w, "error");
+    if len(code) == 0 {
+        w = json.put_null(heap, w);
+    } else {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "code");
+        w = json.put_string(heap, w, code);
+        w = json.put_key(heap, w, "message");
+        w = json.put_string(heap, w, message);
+        w = json.put_key(heap, w, "retryable");
+        w = json.put_bool(heap, w, false);
+        w = json.end_object(heap, w);
+    }
+    w = json.end_object(heap, w);
+    let out = json.finish(w);
+    borrow out as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, out);
+    return 0;
+}
+
+// The text of a field when it is a string, else empty (`gate_task.check` then refuses it).
+fn text_of[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] &s [byte] {
+    if node >= 0 && json.is_string(tape, node) && json.string_plain(tape, node) {
+        return json.string_view(src, tape, node);
+    }
+    return "";
+}
+
+fn is[&s, &t](src: &s [byte], tape: &t [int], node: int, text: &static [byte]) -> [] bool {
+    return node >= 0 && json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+// Write the two evidence files beneath `exec_dir` and answer. `code` is empty for a run that ended with a status (the
+// gate passed or failed: a report), else the error code of a run that has no verdict. A file that cannot be written is
+// `evidence-unwritable`.
+fn finish[&h, &i, &f, &r, &k, &p, &q, &l, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), request_id: &r [byte], task_id: &k [byte], exec_dir: &p [byte], repo: &q [byte], revision: &l [byte], log: &g [byte], verdict: &static [byte], ending: &static [byte], exit_status: int, signal: int, duration_ms: int, code: &static [byte], message: &static [byte]) -> [heap, io_write, fs_write(""), file_write] int {
+    let report = report_json(heap, repo, revision, verdict, ending, exit_status, signal, duration_ms, len(log));
+    let log_path = under(heap, exec_dir, "gate.log");
+    let report_path = under(heap, exec_dir, "report.json");
+    let log_sha = snapshot.hex_digest(heap, log);
+    borrow report as &rb in {
+        let report_sha = snapshot.hex_digest(heap, buffer.bytes(rb));
+        var rc = 0;
+        borrow log_path as &lp in {
+            rc = write_file(fs, buffer.bytes(lp), log);
+        }
+        if rc == 0 {
+            borrow report_path as &pp in {
+                rc = write_file(fs, buffer.bytes(pp), buffer.bytes(rb));
+            }
+        }
+        if rc == 0 {
+            borrow log_sha as &ls in {
+                borrow report_sha as &rs in {
+                    answer(heap, io, request_id, task_id, code, message, true, buffer.bytes(ls), len(log), buffer.bytes(rs), buffer.size(rb));
+                }
+            }
+        } else {
+            answer(heap, io, request_id, task_id, "evidence-unwritable", "the evidence could not be written in the execution directory", false, "", 0, "", 0);
+        }
+        buffer.drop(heap, report_sha);
+    }
+    buffer.drop(heap, log_sha);
+    buffer.drop(heap, log_path);
+    buffer.drop(heap, report_path);
+    buffer.drop(heap, report);
+    return 0;
+}
+
+// What the check that the checkout is at the revision found: 0 it is, 1 it is at another revision, 2 the workspace
+// cannot be used, 3 the check passed its deadline, 4 the shell would not start.
+fn check_head[&h, &x, &c, &w, &v](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, workspace: &w [byte], revision: &v [byte], deadline_ms: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll] int {
+    let script = gate_task.head_script(heap, workspace);
+    var found = 4;
+    borrow script as &sb in {
+        let (out, ran) = run_sh(heap, exec, clock, buffer.bytes(sb), true, 4096, deadline_ms);
+        match ran {
+            process.Ran::Code(n) => {
+                found = 2;
+                if n == 0 {
+                    found = 1;
+                    borrow out as &ob in {
+                        if gate_task.head_matches(buffer.bytes(ob), revision) {
+                            found = 0;
+                        }
+                    }
+                }
+            }
+            process.Ran::Signaled(s) => {
+                found = 2;
+            }
+            process.Ran::TimedOut => {
+                found = 3;
+            }
+            process.Ran::TooMuch => {
+                found = 1;
+            }
+            process.Ran::Failed(e) => {
+                found = 4;
+            }
+        }
+        buffer.drop(heap, out);
+    }
+    buffer.drop(heap, script);
+    return found;
+}
+
+// A task that has passed `gate_task.check`: check the checkout, run the gate, write the evidence, answer.
+fn execute_task[&h, &i, &f, &c, &x, &r, &k, &q, &l, &w, &e](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), request_id: &r [byte], task_id: &k [byte], repo: &q [byte], revision: &l [byte], workspace: &w [byte], exec_dir: &e [byte], timeout_ms: int) -> [heap, io_write, fs_write(""), file_write, exec("/bin/sh"), exec_detached, clock, poll] int {
+    let total = gate_task.runner_deadline_ms(timeout_ms);
+    let start = clock_ms(clock);
+    let found = check_head(heap, exec, clock, workspace, revision, gate_task.head_deadline_ms(total));
+    if found != 0 {
+        var code = "gate-unavailable";
+        var message = "the shell for the revision check could not be started";
+        if found == 1 {
+            code = "revision-mismatch";
+            message = "the checkout is not at the revision the task names";
+        }
+        if found == 2 {
+            code = "workspace-unusable";
+            message = "the workspace could not be entered or is not a git checkout";
+        }
+        if found == 3 {
+            code = "head-timeout";
+            message = "the revision check did not finish in its deadline";
+        }
+        answer(heap, io, request_id, task_id, code, message, false, "", 0, "", 0);
+        return 0;
+    }
+    var remaining = total - (clock_ms(clock) - start);
+    if remaining < 1 {
+        remaining = 1;
+    }
+    let script = gate_task.gate_script(heap, workspace, gate_task.gate_command(repo));
+    var verdict = "incomplete";
+    var ending = "not-started";
+    var code = "gate-unavailable";
+    var message = "the gate could not be started";
+    var exit_status = 0 - 1;
+    var signal = 0;
+    var log = buffer.empty(heap, 1);
+    borrow script as &sb in {
+        let (out, ran) = run_sh(heap, exec, clock, buffer.bytes(sb), true, log_cap(), remaining);
+        buffer.drop(heap, log);
+        log = out;
+        match ran {
+            process.Ran::Code(n) => {
+                exit_status = n;
+                ending = "exited";
+                code = "";
+                message = "";
+                if n == 0 {
+                    verdict = "pass";
+                } else {
+                    verdict = "fail";
+                }
+            }
+            process.Ran::Signaled(s) => {
+                signal = s;
+                ending = "signaled";
+                code = "";
+                message = "";
+                verdict = "fail";
+            }
+            process.Ran::TimedOut => {
+                ending = "timeout";
+                code = "gate-timeout";
+                message = "the gate did not finish inside the runner's deadline; its group was killed";
+            }
+            process.Ran::TooMuch => {
+                ending = "output-overflow";
+                code = "gate-output-overflow";
+                message = "the gate wrote more than the log cap; its group was killed";
+            }
+            process.Ran::Failed(e) => {
+                ending = "not-started";
+            }
+        }
+    }
+    buffer.drop(heap, script);
+    let duration = clock_ms(clock) - start;
+    borrow log as &lb in {
+        finish(heap, io, fs, request_id, task_id, exec_dir, repo, revision, buffer.bytes(lb), verdict, ending, exit_status, signal, duration, code, message);
+    }
+    buffer.drop(heap, log);
+    return 0;
+}
+
+fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh")) -> [heap, io_read, io_write, fs_write(""), file_write, exec("/bin/sh"), exec_detached, clock, poll] int {
+    let (request, whole) = read_request(heap, io);
+    var code = 0;
+    if !whole {
+        code = 4;
+    }
+    borrow request as &rb in {
+        let src = buffer.bytes(rb);
+        let tape = box_slice(heap, json.tape_len(src), 0);
+        borrow mut tape as &!t in {
+            let tp = contents(t);
+            if whole && json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                let task = json.get(src, tp, 0, "task");
+                let input = json.get(src, tp, task, "input");
+                let limits = json.get(src, tp, 0, "limits");
+                let grants = json.get(src, tp, 0, "grants");
+                let rid = json.get(src, tp, 0, "request_id");
+                let tid = json.get(src, tp, task, "id");
+                let timeout = json.get(src, tp, limits, "timeout_ms");
+                var timeout_ms = 0;
+                if timeout >= 0 && json.is_int(tp, timeout) && json.fits_int(src, tp, timeout) {
+                    timeout_ms = json.to_int(src, tp, timeout);
+                }
+                // A request that is not an `execute` of this contract, or that names no request and no task, is not
+                // answered: the worker has nothing to say that Forge could match to a call.
+                if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
+                    code = 4;
+                } else {
+                    let repo = text_of(src, tp, json.get(src, tp, input, "repo"));
+                    let revision = text_of(src, tp, json.get(src, tp, input, "revision"));
+                    let workspace = text_of(src, tp, json.get(src, tp, grants, "workspace"));
+                    let exec_dir = text_of(src, tp, json.get(src, tp, grants, "execution_dir"));
+                    let kind = text_of(src, tp, json.get(src, tp, task, "type"));
+                    match gate_task.check(kind, repo, revision, workspace, exec_dir, timeout_ms) {
+                        gate_task.Checked::Refused(why) => {
+                            answer(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), gate_task.rule_name(why), "the task was refused before anything ran", false, "", 0, "", 0);
+                        }
+                        gate_task.Checked::Held => {
+                            execute_task(heap, io, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), repo, revision, workspace, exec_dir, timeout_ms);
+                        }
+                    }
+                }
+            } else {
+                code = 4;
+            }
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, request);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    release(args);
+    let sh = narrow(exec, "/bin/sh");
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow fs as &f in {
+        borrow clock as &c in {
+            borrow sh as &x in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        code = serve(h, i, f, c, x);
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(clock);
+    release(sh);
+    release(console);
+    release(memory);
+    return code;
+}

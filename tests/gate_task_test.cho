@@ -1,0 +1,244 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.gate_task;
+
+// Unit tests for src/gate_task.cho (docs/self-hosting.md, section 3.1): what a `repo.gate` task may name, the refusals
+// and their rule tags, the deadline arithmetic and the shell text. Run with `cancho test`.
+
+fn rev() -> [] &static [byte] {
+    return "0123456789abcdef0123456789abcdef01234567";
+}
+
+fn refusal(c: gate_task.Checked) -> [] &static [byte] {
+    match c {
+        gate_task.Checked::Held => {
+            return "";
+        }
+        gate_task.Checked::Refused(r) => {
+            return gate_task.rule_name(r);
+        }
+    }
+}
+
+fn good(timeout_ms: int) -> [] &static [byte] {
+    return refusal(gate_task.check("repo.gate", "alpibrusl/cancho-forge", rev(), "/work/forge", "/work/exec/e-1", timeout_ms));
+}
+
+fn test_a_task_naming_an_allowed_repository_and_a_revision_is_held() -> [] int {
+    test.assert(bytes.equal(good(600000), ""));
+    return 0;
+}
+
+fn test_every_repository_of_the_allow_list_has_a_gate_and_no_other_does() -> [] int {
+    test.assert(gate_task.repo_known("alpibrusl/cancho"));
+    test.assert(gate_task.repo_known("alpibrusl/cancho-ui"));
+    test.assert(gate_task.repo_known("alpibrusl/cancho-hdl"));
+    test.assert(gate_task.repo_known("alpibrusl/cancho-forge"));
+    test.assert(!gate_task.repo_known("alpibrusl/cancho-mqtt"));
+    test.assert(!gate_task.repo_known("someone/cancho"));
+    test.assert(!gate_task.repo_known("alpibrusl/cancho "));
+    test.assert(!gate_task.repo_known("alpibrusl/cancho-forge/"));
+    test.assert(!gate_task.repo_known("ALPIBRUSL/CANCHO"));
+    test.assert(!gate_task.repo_known(""));
+    test.assert(len(gate_task.gate_command("alpibrusl/cancho-forge")) > 0);
+    test.assert(len(gate_task.gate_command("alpibrusl/cancho-hdl")) > 0);
+    test.assert(len(gate_task.gate_command("alpibrusl/cancho")) > 0);
+    test.assert(len(gate_task.gate_command("alpibrusl/cancho-ui")) > 0);
+    test.assert_eq(len(gate_task.gate_command("alpibrusl/cancho-mqtt")), 0);
+    return 0;
+}
+
+fn test_the_gate_is_a_row_of_the_table_not_a_thing_a_task_can_say() -> [] int {
+    test.assert(bytes.equal(gate_task.gate_command("alpibrusl/cancho-forge"), "scripts/gate.sh"));
+    test.assert(bytes.equal(gate_task.gate_command("alpibrusl/cancho-hdl"), "scripts/gate_cancho.sh"));
+    test.assert(bytes.equal(gate_task.gate_command("alpibrusl/cancho"), gate_task.gate_command("alpibrusl/cancho-ui")));
+    test.assert(bytes.equal(gate_task.gate_command("alpibrusl/cancho"), "cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test --workspace"));
+    return 0;
+}
+
+fn test_a_repository_that_is_not_listed_is_scope_invalid() -> [] int {
+    let c = gate_task.check("repo.gate", "alpibrusl/cancho-mqtt", rev(), "/work/forge", "/work/exec/e-1", 600000);
+    test.assert(bytes.equal(refusal(c), "scope-invalid"));
+    let d = gate_task.check("repo.gate", "", rev(), "/work/forge", "/work/exec/e-1", 600000);
+    test.assert(bytes.equal(refusal(d), "scope-invalid"));
+    return 0;
+}
+
+fn test_a_revision_is_exactly_forty_lower_case_hex_digits() -> [] int {
+    test.assert(gate_task.revision_ok(rev()));
+    test.assert(gate_task.revision_ok("0000000000000000000000000000000000000000"));
+    test.assert(gate_task.revision_ok("ffffffffffffffffffffffffffffffffffffffff"));
+    test.assert(gate_task.revision_ok("9999999999999999999999999999999999999999"));
+    test.assert(!gate_task.revision_ok(""));
+    test.assert(!gate_task.revision_ok("main"));
+    test.assert(!gate_task.revision_ok("0123456789abcdef0123456789abcdef0123456"));
+    test.assert(!gate_task.revision_ok("0123456789abcdef0123456789abcdef012345678"));
+    test.assert(!gate_task.revision_ok("0123456789ABCDEF0123456789abcdef01234567"));
+    test.assert(!gate_task.revision_ok("0123456789abcdeg0123456789abcdef01234567"));
+    test.assert(!gate_task.revision_ok("0123456789abcdef0123456789abcdef0123456 "));
+    test.assert(!gate_task.revision_ok("0123456789abcdef0123456789abcdef0123456/"));
+    test.assert(!gate_task.revision_ok("0123456789abcdef0123456789abcdef0123456:"));
+    test.assert(!gate_task.revision_ok("`123456789abcdef0123456789abcdef01234567"));
+    test.assert(!gate_task.revision_ok("0123456789abcdef0123456789abcdef0123456\n"));
+    return 0;
+}
+
+fn test_a_revision_that_is_not_one_is_revision_invalid() -> [] int {
+    let c = gate_task.check("repo.gate", "alpibrusl/cancho-forge", "HEAD", "/work/forge", "/work/exec/e-1", 600000);
+    test.assert(bytes.equal(refusal(c), "revision-invalid"));
+    let d = gate_task.check("repo.gate", "alpibrusl/cancho-forge", "0123456789abcdef0123456789abcdef01234567; rm -rf /", "/work/forge", "/work/exec/e-1", 600000);
+    test.assert(bytes.equal(refusal(d), "revision-invalid"));
+    return 0;
+}
+
+fn test_a_task_of_another_type_is_task_type_invalid() -> [] int {
+    let c = gate_task.check("repo.change", "alpibrusl/cancho-forge", rev(), "/work/forge", "/work/exec/e-1", 600000);
+    test.assert(bytes.equal(refusal(c), "task-type-invalid"));
+    let d = gate_task.check("", "alpibrusl/cancho-forge", rev(), "/work/forge", "/work/exec/e-1", 600000);
+    test.assert(bytes.equal(refusal(d), "task-type-invalid"));
+    let e = gate_task.check("repo.gate ", "alpibrusl/cancho-forge", rev(), "/work/forge", "/work/exec/e-1", 600000);
+    test.assert(bytes.equal(refusal(e), "task-type-invalid"));
+    return 0;
+}
+
+fn test_a_path_goes_into_a_shell_command_only_if_the_shell_leaves_it_alone() -> [] int {
+    test.assert(gate_task.path_ok("/work/forge"));
+    test.assert(gate_task.path_ok("/a"));
+    test.assert(gate_task.path_ok("/work/forge-1/exec_2/v1.2"));
+    test.assert(gate_task.path_ok("/tmp/forge-gate.AbC123/ws"));
+    test.assert(!gate_task.path_ok(""));
+    test.assert(!gate_task.path_ok("/"));
+    test.assert(!gate_task.path_ok("work/forge"));
+    test.assert(!gate_task.path_ok("./work"));
+    test.assert(!gate_task.path_ok("/work/../etc"));
+    test.assert(!gate_task.path_ok("/work/a..b"));
+    test.assert(!gate_task.path_ok("/work/.hidden"));
+    test.assert(!gate_task.path_ok("/work/-rf"));
+    test.assert(!gate_task.path_ok("/work/a b"));
+    test.assert(!gate_task.path_ok("/work/a;b"));
+    test.assert(!gate_task.path_ok("/work/a&b"));
+    test.assert(!gate_task.path_ok("/work/a|b"));
+    test.assert(!gate_task.path_ok("/work/a$b"));
+    test.assert(!gate_task.path_ok("/work/a`b"));
+    test.assert(!gate_task.path_ok("/work/a'b"));
+    test.assert(!gate_task.path_ok("/work/a\"b"));
+    test.assert(!gate_task.path_ok("/work/a\\b"));
+    test.assert(!gate_task.path_ok("/work/a*b"));
+    test.assert(!gate_task.path_ok("/work/a(b"));
+    test.assert(!gate_task.path_ok("/work/a\nb"));
+    test.assert(!gate_task.path_ok("/work/ä"));
+    return 0;
+}
+
+fn path_of[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    var b = buffer.push(heap, buffer.empty(heap, 16), byte_of(47));
+    var i = 1;
+    while i < n {
+        b = buffer.push(heap, b, byte_of(97));
+        i = i + 1;
+    }
+    return b;
+}
+
+fn test_a_path_has_a_length_bound[&h](heap: &!h Heap) -> [heap] int {
+    let longest = path_of(heap, 512);
+    borrow longest as &lb in {
+        test.assert(gate_task.path_ok(buffer.bytes(lb)));
+    }
+    buffer.drop(heap, longest);
+    let too_long = path_of(heap, 513);
+    borrow too_long as &tb in {
+        test.assert(!gate_task.path_ok(buffer.bytes(tb)));
+    }
+    buffer.drop(heap, too_long);
+    return 0;
+}
+
+fn test_a_workspace_or_an_execution_directory_that_is_not_ok_is_path_invalid() -> [] int {
+    let c = gate_task.check("repo.gate", "alpibrusl/cancho-forge", rev(), "work/forge", "/work/exec/e-1", 600000);
+    test.assert(bytes.equal(refusal(c), "path-invalid"));
+    let d = gate_task.check("repo.gate", "alpibrusl/cancho-forge", rev(), "/work/forge", "/work/exec;/e-1", 600000);
+    test.assert(bytes.equal(refusal(d), "path-invalid"));
+    return 0;
+}
+
+fn test_a_timeout_outside_two_seconds_to_a_day_is_limits_invalid() -> [] int {
+    test.assert(bytes.equal(good(2000), ""));
+    test.assert(bytes.equal(good(86400000), ""));
+    test.assert(bytes.equal(good(1999), "limits-invalid"));
+    test.assert(bytes.equal(good(0), "limits-invalid"));
+    test.assert(bytes.equal(good(0 - 5), "limits-invalid"));
+    test.assert(bytes.equal(good(86400001), "limits-invalid"));
+    return 0;
+}
+
+fn test_the_first_fault_is_the_one_named() -> [] int {
+    let c = gate_task.check("repo.change", "nope", "nope", "nope", "nope", 0);
+    test.assert(bytes.equal(refusal(c), "task-type-invalid"));
+    let d = gate_task.check("repo.gate", "nope", "nope", "nope", "nope", 0);
+    test.assert(bytes.equal(refusal(d), "scope-invalid"));
+    let e = gate_task.check("repo.gate", "alpibrusl/cancho", "nope", "nope", "nope", 0);
+    test.assert(bytes.equal(refusal(e), "revision-invalid"));
+    let f = gate_task.check("repo.gate", "alpibrusl/cancho", rev(), "nope", "nope", 0);
+    test.assert(bytes.equal(refusal(f), "path-invalid"));
+    let g = gate_task.check("repo.gate", "alpibrusl/cancho", rev(), "/w", "/e", 0);
+    test.assert(bytes.equal(refusal(g), "limits-invalid"));
+    return 0;
+}
+
+fn test_the_runners_deadline_is_four_fifths_of_forges_and_always_less() -> [] int {
+    test.assert_eq(gate_task.runner_deadline_ms(10000), 8000);
+    test.assert_eq(gate_task.runner_deadline_ms(2000), 1600);
+    test.assert_eq(gate_task.runner_deadline_ms(600000), 480000);
+    test.assert_eq(gate_task.runner_deadline_ms(86400000), 69120000);
+    var t = 2000;
+    while t < 3000 {
+        test.assert(gate_task.runner_deadline_ms(t) < t);
+        test.assert(t - gate_task.runner_deadline_ms(t) >= 400);
+        t = t + 1;
+    }
+    return 0;
+}
+
+fn test_the_revision_check_gets_a_tenth_of_the_runners_time_and_at_most_ten_seconds() -> [] int {
+    test.assert_eq(gate_task.head_deadline_ms(1600), 160);
+    test.assert_eq(gate_task.head_deadline_ms(50000), 5000);
+    test.assert_eq(gate_task.head_deadline_ms(100000), 10000);
+    test.assert_eq(gate_task.head_deadline_ms(480000), 10000);
+    return 0;
+}
+
+fn test_the_shell_text_changes_to_the_workspace_and_asks_git[&h](heap: &!h Heap) -> [heap] int {
+    let head = gate_task.head_script(heap, "/work/forge");
+    borrow head as &hb in {
+        test.assert(bytes.equal(buffer.bytes(hb), "cd /work/forge && git rev-parse HEAD"));
+    }
+    buffer.drop(heap, head);
+    return 0;
+}
+
+fn test_the_gate_text_joins_both_streams_and_runs_the_row_in_the_workspace[&h](heap: &!h Heap) -> [heap] int {
+    let script = gate_task.gate_script(heap, "/work/forge", gate_task.gate_command("alpibrusl/cancho-forge"));
+    borrow script as &sb in {
+        test.assert(bytes.equal(buffer.bytes(sb), "exec 2>&1; cd /work/forge && scripts/gate.sh; exit $?"));
+    }
+    buffer.drop(heap, script);
+    return 0;
+}
+
+fn test_a_checkout_is_at_the_revision_only_if_git_printed_it_and_a_newline() -> [] int {
+    test.assert(gate_task.head_matches("0123456789abcdef0123456789abcdef01234567\n", rev()));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567", rev()));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567\n\n", rev()));
+    test.assert(!gate_task.head_matches("", rev()));
+    test.assert(!gate_task.head_matches("fatal: not a git repository\n", rev()));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234568\n", rev()));
+    test.assert(!gate_task.head_matches("1123456789abcdef0123456789abcdef01234567\n", rev()));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567 \n", rev()));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567x", rev()));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567\r", rev()));
+    return 0;
+}

@@ -239,8 +239,9 @@ reaches it.
 
 | rule | meaning | stage | status |
 |---|---|---|---|
-| `scope-invalid` | a task names a repository or a path that is not in the policy allow-list | 1 | **designed** |
-| `revision-invalid` | a revision that is not exactly 40 lower-case hexadecimal digits | 1 | **designed** |
+| `scope-invalid` | a task names a repository that is not in the allow-list | 1 | **implemented in `forge.gate_task`, tested** (Forge's own call arrives with #17) |
+| `revision-invalid` | a revision that is not exactly 40 lower-case hexadecimal digits | 1 | **implemented, tested** |
+| `task-type-invalid`, `limits-invalid` | a task of another type; a `timeout_ms` outside 2 s to one day (added when the runner was built) | 1 | **implemented, tested** |
 | `policy-denied`, `policy-missing`, `approval-missing`, `budget-exhausted` | the architecture's designed policy tags | 3 | designed |
 | `worker-unavailable`, `worker-timeout`, `worker-output-overflow`, `worker-crashed`, `worker-error`, `worker-protocol`, `evidence-ref-invalid` | how a run ended or a reply was malformed (worker contract section 5) | 1 | implemented, tested |
 | `accept-unverified`, `transition-invalid`, `actor-not-allowed` | the state machine | all | implemented, tested |
@@ -255,6 +256,7 @@ outcome recorded as claimed evidence. A task whose gate fails still ends
 |---|---|---|---|
 | This plan | #13 | all | this document |
 | `main` wiring of `worker.cho` | [#17](https://github.com/alpibrusl/cancho-forge/issues/17) | Stage 1 | open; widens `cancho authority` |
+| Gate-runner worker | [#20](https://github.com/alpibrusl/cancho-forge/issues/20) | Stage 1 | **built**, not wired into `main` (#17), not run on a real repository (D7) |
 | First self-hosted task | [#18](https://github.com/alpibrusl/cancho-forge/issues/18) | Stage 1 | open |
 | `capabilities`/`cancel`/`status`/`result` | [#14](https://github.com/alpibrusl/cancho-forge/issues/14) | `status` and `cancel` of a long run; **not** a blocker of a sync runner | open |
 | `error.retryable` | [#15](https://github.com/alpibrusl/cancho-forge/issues/15) | policy retries; a gate that fails is not retried | open |
@@ -270,13 +272,14 @@ settles it:
   CI job) places a read-only mirror under the workers' reach, and the runner
   copies a revision out of it; or the runner does the clone (then it, not
   Forge, holds the network, which is G2 again). Open.
-* **D2. The first real worker is a gate runner, not Cancho Code.** A small
-  worker, preferably a cancho program itself (no foreign code), that runs a
-  repository's gate script in the execution directory under its own `Exec`
-  bound and writes the evidence files. It is a new issue, and #18 depends on
-  it; the Cancho Code adapter (#16) is for Stage 3. Its sync/async level: a
-  gate run is minutes (section 8), which a `sync` worker can do inside a
-  deadline of the same order, so #14 is not a prerequisite.
+* **D2. The first real worker is a gate runner, not Cancho Code. Built** (`workers/gate_runner.cho`, issue #20, worker
+  contract section 10): a cancho program (no foreign code), `sync`, that checks the checkout is at the revision, runs
+  the repository's gate under its own `Exec("/bin/sh")` bound and writes `gate.log` and `report.json`. #18 depends on
+  it; the Cancho Code adapter (#16) is for Stage 3. A gate run is minutes (section 8), which a `sync` worker does
+  inside a deadline of the same order, so #14 is not a prerequisite. Tested against real git checkouts and real child
+  processes (38 checks: 22 conformance cases, 15 outside oracles, the authority report), 60 of 60 unit breaks and 26 of 27
+  end-to-end breaks killed (the survivor is unobservable with dash as `/bin/sh`: worker contract 10.5); **not** run against any of the four real
+  repositories' gates (D7).
 * **D3. G10 applies to the gate runner, not only to Cancho Code. Measured 2026-10-21 (spike S11, `spike/RESULTS.md`).**
   A gate starts compilers; if Forge's deadline kills the runner, what the runner started is leaked, because
   `exec_spawn_under` has no detached form ([cancho#562](https://github.com/alpibrusl/cancho/issues/562)). S11 measured the
@@ -289,6 +292,12 @@ settles it:
   for the group kill and the evidence; Forge's deadline is the last resort and leaks. Corrected in place from the
   earlier text of this item, in the commit that carries spike S11. Not measured: a real gate (descendants that
   `setsid`), a runner that dies mid-gate, a Forge crash (G4).
+* **D7. The gate's environment.** The runner starts the gate with a fixed `PATH=/usr/local/bin:/usr/bin:/bin` and
+  nothing else (measured: the gate sees exactly that, `tests` oracle `pass`). A Rust gate needs more (`HOME`, a
+  toolchain, `CARGO_HOME`) and `scripts/gate.sh` of this repository needs `cancho` on the `PATH`: how the operator
+  provides them, without a task being able to, is open. Candidates: an `env` row of the policy table that Forge puts
+  in `grants`, never in `task.input`; or a wrapper script the operator installs. **Until it is decided, the four real
+  gates have not been run through the runner, and nothing here claims they work.**
 * **D4. Stage 4's push path:** `net` narrowed to a host, or a narrowed
   `exec` of a client run as a worker. Decide with M6's authority review.
 * **D5. Where the allow-list and policy live,** and how a change to them is

@@ -1,0 +1,205 @@
+edition 9;
+module forge.gate_task;
+
+import std.buffer;
+import std.bytes;
+
+// The `repo.gate` task (docs/self-hosting.md, section 3.1): given a repository from the allow-list and a 40-hex
+// revision, run the repository's own gate. This module is the pure half: what a task may name, the refusals with their
+// rule tags, the deadline arithmetic, and the exact shell text the gate runner starts. It opens no file and starts
+// nothing, so every decision is testable without a child; `workers/gate_runner.cho` is the process half, and Forge's own
+// task validation will call the same functions (issue #17).
+//
+// The command a repository's gate runs is a row of the table below, chosen by the key, never taken from a task: the
+// task names which row, not what to run (docs/worker-contract.md, section 9.1: arguments come from configuration).
+
+// What a task is refused for. Each has a rule tag (docs/architecture.md, section 7) and a test that reaches it.
+pub enum Refusal {
+    // `task.type` is not `repo.gate`.
+    TaskTypeInvalid,
+    // `input.repo` is not a row of the allow-list.
+    ScopeInvalid,
+    // `input.revision` is not exactly 40 lower-case hexadecimal digits.
+    RevisionInvalid,
+    // `grants.workspace` or `grants.execution_dir` is not a path the runner will use.
+    PathInvalid,
+    // `limits.timeout_ms` is outside what a gate run can be given.
+    LimitsInvalid,
+}
+
+pub enum Checked {
+    Held,
+    Refused(Refusal),
+}
+
+pub fn rule_name(r: Refusal) -> [] &static [byte] {
+    match r {
+        Refusal::TaskTypeInvalid => {
+            return "task-type-invalid";
+        }
+        Refusal::ScopeInvalid => {
+            return "scope-invalid";
+        }
+        Refusal::RevisionInvalid => {
+            return "revision-invalid";
+        }
+        Refusal::PathInvalid => {
+            return "path-invalid";
+        }
+        Refusal::LimitsInvalid => {
+            return "limits-invalid";
+        }
+    }
+}
+
+pub fn task_type() -> [] &static [byte] {
+    return "repo.gate";
+}
+
+// The shortest and longest `timeout_ms` a gate run is given: 2 seconds (below it the margin of `runner_deadline` is
+// meaningless) and one day.
+pub fn min_timeout_ms() -> [] int {
+    return 2000;
+}
+
+pub fn max_timeout_ms() -> [] int {
+    return 86400000;
+}
+
+// The repository allow-list, and the gate each row runs, in the repository's working directory. A key that is not here
+// is `scope-invalid`. The commands are the ones each repository documents as its gate (CLAUDE.md of each); what they
+// need from the environment (a Rust toolchain, the `cancho` binary) is the operator's to provide and is open decision
+// D7 of docs/self-hosting.md.
+pub fn gate_command[&k](key: &k [byte]) -> [] &static [byte] {
+    if bytes.equal(key, "alpibrusl/cancho-forge") {
+        return "scripts/gate.sh";
+    }
+    if bytes.equal(key, "alpibrusl/cancho-hdl") {
+        return "scripts/gate_cancho.sh";
+    }
+    if bytes.equal(key, "alpibrusl/cancho") || bytes.equal(key, "alpibrusl/cancho-ui") {
+        return "cargo fmt --all --check && cargo clippy --all-targets -- -D warnings && cargo test --workspace";
+    }
+    return "";
+}
+
+pub fn repo_known[&k](key: &k [byte]) -> [] bool {
+    return bytes.equal(key, "alpibrusl/cancho-forge") || bytes.equal(key, "alpibrusl/cancho-hdl") || bytes.equal(key, "alpibrusl/cancho") || bytes.equal(key, "alpibrusl/cancho-ui");
+}
+
+// Exactly 40 digits of `0-9a-f`.
+pub fn revision_ok[&r](revision: &r [byte]) -> [] bool {
+    if len(revision) != 40 {
+        return false;
+    }
+    var i = 0;
+    while i < len(revision) {
+        let c = int_of(revision[i]);
+        let digit = c >= 48 && c <= 57;
+        let lower = c >= 97 && c <= 102;
+        if !digit && !lower {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// A directory the runner will put in a shell command and a file path: absolute, 2 to 512 bytes, only letters, digits
+// and `._/-`, no two dots in a row (so no `..` component, and the file capability's own rule is met), and not a
+// directory name starting with a dot or a dash after a slash (a hidden directory or an option).
+pub fn path_ok[&p](path: &p [byte]) -> [] bool {
+    if len(path) < 2 || len(path) > 512 || int_of(path[0]) != 47 {
+        return false;
+    }
+    var i = 0;
+    while i < len(path) {
+        let c = int_of(path[i]);
+        let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        let punct = c == 46 || c == 47 || c == 45 || c == 95;
+        if !letter && !digit && !punct {
+            return false;
+        }
+        if c == 46 && i > 0 && int_of(path[i - 1]) == 46 {
+            return false;
+        }
+        if i > 0 && int_of(path[i - 1]) == 47 && (c == 46 || c == 45) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The first thing wrong with a task, if anything, in a fixed order: type, scope, revision, paths, limits. A task with
+// two faults is refused for the first, so the answer does not depend on the order a caller checks.
+pub fn check[&y, &r, &v, &w, &e](task_type_text: &y [byte], repo: &r [byte], revision: &v [byte], workspace: &w [byte], execution_dir: &e [byte], timeout_ms: int) -> [] Checked {
+    if !bytes.equal(task_type_text, task_type()) {
+        return Checked::Refused(Refusal::TaskTypeInvalid);
+    }
+    if !repo_known(repo) {
+        return Checked::Refused(Refusal::ScopeInvalid);
+    }
+    if !revision_ok(revision) {
+        return Checked::Refused(Refusal::RevisionInvalid);
+    }
+    if !path_ok(workspace) || !path_ok(execution_dir) {
+        return Checked::Refused(Refusal::PathInvalid);
+    }
+    if timeout_ms < min_timeout_ms() || timeout_ms > max_timeout_ms() {
+        return Checked::Refused(Refusal::LimitsInvalid);
+    }
+    return Checked::Held;
+}
+
+// The runner's own deadline for the whole job, four fifths of Forge's. Forge's deadline kills only the runner's pid, and
+// a gate the runner started detached survives that (spike S11): so the runner must have ended, and killed the gate's
+// group, before Forge's deadline fires. The fifth left over is the margin for the group kill and for writing the
+// evidence.
+pub fn runner_deadline_ms(timeout_ms: int) -> [] int {
+    return timeout_ms / 5 * 4;
+}
+
+// The deadline of the check that the checkout is at the revision: a tenth of the runner's, at most 10 seconds.
+pub fn head_deadline_ms(runner_ms: int) -> [] int {
+    let tenth = runner_ms / 10;
+    if tenth > 10000 {
+        return 10000;
+    }
+    return tenth;
+}
+
+// The shell text that prints the checkout's revision: `cd <workspace> && git rev-parse HEAD`. `workspace` has passed
+// `path_ok`, which leaves nothing the shell treats specially. A caller that has not checked it must not call this.
+pub fn head_script[&h, &w](heap: &!h Heap, workspace: &w [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), "cd ");
+    b = buffer.append(heap, b, workspace);
+    return buffer.append(heap, b, " && git rev-parse HEAD");
+}
+
+// The shell text that runs the gate: its output (both streams) to stdout, in the workspace. `command` is a row of
+// `gate_command`, never text from a task. The trailing `exit $?` keeps the shell from running the last command in its own
+// place (`exec`), so a gate that kills its parent kills the shell, never the runner, and the exit status is the gate's.
+pub fn gate_script[&h, &w, &c](heap: &!h Heap, workspace: &w [byte], command: &c [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 128), "exec 2>&1; cd ");
+    b = buffer.append(heap, b, workspace);
+    b = buffer.append(heap, b, " && ");
+    b = buffer.append(heap, b, command);
+    return buffer.append(heap, b, "; exit $?");
+}
+
+// Is `printed` (what `git rev-parse HEAD` wrote) the revision asked for? One line: the 40 digits and a newline.
+pub fn head_matches[&p, &r](printed: &p [byte], revision: &r [byte]) -> [] bool {
+    if len(printed) != 41 || int_of(printed[40]) != 10 {
+        return false;
+    }
+    var i = 0;
+    while i < 40 {
+        if printed[i] != revision[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
