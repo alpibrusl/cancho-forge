@@ -667,6 +667,8 @@ Designed, not implemented (no test reaches them yet; they are not claims):
 
 | rule | meaning |
 |---|---|
+| `scope-invalid` | a task names a repository or path that is not in the policy allow-list (`docs/self-hosting.md` section 6) |
+| `revision-invalid` | a revision that is not exactly 40 lower-case hexadecimal digits (`docs/self-hosting.md` section 6) |
 | `policy-denied` | policy decision `Deny`, with the policy version |
 | `policy-missing` | no policy loaded or it did not parse (fail closed) |
 | `approval-missing` | a protected action without a granted approval |
