@@ -1,0 +1,300 @@
+edition 9;
+module forge.gate_run;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.map;
+import forge.dispatch;
+import forge.event;
+import forge.flow;
+import forge.gate_task;
+import forge.journal;
+import forge.journal_io;
+import forge.task;
+import forge.worker;
+
+// The first self-hosted task (docs/self-hosting.md section 3.1; issue #18): report a repository's gate at a revision,
+// read-only. One call takes a task from nothing to a state in the journal:
+//
+//   task.proposed, task.approved   (human: the operator who ran the command)
+//   the task is checked            (forge.gate_task: scope, revision, paths, limits; a refusal is a `refusal` record and
+//                                   the task stays `approved`)
+//   task.ready, task.running       (forge)
+//   execution.started              (forge: the intent, written before the worker is started)
+//   the gate runner is started     (forge.worker.execute: a real child process, a deadline, an output cap, the evidence
+//                                   recomputed against the files, a symlink not followed)
+//   a refusal record               (when the ending is a refusal: its rule tag)
+//   execution.finished             (worker, basis "claimed": the verdict of report.json, when the run produced one)
+//   task.verification | ready | blocked   (forge: forge.flow.target_of)
+//
+// The verdict is a CLAIM. Nothing in this file moves a task to `accepted`, and nothing could: only a Forge actor with a
+// check it observed does (architecture section 6; Stage 2 of the plan).
+//
+// The journal is written with the single-writer lock held by the caller. This module appends one record at a time with
+// `journal_io.append` (synced); a crash between two records leaves a journal that replays to the state of the last one.
+
+// What a run of the task came to.
+pub enum Outcome {
+    // Refused before anything ran, by `forge.gate_task`: the task stays `approved`.
+    Refused(gate_task.Refusal),
+    // The journal is not usable (a rule code of `forge.task`, from the replay at start) or could not be written (-1).
+    Journal(int),
+    // The run ended. The ending, and the claimed verdict of the report (0 none, 1 pass, 2 fail, 3 incomplete).
+    Ended(dispatch.Ending, int),
+}
+
+pub struct Finished {
+    outcome: Outcome,
+    // `task.state_code` of the task in the journal at the end (0: it never got that far).
+    state: int,
+    // The number the task was given (`task_id`), 0 when the journal was not usable.
+    number: int,
+    // How many records the journal holds at the end.
+    records: int,
+}
+
+pub fn verdict_name(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "pass";
+    }
+    if code == 2 {
+        return "fail";
+    }
+    if code == 3 {
+        return "incomplete";
+    }
+    return "";
+}
+
+// The verdict of a gate report's text, as a code: 0 when it is not a report of the gate runner or holds none of the
+// three words. A claim that is not one of the three is not recorded as a verdict.
+pub fn verdict_of[&h, &r](heap: &!h Heap, report: &r [byte]) -> [heap] int {
+    var code = 0;
+    let tape = box_slice(heap, json.tape_len(report), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(report, tp) > 0 && json.is_object(tp, 0) {
+            let v = json.get(report, tp, 0, "verdict");
+            if v >= 0 && json.is_string(tp, v) {
+                if json.string_equals(report, tp, v, "pass") {
+                    code = 1;
+                }
+                if json.string_equals(report, tp, v, "fail") {
+                    code = 2;
+                }
+                if json.string_equals(report, tp, v, "incomplete") {
+                    code = 3;
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return code;
+}
+
+// The id of the `n`th gate task: `gate-` and the first 12 digits of the revision when it is a revision, else `gate-x`,
+// and `-n`. Always a legal task id (`task.id_ok`), whatever the revision text was.
+pub fn task_id[&h, &r](heap: &!h Heap, revision: &r [byte], n: int) -> [heap] buffer.Buffer {
+    var id = buffer.append(heap, buffer.empty(heap, 32), "gate-");
+    if gate_task.revision_ok(revision) {
+        id = buffer.append(heap, id, revision[0..12]);
+    } else {
+        id = buffer.append(heap, id, "x");
+    }
+    id = buffer.push(heap, id, byte_of(45));
+    return buffer.push_nat(heap, id, n);
+}
+
+// One transition of `id` by `actor`, written. The table and the next position; the position is -1 once a write failed or
+// the move was refused (a bug in the caller: the sequence of moves here is fixed).
+fn move_to[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], tasks: map.Map[int], seq: int, id: &i [byte], target: task.State, actor: task.Actor, new_file: bool) -> [heap, fs_read(""), fs_write(""), file_write] (map.Map[int], int) {
+    if seq < 0 {
+        return (tasks, seq);
+    }
+    let (table, record, rule) = journal.submit(heap, tasks, seq, id, target, actor, false);
+    var status = 0 - 1;
+    borrow record as &rb in {
+        status = journal_io.append(fs, path, buffer.bytes(rb), new_file);
+    }
+    buffer.drop(heap, record);
+    if status != 0 || rule != 0 {
+        return (table, 0 - 1);
+    }
+    return (table, seq + 1);
+}
+
+fn write_record[&f, &p, &r](fs: &f Fs(""), path: &p [byte], record: &r [byte], new_file: bool) -> [fs_read(""), fs_write(""), file_write] int {
+    return journal_io.append(fs, path, record, new_file);
+}
+
+// The refusal `tag` of task `id`, written.
+fn note[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], tag: &static [byte], new_file: bool) -> [heap, fs_read(""), fs_write(""), file_write] int {
+    if seq < 0 {
+        return seq;
+    }
+    let record = event.refusal(heap, seq, id, tag);
+    var status = 0 - 1;
+    borrow record as &rb in {
+        status = write_record(fs, path, buffer.bytes(rb), new_file);
+    }
+    buffer.drop(heap, record);
+    if status != 0 {
+        return 0 - 1;
+    }
+    return seq + 1;
+}
+
+// An `execution.*` record of task `id`, written.
+fn note_execution[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, kind: &static [byte], id: &i [byte], verdict: &static [byte]) -> [heap, fs_read(""), fs_write(""), file_write] int {
+    if seq < 0 {
+        return seq;
+    }
+    let record = event.execution(heap, seq, kind, id, verdict);
+    var status = 0 - 1;
+    borrow record as &rb in {
+        status = write_record(fs, path, buffer.bytes(rb), false);
+    }
+    buffer.drop(heap, record);
+    if status != 0 {
+        return 0 - 1;
+    }
+    return seq + 1;
+}
+
+// The input of a `repo.gate` task, as JSON text. The repository is a key of the allow-list and the revision 40 hex
+// digits by the time this is called, so neither needs escaping.
+fn gate_input[&h, &r, &v](heap: &!h Heap, repo: &r [byte], revision: &v [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 96), "{\"repo\":\"");
+    b = buffer.append(heap, b, repo);
+    b = buffer.append(heap, b, "\",\"revision\":\"");
+    b = buffer.append(heap, b, revision);
+    return buffer.append(heap, b, "\"}");
+}
+
+// The claimed verdict of the report the runner wrote in `execution_dir`: read after the evidence was recomputed, so the
+// file is the one the reply described (a link in its place would have been refused, `evidence_io`).
+fn claimed_verdict[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), execution_dir: &d [byte]) -> [heap, fs_read(""), file_read] int {
+    let path = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), execution_dir), "/report.json");
+    var code = 0;
+    borrow path as &pb in {
+        let (data, errno) = journal_io.read_all(heap, fs, buffer.bytes(pb));
+        if errno == 0 {
+            borrow data as &db in {
+                code = verdict_of(heap, buffer.bytes(db));
+            }
+        }
+        buffer.drop(heap, data);
+    }
+    buffer.drop(heap, path);
+    return code;
+}
+
+// Is the reply of this ending a `succeeded` one? Only then is there a report to read.
+fn succeeded(e: dispatch.Ending) -> [] bool {
+    match dispatch.consequence(e) {
+        dispatch.Consequence::Verification => {
+            return true;
+        }
+        dispatch.Consequence::Blocked => {
+            return false;
+        }
+        dispatch.Consequence::RetryOrFail => {
+            return false;
+        }
+        dispatch.Consequence::Failed => {
+            return false;
+        }
+        dispatch.Consequence::WorkerSaid => {
+            return false;
+        }
+        dispatch.Consequence::Cancelled => {
+            return false;
+        }
+        dispatch.Consequence::Poll => {
+            return false;
+        }
+    }
+}
+
+// Run the task. `journal_path` is the journal of the workspace (the caller holds the lock); `workers` is the directory
+// holding `gate_runner`; `checkout` is the working copy of `repo` and `execution_dir` an existing directory for the
+// evidence. `timeout_ms` is Forge's deadline for the run.
+pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &k, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], repo: &r [byte], revision: &v [byte], checkout: &k [byte], execution_dir: &e [byte], timeout_ms: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write] Finished {
+    let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
+    if report.rule != 0 || recovered.errno != 0 {
+        map.drop(heap, existing);
+        var rule = report.rule;
+        if rule == 0 {
+            rule = 0 - 1;
+        }
+        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, records: report.records };
+    }
+    let id = task_id(heap, revision, report.tasks + 1);
+    var state = 0;
+    var records = report.records;
+    var outcome = Outcome::Journal(0 - 1);
+    borrow id as &ib in {
+        let tid = buffer.bytes(ib);
+        let fresh = report.records == 0;
+        var seq = report.records + 1;
+        var tasks = existing;
+        let (t1, s1) = move_to(heap, fs, journal_path, tasks, seq, tid, task.State::Proposed, task.Actor::Human, fresh);
+        let (t2, s2) = move_to(heap, fs, journal_path, t1, s1, tid, task.State::Approved, task.Actor::Human, false);
+        tasks = t2;
+        seq = s2;
+        match gate_task.check(gate_task.task_type(), repo, revision, checkout, execution_dir, timeout_ms) {
+            gate_task.Checked::Refused(why) => {
+                seq = note(heap, fs, journal_path, seq, tid, gate_task.rule_name(why), false);
+                outcome = Outcome::Refused(why);
+            }
+            gate_task.Checked::Held => {
+                let (t3, s3) = move_to(heap, fs, journal_path, tasks, seq, tid, task.State::Ready, task.Actor::Forge, false);
+                let (t4, s4) = move_to(heap, fs, journal_path, t3, s3, tid, task.State::Running, task.Actor::Forge, false);
+                tasks = t4;
+                seq = note_execution(heap, fs, journal_path, s4, "execution.started", tid, "");
+                if seq < 0 {
+                    outcome = Outcome::Journal(0 - 1);
+                } else {
+                    let rid = buffer.append(heap, buffer.empty(heap, 32), "r-");
+                    let request_id = buffer.append(heap, rid, tid);
+                    let input = gate_input(heap, repo, revision);
+                    borrow request_id as &rb in {
+                        borrow input as &nb in {
+                            let req = worker.build_execute(heap, buffer.bytes(rb), 1, tid, gate_task.task_type(), buffer.bytes(nb), timeout_ms, 1048576, checkout, execution_dir);
+                            borrow req as &qb in {
+                                let ending = worker.execute(heap, exec, workers, fs, clock, "gate_runner", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, false);
+                                let tag = dispatch.rule_tag(ending);
+                                if len(tag) > 0 {
+                                    seq = note(heap, fs, journal_path, seq, tid, tag, false);
+                                }
+                                var claim = 0;
+                                if succeeded(ending) {
+                                    claim = claimed_verdict(heap, fs, execution_dir);
+                                    seq = note_execution(heap, fs, journal_path, seq, "execution.finished", tid, verdict_name(claim));
+                                }
+                                let (t5, s5) = move_to(heap, fs, journal_path, tasks, seq, tid, flow.target_of(dispatch.consequence(ending)), task.Actor::Forge, false);
+                                tasks = t5;
+                                seq = s5;
+                                outcome = Outcome::Ended(ending, claim);
+                            }
+                            buffer.drop(heap, req);
+                        }
+                        buffer.drop(heap, input);
+                    }
+                    buffer.drop(heap, request_id);
+                }
+            }
+        }
+        if seq < 0 {
+            outcome = Outcome::Journal(0 - 1);
+        }
+        borrow tasks as &tb in {
+            state = journal.state_of(tb, tid);
+        }
+        map.drop(heap, tasks);
+        records = seq - 1;
+    }
+    buffer.drop(heap, id);
+    return Finished { outcome: outcome, state: state, number: report.tasks + 1, records: records };
+}

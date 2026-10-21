@@ -51,3 +51,13 @@ std = true
 name = "stub_script"
 sources = ["tests/stub_script_test.cho", "src/stub_script.cho"]
 std = true
+
+[[test]]
+name = "flow"
+sources = ["tests/flow_test.cho", "src/flow.cho", "src/dispatch.cho", "src/response.cho", "src/task.cho"]
+std = true
+
+[[test]]
+name = "gate_run"
+sources = ["tests/gate_run_test.cho", "src/gate_run.cho", "src/worker.cho", "src/dispatch.cho", "src/response.cho", "src/evidence_io.cho", "src/flow.cho", "src/gate_task.cho", "src/journal.cho", "src/journal_io.cho", "src/task.cho", "src/event.cho", "src/snapshot.cho"]
+std = true

@@ -1,0 +1,84 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.gate_run;
+import forge.task;
+
+// Unit tests for the pure parts of src/gate_run.cho (docs/self-hosting.md section 3.1): the task id, the verdict a report
+// is read for, and the names. The whole run, with a real runner and a journal, is checked by scripts/check_gate_run.sh.
+// Run with `cancho test`.
+
+fn rev() -> [] &static [byte] {
+    return "0123456789abcdef0123456789abcdef01234567";
+}
+
+fn id_for[&h, &r](heap: &!h Heap, revision: &r [byte], n: int) -> [heap] bool {
+    let id = gate_run.task_id(heap, revision, n);
+    var legal = false;
+    borrow id as &b in {
+        legal = task.id_ok(buffer.bytes(b));
+    }
+    buffer.drop(heap, id);
+    return legal;
+}
+
+fn test_the_task_id_is_gate_the_first_twelve_digits_and_a_number[&h](heap: &!h Heap) -> [heap] int {
+    let id = gate_run.task_id(heap, rev(), 1);
+    borrow id as &b in {
+        test.assert(bytes.equal(buffer.bytes(b), "gate-0123456789ab-1"));
+    }
+    buffer.drop(heap, id);
+    let later = gate_run.task_id(heap, rev(), 120);
+    borrow later as &b in {
+        test.assert(bytes.equal(buffer.bytes(b), "gate-0123456789ab-120"));
+    }
+    buffer.drop(heap, later);
+    return 0;
+}
+
+fn test_a_revision_that_is_not_one_still_gives_a_legal_id[&h](heap: &!h Heap) -> [heap] int {
+    let id = gate_run.task_id(heap, "../../etc/passwd/../x", 3);
+    borrow id as &b in {
+        test.assert(bytes.equal(buffer.bytes(b), "gate-x-3"));
+    }
+    buffer.drop(heap, id);
+    test.assert(id_for(heap, "", 1));
+    test.assert(id_for(heap, "abc", 1));
+    test.assert(id_for(heap, "0123456789ABCDEF0123456789ABCDEF01234567", 1));
+    test.assert(id_for(heap, "0123456789abcdef0123456789abcdef0123456", 1));
+    test.assert(id_for(heap, "0123456789abcdef0123456789abcdef012345678", 1));
+    test.assert(id_for(heap, rev(), 1));
+    return 0;
+}
+
+fn test_a_report_is_read_for_one_of_three_verdicts[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(gate_run.verdict_of(heap, "{\"verdict\":\"pass\",\"exit_status\":0}"), 1);
+    test.assert_eq(gate_run.verdict_of(heap, "{\"verdict\":\"fail\"}"), 2);
+    test.assert_eq(gate_run.verdict_of(heap, "{\"x\":1,\"verdict\":\"incomplete\"}"), 3);
+    return 0;
+}
+
+fn test_anything_else_is_no_claim[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(gate_run.verdict_of(heap, ""), 0);
+    test.assert_eq(gate_run.verdict_of(heap, "not json"), 0);
+    test.assert_eq(gate_run.verdict_of(heap, "[]"), 0);
+    test.assert_eq(gate_run.verdict_of(heap, "{}"), 0);
+    test.assert_eq(gate_run.verdict_of(heap, "{\"verdict\":1}"), 0);
+    test.assert_eq(gate_run.verdict_of(heap, "{\"verdict\":\"Pass\"}"), 0);
+    test.assert_eq(gate_run.verdict_of(heap, "{\"verdict\":\"pass \"}"), 0);
+    test.assert_eq(gate_run.verdict_of(heap, "{\"verdict\":\"accepted\"}"), 0);
+    test.assert_eq(gate_run.verdict_of(heap, "{\"verdict\":\"pass\""), 0);
+    return 0;
+}
+
+fn test_the_names_of_the_verdicts() -> [] int {
+    test.assert(bytes.equal(gate_run.verdict_name(1), "pass"));
+    test.assert(bytes.equal(gate_run.verdict_name(2), "fail"));
+    test.assert(bytes.equal(gate_run.verdict_name(3), "incomplete"));
+    test.assert(bytes.equal(gate_run.verdict_name(0), ""));
+    test.assert(bytes.equal(gate_run.verdict_name(4), ""));
+    test.assert(bytes.equal(gate_run.verdict_name(0 - 1), ""));
+    return 0;
+}

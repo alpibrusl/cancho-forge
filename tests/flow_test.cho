@@ -1,0 +1,59 @@
+edition 9;
+
+import std.test;
+import forge.dispatch;
+import forge.flow;
+import forge.task;
+
+// Unit tests for src/flow.cho (docs/stub-llm.md section 5; docs/worker-contract.md section 5): the state a task is in
+// after a run, for each consequence of the ending. Run with `cancho test`.
+
+fn code_of(c: dispatch.Consequence) -> [] int {
+    return task.state_code(flow.target_of(c));
+}
+
+fn test_a_workers_success_is_a_claim_for_verification() -> [] int {
+    test.assert_eq(code_of(dispatch.Consequence::Verification), task.state_code(task.State::Verification));
+    return 0;
+}
+
+fn test_a_lost_or_failed_execution_goes_back_to_ready() -> [] int {
+    test.assert_eq(code_of(dispatch.Consequence::RetryOrFail), task.state_code(task.State::Ready));
+    return 0;
+}
+
+fn test_what_needs_an_operator_is_blocked() -> [] int {
+    test.assert_eq(code_of(dispatch.Consequence::Blocked), task.state_code(task.State::Blocked));
+    test.assert_eq(code_of(dispatch.Consequence::Failed), task.state_code(task.State::Blocked));
+    test.assert_eq(code_of(dispatch.Consequence::WorkerSaid), task.state_code(task.State::Blocked));
+    return 0;
+}
+
+fn test_a_cancelled_run_is_cancelled_and_a_poll_moves_nothing() -> [] int {
+    test.assert_eq(code_of(dispatch.Consequence::Cancelled), task.state_code(task.State::Cancelled));
+    test.assert_eq(code_of(dispatch.Consequence::Poll), task.state_code(task.State::Running));
+    return 0;
+}
+
+fn test_no_ending_accepts_a_task() -> [] int {
+    let accepted = task.state_code(task.State::Accepted);
+    test.assert(code_of(dispatch.Consequence::Blocked) != accepted);
+    test.assert(code_of(dispatch.Consequence::RetryOrFail) != accepted);
+    test.assert(code_of(dispatch.Consequence::Failed) != accepted);
+    test.assert(code_of(dispatch.Consequence::Verification) != accepted);
+    test.assert(code_of(dispatch.Consequence::WorkerSaid) != accepted);
+    test.assert(code_of(dispatch.Consequence::Cancelled) != accepted);
+    test.assert(code_of(dispatch.Consequence::Poll) != accepted);
+    return 0;
+}
+
+fn test_every_move_a_run_makes_from_running_is_an_edge_of_the_table() -> [] int {
+    // `running` can go to verification, ready, blocked or cancelled, or stay: nothing else (architecture section 6)
+    test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::Blocked)));
+    test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::RetryOrFail)));
+    test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::Failed)));
+    test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::Verification)));
+    test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::WorkerSaid)));
+    test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::Cancelled)));
+    return 0;
+}

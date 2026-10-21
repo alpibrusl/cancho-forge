@@ -1,6 +1,6 @@
 # Self-hosting: Forge managing the cancho project
 
-> **Status: a plan, not a build.** Nothing here is implemented. It says
+> **Status: a plan; Stage 1's first task is built (`forge gate`, sections 3.1, 7 and 8), nothing else is.** It says
 > which tasks Forge takes first, how its responsibility for the cancho
 > project (the compiler `alpibrusl/cancho`, the language documents, and the
 > packages and repositories around it) grows in stages, what authority each
@@ -78,9 +78,23 @@ Issue [#18](https://github.com/alpibrusl/cancho-forge/issues/18).
   and it has an oracle that is not Forge: the repository's CI ran the same
   gate on the same revision.
 
+**Built** (`forge gate`, issue #18): `forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms]`
+(`src/main.cho`, `src/gate_run.cho`) takes the lock of the workspace, records the task (`task.proposed`, `task.approved`
+by the human who ran the command), checks it (`forge.gate_task`: a refusal is a `refusal` record with its rule tag and the
+task stays `approved`), moves it to `ready` and `running`, writes `execution.started` (the intent, before the worker
+starts), starts the gate runner as a child process (`forge.worker.execute`: a deadline, an output cap, the evidence
+recomputed against the files, a symlink not followed), writes the rule tag if the ending is a refusal, writes
+`execution.finished` with the runner's verdict as a claim (`"actor":"worker","basis":"claimed"`), and moves the task by
+`forge.flow.target_of`: **`verification`**, never `accepted`. Exit status: 0 a claim was recorded (a failing gate is
+still 0: the project telling the truth, or the environment, see D7), 1 the task or the journal was refused, 2 usage or a
+path that is not ok, 3 the workspace is locked or a directory cannot be opened, 4 the run ended without a claim (the
+ending and the state are printed). What Forge cannot do itself (cancho has no `mkdir`, and decision D1 stays open): the
+execution directory (empty), the checkout (at the revision) and the workers directory are made by the operator
+beforehand. Measured in section 8.
+
 Success criterion, to be measured and not assumed: for N revisions of the
 four repositories, Forge's claimed verdict equals CI's. *N and the time per
-run are unmeasured.* One data point exists: see section 8.
+run are unmeasured.* Data points exist: see section 8.
 
 ### 3.2 Later tasks, one stage at a time
 
@@ -260,9 +274,9 @@ outcome recorded as claimed evidence. A task whose gate fails still ends
 | item | issue | needed for | state |
 |---|---|---|---|
 | This plan | #13 | all | this document |
-| `main` wiring of `worker.cho` | [#17](https://github.com/alpibrusl/cancho-forge/issues/17) | Stage 1 | open; widens `cancho authority` |
-| Gate-runner worker | [#20](https://github.com/alpibrusl/cancho-forge/issues/20) | Stage 1 | **built**, not wired into `main` (#17), not run on a real repository (D7) |
-| First self-hosted task | [#18](https://github.com/alpibrusl/cancho-forge/issues/18) | Stage 1 | open |
+| `main` wiring of `worker.cho` | [#17](https://github.com/alpibrusl/cancho-forge/issues/17) | Stage 1 | **done for one verb**: `forge gate` links it; `docs/authority.txt` widened (architecture section 4.9). Not a general wiring: no other verb starts a worker |
+| Gate-runner worker | [#20](https://github.com/alpibrusl/cancho-forge/issues/20) | Stage 1 | **built**, wired into `forge gate`; run on a real repository once, see section 8 and D7 |
+| First self-hosted task | [#18](https://github.com/alpibrusl/cancho-forge/issues/18) | Stage 1 | **built** (`forge gate`, section 3.1); its first real run **disagrees with CI**, for reasons D7 names |
 | `capabilities`/`cancel`/`status`/`result` | [#14](https://github.com/alpibrusl/cancho-forge/issues/14) | `status` and `cancel` of a long run; **not** a blocker of a sync runner | open |
 | `error.retryable` | [#15](https://github.com/alpibrusl/cancho-forge/issues/15) | policy retries; a gate that fails is not retried | open |
 | Cancho Code adapter | [#16](https://github.com/alpibrusl/cancho-forge/issues/16), blocked on [cancho#562](https://github.com/alpibrusl/cancho/issues/562) | Stage 3 | blocked |
@@ -301,8 +315,26 @@ settles it:
   nothing else (measured: the gate sees exactly that, `tests` oracle `pass`). A Rust gate needs more (`HOME`, a
   toolchain, `CARGO_HOME`) and `scripts/gate.sh` of this repository needs `cancho` on the `PATH`: how the operator
   provides them, without a task being able to, is open. Candidates: an `env` row of the policy table that Forge puts
-  in `grants`, never in `task.input`; or a wrapper script the operator installs. **Until it is decided, the four real
-  gates have not been run through the runner, and nothing here claims they work.**
+  in `grants`, never in `task.input`; or a wrapper script the operator installs. **First real runs, 2026-10-21 (section
+  8), each measured, showed three more things D7 has to settle:**
+  1. `cancho` is not on the fixed `PATH`: the gate of this repository fails in 338 ms with `cancho: not found`, claimed
+     `fail`. Put on it by a symlink, it fails again: **`cancho test` and `cancho build` need `CANCHO_CACHE` or `HOME`**
+     ("no cache directory"), which the runner does not pass. What worked is a wrapper script the operator installed as
+     `cancho` that sets `CANCHO_CACHE` and execs the compiler. A Rust gate (`cancho-ui`, `cancho`) fails in 6 ms with exit
+     127, `cargo: not found` (it lives in `~/.cargo/bin`; rustup also wants `HOME`).
+  2. **An environment failure is claimed `fail`.** The runner's verdict is `fail` for any non-zero exit, so "the project's
+     gate failed" and "the gate could not run" (126 or 127: the shell could not find or run the command) cannot be told
+     apart in the journal. Proposed, not built: exit 126 and 127 are `incomplete` (no verdict could be had), as a deadline
+     is.
+  3. **The gate of this repository is not re-entrant.** With the environment provided, the gate ran completely under the
+     runner (85.8 s) and failed one check: `no runner outlived the run` (`pgrep -x gate_runner`), because the runner that is
+     running the gate *is* a `gate_runner`. The process-table oracles of `scripts/gate.sh`, `check_gate_runner.sh`,
+     `check_stub_llm.sh` and `check_gate_run.sh` (`pgrep -x mock_worker`, `gate_runner`, `stub_llm`) assume no other
+     instance. They need to ask about *their* children, not the process table. Not fixed here: a `pgrep -f` on the path
+     would match nothing (the children are started by name beneath a directory), so the fix needs thought.
+  **So: the claimed verdict for `alpibrusl/cancho-forge` at `592421a` is `fail`, and CI's is green. They disagree (one
+  revision, one repository), the cause is known, and it is not a defect of the project.** No other repository's gate was
+  run to completion; nothing here claims they work.
 * **D4. Stage 4's push path:** `net` narrowed to a host, or a narrowed
   `exec` of a client run as a worker. Decide with M6's authority review.
 * **D5. Where the allow-list and policy live,** and how a change to them is
@@ -324,10 +356,11 @@ Measured in this repository:
   (19 tests, 32 of 32);
 * the authority report of today's binary (`docs/authority.txt`).
 
+Also measured: the first self-hosted task (`forge gate`): 13 unit tests (`tests/flow_test.cho`, `tests/gate_run_test.cho`, `tests/event_test.cho`) and 29 checks on the built binary against real git checkouts and a real runner process (`scripts/check_gate_run.sh`): a pass and a fail are both claims in `verification` and never `accepted`; a checkout at another revision, a gate that never ends (nothing it started left running), a runner that is not there, a locked workspace and five refusals each end in the state and the journal records the document says. 28 of 29 deliberate breaks of `flow`, `gate_run`, `event` and `main` are killed and one is equivalent (`scripts/mutate_gate_run.py`; the first run had three survivors, all gaps in the oracles: the id of the task in the journal, and who proposed and approved it).
+
 Not measured, and not claimed:
 
-* a gate run of any of the four repositories through Forge: its time, its
-  agreement with CI (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
+* a gate run of any of the four repositories through Forge in agreement with CI (first runs, 2026-10-21, one revision of two repositories, **all claimed `fail`, for the reasons of D7** (cancho-forge at `592421a`: 85.8 s, one check of the gate that is not re-entrant; cancho-ui at `e0a2217`: 6 ms, `cargo: not found`); the time per run beyond the first (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
 * anything with a real worker, a real network, power loss, macOS, several
   workers at once, or a journal larger than the tests'.
 
