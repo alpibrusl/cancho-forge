@@ -1,0 +1,498 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.process;
+import std.test;
+import forge.dispatch;
+import forge.response;
+import forge.verbs;
+
+// Unit tests for src/verbs.cho (docs/worker-contract.md, sections 1.2, 3.1, 3.3 to 3.6). Run with `cancho test`.
+// An outcome is (class, code): class 1 `worker-protocol`, 2 `worker-contract-version`, 3 `worker-verb-unsupported`,
+// 4 `evidence-ref-invalid` (the code is the reason); 10/11 a `sync`/`async` worker; 20 to 22 a cancel (cancelled, not
+// running, too late); 30 to 33 a status (queued, running, finished, unknown); 40 a result not ready; 50 + n a result
+// whose response is in state n of `forge.response` (succeeded 50, failed 51, partial 52, cancelled 53, accepted 54).
+
+fn outcome(j: verbs.Judged) -> [] (int, int) {
+    match j {
+        verbs.Judged::Capabilities(level) => {
+            match level {
+                verbs.Level::Sync => {
+                    return (10, 0);
+                }
+                verbs.Level::Async => {
+                    return (11, 0);
+                }
+            }
+        }
+        verbs.Judged::Cancel(c) => {
+            match c {
+                verbs.CancelState::Cancelled => {
+                    return (20, 0);
+                }
+                verbs.CancelState::NotRunning => {
+                    return (21, 0);
+                }
+                verbs.CancelState::TooLate => {
+                    return (22, 0);
+                }
+            }
+        }
+        verbs.Judged::Status(s) => {
+            match s {
+                verbs.StatusState::Queued => {
+                    return (30, 0);
+                }
+                verbs.StatusState::Running => {
+                    return (31, 0);
+                }
+                verbs.StatusState::Finished => {
+                    return (32, 0);
+                }
+                verbs.StatusState::Unknown => {
+                    return (33, 0);
+                }
+            }
+        }
+        verbs.Judged::Result(r) => {
+            match r {
+                verbs.Resulted::NotReady => {
+                    return (40, 0);
+                }
+                verbs.Resulted::Ready(s) => {
+                    match s {
+                        response.State::Succeeded => {
+                            return (50, 0);
+                        }
+                        response.State::Failed => {
+                            return (51, 0);
+                        }
+                        response.State::Partial => {
+                            return (52, 0);
+                        }
+                        response.State::Cancelled => {
+                            return (53, 0);
+                        }
+                        response.State::Accepted => {
+                            return (54, 0);
+                        }
+                    }
+                }
+            }
+        }
+        verbs.Judged::Refused(rule, reason) => {
+            match rule {
+                verbs.Rule::Protocol => {
+                    return (1, reason);
+                }
+                verbs.Rule::ContractVersion => {
+                    return (2, reason);
+                }
+                verbs.Rule::VerbUnsupported => {
+                    return (3, reason);
+                }
+                verbs.Rule::EvidenceRefInvalid => {
+                    return (4, reason);
+                }
+            }
+        }
+    }
+}
+
+// The verdict on `body` as the reply to `verb`: request id `r-1`, target `r-0`, task `t-1`.
+fn judge[&h, &b, &v](heap: &!h Heap, verb: &v [byte], body: &b [byte]) -> [heap] (int, int) {
+    return outcome(verbs.judge(heap, verb, body, "r-1", "r-0", "t-1"));
+}
+
+fn same(got: (int, int), class: int, code: int) -> [] int {
+    let (c, r) = got;
+    test.assert_eq(c, class);
+    test.assert_eq(r, code);
+    return 0;
+}
+
+// The class of how a call ended when it was not a clean exit (1 unavailable, 2 timeout, 3 overflow, 4 crashed, 5 error),
+// or 0 when the exit was clean and the reply was judged.
+fn ended[&h, &b](heap: &!h Heap, ran: process.Ran, body: &b [byte]) -> [heap] int {
+    match verbs.settle(heap, ran, "capabilities", body, "r-1", "r-0", "t-1") {
+        verbs.Settled::Reply(j) => {
+            return 0;
+        }
+        verbs.Settled::Ended(e) => {
+            match e {
+                dispatch.Ending::Unavailable(errno) => {
+                    return 1;
+                }
+                dispatch.Ending::Timeout => {
+                    return 2;
+                }
+                dispatch.Ending::Overflow => {
+                    return 3;
+                }
+                dispatch.Ending::Crashed(signal) => {
+                    return 4;
+                }
+                dispatch.Ending::Error(code) => {
+                    return 5;
+                }
+                dispatch.Ending::Setup(errno) => {
+                    return 6;
+                }
+                dispatch.Ending::Reply(v) => {
+                    return 7;
+                }
+            }
+        }
+    }
+}
+
+// A valid reply, every prefix of it and every position changed to each of eight bytes: each is a verdict (a value), never
+// a trap, and no proper prefix is accepted.
+fn sweep[&h, &v, &b](heap: &!h Heap, verb: &v [byte], whole: &b [byte]) -> [heap] int {
+    let n = len(whole);
+    var refused = 0;
+    var cut = 0;
+    while cut < n {
+        let (c, r) = judge(heap, verb, whole[0..cut]);
+        test.assert_eq(c, 1);
+        refused = refused + 1;
+        cut = cut + 1;
+    }
+    let swaps = "\"{}[:,x9";
+    var changed = 0;
+    var at = 0;
+    while at < n {
+        var k = 0;
+        while k < len(swaps) {
+            var copy = buffer.empty(heap, n + 1);
+            var j = 0;
+            while j < n {
+                if j == at {
+                    copy = buffer.push(heap, copy, swaps[k]);
+                } else {
+                    copy = buffer.push(heap, copy, whole[j]);
+                }
+                j = j + 1;
+            }
+            borrow copy as &cb in {
+                let (c, r) = judge(heap, verb, buffer.bytes(cb));
+                test.assert(c >= 1);
+                changed = changed + 1;
+            }
+            buffer.drop(heap, copy);
+            k = k + 1;
+        }
+        at = at + 1;
+    }
+    test.assert(refused > 50);
+    test.assert(changed > 400);
+    return 0;
+}
+
+fn test_a_well_formed_capabilities_reply_names_its_level[&h](heap: &!h Heap) -> [heap] int {
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 10, 0);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"async\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 11, 0);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[]}"), 10, 0);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/0\",\"forge-worker/1\",\"forge-worker/2\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 10, 0);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"extra\":[1,{\"x\":null}],\"worker\":{\"name\":\"m\",\"version\":\"1\",\"more\":true},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1,\"other\":2},\"note\":\"x\"}]}"), 10, 0);
+    return 0;
+}
+
+fn test_a_capabilities_reply_that_is_not_one_is_worker_protocol_with_its_reason[&h](heap: &!h Heap) -> [heap] int {
+    same(judge(heap, "capabilities", "this is not json"), 1, 1);
+    same(judge(heap, "capabilities", "[1,2]"), 1, 2);
+    same(judge(heap, "capabilities", "\"x\""), 1, 2);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/2\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 3);
+    same(judge(heap, "capabilities", "{\"contract\":1,\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 3);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-other\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 4);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":7,\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 4);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":\"mock\",\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"version\":\"1\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"\",\"version\":\"1\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"m\\u0041\",\"version\":\"1\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":7,\"version\":\"1\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"m\",\"version\":[\"1\"]},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"version\":\"1\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"version\":\"1\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 10, 0);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":\"forge-worker/1\",\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 31);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 31);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\",1],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 31);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 31);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\",\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 10, 0);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"eventually\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 32);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"Sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 32);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":true,\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 32);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":\"repo.change\"}"), 1, 33);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":{}}"), 1, 33);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"t0\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t1\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t2\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t3\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t4\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t5\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t6\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t7\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t8\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t9\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t10\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t11\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t12\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t13\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t14\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t15\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t16\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t17\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t18\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t19\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t20\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t21\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t22\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t23\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t24\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t25\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t26\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t27\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t28\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t29\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t30\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t31\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t32\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t33\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t34\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t35\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t36\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t37\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t38\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t39\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t40\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t41\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t42\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t43\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t44\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t45\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t46\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t47\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t48\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t49\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t50\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t51\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t52\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t53\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t54\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t55\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t56\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t57\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t58\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t59\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t60\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t61\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t62\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t63\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t64\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}}]}"), 1, 33);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"t0\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t1\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t2\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t3\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t4\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t5\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t6\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t7\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t8\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t9\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t10\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t11\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t12\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t13\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t14\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t15\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t16\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t17\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t18\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t19\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t20\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t21\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t22\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t23\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t24\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t25\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t26\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t27\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t28\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t29\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t30\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t31\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t32\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t33\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t34\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t35\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t36\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t37\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t38\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t39\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t40\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t41\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t42\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t43\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t44\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t45\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t46\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t47\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t48\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t49\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t50\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t51\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t52\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t53\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t54\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t55\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t56\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t57\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t58\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t59\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t60\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t61\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t62\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"t63\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}}]}"), 10, 0);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[\"repo.change\"]}"), 1, 34);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}}]}"), 1, 34);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}}]}"), 1, 34);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":5,\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}}]}"), 1, 34);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\"}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":5}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"max_output_bytes\":1}}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":1}}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":0,\"max_output_bytes\":1}}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":0}}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":-5,\"max_output_bytes\":1}}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":\"9\",\"max_output_bytes\":1}}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":1.5,\"max_output_bytes\":1}}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":99999999999999999999,\"max_output_bytes\":1}}]}"), 1, 35);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"a\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":1}},{\"type\":\"b\",\"limits_max\":{\"timeout_ms\":1,\"max_output_bytes\":0}}]}"), 1, 35);
+    return 0;
+}
+
+fn test_no_common_contract_version_is_its_own_rule_and_only_for_a_well_formed_reply[&h](heap: &!h Heap) -> [heap] int {
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/2\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 2, 31);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/0\",\"forge-worker/2\",\"x\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 2, 31);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"Forge-Worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 2, 31);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1 \"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 2, 31);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/2\"],\"level\":\"nope\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 32);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":1,\"supports\":[\"forge-worker/2\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}"), 1, 30);
+    same(judge(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/2\"],\"level\":\"sync\",\"task_types\":[1]}"), 1, 34);
+    return 0;
+}
+
+fn test_a_cancel_reply_has_one_of_three_states_and_names_its_target[&h](heap: &!h Heap) -> [heap] int {
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"target\":\"r-0\"}"), 20, 0);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"not_running\",\"target\":\"r-0\"}"), 21, 0);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"too_late\",\"target\":\"r-0\"}"), 22, 0);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"target\":\"r-0\",\"extra\":{\"a\":[1]}}"), 20, 0);
+    same(judge(heap, "cancel", "not json"), 1, 1);
+    same(judge(heap, "cancel", "[]"), 1, 2);
+    same(judge(heap, "cancel", "{\"contract\":\"x\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"target\":\"r-0\"}"), 1, 3);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-2\",\"state\":\"cancelled\",\"target\":\"r-0\"}"), 1, 4);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\"}"), 1, 36);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"target\":\"r-9\"}"), 1, 36);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"target\":5}"), 1, 36);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"done\",\"target\":\"r-0\"}"), 1, 37);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"Cancelled\",\"target\":\"r-0\"}"), 1, 37);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":null,\"target\":\"r-0\"}"), 1, 37);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"accepted\",\"target\":\"r-0\"}"), 1, 37);
+    same(judge(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"queued\",\"target\":\"r-0\"}"), 1, 37);
+    return 0;
+}
+
+fn test_a_status_reply_has_one_of_four_states_and_an_optional_progress[&h](heap: &!h Heap) -> [heap] int {
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"queued\",\"target\":\"r-0\"}"), 30, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\"}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"finished\",\"target\":\"r-0\"}"), 32, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"unknown\",\"target\":\"r-0\"}"), 33, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"step\":\"running tests\",\"fraction\":0.6},\"updated\":\"2026-10-19T10:00:00Z\"}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{}}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"step\":\"x\"}}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":0}}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":1}}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":0.0}}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":1.0}}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":1e0}}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":5e-1}}"), 31, 0);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"step\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}"), 31, 0);
+    same(judge(heap, "status", "not json"), 1, 1);
+    same(judge(heap, "status", "7"), 1, 2);
+    same(judge(heap, "status", "{\"contract\":2,\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\"}"), 1, 3);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"\",\"state\":\"running\",\"target\":\"r-0\"}"), 1, 4);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\"}"), 1, 36);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-3\"}"), 1, 36);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"paused\",\"target\":\"r-0\"}"), 1, 38);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"Running\",\"target\":\"r-0\"}"), 1, 38);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":true,\"target\":\"r-0\"}"), 1, 38);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"target\":\"r-0\"}"), 1, 38);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":5}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":\"x\"}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":[]}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"step\":7}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"step\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":\"0.5\"}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":-0.1}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":1.1}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":2}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":-1}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":1e1}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"fraction\":null}}"), 1, 39);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"updated\":5}"), 1, 40);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"updated\":\"\"}"), 1, 40);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"updated\":[\"x\"]}"), 1, 40);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"updated\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"), 1, 40);
+    same(judge(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"updated\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}"), 31, 0);
+    return 0;
+}
+
+fn test_a_result_is_not_ready_or_the_final_response_of_execute[&h](heap: &!h Heap) -> [heap] int {
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"not_ready\"}"), 40, 0);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"not_ready\",\"target\":\"r-0\",\"x\":[]}"), 40, 0);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}"), 50, 0);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"ev-1\",\"kind\":\"file\",\"ref\":\"out.txt\",\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"bytes\":3}]}"), 50, 0);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"c\",\"message\":\"m\",\"retryable\":false}}"), 51, 0);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"partial\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"c\",\"message\":\"m\",\"retryable\":false}}"), 52, 0);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"task_id\":\"t-1\",\"evidence\":[]}"), 53, 0);
+    same(judge(heap, "result", "not json"), 1, 1);
+    same(judge(heap, "result", "null"), 1, 2);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/9\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}"), 1, 3);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-2\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[]}"), 1, 4);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-2\",\"evidence\":[]}"), 1, 6);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"accepted\",\"task_id\":\"t-1\",\"evidence\":[]}"), 1, 5);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"task_id\":\"t-1\",\"evidence\":[]}"), 1, 5);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"not_ready\",\"task_id\":\"t-1\",\"evidence\":[]}"), 40, 0);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[]}"), 1, 17);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":{\"code\":\"c\",\"message\":\"m\",\"retryable\":false}}"), 1, 17);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-2\",\"state\":\"not_ready\"}"), 1, 4);
+    same(judge(heap, "result", "{\"contract\":\"x\",\"request_id\":\"r-1\",\"state\":\"not_ready\"}"), 1, 3);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"Not_Ready\"}"), 1, 5);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"ev-1\",\"kind\":\"file\",\"ref\":\"../x\",\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"bytes\":3}]}"), 4, 13);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"ev-1\",\"kind\":\"file\",\"ref\":\"/etc/passwd\",\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"bytes\":3}]}"), 4, 13);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"ev-1\",\"kind\":\"file\",\"ref\":\"a\",\"sha256\":\"xyz\",\"bytes\":3}]}"), 4, 14);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"ev-1\",\"kind\":\"file\",\"ref\":\"a\",\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"bytes\":-1}]}"), 4, 15);
+    same(judge(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"ev-1\",\"kind\":\"weird\",\"ref\":\"a\",\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"bytes\":1}]}"), 1, 12);
+    return 0;
+}
+
+fn test_which_verbs_a_level_has_and_what_an_unknown_verb_is[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(verbs.verb_allowed(verbs.Level::Sync, "capabilities"));
+    test.assert(verbs.verb_allowed(verbs.Level::Sync, "execute"));
+    test.assert(!verbs.verb_allowed(verbs.Level::Sync, "cancel"));
+    test.assert(!verbs.verb_allowed(verbs.Level::Sync, "status"));
+    test.assert(!verbs.verb_allowed(verbs.Level::Sync, "result"));
+    test.assert(verbs.verb_allowed(verbs.Level::Async, "capabilities"));
+    test.assert(verbs.verb_allowed(verbs.Level::Async, "execute"));
+    test.assert(verbs.verb_allowed(verbs.Level::Async, "cancel"));
+    test.assert(verbs.verb_allowed(verbs.Level::Async, "status"));
+    test.assert(verbs.verb_allowed(verbs.Level::Async, "result"));
+    test.assert(!verbs.verb_allowed(verbs.Level::Async, ""));
+    test.assert(!verbs.verb_allowed(verbs.Level::Async, "Execute"));
+    test.assert(!verbs.verb_allowed(verbs.Level::Async, "frobnicate"));
+    test.assert(!verbs.verb_allowed(verbs.Level::Sync, "cancel "));
+    same(outcome(verbs.refuse_verb()), 3, verbs.r_verb());
+    same(judge(heap, "frobnicate", "{}"), 3, verbs.r_verb());
+    same(judge(heap, "execute", "{}"), 3, verbs.r_verb());
+    same(judge(heap, "", "{}"), 3, verbs.r_verb());
+    return 0;
+}
+
+fn test_the_requests_are_written_exactly[&h](heap: &!h Heap) -> [heap] int {
+    let cap = verbs.build_capabilities(heap, "r-0");
+    borrow cap as &cb in {
+        test.assert(bytes.equal(buffer.bytes(cb), "{\"contract\":\"forge-worker/1\",\"verb\":\"capabilities\",\"request_id\":\"r-0\"}"));
+    }
+    buffer.drop(heap, cap);
+    let c = verbs.build_targeted(heap, "cancel", "r-18", "r-17");
+    borrow c as &b in {
+        test.assert(bytes.equal(buffer.bytes(b), "{\"contract\":\"forge-worker/1\",\"verb\":\"cancel\",\"request_id\":\"r-18\",\"target\":\"r-17\"}"));
+    }
+    buffer.drop(heap, c);
+    let s = verbs.build_targeted(heap, "status", "r-19", "r-17");
+    borrow s as &b2 in {
+        test.assert(bytes.equal(buffer.bytes(b2), "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-19\",\"target\":\"r-17\"}"));
+    }
+    buffer.drop(heap, s);
+    let r = verbs.build_targeted(heap, "result", "r-20", "r-17");
+    borrow r as &b3 in {
+        test.assert(bytes.equal(buffer.bytes(b3), "{\"contract\":\"forge-worker/1\",\"verb\":\"result\",\"request_id\":\"r-20\",\"target\":\"r-17\"}"));
+    }
+    buffer.drop(heap, r);
+    // a verb that is not one of the three is not built, so that a wrong name cannot reach a worker
+    let e = verbs.build_targeted(heap, "execute", "r-1", "r-0");
+    borrow e as &eb in {
+        test.assert_eq(len(buffer.bytes(eb)), 0);
+    }
+    buffer.drop(heap, e);
+    let e2 = verbs.build_targeted(heap, "capabilities", "r-1", "r-0");
+    borrow e2 as &e2b in {
+        test.assert_eq(len(buffer.bytes(e2b)), 0);
+    }
+    buffer.drop(heap, e2);
+    let e3 = verbs.build_targeted(heap, "", "r-1", "r-0");
+    borrow e3 as &e3b in {
+        test.assert_eq(len(buffer.bytes(e3b)), 0);
+    }
+    buffer.drop(heap, e3);
+    // an id with a quote or a newline is escaped, not copied into the JSON
+    let q = verbs.build_targeted(heap, "status", "r\"1", "r\n0");
+    borrow q as &b4 in {
+        test.assert(bytes.equal(buffer.bytes(b4), "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r\\\"1\",\"target\":\"r\\n0\"}"));
+    }
+    buffer.drop(heap, q);
+    return 0;
+}
+
+fn test_a_capabilities_reply_written_by_a_worker_is_one_this_judges_valid[&h](heap: &!h Heap) -> [heap] int {
+    let a = verbs.capabilities_reply(heap, "r-1", "stub-llm", "0.1.0", "sync", "repo.change", 600000, 1048576);
+    borrow a as &ab in {
+        same(judge(heap, "capabilities", buffer.bytes(ab)), 10, 0);
+        test.assert(verbs.lists_type(heap, buffer.bytes(ab), "repo.change"));
+        test.assert(!verbs.lists_type(heap, buffer.bytes(ab), "repo.gate"));
+        test.assert(!verbs.lists_type(heap, buffer.bytes(ab), ""));
+        test.assert(!verbs.lists_type(heap, buffer.bytes(ab), "repo.chang"));
+    }
+    buffer.drop(heap, a);
+    let b = verbs.capabilities_reply(heap, "r-1", "x", "1", "async", "repo.gate", 86400000, 1);
+    borrow b as &bb in {
+        same(judge(heap, "capabilities", buffer.bytes(bb)), 11, 0);
+        test.assert(verbs.lists_type(heap, buffer.bytes(bb), "repo.gate"));
+    }
+    buffer.drop(heap, b);
+    let c = verbs.capabilities_reply(heap, "r-1", "x", "1", "sync", "", 1, 1);
+    borrow c as &cb in {
+        same(judge(heap, "capabilities", buffer.bytes(cb)), 10, 0);
+        test.assert(!verbs.lists_type(heap, buffer.bytes(cb), "repo.gate"));
+    }
+    buffer.drop(heap, c);
+    // the wanted type is found wherever it is in the list
+    let many = "{\"task_types\":[{\"type\":\"a\"},{\"type\":\"b\"},{\"type\":\"c\"}]}";
+    test.assert(verbs.lists_type(heap, many, "a"));
+    test.assert(verbs.lists_type(heap, many, "b"));
+    test.assert(verbs.lists_type(heap, many, "c"));
+    test.assert(!verbs.lists_type(heap, many, "d"));
+    // a level the reply writer is given that is not one of the two is not a valid reply
+    let d = verbs.capabilities_reply(heap, "r-1", "x", "1", "maybe", "repo.gate", 1, 1);
+    borrow d as &db in {
+        same(judge(heap, "capabilities", buffer.bytes(db)), 1, verbs.r_level());
+    }
+    buffer.drop(heap, d);
+    // a limit of zero is not a valid limit, and the type list is read only from a body that is an object
+    test.assert(!verbs.lists_type(heap, "not json", "repo.change"));
+    test.assert(!verbs.lists_type(heap, "[]", "repo.change"));
+    test.assert(!verbs.lists_type(heap, "{\"task_types\":5}", "repo.change"));
+    return 0;
+}
+
+fn test_how_a_call_ended_is_the_ending_of_execute_and_a_clean_exit_is_judged[&h](heap: &!h Heap) -> [heap] int {
+    // exit status 0 is judged; every other ending is the one of `forge.dispatch`, whatever was written
+    let body = "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}";
+    match verbs.settle(heap, process.Ran::Code(0), "capabilities", body, "r-1", "r-0", "t-1") {
+        verbs.Settled::Reply(j) => {
+            same(outcome(j), 10, 0);
+        }
+        verbs.Settled::Ended(e) => {
+            test.assert(false);
+        }
+    }
+    match verbs.settle(heap, process.Ran::Code(0), "capabilities", "garbage", "r-1", "r-0", "t-1") {
+        verbs.Settled::Reply(j) => {
+            same(outcome(j), 1, 1);
+        }
+        verbs.Settled::Ended(e) => {
+            test.assert(false);
+        }
+    }
+    test.assert(ended(heap, process.Ran::Code(3), body) == 5);
+    test.assert(ended(heap, process.Ran::Code(1), "") == 5);
+    test.assert(ended(heap, process.Ran::Failed(2), body) == 1);
+    test.assert(ended(heap, process.Ran::TimedOut, body) == 2);
+    test.assert(ended(heap, process.Ran::TooMuch, body) == 3);
+    test.assert(ended(heap, process.Ran::Signaled(9), body) == 4);
+    test.assert(ended(heap, process.Ran::Code(0), body) == 0);
+    return 0;
+}
+
+fn test_every_truncation_and_every_single_byte_change_of_each_reply_is_a_verdict[&h](heap: &!h Heap) -> [heap] int {
+    sweep(heap, "capabilities", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"worker\":{\"name\":\"mock\",\"version\":\"0.1.0\"},\"supports\":[\"forge-worker/1\"],\"level\":\"sync\",\"task_types\":[{\"type\":\"repo.change\",\"limits_max\":{\"timeout_ms\":600000,\"max_output_bytes\":1048576}}]}");
+    sweep(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"target\":\"r-0\"}");
+    sweep(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"step\":\"a\",\"fraction\":0.5},\"updated\":\"t\"}");
+    sweep(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"ev-1\",\"kind\":\"file\",\"ref\":\"out.txt\",\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"bytes\":3}]}");
+    return 0;
+}

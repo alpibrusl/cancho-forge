@@ -1,9 +1,11 @@
 edition 9;
 
 import std.buffer;
+import std.bytes;
 import std.io;
 import std.json;
 import forge.support;
+import forge.verbs;
 
 // The mock worker of docs/worker-contract.md, section 8: one `execute` request on stdin, one response on stdout, exit
 // 0. It does what the request tells it to, the way a real worker would be driven: `task.input.inject` names the
@@ -24,6 +26,23 @@ import forge.support;
 //   missing       evidence naming a file that is not there
 //   link          evidence naming `link`, which the gate made a symlink to a file outside the directory
 //   dotdot        evidence whose ref has two dots
+//
+// The other four verbs (section 3.6) are answered from the request id (`capabilities`) or the `target` (`cancel`, `status`,
+// `result`), so a test reaches every verdict of `forge.verbs` with a real child process:
+//
+//   capabilities, request id      reply
+//   r-async                       level `async` (any other id: `sync`)
+//   r-caps-noversion              `supports` lists a version Forge does not speak
+//   r-caps-level, r-caps-limits, r-caps-worker, r-caps-types, r-caps-supports   one malformed part
+//   cancel, target                reply
+//   c-cancelled, c-none, c-late   `cancelled`, `not_running`, `too_late`
+//   c-bad-state, c-wrong-target, c-no-target, c-wrong-id   one malformed part
+//   status, target                reply
+//   s-queued, s-running, s-finished, s-unknown   the four states (`s-running` with a progress and a time)
+//   s-bad-state, s-bad-fraction, s-bad-step, s-bad-updated, s-wrong-target   one malformed part
+//   result, target                reply
+//   x-notready, x-ok, x-failed    `not_ready`; `succeeded`; `failed` with an error (task id `t-1`)
+//   x-accepted, x-bad-id, x-garbage, x-bad-ref   `accepted` (never a result); another request id; not JSON; an escaped ref
 //
 // It holds `Fs` (to write its evidence), `Io` and `Heap`: no `Net`, no `Exec`.
 
@@ -103,6 +122,252 @@ fn answer[&h, &i, &r, &k, &p](heap: &!h Heap, io: &!i Io, request_id: &r [byte],
     return 0;
 }
 
+// ---- the verbs besides `execute` ---------------------------------------------------------------------------
+
+fn isn[&s, &t](src: &s [byte], tape: &t [int], node: int, text: &static [byte]) -> [] bool {
+    return node >= 0 && json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+fn textn[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] &s [byte] {
+    if node >= 0 && json.is_string(tape, node) && json.string_plain(tape, node) {
+        return json.string_view(src, tape, node);
+    }
+    return "";
+}
+
+// The start of every reply: `{"contract":"forge-worker/1","request_id":...`.
+fn head[&h, &r](heap: &!h Heap, request_id: &r [byte]) -> [heap] json.Writer {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    return w;
+}
+
+fn finish[&h, &i](heap: &!h Heap, io: &!i Io, w: json.Writer) -> [heap, io_write] int {
+    let done = json.end_object(heap, w);
+    let out = json.finish(done);
+    borrow out as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, out);
+    return 0;
+}
+
+fn put_target[&h, &g](heap: &!h Heap, w: json.Writer, target: &g [byte]) -> [heap] json.Writer {
+    var x = json.put_key(heap, w, "target");
+    x = json.put_string(heap, x, target);
+    return x;
+}
+
+fn reply_capabilities[&h, &i, &r](heap: &!h Heap, io: &!i Io, rid: &r [byte]) -> [heap, io_write] int {
+    var level = "sync";
+    if bytes.equal(rid, "r-async") {
+        level = "async";
+    }
+    var version = "forge-worker/1";
+    if bytes.equal(rid, "r-caps-noversion") {
+        version = "forge-worker/9";
+    }
+    var w = head(heap, rid);
+    w = json.put_key(heap, w, "worker");
+    if bytes.equal(rid, "r-caps-worker") {
+        w = json.put_string(heap, w, "mock");
+    } else {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "name");
+        w = json.put_string(heap, w, "mock");
+        w = json.put_key(heap, w, "version");
+        w = json.put_string(heap, w, "0.1.0");
+        w = json.end_object(heap, w);
+    }
+    w = json.put_key(heap, w, "supports");
+    if bytes.equal(rid, "r-caps-supports") {
+        w = json.begin_array(heap, w);
+        w = json.end_array(heap, w);
+    } else {
+        w = json.begin_array(heap, w);
+        w = json.put_string(heap, w, version);
+        w = json.end_array(heap, w);
+    }
+    w = json.put_key(heap, w, "level");
+    if bytes.equal(rid, "r-caps-level") {
+        w = json.put_string(heap, w, "eventually");
+    } else {
+        w = json.put_string(heap, w, level);
+    }
+    w = json.put_key(heap, w, "task_types");
+    if bytes.equal(rid, "r-caps-types") {
+        w = json.put_string(heap, w, "repo.change");
+    } else {
+        w = json.begin_array(heap, w);
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "type");
+        w = json.put_string(heap, w, "repo.change");
+        w = json.put_key(heap, w, "limits_max");
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "timeout_ms");
+        if bytes.equal(rid, "r-caps-limits") {
+            w = json.put_int(heap, w, 0);
+        } else {
+            w = json.put_int(heap, w, 600000);
+        }
+        w = json.put_key(heap, w, "max_output_bytes");
+        w = json.put_int(heap, w, 1048576);
+        w = json.end_object(heap, w);
+        w = json.end_object(heap, w);
+        w = json.end_array(heap, w);
+    }
+    return finish(heap, io, w);
+}
+
+fn reply_cancel[&h, &i, &r, &g](heap: &!h Heap, io: &!i Io, rid: &r [byte], target: &g [byte]) -> [heap, io_write] int {
+    var state = "cancelled";
+    if bytes.equal(target, "c-none") {
+        state = "not_running";
+    }
+    if bytes.equal(target, "c-late") {
+        state = "too_late";
+    }
+    if bytes.equal(target, "c-bad-state") {
+        state = "done";
+    }
+    var id = rid;
+    if bytes.equal(target, "c-wrong-id") {
+        id = "r-other";
+    }
+    var w = head(heap, id);
+    w = json.put_key(heap, w, "state");
+    w = json.put_string(heap, w, state);
+    if bytes.equal(target, "c-wrong-target") {
+        w = put_target(heap, w, "r-other");
+    } else if !bytes.equal(target, "c-no-target") {
+        w = put_target(heap, w, target);
+    }
+    return finish(heap, io, w);
+}
+
+fn reply_status[&h, &i, &r, &g](heap: &!h Heap, io: &!i Io, rid: &r [byte], target: &g [byte]) -> [heap, io_write] int {
+    var state = "queued";
+    if bytes.equal(target, "s-running") || bytes.equal(target, "s-bad-fraction") || bytes.equal(target, "s-bad-step") || bytes.equal(target, "s-bad-updated") {
+        state = "running";
+    }
+    if bytes.equal(target, "s-finished") {
+        state = "finished";
+    }
+    if bytes.equal(target, "s-unknown") {
+        state = "unknown";
+    }
+    if bytes.equal(target, "s-bad-state") {
+        state = "paused";
+    }
+    var w = head(heap, rid);
+    w = json.put_key(heap, w, "state");
+    w = json.put_string(heap, w, state);
+    if bytes.equal(target, "s-wrong-target") {
+        w = put_target(heap, w, "r-other");
+    } else {
+        w = put_target(heap, w, target);
+    }
+    if bytes.equal(target, "s-running") || bytes.equal(target, "s-bad-fraction") || bytes.equal(target, "s-bad-step") {
+        w = json.put_key(heap, w, "progress");
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "step");
+        if bytes.equal(target, "s-bad-step") {
+            w = json.put_int(heap, w, 7);
+        } else {
+            w = json.put_string(heap, w, "running tests");
+        }
+        w = json.put_key(heap, w, "fraction");
+        if bytes.equal(target, "s-bad-fraction") {
+            w = json.put_int(heap, w, 2);
+        } else {
+            w = json.put_fragment(heap, w, "0.6");
+        }
+        w = json.end_object(heap, w);
+    }
+    if bytes.equal(target, "s-running") {
+        w = json.put_key(heap, w, "updated");
+        w = json.put_string(heap, w, "2026-10-21T10:00:00Z");
+    }
+    if bytes.equal(target, "s-bad-updated") {
+        w = json.put_key(heap, w, "updated");
+        w = json.put_int(heap, w, 5);
+    }
+    return finish(heap, io, w);
+}
+
+fn reply_result[&h, &i, &r, &g](heap: &!h Heap, io: &!i Io, rid: &r [byte], target: &g [byte]) -> [heap, io_write] int {
+    if bytes.equal(target, "x-garbage") {
+        io.write_all(io, "this is not json\n");
+        return 0;
+    }
+    if bytes.equal(target, "x-notready") {
+        var w = head(heap, rid);
+        w = json.put_key(heap, w, "state");
+        w = json.put_string(heap, w, "not_ready");
+        return finish(heap, io, w);
+    }
+    var id = rid;
+    if bytes.equal(target, "x-bad-id") {
+        id = "r-other";
+    }
+    if bytes.equal(target, "x-failed") {
+        return answer(heap, io, id, "t-1", "failed", false, "", abc_sha(), 0, true);
+    }
+    if bytes.equal(target, "x-accepted") {
+        return answer(heap, io, id, "t-1", "accepted", false, "", abc_sha(), 0, false);
+    }
+    if bytes.equal(target, "x-bad-ref") {
+        return answer(heap, io, id, "t-1", "succeeded", true, "../x", abc_sha(), 3, false);
+    }
+    return answer(heap, io, id, "t-1", "succeeded", false, "", abc_sha(), 0, false);
+}
+
+// Is this request one of the four verbs besides `execute` of this contract? If so it is answered here and this is true;
+// anything else (an `execute`, or what is not a request of the contract) is left to `serve`.
+fn serve_verb[&h, &i, &s, &t](heap: &!h Heap, io: &!i Io, src: &s [byte], tp: &t [int]) -> [heap, io_read, io_write] bool {
+    if !isn(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") {
+        return false;
+    }
+    let verb = json.get(src, tp, 0, "verb");
+    let rid = textn(src, tp, json.get(src, tp, 0, "request_id"));
+    let target = textn(src, tp, json.get(src, tp, 0, "target"));
+    if bytes.equal(target, "v-overflow") {
+        var n = 0;
+        while n < 200 {
+            io.write_all(io, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+            n = n + 1;
+        }
+    }
+    if bytes.equal(target, "v-hang") {
+        var c = getchar(io);
+        while c >= 0 || c < 0 {
+            c = getchar(io);
+        }
+    }
+    if isn(src, tp, verb, "capabilities") {
+        reply_capabilities(heap, io, rid);
+        return true;
+    }
+    if isn(src, tp, verb, "cancel") {
+        reply_cancel(heap, io, rid, target);
+        return true;
+    }
+    if isn(src, tp, verb, "status") {
+        reply_status(heap, io, rid, target);
+        return true;
+    }
+    if isn(src, tp, verb, "result") {
+        reply_result(heap, io, rid, target);
+        return true;
+    }
+    return false;
+}
+
 fn serve[&h, &i, &f, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), g: &g Args) -> [heap, io_read, io_write, args, fs_write(""), file_write] int {
     let request = read_request(heap, io);
     var code = 0;
@@ -111,7 +376,9 @@ fn serve[&h, &i, &f, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), g: &g Args) 
         let tape = box_slice(heap, json.tape_len(src), 0);
         borrow mut tape as &!t in {
             let tp = contents(t);
-            if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+            let handled = json.parse(src, tp) > 0 && json.is_object(tp, 0) && serve_verb(heap, io, src, tp);
+            if handled {
+            } else if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
                 let task = json.get(src, tp, 0, "task");
                 let inject = json.get(src, tp, json.get(src, tp, task, "input"), "inject");
                 let rid = json.string_view(src, tp, json.get(src, tp, 0, "request_id"));

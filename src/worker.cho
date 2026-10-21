@@ -7,6 +7,7 @@ import std.process;
 import forge.dispatch;
 import forge.evidence_io;
 import forge.response;
+import forge.verbs;
 
 // Running a worker (docs/worker-contract.md, sections 3.2, 5 and 8): build the `execute` request, start the worker
 // beneath the workers directory under a deadline and an output cap, and turn how it ended, and what it wrote, into an
@@ -145,4 +146,22 @@ pub fn execute[&h, &x, &w, &f, &c, &n, &q, &r, &k, &e](heap: &!h Heap, exec: &x 
     }
     buffer.drop(heap, out);
     return ending;
+}
+
+// One call of a verb besides `execute` (docs/worker-contract.md, section 3.6): `capabilities`, or `cancel`, `status` and
+// `result` about the request `target`. Nothing is started for a verb the worker's declared `level` does not have: that is
+// `worker-verb-unsupported` (and so is a `request` that is empty, which `build_targeted` makes of a verb it does not
+// know). Otherwise the worker is run as `execute` runs it (the same bounds, the same endings) and the reply is judged by
+// `forge.verbs`. A `result` that is `Ready` still has its evidence to be recomputed by `execute`'s caller.
+pub fn call[&h, &x, &d, &c, &n, &v, &q, &r, &g, &k](heap: &!h Heap, exec: &x Exec(""), workers: &d Dir, clock: &c Clock, name: &n [byte], level: verbs.Level, verb: &v [byte], request: &q [byte], request_id: &r [byte], target: &g [byte], task_id: &k [byte], most: int, timeout_ms: int) -> [heap, exec_under, clock, poll] verbs.Settled {
+    if len(request) == 0 || !verbs.verb_allowed(level, verb) {
+        return verbs.Settled::Reply(verbs.refuse_verb());
+    }
+    let (out, ran) = run(heap, exec, workers, clock, name, request, most, timeout_ms);
+    var settled = verbs.Settled::Reply(verbs.refuse_verb());
+    borrow out as &ob in {
+        settled = verbs.settle(heap, ran, verb, buffer.bytes(ob), request_id, target, task_id);
+    }
+    buffer.drop(heap, out);
+    return settled;
 }

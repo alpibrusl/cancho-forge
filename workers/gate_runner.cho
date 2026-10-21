@@ -9,6 +9,7 @@ import forge.gate_env;
 import forge.gate_task;
 import forge.journal_io;
 import forge.snapshot;
+import forge.verbs;
 
 // The gate runner (docs/self-hosting.md section 3.1; issue #20): a `sync` worker of the contract
 // (docs/worker-contract.md, section 10). One `execute` request on stdin, one response on stdout, exit 0. The task is
@@ -418,7 +419,15 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                 }
                 // A request that is not an `execute` of this contract, or that names no request and no task, is not
                 // answered: the worker has nothing to say that Forge could match to a call.
-                if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
+                if is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") && is(src, tp, json.get(src, tp, 0, "verb"), "capabilities") && len(text_of(src, tp, rid)) > 0 {
+                    // The only other verb of a `sync` worker (docs/worker-contract.md, 1.2 and 3.1).
+                    let reply = verbs.capabilities_reply(heap, text_of(src, tp, rid), "gate-runner", "0.1.0", "sync", "repo.gate", gate_task.max_timeout_ms(), 1048576);
+                    borrow reply as &yb in {
+                        io.write_all(io, buffer.bytes(yb));
+                    }
+                    io.newline(io);
+                    buffer.drop(heap, reply);
+                } else if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
                     code = 4;
                 } else {
                     let repo = text_of(src, tp, json.get(src, tp, input, "repo"));

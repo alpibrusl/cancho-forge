@@ -239,6 +239,56 @@ ending.
 twice returns the same answer (idempotent); a worker may not change a result
 once reported.
 
+### 3.6 Which verb goes to which worker, and how a reply to it is judged *(built: `src/verbs.cho`, `forge.worker.call`)*
+
+The level a worker declares (section 1.2) decides what Forge sends it:
+
+| verb | `sync` worker | `async` worker |
+|---|---|---|
+| `capabilities` | answered | answered |
+| `execute` | answered | answered (may answer `accepted`) |
+| `cancel`, `status`, `result` | **not sent**: `worker-verb-unsupported`, nothing is started | answered |
+
+A worker's **level is learned from its own `capabilities` reply**, not assumed (section 3.1 says: asked at registration,
+kept per worker version; the wiring of that is not built, see the end of this section). `forge.worker.call` is the one door for the four verbs besides `execute`:
+it checks the verb against the level **before** it starts anything (the refusal costs no process), builds the request
+(`verbs.build_capabilities`, `verbs.build_targeted`: a verb that is not one of the three that name a `target` is not built,
+so a wrong name cannot reach a worker), runs the worker as `execute` runs it (same capability, same deadline, same output
+cap, same endings 1 to 5 of section 5 with the same rule tags) and judges what it wrote (`verbs.judge`).
+
+What makes a reply valid, checked before any field is used (a reply is judged as a whole; nothing is half-read):
+
+* **All four:** one JSON object, `contract` is `forge-worker/1`, `request_id` is the id of **this** request.
+* **`capabilities`:** `worker` is an object with a `name` and a `version`, each plain text of 1 to 128 bytes; `supports`
+  is a list of 1 to 16 strings; `level` is exactly `sync` or `async`; `task_types` is a list of at most 64 objects, each
+  with a plain `type` of 1 to 128 bytes and `limits_max` an object whose `timeout_ms` and `max_output_bytes` are integers
+  of at least 1 that fit 64 bits. When all of that holds and `supports` does not contain `forge-worker/1`, the reply is
+  `worker-contract-version` (decided **last**: a malformed reply is never taken for a version mismatch). A task whose
+  `type` is not in `task_types` is not sent (`verbs.lists_type`; the refusal that Forge makes for it is `policy-denied`,
+  still designed).
+* **`cancel`:** `target` is the request the verb was about, and `state` is one of `cancelled`, `not_running`, `too_late`.
+* **`status`:** `target` as above; `state` is one of `queued`, `running`, `finished`, `unknown`; `progress`, if present, is
+  an object whose `step`, if present, is text of at most 256 bytes and whose `fraction`, if present, is a number from 0 to 1;
+  `updated`, if present, is plain text of 1 to 128 bytes. A status is advisory: nothing in it moves a task.
+* **`result`:** either `{"state":"not_ready"}` (with the right contract and request id), or the final response of
+  `execute` (section 3.2) judged as a `sync` reply for the same task: so `accepted` is **not** a result, and the evidence
+  rules of section 4 hold, with the evidence refusals keeping their own rule `evidence-ref-invalid`. The caller still
+  recomputes the evidence against the files, as for `execute`.
+
+Refusals (`docs/architecture.md`, section 7): `worker-protocol` for a reply that is not valid for its verb (the reason
+is a code, `verbs.reason_name`, 30 to 41, beside those of `forge.response`, 1 to 22); `worker-contract-version` for no
+common version; `worker-verb-unsupported` for a verb the declared level has not (and for a verb the contract has not);
+`evidence-ref-invalid` for the evidence of a result. None moves a task by itself: what a refusal does to a task is the
+policy layer's (milestone M4).
+
+**Answered by the three workers of this repository** (all `sync`): the mock worker answers every verdict above from the
+request id or the `target` (the table is at the top of `tests/contract/mock_worker.cho`, so a test reaches each verdict
+with a real child process); the stub LLM and the gate runner answer `capabilities` (task types `repo.change` and
+`repo.gate`) and, being `sync`, are sent nothing else; a `cancel`, `status` or `result` forced onto them is not answered
+(exit 4, `worker-error`), which is the conformance a `sync` worker owes. **Not built:** a worker at the `async` level
+that does the work (the mock only answers the verdicts), so the `accepted` / poll / `result` flow is **not measured end
+to end**; Forge does not yet call `capabilities` at registration, cache the answer, or act on `status`; that is M4.
+
 ## 4. Evidence references
 
 Evidence is **by reference**. The journal does not hold file contents.
@@ -339,7 +389,9 @@ output it relays (`threat-model.md`):
 | bounds: deadline, output cap, exit status, kill | S2 | **measured** |
 | the `Exec` bound a worker is started under | S3 | **measured** |
 | a worker's subprocesses are killed with it | S7 | **measured: not for a plain start; yes for a detached start, killed by `capture` or by `child_kill_group`, with no `/bin/kill`** (corrected after cancho #533) |
-| `capabilities`, `cancel`, `status`, `result`, `async` level | | designed |
+| `capabilities`, `cancel`, `status`, `result`: the requests, and the judgement of each reply as a pure function (section 3.6) | `src/verbs.cho`; `tests/verbs_test.cho` (11 tests: every state, every malformed part with its reason, the limits at the byte, the version rule, the request builders byte for byte, every truncation and every single-byte change of a valid reply of each verb); `scripts/mutate_verbs.py` (69 deliberate breaks, all killed; two equivalent breaks left out, see its header) | **measured** |
+| the same four verbs against real workers: `forge.worker.call` starts the worker beneath the workers directory under a deadline, checks the verb against the level before it starts anything, and judges the reply | `tests/conformance/verbs.cho` (47 cases as real child processes: the mock worker for every verdict, the stub LLM and the gate runner for `capabilities`), in `scripts/gate.sh` | **measured** |
+| the `async` level that does the work: `accepted`, then `status` and `result` of a running job | | designed; the mock answers the verbs but does no work |
 | contract tests run against mock and the real adapter | `tests/contract/` (M2) | not started |
 | the response of `execute` against section 2, 3.2 and 4 (the shape, the closed sets, the ref and hash syntax, the bounds), as a pure function | `src/response.cho`; `tests/response_test.cho` (19 tests, among them every prefix and every single-byte change of a valid response), and `scripts/mutate_response.py` (32 deliberate breaks, all killed) | **built** (rows 6, 9 and 10 of section 5 are reached by it) |
 | how a run ended (section 5) to a rule tag and a consequence, as a pure function of what `capture` observed and the bytes it captured | `src/dispatch.cho` (`classify`, `rule_tag`, `consequence`); `tests/dispatch_test.cho` (14 tests: every row, and that the ending wins over what the worker wrote), `scripts/mutate_dispatch.py` (28 deliberate breaks, all killed) | **built**. Not built: the half that spawns beneath the workers directory under a deadline and feeds `classify`; reading `error.retryable` for the `worker-said` consequence |
@@ -440,8 +492,9 @@ binding (audit 5) and has not been spiked from a cancho client.
 ## 10. The gate runner: task type `repo.gate` *(built: `workers/gate_runner.cho`)*
 
 The first real worker (issue #20, `docs/self-hosting.md` section 3.1). It speaks the **stdio binding** (section 1) at the
-`sync` level and implements `execute` only: `capabilities`, `cancel`, `status` and `result` are not built (#14), and a
-request with any other verb is not answered (exit 4, nothing on stdout). It is a cancho program; no foreign code.
+`sync` level and implements `execute` and `capabilities` (task type `repo.gate`, the largest timeout of one day); `cancel`,
+`status` and `result` are the `async` level's (section 3.6), and a request with any other verb is not answered (exit 4,
+nothing on stdout). It is a cancho program; no foreign code.
 
 ### 10.1 The task
 
@@ -515,7 +568,7 @@ the fixed `PATH` and the operator's `grants.env`, nothing else (D7); the runner'
 
 ### 10.5 Not done
 
-`capabilities`/`cancel`/`status`/`result`; a gate of a real repository run to agreement with CI (self-hosting section 8 says what was measured); a gate that starts a descendant that
+The `async` level (a runner that answers `accepted` and is polled); a gate of a real repository run to agreement with CI (self-hosting section 8 says what was measured); a gate that starts a descendant that
 leaves the gate's group (`setsid`: not reached by the group kill, cancho `docs/processes.md` section 9); a runner that
 dies in the middle of a gate (its detached gate is orphaned: spike S11, G4); the `exec`-in-place case (a shell that runs the gate's last command in its own process: dash does not, bash may; the trailing `exit $?` is there for it and only the unit test sees it); several runners at once; macOS.
 

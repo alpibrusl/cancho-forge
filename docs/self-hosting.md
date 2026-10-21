@@ -279,7 +279,7 @@ outcome recorded as claimed evidence. A task whose gate fails still ends
 | `main` wiring of `worker.cho` | [#17](https://github.com/alpibrusl/cancho-forge/issues/17) | Stage 1 | **done for one verb**: `forge gate` links it; `docs/authority.txt` widened (architecture section 4.9). Not a general wiring: no other verb starts a worker |
 | Gate-runner worker | [#20](https://github.com/alpibrusl/cancho-forge/issues/20) | Stage 1 | **built**, wired into `forge gate`; run on two real repositories, see section 8 and D7 |
 | First self-hosted task | [#18](https://github.com/alpibrusl/cancho-forge/issues/18) | Stage 1 | **built** (`forge gate`, section 3.1); run on `cancho-forge` and `cancho-ui` with the operator's environment it **agrees with CI** (one revision each, section 8); without it, `incomplete` (D7) |
-| `capabilities`/`cancel`/`status`/`result` | [#14](https://github.com/alpibrusl/cancho-forge/issues/14) | `status` and `cancel` of a long run; **not** a blocker of a sync runner | open |
+| `capabilities`/`cancel`/`status`/`result` | [#14](https://github.com/alpibrusl/cancho-forge/issues/14) | `status` and `cancel` of a long run; **not** a blocker of a sync runner | requests and judgement built and measured (worker-contract 3.6); the `async` level that does work, and Forge calling `capabilities` at registration, are not |
 | `error.retryable` | [#15](https://github.com/alpibrusl/cancho-forge/issues/15) | policy retries; a gate that fails is not retried | open |
 | Cancho Code adapter | [#16](https://github.com/alpibrusl/cancho-forge/issues/16), blocked on [cancho#562](https://github.com/alpibrusl/cancho/issues/562) | Stage 3 | blocked |
 | M3 (observed checks) | roadmap | Stage 2 | not started |
@@ -386,11 +386,22 @@ Also measured: the first self-hosted task (`forge gate`): 13 unit tests (`tests/
 | cancho-ui @ `5e77f0b` | `PATH` (`~/.cargo/bin`), `HOME`, `CARGO_HOME`, `RUSTUP_HOME` | claimed **pass**, `verification`, exit 0 | 99 s (an earlier run: 84 s) | green (the `gate` run of that commit on `main`, 70 s) |
 | cancho-forge @ `d35285f` | none | **incomplete**, `environment`, exit 127: `the gate needs cancho, which is not on PATH`; the task is `blocked`, exit 4, no claim | 0.01 s | n/a |
 | cancho-ui @ `5e77f0b` | none | **incomplete**, `environment`, exit 127: `the gate needs cargo ...`; `blocked`, exit 4 | 0.02 s | n/a |
+| cancho @ `844b168` | `PATH` (the compiler's `target/release` and the system directories), `HOME`, `CANCHO_CACHE`, `CARGO_HOME`, `RUSTUP_HOME` | claimed **pass**, task in `verification`, exit 0, report `verdict: pass` | 1,998 s (33 m 18 s) | green (`ci`, 14:41:15 to 15:26:41 UTC the same day: about 45 m) |
+| cancho-hdl @ `56d1ebd` | `PATH` (as above, with `/usr/bin` for `git`, `python3`, `iverilog`), `HOME`, `CANCHO_CACHE`; the compiler checkout beside the checkout (`../cancho`, the path `scripts/gate_cancho.sh` expects) | claimed **pass**, `verification`, exit 0, report `verdict: pass` | 3,219 s (53 m 39 s) | green (`ci`, 14:12:38 to 14:52:22 UTC the same day: about 40 m) |
 
-So for these two revisions Forge's claim equals CI's, once the operator provides the environment, and an environment that is
-not provided is no longer claimed as the project's failure. **That is two data points, not N**: the other two repositories
-(`cancho`, `cancho-hdl`) were not run, no revision with a failing CI was run (so "Forge says fail when CI says fail" is
-unmeasured for a real gate), and the times are one run each.
+So for these four revisions Forge's claim equals CI's, once the operator provides the environment, and an environment that is
+not provided is no longer claimed as the project's failure. **That is four data points, not N**: each repository was
+run once, all four are passes, no revision with a failing CI was run (so "Forge says fail when CI says fail" is unmeasured
+for a real gate), and the times are one run each. The two long runs were measured on a 4-core container that was also running
+other work (a second cargo build for most of the `cancho` run; the mutation and gate runs of this change during the
+`cancho-hdl` run), so their times are upper bounds on what Forge adds; CI's times are on GitHub's runners and are not
+comparable as a ratio. Both ended well inside the deadline given (`cancho`: 2,880,000 ms; `cancho-hdl`: 5,400,000 ms), and
+the process table showed nothing of either gate left behind afterwards. What the runs show about Forge is that the deadline of D7 has to be given per
+repository (a single default would have cut the `cancho-hdl` gate); the allow-list's `max_timeout_ms` (24 h) already allows
+it, so no change was needed. The preflight lists only `git` for `cancho-hdl`, but its gate also needs `python3`, `cc`,
+`iverilog` and the compiler beside the checkout: the run passed because the operator provided them, and a missing one would
+have shown as a `fail` of that step, not as `incomplete`; extending `required_tools` for it is a table row and a test, not
+done here because the list of tools of that gate is the gate's own to state (it is not machine-readable today).
 
 **What measuring found, and the change it caused.** The first run without `cancho` on the `PATH` (before the preflight below)
 was still claimed `fail`: `scripts/gate.sh` runs every step, counts the failed ones and exits 1, so the shell's 127 never
@@ -403,7 +414,7 @@ is still `fail` when that tool is missing (the list is a table row to extend, wi
 
 Not measured, and not claimed:
 
-* a gate run of `cancho` or `cancho-hdl` through Forge; a gate that really fails, in agreement with CI; the time per run beyond one run (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
+* a gate that really fails, in agreement with CI; a second run of the same revision (the time per run beyond one run) (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
 * anything with a real worker, a real network, power loss, macOS, several
   workers at once, or a journal larger than the tests'.
 

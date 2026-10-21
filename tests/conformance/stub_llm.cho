@@ -394,7 +394,7 @@ fn run[&h, &x, &w, &f, &c, &i, &b](heap: &!h Heap, exec: &x Exec(""), workers: &
     // requests the stub does not serve: no answer, exit 4
     bad = bad + exits(heap, exec, workers, clock, io, "refused_not_json", "this is not json", 4);
     bad = bad + exits(heap, exec, workers, clock, io, "refused_not_an_object", "[]", 4);
-    bad = bad + exits(heap, exec, workers, clock, io, "refused_other_verb", "{\"contract\":\"forge-worker/1\",\"verb\":\"capabilities\",\"request_id\":\"r-1\",\"task\":{\"id\":\"t-1\",\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
+    bad = bad + exits(heap, exec, workers, clock, io, "refused_other_verb", "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-1\",\"task\":{\"id\":\"t-1\",\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
     bad = bad + exits(heap, exec, workers, clock, io, "refused_other_contract", "{\"contract\":\"forge-worker/2\",\"verb\":\"execute\",\"request_id\":\"r-1\",\"task\":{\"id\":\"t-1\",\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
     bad = bad + exits(heap, exec, workers, clock, io, "refused_no_request_id", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"task\":{\"id\":\"t-1\",\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
     bad = bad + exits(heap, exec, workers, clock, io, "refused_no_task_id", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r-1\",\"task\":{\"input\":{\"prompt\":\"go\"}},\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
