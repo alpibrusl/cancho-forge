@@ -10,16 +10,19 @@ import forge.support;
 import forge.worker;
 
 // The gate runner against real repositories and real child processes (docs/self-hosting.md 3.1, worker-contract 10).
-// `scripts/gate.sh` builds git checkouts whose `scripts/gate.sh` do one thing each (pass, fail, hang, write too much,
+// `scripts/gate.sh` builds git checkouts whose `scripts/gate_cancho.sh` do one thing each (pass, fail, hang, write too much,
 // kill their shell), starts this program, and then looks at the evidence files itself (the oracle is outside the
 // programs). This program checks what only it can see: the worker's reply (its state and error code), the time it took,
 // and that Forge's own path (`forge.worker.execute`) accepts a good run's evidence.
 //
 // Usage: gate_runner <workers directory holding gate_runner> <scratch directory> <revision of each of ws_pass ws_fail
-//        ws_hang ws_noisy ws_sig>. Execution directories `ev_*` exist under the scratch directory.
+//        ws_hang ws_noisy ws_sig ws_env ws_127 ws_126>. Execution directories `ev_*` exist under the scratch directory.
 
+// The repository the fixtures stand for: the row of `cancho-hdl` runs `scripts/gate_cancho.sh` and needs only `git`, which
+// the runner needs anyway; the row of `cancho-forge` also needs `cancho`, which these fixtures do not have (the checks of
+// it are in scripts/check_gate_run.sh).
 fn forge_repo() -> [] &static [byte] {
-    return "alpibrusl/cancho-forge";
+    return "alpibrusl/cancho-hdl";
 }
 
 fn a_revision() -> [] &static [byte] {
@@ -59,13 +62,14 @@ fn reply_is[&h, &b](heap: &!h Heap, out: &b [byte], state: &static [byte], code:
     return held;
 }
 
-// One case through `worker.run`: the reply must be `state`/`code` with `evidence` entries, within `within_ms`.
-fn case[&h, &x, &w, &c, &i, &d, &r, &v, &s](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], task_type: &static [byte], repo_key: &r [byte], revision: &v [byte], workspace: &s [byte], exec_dir: &d [byte], timeout_ms: int, state: &static [byte], code: &static [byte], evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+// One case through `worker.run`: the reply must be `state`/`code` with `evidence` entries, within `within_ms`. `env` is the
+// text put in `grants.env` (empty for none; any JSON, so that a bad one can be sent).
+fn case[&h, &x, &w, &c, &i, &d, &r, &v, &s, &n](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], task_type: &static [byte], repo_key: &r [byte], revision: &v [byte], workspace: &s [byte], exec_dir: &d [byte], env: &n [byte], timeout_ms: int, state: &static [byte], code: &static [byte], evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
     let inp = input(heap, repo_key, revision);
     let began = clock_ms(clock);
     var held = false;
     borrow inp as &ib in {
-        let req = worker.build_execute(heap, "r-1", 1, "t-1", task_type, buffer.bytes(ib), timeout_ms, 1048576, workspace, exec_dir);
+        let req = worker.build_execute_env(heap, "r-1", 1, "t-1", task_type, buffer.bytes(ib), timeout_ms, 1048576, workspace, exec_dir, env);
         borrow req as &qb in {
             let (out, ran) = worker.run(heap, exec, workers, clock, "gate_runner", buffer.bytes(qb), 1048576, timeout_ms);
             borrow out as &ob in {
@@ -139,14 +143,19 @@ fn forge_path[&h, &x, &w, &f, &c, &i, &v, &s, &d](heap: &!h Heap, exec: &x Exec(
     return support.verdict(io, held, "forge's path: the evidence of a good run is recomputed and held, and the task goes to verification");
 }
 
-// `case` with the workspace `ws_*` and the execution directory `ev_*` beneath the scratch directory.
+// `case` with the workspace `ws_*` and the execution directory `ev_*` beneath the scratch directory, and no environment.
 fn go[&h, &x, &w, &c, &i, &s, &r, &v](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, scratch: &s [byte], label: &static [byte], task_type: &static [byte], repo_key: &r [byte], revision: &v [byte], ws_name: &static [byte], ev_name: &static [byte], timeout_ms: int, state: &static [byte], code: &static [byte], evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+    return go_env(heap, exec, workers, clock, io, scratch, label, task_type, repo_key, revision, ws_name, ev_name, "", timeout_ms, state, code, evidence, within_ms);
+}
+
+// `go` with the operator's environment (`grants.env`).
+fn go_env[&h, &x, &w, &c, &i, &s, &r, &v, &n](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, scratch: &s [byte], label: &static [byte], task_type: &static [byte], repo_key: &r [byte], revision: &v [byte], ws_name: &static [byte], ev_name: &static [byte], env: &n [byte], timeout_ms: int, state: &static [byte], code: &static [byte], evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
     let workspace = support.under(heap, scratch, ws_name);
     let exec_dir = support.under(heap, scratch, ev_name);
     var bad = 0;
     borrow workspace as &wb in {
         borrow exec_dir as &eb in {
-            bad = case(heap, exec, workers, clock, io, label, task_type, repo_key, revision, buffer.bytes(wb), buffer.bytes(eb), timeout_ms, state, code, evidence, within_ms);
+            bad = case(heap, exec, workers, clock, io, label, task_type, repo_key, revision, buffer.bytes(wb), buffer.bytes(eb), env, timeout_ms, state, code, evidence, within_ms);
         }
     }
     buffer.drop(heap, workspace);
@@ -154,7 +163,7 @@ fn go[&h, &x, &w, &c, &i, &s, &r, &v](heap: &!h Heap, exec: &x Exec(""), workers
     return bad;
 }
 
-fn run[&h, &x, &w, &f, &c, &i, &s, &a, &b, &d, &e, &g](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, scratch: &s [byte], rev_pass: &a [byte], rev_fail: &b [byte], rev_hang: &d [byte], rev_noisy: &e [byte], rev_sig: &g [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read, io_write] int {
+fn run[&h, &x, &w, &f, &c, &i, &s, &a, &b, &d, &e, &g, &k, &l, &m](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, scratch: &s [byte], rev_pass: &a [byte], rev_fail: &b [byte], rev_hang: &d [byte], rev_noisy: &e [byte], rev_sig: &g [byte], rev_env: &k [byte], rev_127: &l [byte], rev_126: &m [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read, io_write] int {
     var bad = 0;
     let repo = forge_repo();
     bad = bad + go(heap, exec, workers, clock, io, scratch, "a gate that passes: succeeded, a log and a report", "repo.gate", repo, rev_pass, "ws_pass", "ev_pass", 20000, "succeeded", "", 2, 15000);
@@ -171,6 +180,19 @@ fn run[&h, &x, &w, &f, &c, &i, &s, &a, &b, &d, &e, &g](heap: &!h Heap, exec: &x 
     bad = bad + go(heap, exec, workers, clock, io, scratch, "another task type: failed, task-type-invalid", "repo.change", repo, rev_pass, "ws_pass", "ev_refuse", 20000, "failed", "task-type-invalid", 0, 5000);
     bad = bad + go(heap, exec, workers, clock, io, scratch, "a timeout under two seconds: failed, limits-invalid", "repo.gate", repo, rev_pass, "ws_pass", "ev_refuse", 1999, "failed", "limits-invalid", 0, 5000);
     bad = bad + go(heap, exec, workers, clock, io, scratch, "a shell metacharacter in a path: failed, path-invalid, nothing run", "repo.gate", repo, rev_pass, "ws_pass;x", "ev_refuse", 20000, "failed", "path-invalid", 0, 5000);
+    // ---- the operator's environment (docs/self-hosting.md D7)
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "an operator environment reaches the gate: succeeded, a log and a report", "repo.gate", repo, rev_env, "ws_env", "ev_env", "[\"PATH=/opt/forge-x:/root/.cargo/bin\",\"HOME=/work/home\",\"CANCHO_CACHE=/work/cache\",\"CARGO_HOME=/work/cargo\",\"RUSTUP_HOME=/work/rustup\"]", 20000, "succeeded", "", 2, 15000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "an empty environment is none: succeeded", "repo.gate", repo, rev_env, "ws_env", "ev_envnone", "[]", 20000, "succeeded", "", 2, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a gate whose command is not found (127): incomplete, gate-environment, a log and a report, no verdict claimed", "repo.gate", repo, rev_127, "ws_127", "ev_127", 20000, "failed", "gate-environment", 2, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a gate whose command is not executable (126): incomplete, gate-environment", "repo.gate", repo, rev_126, "ws_126", "ev_126", 20000, "failed", "gate-environment", 2, 15000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "a name that is not on the list (LD_PRELOAD): failed, env-invalid, nothing run", "repo.gate", repo, rev_env, "ws_env", "ev_refuse", "[\"LD_PRELOAD=/x/y.so\"]", 20000, "failed", "env-invalid", 0, 5000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "a relative HOME: failed, env-invalid", "repo.gate", repo, rev_env, "ws_env", "ev_refuse", "[\"HOME=work/home\"]", 20000, "failed", "env-invalid", 0, 5000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "a value with a space: failed, env-invalid", "repo.gate", repo, rev_env, "ws_env", "ev_refuse", "[\"HOME=/work/my home\"]", 20000, "failed", "env-invalid", 0, 5000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "a name twice: failed, env-invalid", "repo.gate", repo, rev_env, "ws_env", "ev_refuse", "[\"HOME=/a\",\"HOME=/b\"]", 20000, "failed", "env-invalid", 0, 5000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "six entries: failed, env-invalid", "repo.gate", repo, rev_env, "ws_env", "ev_refuse", "[\"HOME=/a\",\"HOME=/a\",\"HOME=/a\",\"HOME=/a\",\"HOME=/a\",\"HOME=/a\"]", 20000, "failed", "env-invalid", 0, 5000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "env that is a string, not an array: failed, env-invalid", "repo.gate", repo, rev_env, "ws_env", "ev_refuse", "\"HOME=/work/home\"", 20000, "failed", "env-invalid", 0, 5000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "an entry that is not a string: failed, env-invalid", "repo.gate", repo, rev_env, "ws_env", "ev_refuse", "[7]", 20000, "failed", "env-invalid", 0, 5000);
+    bad = bad + go_env(heap, exec, workers, clock, io, scratch, "a task with two faults is refused for the first (scope before env)", "repo.gate", "alpibrusl/cancho-mqtt", rev_env, "ws_env", "ev_refuse", "[\"LD_PRELOAD=/x\"]", 20000, "failed", "scope-invalid", 0, 5000);
     bad = bad + raw(heap, exec, workers, clock, io, "garbage on stdin: no answer, exit 4", "this is not json", 4);
     bad = bad + raw(heap, exec, workers, clock, io, "a verb that is not execute: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"capabilities\",\"request_id\":\"r-0\"}", 4);
     bad = bad + raw(heap, exec, workers, clock, io, "a complete task under another verb: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-0\",\"task\":{\"id\":\"t\",\"type\":\"repo.gate\",\"input\":{\"repo\":\"alpibrusl/cancho-forge\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"}},\"limits\":{\"timeout_ms\":20000},\"grants\":{\"workspace\":\"/nonexistent-forge\",\"execution_dir\":\"/nonexistent-forge\"}}", 4);
@@ -205,12 +227,12 @@ fn main(world: World) -> [] int {
                 borrow mut console as &!i in {
                     borrow mut memory as &!h in {
                         borrow args as &g in {
-                            if arg_count(g) == 8 {
+                            if arg_count(g) == 11 {
                                 match open_dir(f, arg(g, 1)) {
                                     DirOpened::Ok(d) => {
                                         var workers = d;
                                         borrow workers as &w in {
-                                            status = run(h, x, w, f, c, i, arg(g, 2), arg(g, 3), arg(g, 4), arg(g, 5), arg(g, 6), arg(g, 7));
+                                            status = run(h, x, w, f, c, i, arg(g, 2), arg(g, 3), arg(g, 4), arg(g, 5), arg(g, 6), arg(g, 7), arg(g, 8), arg(g, 9), arg(g, 10));
                                         }
                                         dir_close(workers);
                                     }
@@ -219,7 +241,7 @@ fn main(world: World) -> [] int {
                                     }
                                 }
                             } else {
-                                io.error_all(i, "usage: gate_runner <workers dir> <scratch dir> <5 revisions>\n");
+                                io.error_all(i, "usage: gate_runner <workers dir> <scratch dir> <8 revisions>\n");
                             }
                         }
                     }

@@ -29,6 +29,13 @@ pub fn name_ok[&x, &p](exec: &x Exec(""), name: &p [byte]) -> [] bool {
 
 // The `execute` request of section 3.2. `input` is the task's input as JSON text (opaque to Forge), put in as it is.
 pub fn build_execute[&h, &a, &t, &y, &i, &w, &e](heap: &!h Heap, request_id: &a [byte], attempt: int, task_id: &t [byte], task_type: &y [byte], input: &i [byte], timeout_ms: int, max_output_bytes: int, workspace: &w [byte], execution_dir: &e [byte]) -> [heap] buffer.Buffer {
+    return build_execute_env(heap, request_id, attempt, task_id, task_type, input, timeout_ms, max_output_bytes, workspace, execution_dir, "");
+}
+
+// The same request with the operator's environment: `env` is the text of a JSON array of `NAME=value` strings, put in
+// `grants.env` as it is, or empty for none (then the request is byte for byte the one of `build_execute`). It comes from
+// the operator's command line through Forge, never from the task (docs/self-hosting.md, D7); the worker checks it again.
+pub fn build_execute_env[&h, &a, &t, &y, &i, &w, &e, &v](heap: &!h Heap, request_id: &a [byte], attempt: int, task_id: &t [byte], task_type: &y [byte], input: &i [byte], timeout_ms: int, max_output_bytes: int, workspace: &w [byte], execution_dir: &e [byte], env: &v [byte]) -> [heap] buffer.Buffer {
     var w2 = json.writer(heap, 256);
     w2 = json.begin_object(heap, w2);
     w2 = json.put_key(heap, w2, "contract");
@@ -61,6 +68,10 @@ pub fn build_execute[&h, &a, &t, &y, &i, &w, &e](heap: &!h Heap, request_id: &a 
     w2 = json.put_string(heap, w2, workspace);
     w2 = json.put_key(heap, w2, "execution_dir");
     w2 = json.put_string(heap, w2, execution_dir);
+    if len(env) > 0 {
+        w2 = json.put_key(heap, w2, "env");
+        w2 = json.put_fragment(heap, w2, env);
+    }
     w2 = json.end_object(heap, w2);
     w2 = json.end_object(heap, w2);
     return json.finish(w2);

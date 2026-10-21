@@ -63,6 +63,10 @@ for prog in journal_files snapshot_files evidence_files; do
 done
 echo "conformance cases held: $held"
 
+echo "== process-table helper (scripts/procs.sh: a leak is found, the process we run under is not; docs/self-hosting.md D7)"
+mkdir "$scratch/procs" || exit 1
+sh scripts/check_procs.sh "$scratch/procs" || fail=1
+
 echo "== worker contract (the mock worker, real child processes)"
 # tests/contract/mock_worker.cho is built into a workers directory made here; worker_contract starts it beneath that
 # directory (exec_spawn_under) once per way a run can end and checks the rule tag and consequence of each. The gate
@@ -78,7 +82,7 @@ if $C build tests/contract/mock_worker.cho tests/conformance/support.cho $libs -
   "$scratch/worker_contract" "$wdir" "$edir" > "$scratch/worker_contract.out" || fail=1
   cat "$scratch/worker_contract.out"
   if grep -q '^FAIL ' "$scratch/worker_contract.out"; then fail=1; fi
-  if pgrep -x mock_worker > /dev/null; then echo "FAIL a mock worker outlived the run"; fail=1; fi
+  if (. scripts/procs.sh; leftover -x mock_worker > /dev/null); then echo "FAIL a mock worker outlived the run"; fail=1; fi
 else
   echo "worker contract: did not build"
   fail=1

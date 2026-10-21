@@ -5,6 +5,7 @@ import std.bytes;
 import std.test;
 import forge.gate_run;
 import forge.task;
+import forge.worker;
 
 // Unit tests for the pure parts of src/gate_run.cho (docs/self-hosting.md section 3.1): the task id, the verdict a report
 // is read for, and the names. The whole run, with a real runner and a journal, is checked by scripts/check_gate_run.sh.
@@ -80,5 +81,31 @@ fn test_the_names_of_the_verdicts() -> [] int {
     test.assert(bytes.equal(gate_run.verdict_name(0), ""));
     test.assert(bytes.equal(gate_run.verdict_name(4), ""));
     test.assert(bytes.equal(gate_run.verdict_name(0 - 1), ""));
+    return 0;
+}
+
+fn test_a_request_without_an_environment_is_the_old_one_and_one_with_it_adds_grants_env[&h](heap: &!h Heap) -> [heap] int {
+    let plain = worker.build_execute(heap, "r-1", 1, "t-1", "repo.gate", "{}", 20000, 1048576, "/w", "/e");
+    let none = worker.build_execute_env(heap, "r-1", 1, "t-1", "repo.gate", "{}", 20000, 1048576, "/w", "/e", "");
+    let with = worker.build_execute_env(heap, "r-1", 1, "t-1", "repo.gate", "{}", 20000, 1048576, "/w", "/e", "[\"HOME=/h\"]");
+    borrow plain as &p in {
+        borrow none as &n in {
+            borrow with as &w in {
+                test.assert(bytes.equal(buffer.bytes(p), buffer.bytes(n)));
+                let a = buffer.bytes(p);
+                // `plain` ends `"execution_dir":"/e"}}`: the environment goes inside `grants`, after the two paths
+                var expected = buffer.append(heap, buffer.empty(heap, 512), a[0..len(a) - 2]);
+                expected = buffer.append(heap, expected, ",\"env\":[\"HOME=/h\"]}}");
+                borrow expected as &x in {
+                    test.assert(bytes.equal(buffer.bytes(w), buffer.bytes(x)));
+                }
+                buffer.drop(heap, expected);
+                test.assert(len(buffer.bytes(w)) > len(a));
+            }
+        }
+    }
+    buffer.drop(heap, plain);
+    buffer.drop(heap, none);
+    buffer.drop(heap, with);
     return 0;
 }

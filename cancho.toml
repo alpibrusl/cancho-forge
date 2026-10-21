@@ -43,8 +43,13 @@ sources = ["tests/dispatch_test.cho", "src/dispatch.cho", "src/response.cho"]
 std = true
 
 [[test]]
+name = "gate_env"
+sources = ["tests/gate_env_test.cho", "src/gate_env.cho"]
+std = true
+
+[[test]]
 name = "gate_task"
-sources = ["tests/gate_task_test.cho", "src/gate_task.cho"]
+sources = ["tests/gate_task_test.cho", "src/gate_task.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]
@@ -59,5 +64,5 @@ std = true
 
 [[test]]
 name = "gate_run"
-sources = ["tests/gate_run_test.cho", "src/gate_run.cho", "src/worker.cho", "src/dispatch.cho", "src/response.cho", "src/evidence_io.cho", "src/flow.cho", "src/gate_task.cho", "src/journal.cho", "src/journal_io.cho", "src/task.cho", "src/event.cho", "src/snapshot.cho"]
+sources = ["tests/gate_run_test.cho", "src/gate_run.cho", "src/worker.cho", "src/dispatch.cho", "src/response.cho", "src/evidence_io.cho", "src/flow.cho", "src/gate_task.cho", "src/gate_env.cho", "src/journal.cho", "src/journal_io.cho", "src/task.cho", "src/event.cho", "src/snapshot.cho"]
 std = true

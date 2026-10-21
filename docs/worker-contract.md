@@ -448,7 +448,7 @@ request with any other verb is not answered (exit 4, nothing on stdout). It is a
 ```json
 "task":   {"id": "t-1", "type": "repo.gate", "input": {"repo": "alpibrusl/cancho-forge", "revision": "<40 lower-case hex>"}},
 "limits": {"timeout_ms": 600000, "max_output_bytes": 1048576},
-"grants": {"workspace": "/abs/checkout", "execution_dir": "/abs/executions/e-1"}
+"grants": {"workspace": "/abs/checkout", "execution_dir": "/abs/executions/e-1", "env": ["PATH=/opt/cancho/bin", "HOME=/work/home"]}
 ```
 
 * `repo` is a key of the allow-list in `forge.gate_task` (`alpibrusl/cancho`, `cancho-ui`, `cancho-hdl`, `cancho-forge`).
@@ -459,10 +459,20 @@ request with any other verb is not answered (exit 4, nothing on stdout). It is a
 * Both paths must be absolute, 2 to 512 bytes of letters, digits and `._/-`, with no two dots in a row and no component
   that starts with a dot or a dash: they are put in a shell command, and this is the whole of the quoting.
 * `timeout_ms` is 2 000 to 86 400 000.
+* `grants.env` is **optional and the operator's** (self-hosting D7): an array of at most 5 `NAME=value` strings (one for each name) that Forge
+  builds from the trailing arguments of `forge gate`, never from `task.input` (section 9.1: arguments come from
+  configuration; a task cannot name an environment). The names are a closed list, `PATH`, `HOME`, `CANCHO_CACHE`,
+  `CARGO_HOME`, `RUSTUP_HOME`, none twice; a value is an absolute directory of at most 512 bytes (`PATH`: directories
+  joined by `:`, at most 1024), letters, digits and `._/-`, no `..`, no `.` component. The gate is started with `PATH` =
+  the operator's directories **in front of** the fixed `/usr/local/bin:/usr/bin:/bin` (which stays), and the other
+  entries; with no `env` it is the fixed `PATH` alone. A request without `env` is byte for byte the one of before
+  (`worker.build_execute`). Anything else is `env-invalid`: Forge refuses it before anything runs, and the runner checks
+  again.
 
 ### 10.2 What it does, and its deadline
 
-1. Validate (`gate_task.check`; the first fault, in the order type, repository, revision, paths, limits, is the one named).
+1. Validate (`gate_task.check`, then the environment: the first fault, in the order type, repository, revision, paths,
+   limits, env, is the one named).
 2. Check the revision (a tenth of the runner's time, at most 10 s). 3. Run the gate under `/bin/sh -c`, both streams to one
    log, **started detached** (a group of its own). 4. Write the evidence. 5. Answer.
 
@@ -480,17 +490,18 @@ the truth, not a worker error, and the verdict is a claim in `report.json` (Forg
 
 | `error.code` | when | evidence |
 |---|---|---|
-| `task-type-invalid`, `scope-invalid`, `revision-invalid`, `path-invalid`, `limits-invalid` | the task was refused before anything ran (the rule tags of architecture section 7) | none; nothing is written |
+| `task-type-invalid`, `scope-invalid`, `revision-invalid`, `path-invalid`, `limits-invalid`, `env-invalid` | the task was refused before anything ran (the rule tags of architecture section 7) | none; nothing is written |
 | `revision-mismatch` | the checkout is at another revision | none |
 | `workspace-unusable` | the workspace cannot be entered or is not a git checkout | none |
 | `head-timeout` | the revision check passed its deadline | none |
 | `gate-unavailable` | a shell could not be started (for the revision check: nothing written; for the gate: the empty log and the report) | none, or the log and the report |
 | `gate-timeout` | the gate did not finish inside the runner's deadline; its group was killed | `gate.log` (what it wrote) and `report.json` (`verdict: incomplete`) |
+| `gate-environment` | the gate ended with 126 or 127: the shell could not run or find a command (the operator's environment is incomplete), **no verdict** | `gate.log` (the shell's complaint) and `report.json` (`verdict: incomplete`, `ending: environment`, the exit status) |
 | `gate-output-overflow` | the gate wrote more than 8 MiB; its group was killed | the log, truncated at exactly 8 MiB, and the report |
 | `evidence-unwritable` | a file could not be written in `execution_dir` | none |
 
 Evidence (`kind`, `ref`, both under `execution_dir`): `log` `gate.log`, and `report` `report.json`:
-`{"schema":"forge-gate-report/1","repo","revision","verdict":"pass"|"fail"|"incomplete","ending":"exited"|"signaled"|"timeout"|"output-overflow"|"not-started","exit_status","signal","duration_ms","log_bytes"}`.
+`{"schema":"forge-gate-report/1","repo","revision","verdict":"pass"|"fail"|"incomplete","ending":"exited"|"signaled"|"environment"|"timeout"|"output-overflow"|"not-started","exit_status","signal","duration_ms","log_bytes"}`.
 `signal` is the number `std.process` reports (256 for KILL, spike S7), not the POSIX one. A request that is not an
 `execute` of this contract, or names no request or task id, or is not JSON, or is over 1 MiB, is **not answered**: exit 4,
 which Forge classifies `worker-error`.
@@ -500,11 +511,11 @@ which Forge classifies `worker-error`.
 `cancho authority workers/gate_runner.cho` (checked in as `docs/authority-gate-runner.txt`, compared by the gate): `exec`
 narrowed to `/bin/sh` plus `exec_detached`, `fs_write("")` for the evidence, a clock, the heap, stdio; no network, no
 signals, no foreign code, no read of any file. What the gate does once started is the gate's authority (G2). It runs with
-a fixed `PATH=/usr/local/bin:/usr/bin:/bin` and nothing else; what a real gate needs beyond that is self-hosting D7.
+the fixed `PATH` and the operator's `grants.env`, nothing else (D7); the runner's authority did not change for it (the environment was already an argument of the spawn): the report is the checked-in one. A gate that exits 126 or 127 for reasons of its own is also `incomplete`: that errs on the side of not claiming a failure the project did not make.
 
 ### 10.5 Not done
 
-`capabilities`/`cancel`/`status`/`result`; running a gate of a real repository (D7); a gate that starts a descendant that
+`capabilities`/`cancel`/`status`/`result`; a gate of a real repository run to agreement with CI (self-hosting section 8 says what was measured); a gate that starts a descendant that
 leaves the gate's group (`setsid`: not reached by the group kill, cancho `docs/processes.md` section 9); a runner that
 dies in the middle of a gate (its detached gate is orphaned: spike S11, G4); the `exec`-in-place case (a shell that runs the gate's last command in its own process: dash does not, bash may; the trailing `exit $?` is there for it and only the unit test sees it); several runners at once; macOS.
 

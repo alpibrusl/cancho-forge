@@ -21,6 +21,7 @@ F = "src/flow.cho"
 G = "src/gate_run.cho"
 E = "src/event.cho"
 M_ = "src/main.cho"
+R = "workers/gate_runner.cho"
 # (name, file, old, new, what it breaks); `old` must occur exactly once in the file.
 M = [
     ("flow-verification-accepted", F, "dispatch.Consequence::Verification => {\n            return task.State::Verification;", "dispatch.Consequence::Verification => {\n            return task.State::Accepted;", "a worker's success accepts the task"),
@@ -32,6 +33,10 @@ M = [
     ("flow-poll", F, "dispatch.Consequence::Poll => {\n            return task.State::Running;", "dispatch.Consequence::Poll => {\n            return task.State::Ready;", "an async worker's accepted job puts the task back to ready"),
     ("event-basis", E, 'w = json.put_string(heap, w, "claimed");', 'w = json.put_string(heap, w, "observed");', "a worker's claim is marked observed"),
     ("event-actor", E, 'w = json.put_string(heap, w, "worker");', 'w = json.put_string(heap, w, "forge");', "a worker's claim is written as Forge's"),
+    ("env-unchecked", G, "checked = gate_task.env_checked(gate_env.check_text(heap, env));", "checked = gate_task.Checked::Held;", "Forge runs a bad environment and leaves the refusal to the runner"),
+    ("env-not-passed", G, "buffer.bytes(nb), timeout_ms, 1048576, checkout, execution_dir, env)", 'buffer.bytes(nb), timeout_ms, 1048576, checkout, execution_dir, "")', "the operator's environment is not put in the request"),
+    ("env-checked-only-when-empty", G, "if len(env) > 0 {\n            match checked {", "if len(env) == 0 {\n            match checked {", "the environment is checked only when there is none"),
+    ("tools-not-checked", R, "gate_task.required_tools(repo), gate_task.gate_command(repo))", 'gate_task.required_tools(""), gate_task.gate_command(repo))', "the runner starts the gate without checking for the tools it needs"),
     ("verdict-pass", G, 'if json.string_equals(report, tp, v, "pass") {\n                    code = 1;', 'if json.string_equals(report, tp, v, "pass") {\n                    code = 2;', "a pass is recorded as a fail"),
     ("verdict-fail", G, 'if json.string_equals(report, tp, v, "fail") {\n                    code = 2;', 'if json.string_equals(report, tp, v, "fail") {\n                    code = 1;', "a fail is recorded as a pass"),
     ("started-not-written", G, 'seq = note_execution(heap, fs, journal_path, s4, "execution.started", tid, "");', "seq = s4;", "the intent is not written before the worker starts"),

@@ -3,6 +3,7 @@ edition 9;
 import std.buffer;
 import std.bytes;
 import std.test;
+import forge.gate_env;
 import forge.gate_task;
 
 // Unit tests for src/gate_task.cho (docs/self-hosting.md, section 3.1): what a `repo.gate` task may name, the refusals
@@ -221,11 +222,30 @@ fn test_the_shell_text_changes_to_the_workspace_and_asks_git[&h](heap: &!h Heap)
 }
 
 fn test_the_gate_text_joins_both_streams_and_runs_the_row_in_the_workspace[&h](heap: &!h Heap) -> [heap] int {
-    let script = gate_task.gate_script(heap, "/work/forge", gate_task.gate_command("alpibrusl/cancho-forge"));
+    let script = gate_task.gate_script(heap, "/work/forge", "", gate_task.gate_command("alpibrusl/cancho-forge"));
     borrow script as &sb in {
         test.assert(bytes.equal(buffer.bytes(sb), "exec 2>&1; cd /work/forge && scripts/gate.sh; exit $?"));
     }
     buffer.drop(heap, script);
+    return 0;
+}
+
+fn test_the_gate_text_first_checks_each_required_tool_and_ends_127_for_a_missing_one[&h](heap: &!h Heap) -> [heap] int {
+    let script = gate_task.gate_script(heap, "/work/forge", gate_task.required_tools("alpibrusl/cancho-forge"), gate_task.gate_command("alpibrusl/cancho-forge"));
+    borrow script as &sb in {
+        test.assert(bytes.equal(buffer.bytes(sb), "exec 2>&1; for t in cancho git; do command -v \"$t\" > /dev/null 2>&1 || { echo \"gate-environment: the gate needs $t, which is not on PATH\"; exit 127; }; done; cd /work/forge && scripts/gate.sh; exit $?"));
+    }
+    buffer.drop(heap, script);
+    return 0;
+}
+
+fn test_every_repository_names_the_tools_its_gate_cannot_run_without() -> [] int {
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho-forge"), "cancho git"));
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho-hdl"), "git"));
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho"), "cargo"));
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho-ui"), "cargo"));
+    test.assert(bytes.equal(gate_task.required_tools("alpibrusl/cancho-mqtt"), ""));
+    test.assert(bytes.equal(gate_task.required_tools(""), ""));
     return 0;
 }
 
@@ -240,5 +260,29 @@ fn test_a_checkout_is_at_the_revision_only_if_git_printed_it_and_a_newline() -> 
     test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567 \n", rev()));
     test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567x", rev()));
     test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567\r", rev()));
+    return 0;
+}
+
+fn test_a_bad_environment_is_env_invalid_and_comes_after_every_other_fault() -> [] int {
+    test.assert(bytes.equal(refusal(gate_task.env_checked(gate_env.Fault::Held)), ""));
+    test.assert(bytes.equal(refusal(gate_task.env_checked(gate_env.Fault::NotAnArray)), "env-invalid"));
+    test.assert(bytes.equal(refusal(gate_task.env_checked(gate_env.Fault::TooMany)), "env-invalid"));
+    test.assert(bytes.equal(refusal(gate_task.env_checked(gate_env.Fault::BadEntry)), "env-invalid"));
+    test.assert(bytes.equal(refusal(gate_task.env_checked(gate_env.Fault::Twice)), "env-invalid"));
+    test.assert(bytes.equal(gate_task.rule_name(gate_task.Refusal::EnvInvalid), "env-invalid"));
+    return 0;
+}
+
+fn test_exit_126_and_127_are_the_environment_and_nothing_else_is() -> [] int {
+    test.assert(gate_task.environment_failure(126));
+    test.assert(gate_task.environment_failure(127));
+    test.assert(!gate_task.environment_failure(0));
+    test.assert(!gate_task.environment_failure(1));
+    test.assert(!gate_task.environment_failure(2));
+    test.assert(!gate_task.environment_failure(125));
+    test.assert(!gate_task.environment_failure(128));
+    test.assert(!gate_task.environment_failure(255));
+    test.assert(!gate_task.environment_failure(256));
+    test.assert(!gate_task.environment_failure(0 - 1));
     return 0;
 }
