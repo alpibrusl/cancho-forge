@@ -4,6 +4,7 @@
 #   cancho check         every program type-checks, under its declared authority
 #   cancho test          every `fn test_*` passes (pure logic: tasks, journal replay)
 #   forge gate           `forge gate` end to end against real git checkouts and a real runner (scripts/check_gate_run.sh)
+#   recover              `forge recover` on journals a crash left, one real crash included (scripts/check_recover.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
 #   verbs                capabilities, cancel, status and result against the mock worker (every verdict) and the stub LLM and gate runner (capabilities), real child processes
 #   conformance          tests/conformance/*.cho, programs that need an Fs, which
@@ -114,6 +115,10 @@ CANCHO="$C" sh scripts/check_gate_runner.sh "$scratch/gate-runner" || fail=1
 echo "== forge gate (the first self-hosted task: the lock, the runner as a child process, the journal, the claim)"
 mkdir "$scratch/gate-run" || exit 1
 CANCHO="$C" sh scripts/check_gate_run.sh "$scratch/gate-run" || fail=1
+
+echo "== forge recover (the tasks a crash left running: lost, unstarted, exhausted, finished; one real SIGKILL of forge gate)"
+mkdir "$scratch/recover" || exit 1
+CANCHO="$C" sh scripts/check_recover.sh "$scratch/recover" || fail=1
 
 echo "== stub LLM (workers/stub_llm.cho: the contract, and a whole flow per way it can answer, journalled and replayed)"
 mkdir "$scratch/stub-llm" || exit 1

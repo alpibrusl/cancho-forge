@@ -1,0 +1,8 @@
+{"v":1,"seq":1,"kind":"task.proposed","task":"t-1","actor":"human"}
+{"v":1,"seq":2,"kind":"task.approved","task":"t-1","actor":"human"}
+{"v":1,"seq":3,"kind":"task.ready","task":"t-1","actor":"forge"}
+{"v":1,"seq":4,"kind":"task.running","task":"t-1","actor":"forge"}
+{"v":1,"seq":5,"kind":"task.proposed","task":"t-2","actor":"human"}
+{"v":1,"seq":6,"kind":"task.approved","task":"t-2","actor":"human"}
+{"v":1,"seq":7,"kind":"task.ready","task":"t-2","actor":"forge"}
+{"v":1,"seq":8,"kind":"task.running","task":"t-2","actor":"forge"}

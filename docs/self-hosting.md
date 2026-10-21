@@ -242,7 +242,7 @@ else, that stops being true, and the task type needs an OS sandbox first
 **Evidence.** A task's execution is journalled as events (`execution.*`), with
 the intent written and synced *before* the worker starts (architecture 4.4),
 so a crash between intent and outcome becomes `execution.lost` on recovery
-(architecture 4.3; measured at 25 crash points for a process kill, **not**
+(`forge recover`, architecture 4.4.1; measured at 25 crash points for a process kill, **not**
 for power loss). Evidence is a list of references, never content:
 `{kind, ref, sha256, bytes}`, each recomputed by Forge beneath the
 execution directory, following no link (worker contract 4.1; measured by

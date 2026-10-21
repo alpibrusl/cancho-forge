@@ -1,0 +1,364 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.map;
+import std.test;
+import forge.event;
+import forge.journal;
+import forge.recover;
+import forge.retry;
+import forge.task;
+
+// Unit tests for src/recover.cho (docs/architecture.md section 4.4): what recovery writes for a task that was `running`
+// when Forge stopped, from the journal alone. Pure: no file is touched; the verb is exercised on the built binary by
+// scripts/check_recover.sh. Run with `cancho test`.
+
+// ---- helpers ------------------------------------------------------------
+
+fn seq_next[&b](j: &b buffer.Buffer) -> [] int {
+    return bytes.count_byte(buffer.bytes(j), 10) + 1;
+}
+
+// `j` with one more record: a `task.*` move (proposed and approved by a human, every other by forge), a refusal or an
+// `execution.*` record, numbered by the journal's length.
+fn push[&h, &a, &i](heap: &!h Heap, j: buffer.Buffer, kind: &a [byte], id: &i [byte]) -> [heap] buffer.Buffer {
+    var seq = 0;
+    borrow j as &jb in {
+        seq = seq_next(jb);
+    }
+    var r = event.execution(heap, seq, kind, id, "");
+    if bytes.starts_with(kind, "task.") {
+        var actor = "forge";
+        if bytes.equal(kind, "task.proposed") || bytes.equal(kind, "task.approved") {
+            actor = "human";
+        }
+        buffer.drop(heap, r);
+        r = event.transition(heap, seq, kind, id, actor, "");
+    }
+    var out = j;
+    borrow r as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, r);
+    return out;
+}
+
+// proposed, approved, ready, running.
+fn running[&h, &i](heap: &!h Heap, j: buffer.Buffer, id: &i [byte]) -> [heap] buffer.Buffer {
+    var out = push(heap, j, "task.proposed", id);
+    out = push(heap, out, "task.approved", id);
+    out = push(heap, out, "task.ready", id);
+    return push(heap, out, "task.running", id);
+}
+
+fn state_of[&h, &d, &i](heap: &!h Heap, data: &d [byte], id: &i [byte]) -> [heap] (int, int) {
+    let (table, report) = journal.replay(heap, data);
+    var code = 0;
+    borrow table as &tb in {
+        code = journal.state_of(tb, id);
+    }
+    map.drop(heap, table);
+    return (code, report.rule);
+}
+
+// What recovery wrote for a journal, as facts the tests ask about.
+struct Run {
+    empty: bool,
+    lost_record: bool,
+    tag_unstarted: bool,
+    tag_lost: bool,
+    tag_exhausted: bool,
+    refusal: bool,
+    ready: bool,
+    blocked: bool,
+    verification: bool,
+    by_forge: bool,
+    seq5: bool,
+    seq6: bool,
+    text_names_task: bool,
+    counts: recover.Counts,
+    // `task.state_code` of the task after recovery (-1 when the journal with the plan does not replay clean)
+    state: int,
+    // a second plan over the journal and the first plan: empty
+    settled: bool,
+}
+
+fn contains[&d, &n](data: &d [byte], needle: &n [byte]) -> [] bool {
+    return bytes.find(data, needle) >= 0;
+}
+
+// Plan for `j` (consumed), judged for task `id`.
+fn run[&h, &i](heap: &!h Heap, j: buffer.Buffer, id: &i [byte]) -> [heap] Run {
+    var v_empty = false;
+    var v_lost_record = false;
+    var v_tag_unstarted = false;
+    var v_tag_lost = false;
+    var v_tag_exhausted = false;
+    var v_refusal = false;
+    var v_ready = false;
+    var v_blocked = false;
+    var v_verification = false;
+    var v_by_forge = false;
+    var v_seq5 = false;
+    var v_seq6 = false;
+    var v_text_names_task = false;
+    var v_counts = recover.Counts { unstarted: 0, lost: 0, finished: 0, exhausted: 0 };
+    var v_state = 0 - 1;
+    var v_settled = false;
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        let (records, text, counts) = recover.plan(heap, data, bytes.count_byte(data, 10));
+        borrow records as &rb in {
+            let r = buffer.bytes(rb);
+            v_empty = len(r) == 0;
+            v_lost_record = contains(r, "\"kind\":\"execution.lost\"");
+            v_tag_unstarted = contains(r, "\"rule\":\"execution-unstarted\"");
+            v_tag_lost = contains(r, "\"rule\":\"execution-lost\"");
+            v_tag_exhausted = contains(r, "\"rule\":\"retry-exhausted\"");
+            v_refusal = contains(r, "\"kind\":\"refusal\"");
+            v_ready = contains(r, "\"kind\":\"task.ready\"");
+            v_blocked = contains(r, "\"kind\":\"task.blocked\"");
+            v_verification = contains(r, "\"kind\":\"task.verification\"");
+            v_by_forge = contains(r, "\"actor\":\"forge\"");
+            v_seq5 = contains(r, "\"seq\":5,");
+            v_seq6 = contains(r, "\"seq\":6,");
+            var all = buffer.append(heap, buffer.empty(heap, 512), data);
+            all = buffer.append(heap, all, r);
+            borrow all as &ab in {
+                let (code, rule) = state_of(heap, buffer.bytes(ab), id);
+                if rule == 0 {
+                    v_state = code;
+                }
+                let again = buffer.bytes(ab);
+                let (more, more_text, more_counts) = recover.plan(heap, again, bytes.count_byte(again, 10));
+                borrow more as &mb in {
+                    v_settled = size(mb) == 0;
+                }
+                buffer.drop(heap, more);
+                buffer.drop(heap, more_text);
+            }
+            buffer.drop(heap, all);
+        }
+        borrow text as &tb in {
+            v_text_names_task = contains(buffer.bytes(tb), id);
+        }
+        v_counts = counts;
+        buffer.drop(heap, records);
+        buffer.drop(heap, text);
+    }
+    buffer.drop(heap, j);
+    return Run { empty: v_empty, lost_record: v_lost_record, tag_unstarted: v_tag_unstarted, tag_lost: v_tag_lost, tag_exhausted: v_tag_exhausted, refusal: v_refusal, ready: v_ready, blocked: v_blocked, verification: v_verification, by_forge: v_by_forge, seq5: v_seq5, seq6: v_seq6, text_names_task: v_text_names_task, counts: v_counts, state: v_state, settled: v_settled };
+}
+
+fn size[&b](b: &b buffer.Buffer) -> [] int {
+    return len(buffer.bytes(b));
+}
+
+// ---- nothing to recover -------------------------------------------------
+
+fn test_a_journal_with_nothing_running_gets_no_records[&h](heap: &!h Heap) -> [heap] int {
+    var j = push(heap, buffer.empty(heap, 256), "task.proposed", "t-1");
+    j = push(heap, j, "task.approved", "t-1");
+    j = push(heap, j, "task.ready", "t-1");
+    // a task that was running and ended: its records say so
+    j = running(heap, j, "t-2");
+    j = push(heap, j, "execution.started", "t-2");
+    j = push(heap, j, "execution.finished", "t-2");
+    j = push(heap, j, "task.verification", "t-2");
+    let r = run(heap, j, "t-2");
+    test.assert(r.empty);
+    test.assert(!r.text_names_task);
+    test.assert_eq(r.counts.unstarted + r.counts.lost + r.counts.finished + r.counts.exhausted, 0);
+    test.assert_eq(r.state, 6);
+    return 0;
+}
+
+fn test_an_empty_journal_gets_no_records[&h](heap: &!h Heap) -> [heap] int {
+    let (records, text, counts) = recover.plan(heap, "", 0);
+    borrow records as &rb in {
+        test.assert_eq(size(rb), 0);
+    }
+    test.assert_eq(counts.lost, 0);
+    buffer.drop(heap, records);
+    buffer.drop(heap, text);
+    return 0;
+}
+
+fn test_an_execution_record_of_a_task_that_is_not_running_is_ignored[&h](heap: &!h Heap) -> [heap] int {
+    var j = push(heap, buffer.empty(heap, 256), "task.proposed", "t-1");
+    j = push(heap, j, "task.approved", "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = push(heap, j, "task.ready", "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    let r = run(heap, j, "t-1");
+    test.assert(r.empty);
+    test.assert_eq(r.counts.lost, 0);
+    test.assert_eq(r.state, 3);
+    return 0;
+}
+
+fn test_a_finished_or_lost_record_of_a_task_that_is_not_running_is_ignored[&h](heap: &!h Heap) -> [heap] int {
+    var j = push(heap, buffer.empty(heap, 256), "task.proposed", "t-1");
+    j = push(heap, j, "task.approved", "t-1");
+    j = push(heap, j, "task.ready", "t-1");
+    j = push(heap, j, "execution.finished", "t-1");
+    let finished = run(heap, j, "t-1");
+    test.assert(finished.empty);
+    test.assert_eq(finished.state, 3);
+    var k = push(heap, buffer.empty(heap, 256), "task.proposed", "t-2");
+    k = push(heap, k, "task.approved", "t-2");
+    k = push(heap, k, "task.ready", "t-2");
+    k = push(heap, k, "execution.lost", "t-2");
+    let lost = run(heap, k, "t-2");
+    test.assert(lost.empty);
+    test.assert_eq(lost.state, 3);
+    return 0;
+}
+
+// ---- phase 1: running, the worker was never started ---------------------
+
+fn test_a_running_task_with_no_intent_goes_back_to_ready_under_execution_unstarted[&h](heap: &!h Heap) -> [heap] int {
+    let r = run(heap, running(heap, buffer.empty(heap, 256), "t-1"), "t-1");
+    test.assert(r.tag_unstarted);
+    test.assert(r.ready);
+    test.assert(r.seq5);
+    test.assert(r.seq6);
+    test.assert(r.by_forge);
+    test.assert(!r.lost_record);
+    test.assert_eq(r.counts.unstarted, 1);
+    test.assert_eq(r.counts.lost, 0);
+    test.assert(r.text_names_task);
+    test.assert_eq(r.state, 3);
+    test.assert(r.settled);
+    return 0;
+}
+
+// ---- phase 2: the intent was written and nothing after it ---------------
+
+fn test_a_started_execution_with_no_ending_is_lost_and_the_task_is_ready[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    let r = run(heap, j, "t-1");
+    test.assert(r.lost_record);
+    test.assert(r.tag_lost);
+    test.assert(r.ready);
+    test.assert(r.by_forge);
+    test.assert(!r.tag_exhausted);
+    test.assert_eq(r.counts.lost, 1);
+    test.assert_eq(r.counts.exhausted, 0);
+    test.assert(r.text_names_task);
+    test.assert_eq(r.state, 3);
+    test.assert(r.settled);
+    return 0;
+}
+
+fn test_the_third_start_with_no_ending_uses_the_budget_and_blocks_the_task[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(retry.max_attempts(), 3);
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = push(heap, j, "execution.retry", "t-1");
+    j = push(heap, j, "task.ready", "t-1");
+    j = push(heap, j, "task.running", "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = push(heap, j, "execution.retry", "t-1");
+    j = push(heap, j, "task.ready", "t-1");
+    j = push(heap, j, "task.running", "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    let r = run(heap, j, "t-1");
+    test.assert(r.lost_record);
+    test.assert(r.tag_exhausted);
+    test.assert(r.blocked);
+    test.assert(!r.ready);
+    test.assert(!r.tag_lost);
+    test.assert_eq(r.counts.lost, 1);
+    test.assert_eq(r.counts.exhausted, 1);
+    test.assert_eq(r.state, 5);
+    test.assert(r.settled);
+    return 0;
+}
+
+fn test_the_second_start_with_no_ending_still_has_budget[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = push(heap, j, "execution.retry", "t-1");
+    j = push(heap, j, "task.ready", "t-1");
+    j = push(heap, j, "task.running", "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    let r = run(heap, j, "t-1");
+    test.assert(r.tag_lost);
+    test.assert(!r.tag_exhausted);
+    test.assert_eq(r.state, 3);
+    return 0;
+}
+
+// ---- phase 3: the claim was recorded, the move was not -------------------
+
+fn test_a_finished_execution_with_no_move_goes_to_verification[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = push(heap, j, "execution.finished", "t-1");
+    let r = run(heap, j, "t-1");
+    test.assert(r.verification);
+    test.assert(!r.lost_record);
+    test.assert(!r.refusal);
+    test.assert_eq(r.counts.finished, 1);
+    test.assert_eq(r.counts.lost, 0);
+    test.assert_eq(r.state, 6);
+    test.assert(r.settled);
+    return 0;
+}
+
+// ---- phase 4: a recovery that was cut short -----------------------------
+
+fn test_a_lost_record_with_no_move_is_not_written_twice[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = push(heap, j, "execution.lost", "t-1");
+    let r = run(heap, j, "t-1");
+    test.assert(!r.lost_record);
+    test.assert(r.tag_lost);
+    test.assert(r.ready);
+    test.assert_eq(r.counts.lost, 1);
+    test.assert_eq(r.state, 3);
+    return 0;
+}
+
+// ---- the whole ---------------------------------------------------------
+
+fn test_several_tasks_are_settled_one_by_one_and_the_journal_still_replays[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = running(heap, j, "t-2");
+    j = running(heap, j, "t-3");
+    j = push(heap, j, "execution.started", "t-3");
+    j = push(heap, j, "execution.finished", "t-3");
+    let r = run(heap, j, "t-3");
+    test.assert_eq(r.counts.lost, 1);
+    test.assert_eq(r.counts.unstarted, 1);
+    test.assert_eq(r.counts.finished, 1);
+    test.assert_eq(r.state, 6);
+    test.assert(r.settled);
+    return 0;
+}
+
+fn test_a_line_that_is_not_a_record_is_passed_over[&h](heap: &!h Heap) -> [heap] int {
+    let data = "garbage\n{\"v\":1}\n[1]\n{\"kind\":3,\"task\":4}\n";
+    let (records, text, counts) = recover.plan(heap, data, 4);
+    borrow records as &rb in {
+        test.assert_eq(size(rb), 0);
+    }
+    test.assert_eq(counts.lost, 0);
+    buffer.drop(heap, records);
+    buffer.drop(heap, text);
+    return 0;
+}
+
+fn test_a_torn_tail_is_not_a_record[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":5,\"kind\":\"execution.started\",\"task\":\"t-1\"");
+    let r = run(heap, j, "t-1");
+    test.assert_eq(r.counts.unstarted, 1);
+    test.assert_eq(r.counts.lost, 0);
+    return 0;
+}

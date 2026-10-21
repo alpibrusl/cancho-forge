@@ -76,3 +76,8 @@ std = true
 name = "verbs"
 sources = ["tests/verbs_test.cho", "src/verbs.cho", "src/dispatch.cho", "src/response.cho"]
 std = true
+
+[[test]]
+name = "recover"
+sources = ["tests/recover_test.cho", "src/recover.cho", "src/retry.cho", "src/flow.cho", "src/dispatch.cho", "src/response.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true
