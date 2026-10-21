@@ -7,6 +7,7 @@ import std.json;
 import std.map;
 import forge.dispatch;
 import forge.event;
+import forge.gate_env;
 import forge.flow;
 import forge.gate_task;
 import forge.journal;
@@ -219,8 +220,10 @@ fn succeeded(e: dispatch.Ending) -> [] bool {
 
 // Run the task. `journal_path` is the journal of the workspace (the caller holds the lock); `workers` is the directory
 // holding `gate_runner`; `checkout` is the working copy of `repo` and `execution_dir` an existing directory for the
-// evidence. `timeout_ms` is Forge's deadline for the run.
-pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &k, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], repo: &r [byte], revision: &v [byte], checkout: &k [byte], execution_dir: &e [byte], timeout_ms: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write] Finished {
+// evidence. `env` is the text of a JSON array of the operator's `NAME=value` entries for the gate (empty for none): it
+// is checked here with the rest of the task (`env-invalid`, the task stays `approved`) and passed on in `grants.env`.
+// `timeout_ms` is Forge's deadline for the run.
+pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &k, &e, &n](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], repo: &r [byte], revision: &v [byte], checkout: &k [byte], execution_dir: &e [byte], env: &n [byte], timeout_ms: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write] Finished {
     let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
     if report.rule != 0 || recovered.errno != 0 {
         map.drop(heap, existing);
@@ -243,7 +246,17 @@ pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &k, &e](heap: &!h Heap, fs: &f Fs("")
         let (t2, s2) = move_to(heap, fs, journal_path, t1, s1, tid, task.State::Approved, task.Actor::Human, false);
         tasks = t2;
         seq = s2;
-        match gate_task.check(gate_task.task_type(), repo, revision, checkout, execution_dir, timeout_ms) {
+        var checked = gate_task.check(gate_task.task_type(), repo, revision, checkout, execution_dir, timeout_ms);
+        if len(env) > 0 {
+            match checked {
+                gate_task.Checked::Held => {
+                    checked = gate_task.env_checked(gate_env.check_text(heap, env));
+                }
+                gate_task.Checked::Refused(why) => {
+                }
+            }
+        }
+        match checked {
             gate_task.Checked::Refused(why) => {
                 seq = note(heap, fs, journal_path, seq, tid, gate_task.rule_name(why), false);
                 outcome = Outcome::Refused(why);
@@ -261,7 +274,7 @@ pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &k, &e](heap: &!h Heap, fs: &f Fs("")
                     let input = gate_input(heap, repo, revision);
                     borrow request_id as &rb in {
                         borrow input as &nb in {
-                            let req = worker.build_execute(heap, buffer.bytes(rb), 1, tid, gate_task.task_type(), buffer.bytes(nb), timeout_ms, 1048576, checkout, execution_dir);
+                            let req = worker.build_execute_env(heap, buffer.bytes(rb), 1, tid, gate_task.task_type(), buffer.bytes(nb), timeout_ms, 1048576, checkout, execution_dir, env);
                             borrow req as &qb in {
                                 let ending = worker.execute(heap, exec, workers, fs, clock, "gate_runner", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, false);
                                 let tag = dispatch.rule_tag(ending);

@@ -1,0 +1,245 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.test;
+import forge.gate_env;
+
+// Unit tests for src/gate_env.cho (docs/self-hosting.md, D7): the operator's environment for a gate run. Run with
+// `cancho test`.
+
+fn held(f: gate_env.Fault) -> [] bool {
+    return gate_env.is_held(f);
+}
+
+fn fault_name(f: gate_env.Fault) -> [] &static [byte] {
+    match f {
+        gate_env.Fault::Held => {
+            return "held";
+        }
+        gate_env.Fault::NotAnArray => {
+            return "not-an-array";
+        }
+        gate_env.Fault::TooMany => {
+            return "too-many";
+        }
+        gate_env.Fault::BadEntry => {
+            return "bad-entry";
+        }
+        gate_env.Fault::Twice => {
+            return "twice";
+        }
+    }
+}
+
+fn test_only_a_held_array_is_held() -> [] int {
+    test.assert(gate_env.is_held(gate_env.Fault::Held));
+    test.assert(!gate_env.is_held(gate_env.Fault::NotAnArray));
+    test.assert(!gate_env.is_held(gate_env.Fault::TooMany));
+    test.assert(!gate_env.is_held(gate_env.Fault::BadEntry));
+    test.assert(!gate_env.is_held(gate_env.Fault::Twice));
+    return 0;
+}
+
+fn test_the_five_names_are_the_only_names() -> [] int {
+    test.assert(gate_env.name_ok("PATH"));
+    test.assert(gate_env.name_ok("HOME"));
+    test.assert(gate_env.name_ok("CANCHO_CACHE"));
+    test.assert(gate_env.name_ok("CARGO_HOME"));
+    test.assert(gate_env.name_ok("RUSTUP_HOME"));
+    test.assert(!gate_env.name_ok("LD_PRELOAD"));
+    test.assert(!gate_env.name_ok("BASH_ENV"));
+    test.assert(!gate_env.name_ok("ENV"));
+    test.assert(!gate_env.name_ok("path"));
+    test.assert(!gate_env.name_ok("PATH2"));
+    test.assert(!gate_env.name_ok("PAT"));
+    test.assert(!gate_env.name_ok(""));
+    return 0;
+}
+
+fn test_a_directory_is_absolute_plain_and_without_dot_components() -> [] int {
+    test.assert(gate_env.dir_ok("/root"));
+    test.assert(gate_env.dir_ok("/root/.cargo/bin"));
+    test.assert(gate_env.dir_ok("/opt/rust-1.90/lib_x"));
+    test.assert(gate_env.dir_ok("/a.b"));
+    test.assert(gate_env.dir_ok("/Opt/RustToolchain-1_90"));
+    test.assert(gate_env.dir_ok("/ABC"));
+    test.assert(!gate_env.dir_ok(""));
+    test.assert(!gate_env.dir_ok("/"));
+    test.assert(!gate_env.dir_ok("root"));
+    test.assert(!gate_env.dir_ok("./root"));
+    test.assert(!gate_env.dir_ok("/root/"));
+    test.assert(!gate_env.dir_ok("/root//bin"));
+    test.assert(!gate_env.dir_ok("/root/../etc"));
+    test.assert(!gate_env.dir_ok("/root/./bin"));
+    test.assert(!gate_env.dir_ok("/.."));
+    test.assert(!gate_env.dir_ok("/."));
+    test.assert(!gate_env.dir_ok("/root/.."));
+    test.assert(!gate_env.dir_ok("/root/bin/."));
+    test.assert(!gate_env.dir_ok("/ro ot"));
+    test.assert(!gate_env.dir_ok("/ro;ot"));
+    test.assert(!gate_env.dir_ok("/ro'ot"));
+    test.assert(!gate_env.dir_ok("/ro$ot"));
+    test.assert(!gate_env.dir_ok("/ro:ot"));
+    return 0;
+}
+
+fn test_a_path_is_directories_joined_by_colons() -> [] int {
+    test.assert(gate_env.path_list_ok("/a"));
+    test.assert(gate_env.path_list_ok("/a:/b/c:/root/.cargo/bin"));
+    test.assert(!gate_env.path_list_ok(""));
+    test.assert(!gate_env.path_list_ok("a"));
+    test.assert(!gate_env.path_list_ok("/a:"));
+    test.assert(!gate_env.path_list_ok(":/a"));
+    test.assert(!gate_env.path_list_ok("/a::/b"));
+    test.assert(!gate_env.path_list_ok("/a:b"));
+    test.assert(!gate_env.path_list_ok("/a:/b/../c"));
+    return 0;
+}
+
+fn test_an_entry_is_a_name_an_equals_sign_and_a_value_that_fits_the_name() -> [] int {
+    test.assert(gate_env.entry_ok("HOME=/root"));
+    test.assert(gate_env.entry_ok("CANCHO_CACHE=/tmp/cc"));
+    test.assert(gate_env.entry_ok("PATH=/a:/b"));
+    test.assert(gate_env.entry_ok("CARGO_HOME=/root/.cargo"));
+    test.assert(gate_env.entry_ok("RUSTUP_HOME=/root/.rustup"));
+    test.assert(!gate_env.entry_ok("HOME"));
+    test.assert(!gate_env.entry_ok("=/root"));
+    test.assert(!gate_env.entry_ok("HOME="));
+    test.assert(!gate_env.entry_ok("HOME=root"));
+    test.assert(!gate_env.entry_ok("HOME=/a:/b"));
+    test.assert(!gate_env.entry_ok("LD_PRELOAD=/lib/x.so"));
+    test.assert(!gate_env.entry_ok("PATH=/a b"));
+    test.assert(!gate_env.entry_ok("PATH="));
+    return 0;
+}
+
+// "/" and `n - 1` letters `c`: a legal directory of exactly `n` bytes.
+fn dir_of[&h](heap: &!h Heap, n: int, c: byte) -> [heap] buffer.Buffer {
+    var d = buffer.push(heap, buffer.empty(heap, n + 1), byte_of(47));
+    var k = 1;
+    while k < n {
+        d = buffer.push(heap, d, c);
+        k = k + 1;
+    }
+    return d;
+}
+
+fn test_the_length_limits_are_enforced_at_the_edge[&h](heap: &!h Heap) -> [heap] int {
+    // 512 bytes is the longest directory.
+    let d512 = dir_of(heap, 512, byte_of(97));
+    borrow d512 as &a in {
+        test.assert_eq(len(buffer.bytes(a)), 512);
+        test.assert(gate_env.dir_ok(buffer.bytes(a)));
+    }
+    let d513 = dir_of(heap, 513, byte_of(97));
+    borrow d513 as &b in {
+        test.assert(!gate_env.dir_ok(buffer.bytes(b)));
+    }
+    // a PATH of 1024 bytes is the longest: 511 + ':' + 512, and 1026 (511 + ':' + 511 + ':' + "/c") is refused
+    let d511 = dir_of(heap, 511, byte_of(98));
+    var ok = buffer.empty(heap, 1100);
+    var over = buffer.empty(heap, 1100);
+    var edge = buffer.empty(heap, 1100);
+    borrow d511 as &x in {
+        borrow d512 as &y in {
+            ok = buffer.append(heap, ok, buffer.bytes(x));
+            ok = buffer.push(heap, ok, byte_of(58));
+            ok = buffer.append(heap, ok, buffer.bytes(y));
+            over = buffer.append(heap, over, buffer.bytes(x));
+            over = buffer.push(heap, over, byte_of(58));
+            over = buffer.append(heap, over, buffer.bytes(x));
+            over = buffer.push(heap, over, byte_of(58));
+            over = buffer.append(heap, over, "/c");
+            edge = buffer.append(heap, edge, buffer.bytes(y));
+            edge = buffer.push(heap, edge, byte_of(58));
+            edge = buffer.append(heap, edge, buffer.bytes(y));
+        }
+    }
+    borrow ok as &p in {
+        test.assert_eq(len(buffer.bytes(p)), 1024);
+        test.assert(gate_env.path_list_ok(buffer.bytes(p)));
+    }
+    borrow edge as &e in {
+        test.assert_eq(len(buffer.bytes(e)), 1025);
+        test.assert(!gate_env.path_list_ok(buffer.bytes(e)));
+    }
+    borrow over as &q in {
+        test.assert_eq(len(buffer.bytes(q)), 1026);
+        test.assert(!gate_env.path_list_ok(buffer.bytes(q)));
+    }
+    buffer.drop(heap, d512);
+    buffer.drop(heap, d513);
+    buffer.drop(heap, d511);
+    buffer.drop(heap, ok);
+    buffer.drop(heap, over);
+    buffer.drop(heap, edge);
+    return 0;
+}
+
+fn test_an_array_is_checked_in_a_fixed_order[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[]")), "held"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[\"HOME=/root\",\"PATH=/a\"]")), "held"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "{}")), "not-an-array"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "\"HOME=/root\"")), "not-an-array"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "nonsense")), "not-an-array"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[1]")), "bad-entry"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[\"LD_PRELOAD=/x\"]")), "bad-entry"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[\"HOME=/root\",\"HOME=/tmp\"]")), "twice"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[\"HOME=/a\\n\"]")), "bad-entry"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[\"HOME=/a\",\"PATH=/b\",\"CARGO_HOME=/c\",\"RUSTUP_HOME=/d\",\"CANCHO_CACHE=/e\"]")), "held"));
+    // six entries: too many, whatever they are (the limit is checked first, before a name twice)
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[\"HOME=/a\",\"HOME=/a\",\"HOME=/a\",\"HOME=/a\",\"HOME=/a\",\"HOME=/a\"]")), "too-many"));
+    test.assert(bytes.equal(fault_name(gate_env.check_text(heap, "[\"HOME=/a\",\"HOME=/a\",\"HOME=/a\",\"HOME=/a\",\"HOME=/a\"]")), "twice"));
+    return 0;
+}
+
+fn block_of[&h, &j](heap: &!h Heap, text: &j [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 1);
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(text, tp) > 0 {
+            buffer.drop(heap, out);
+            out = gate_env.block(heap, text, tp, 0);
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
+
+fn test_the_block_puts_the_operators_path_in_front_of_the_fixed_one[&h](heap: &!h Heap) -> [heap] int {
+    let none = block_of(heap, "[]");
+    borrow none as &nb in {
+        test.assert(bytes.equal(buffer.bytes(nb), "PATH=/usr/local/bin:/usr/bin:/bin\0"));
+    }
+    buffer.drop(heap, none);
+    let some = block_of(heap, "[\"HOME=/root\",\"PATH=/opt/cancho:/root/.cargo/bin\",\"CANCHO_CACHE=/tmp/cc\"]");
+    borrow some as &sb in {
+        test.assert(bytes.equal(buffer.bytes(sb), "PATH=/opt/cancho:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin\0HOME=/root\0CANCHO_CACHE=/tmp/cc\0"));
+    }
+    buffer.drop(heap, some);
+    let only_home = block_of(heap, "[\"HOME=/root\"]");
+    borrow only_home as &hb in {
+        test.assert(bytes.equal(buffer.bytes(hb), "PATH=/usr/local/bin:/usr/bin:/bin\0HOME=/root\0"));
+    }
+    buffer.drop(heap, only_home);
+    return 0;
+}
+
+fn test_no_env_at_all_is_held_and_gives_the_fixed_block[&h](heap: &!h Heap) -> [heap] int {
+    let tape = box_slice(heap, json.tape_len("{}"), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        test.assert(json.parse("{}", tp) > 0);
+        test.assert(held(gate_env.check_node("{}", tp, 0 - 1)));
+        let b = gate_env.block(heap, "{}", tp, 0 - 1);
+        borrow b as &bb in {
+            test.assert(bytes.equal(buffer.bytes(bb), "PATH=/usr/local/bin:/usr/bin:/bin\0"));
+        }
+        buffer.drop(heap, b);
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}

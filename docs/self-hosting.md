@@ -78,7 +78,7 @@ Issue [#18](https://github.com/alpibrusl/cancho-forge/issues/18).
   and it has an oracle that is not Forge: the repository's CI ran the same
   gate on the same revision.
 
-**Built** (`forge gate`, issue #18): `forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms]`
+**Built** (`forge gate`, issue #18): `forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]`
 (`src/main.cho`, `src/gate_run.cho`) takes the lock of the workspace, records the task (`task.proposed`, `task.approved`
 by the human who ran the command), checks it (`forge.gate_task`: a refusal is a `refusal` record with its rule tag and the
 task stays `approved`), moves it to `ready` and `running`, writes `execution.started` (the intent, before the worker
@@ -86,9 +86,11 @@ starts), starts the gate runner as a child process (`forge.worker.execute`: a de
 recomputed against the files, a symlink not followed), writes the rule tag if the ending is a refusal, writes
 `execution.finished` with the runner's verdict as a claim (`"actor":"worker","basis":"claimed"`), and moves the task by
 `forge.flow.target_of`: **`verification`**, never `accepted`. Exit status: 0 a claim was recorded (a failing gate is
-still 0: the project telling the truth, or the environment, see D7), 1 the task or the journal was refused, 2 usage or a
+still 0: the project telling the truth; an environment failure is not a fail, D7), 1 the task or the journal was refused, 2 usage or a
 path that is not ok, 3 the workspace is locked or a directory cannot be opened, 4 the run ended without a claim (the
-ending and the state are printed). What Forge cannot do itself (cancho has no `mkdir`, and decision D1 stays open): the
+ending and the state are printed: a gate that ends 126 or 127 is such a run, `incomplete`, D7). The trailing `NAME=value`
+arguments are the operator's environment for the gate (D7); `scripts/self_host_gate.sh` runs one repository at one
+revision with it, the way section 8 reports. What Forge cannot do itself (cancho has no `mkdir`, and decision D1 stays open): the
 execution directory (empty), the checkout (at the revision) and the workers directory are made by the operator
 beforehand. Measured in section 8.
 
@@ -311,30 +313,43 @@ settles it:
   for the group kill and the evidence; Forge's deadline is the last resort and leaks. Corrected in place from the
   earlier text of this item, in the commit that carries spike S11. Not measured: a real gate (descendants that
   `setsid`), a runner that dies mid-gate, a Forge crash (G4).
-* **D7. The gate's environment.** The runner starts the gate with a fixed `PATH=/usr/local/bin:/usr/bin:/bin` and
-  nothing else (measured: the gate sees exactly that, `tests` oracle `pass`). A Rust gate needs more (`HOME`, a
-  toolchain, `CARGO_HOME`) and `scripts/gate.sh` of this repository needs `cancho` on the `PATH`: how the operator
-  provides them, without a task being able to, is open. Candidates: an `env` row of the policy table that Forge puts
-  in `grants`, never in `task.input`; or a wrapper script the operator installs. **First real runs, 2026-10-21 (section
-  8), each measured, showed three more things D7 has to settle:**
+* **D7. The gate's environment. Decided 2026-10-21, built in the change that carries this text; measured in section 8.**
+  Before it, the runner started the gate with a fixed `PATH=/usr/local/bin:/usr/bin:/bin` and nothing else, and the first
+  real runs (below, kept as the evidence) showed three problems. The decision for each:
+  1. **The environment is the operator's, never the task's.** `forge gate` takes it as trailing arguments,
+     `NAME=value`, after the optional timeout; Forge puts it in `grants.env` of the `execute` request (a JSON array of
+     strings; absent means none), never in `task.input`, which is all a task controls (worker contract 9.1: arguments
+     come from configuration). The names are a closed list, **`PATH`, `HOME`, `CANCHO_CACHE`, `CARGO_HOME`,
+     `RUSTUP_HOME`**, at most 5 entries (one for each name), no name twice; the values are absolute paths (`PATH`: absolute directories
+     joined by `:`), letters, digits and `._/-`, no `..`, at most 512 bytes (`PATH`: 1024). Anything else (`LD_PRELOAD`,
+     `BASH_ENV`, a relative path, a value with a space or a quote) is the refusal **`env-invalid`**: Forge refuses it
+     before anything runs (the task stays `approved`, the tag is journalled), and the runner checks again, because a
+     request may not come from Forge. An operator `PATH` is put **in front of** the fixed one, which stays: the system
+     directories are never removed. The runner's authority does not change (the environment was already an argument of the
+     spawn); the checks are pure (`src/gate_env.cho`). **Not decided here: who may write the operator's command line.**
+     It is whoever runs `forge`, as before.
+  2. **An environment failure is not the project's failure.** Exit 126 and 127 of the gate (the shell could not run or
+     find a command) end the run as **`incomplete`**, ending `environment`, worker error `gate-environment`, with the log
+     and the report written: no verdict is claimed, the task is not moved to `verification`, and nothing says `fail`. The
+     cost is that a gate that exits 127 for its own reasons is also `incomplete`; that errs on the side of not claiming.
+  3. **The oracles of the gates ask about their own children.** `pgrep -x gate_runner` (and `mock_worker`, `stub_llm`, the
+     `sleep 79` and `git rev-parse HEAD` of the fixtures) saw the runner that was running the gate. They now go through
+     `scripts/procs.sh`, which drops the **ancestors** of the asking process (read from `/proc`, no `ps`): the runner that
+     runs the gate is an ancestor and is not a leak; a runner that is not an ancestor still is. The leak case is kept as a
+     test of the helper (`scripts/check_procs.sh`), and broken on purpose (`scripts/mutate_procs.py`).
+
+  **First real runs, 2026-10-21 (before this decision), each measured, kept as the evidence for it:**
   1. `cancho` is not on the fixed `PATH`: the gate of this repository fails in 338 ms with `cancho: not found`, claimed
      `fail`. Put on it by a symlink, it fails again: **`cancho test` and `cancho build` need `CANCHO_CACHE` or `HOME`**
-     ("no cache directory"), which the runner does not pass. What worked is a wrapper script the operator installed as
+     ("no cache directory"), which the runner does not pass. What worked was a wrapper script the operator installed as
      `cancho` that sets `CANCHO_CACHE` and execs the compiler. A Rust gate (`cancho-ui`, `cancho`) fails in 6 ms with exit
      127, `cargo: not found` (it lives in `~/.cargo/bin`; rustup also wants `HOME`).
-  2. **An environment failure is claimed `fail`.** The runner's verdict is `fail` for any non-zero exit, so "the project's
-     gate failed" and "the gate could not run" (126 or 127: the shell could not find or run the command) cannot be told
-     apart in the journal. Proposed, not built: exit 126 and 127 are `incomplete` (no verdict could be had), as a deadline
-     is.
-  3. **The gate of this repository is not re-entrant.** With the environment provided, the gate ran completely under the
-     runner (85.8 s) and failed one check: `no runner outlived the run` (`pgrep -x gate_runner`), because the runner that is
-     running the gate *is* a `gate_runner`. The process-table oracles of `scripts/gate.sh`, `check_gate_runner.sh`,
-     `check_stub_llm.sh` and `check_gate_run.sh` (`pgrep -x mock_worker`, `gate_runner`, `stub_llm`) assume no other
-     instance. They need to ask about *their* children, not the process table. Not fixed here: a `pgrep -f` on the path
-     would match nothing (the children are started by name beneath a directory), so the fix needs thought.
-  **So: the claimed verdict for `alpibrusl/cancho-forge` at `592421a` is `fail`, and CI's is green. They disagree (one
-  revision, one repository), the cause is known, and it is not a defect of the project.** No other repository's gate was
-  run to completion; nothing here claims they work.
+  2. An environment failure was claimed `fail`: any non-zero exit was.
+  3. The gate of this repository was not re-entrant: with the environment provided it ran completely under the runner
+     (85.8 s) and failed one check, `no runner outlived the run`, because the runner running the gate *is* a `gate_runner`.
+  **So: the claimed verdict for `alpibrusl/cancho-forge` at `592421a` was `fail`, and CI's was green. They disagreed (one
+  revision, one repository), the cause was known, and it was not a defect of the project.** What the same runs say after
+  this change is in section 8.
 * **D4. Stage 4's push path:** `net` narrowed to a host, or a narrowed
   `exec` of a client run as a worker. Decide with M6's authority review.
 * **D5. Where the allow-list and policy live,** and how a change to them is

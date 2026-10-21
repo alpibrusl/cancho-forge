@@ -54,7 +54,7 @@ if $C build workers/stub_llm.cho $libs --std -o "$sl/workers/stub_llm" \
   oracle "crash: the progress it made before dying is left, and no reply file" sh -c "cmp -s '$sl/ev_crash/progress.txt' '$sl/want_progress' && [ ! -e '$sl/ev_crash/reply.md' ]"
   oracle "malformed: nothing but the script was written" sh -c "[ \"\$(ls '$sl/ev_malformed')\" = 'stub_script.json' ]"
   oracle "no script: nothing was written" sh -c "[ -z \"\$(ls -A '$sl/ev_no_script')\" ]"
-  oracle "no stub outlived the run (a slow one was killed at its deadline)" sh -c "! pgrep -x stub_llm > /dev/null"
+  oracle "no stub outlived the run (a slow one was killed at its deadline)" sh -c ". scripts/procs.sh; ! leftover -x stub_llm > /dev/null"
   # The journal is read back by the forge binary, which shares no code with the test that wrote it but the library.
   oracle "journal of a refusal: forge status reads it, one task, blocked" sh -c "mkdir '$sl/ws_m' && cp '$sl/malformed.journal.jsonl' '$sl/ws_m/journal.jsonl' && '$sl/forge' status '$sl/ws_m' > '$sl/status_m' && grep -q '^records: 6\$' '$sl/status_m' && grep -q '^  blocked: 1\$' '$sl/status_m'"
   oracle "journal of a refusal: forge history shows the rule tag, once" sh -c "'$sl/forge' history '$sl/ws_m' > '$sl/history_m' && [ \$(grep -c 'kind=refusal' '$sl/history_m') -eq 1 ]"

@@ -21,6 +21,10 @@ mkfix() { # name, body of scripts/gate.sh
 mkfix ws_pass 'echo hello gate; exit 0'
 mkfix ws_fail 'echo failing; exit 3'
 mkfix ws_hang 'sleep 79 & wait'
+# the operator's environment (docs/self-hosting.md D7): what the gate sees; a command not found (127); a file not executable (126)
+mkfix ws_env 'echo "path=$PATH"; echo "home=${HOME-unset}"; echo "cc=${CANCHO_CACHE-unset}"; exit 0'
+mkfix ws_127 'forge_no_such_command_127'
+mkfix ws_126 'printf x > not_executable; chmod 644 not_executable; ./not_executable'
 rev() { git -C "$gr/$1" rev-parse HEAD; }
 $C check src/*.cho --std || fail=1
 $C check workers/gate_runner.cho $libs --std || fail=1
@@ -71,7 +75,35 @@ if $C build src/*.cho --std -o "$gr/forge" && $C build workers/gate_runner.cho $
   # ---- a gate that never ends: the runner's own deadline; nothing it started is left
   mkws hang; gate hang ws_hang "$(rev ws_hang)" 2000
   check "hang: exit 4, no claim" sh -c "[ '$(rc hang)' = 4 ] && ! grep -q 'claimed verdict' '$gr/hang.out'"
-  check "hang: nothing the gate started is left running" sh -c "! pgrep -f '^sleep 79\$' > /dev/null"
+  check "hang: nothing the gate started is left running" sh -c ". scripts/procs.sh; ! leftover -f '^sleep 79\$' > /dev/null"
+
+  # ---- the operator's environment: trailing NAME=value arguments, after the optional timeout
+  mkws env; gate env ws_env "$(rev ws_env)" 20000 PATH=/opt/forge-x HOME=/work/home CANCHO_CACHE=/work/cache
+  check "env: exit 0, the gate saw the operator's PATH in front of the fixed one, HOME and CANCHO_CACHE" sh -c "[ '$(rc env)' = 0 ] && grep -q '^claimed verdict: pass\$' '$gr/env.out' && grep -q '^path=/opt/forge-x:/usr/local/bin:/usr/bin:/bin\$' '$gr/env/ev/gate.log' && grep -q '^home=/work/home\$' '$gr/env/ev/gate.log' && grep -q '^cc=/work/cache\$' '$gr/env/ev/gate.log'"
+  mkws envnt; gate envnt ws_env "$(rev ws_env)" HOME=/work/home2
+  check "env without a timeout: the first argument is already an entry; the default timeout applies" sh -c "[ '$(rc envnt)' = 0 ] && grep -q '^home=/work/home2\$' '$gr/envnt/ev/gate.log' && grep -q '^cc=unset\$' '$gr/envnt/ev/gate.log'"
+  mkws envnone; gate envnone ws_env "$(rev ws_env)" 20000
+  check "no env: the gate sees the fixed PATH alone and no HOME" sh -c "[ '$(rc envnone)' = 0 ] && grep -q '^path=/usr/local/bin:/usr/bin:/bin\$' '$gr/envnone/ev/gate.log' && grep -q '^home=unset\$' '$gr/envnone/ev/gate.log'"
+  mkws envbad; gate envbad ws_env "$(rev ws_env)" 20000 LD_PRELOAD=/x/y.so
+  check "env-invalid (a name not on the list): exit 1, journalled with its tag, the task stays approved, nothing ran" sh -c "[ '$(rc envbad)' = 1 ] && grep -q '^refused: env-invalid\$' '$gr/envbad.out' && grep -q '^state: approved\$' '$gr/envbad.out' && grep -q '\"kind\":\"refusal\".*\"rule\":\"env-invalid\"' '$gr/envbad/journal.jsonl' && ! grep -q 'execution' '$gr/envbad/journal.jsonl' && [ -z \"\$(ls -A '$gr/envbad/ev')\" ]"
+  mkws envrel; gate envrel ws_env "$(rev ws_env)" HOME=relative/home
+  check "env-invalid (a relative path): exit 1" sh -c "[ '$(rc envrel)' = 1 ] && grep -q '^refused: env-invalid\$' '$gr/envrel.out'"
+  mkws envtwice; gate envtwice ws_env "$(rev ws_env)" HOME=/a HOME=/b
+  check "env-invalid (a name twice): exit 1" sh -c "[ '$(rc envtwice)' = 1 ] && grep -q '^refused: env-invalid\$' '$gr/envtwice.out'"
+  mkws envmany; gate envmany ws_env "$(rev ws_env)" HOME=/a PATH=/b CANCHO_CACHE=/c CARGO_HOME=/d RUSTUP_HOME=/e HOME=/f
+  check "env-invalid (six entries): exit 1" sh -c "[ '$(rc envmany)' = 1 ] && grep -q '^refused: env-invalid\$' '$gr/envmany.out'"
+  mkws envfirst; gate envfirst ws_env "not-a-revision" 20000 LD_PRELOAD=/x
+  check "a task with two faults is refused for the first: revision-invalid before env-invalid" sh -c "[ '$(rc envfirst)' = 1 ] && grep -q '^refused: revision-invalid\$' '$gr/envfirst.out'"
+
+  # ---- the environment is the operator's, not the task's: nothing a task names can reach it
+  check "the task input has no env: the request Forge builds takes the environment from the command line only (grants.env)" sh -c "! grep -n 'env' src/gate_run.cho | grep -q 'task\.input'"
+
+  # ---- 127 and 126 are the environment failing, not the project: no claim, the task is not moved to verification
+  mkws e127; gate e127 ws_127 "$(rev ws_127)" 20000
+  check "127: exit 4, no claimed verdict, no execution.finished, not in verification" sh -c "[ '$(rc e127)' = 4 ] && ! grep -q 'claimed verdict' '$gr/e127.out' && ! grep -q 'execution.finished' '$gr/e127/journal.jsonl' && ! grep -q '^state: verification\$' '$gr/e127.out'"
+  check "127: the evidence is there for the operator: the log names the command, the report says incomplete" sh -c "grep -q 'forge_no_such_command_127' '$gr/e127/ev/gate.log' && grep -q '\"verdict\":\"incomplete\"' '$gr/e127/ev/report.json'"
+  mkws e126; gate e126 ws_126 "$(rev ws_126)" 20000
+  check "126: exit 4, no claimed verdict, not in verification" sh -c "[ '$(rc e126)' = 4 ] && ! grep -q 'claimed verdict' '$gr/e126.out' && ! grep -q '^state: verification\$' '$gr/e126.out'"
 
   # ---- refusals: the task is approved, the rule tag is journalled, nothing ran
   mkws scope; "$gr/forge" gate "$gr/scope" "$gr/workers" someone/else "$(rev ws_pass)" "$gr/ws_pass" "$gr/scope/ev" > "$gr/scope.out" 2>&1; echo $? > "$gr/scope.rc"
@@ -106,8 +138,10 @@ if $C build src/*.cho --std -o "$gr/forge" && $C build workers/gate_runner.cho $
   "$gr/forge" gate relative "$gr/workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" > /dev/null 2>&1; check "usage: a relative workspace is exit 2" test $? = 2
   "$gr/forge" gate "$gr/pass" "$gr/workers/../workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" > /dev/null 2>&1; check "usage: a workers directory with .. is exit 2" test $? = 2
   "$gr/forge" gate "$gr/pass" "$gr/workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" 12x > /dev/null 2>&1; check "usage: a timeout that is not a number is exit 2" test $? = 2
+  "$gr/forge" gate "$gr/pass" "$gr/workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" 20000 HOME > /dev/null 2>&1; check "usage: an environment argument with no = is exit 2" test $? = 2
+  "$gr/forge" gate "$gr/pass" "$gr/workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" =/x > /dev/null 2>&1; check "usage: an environment argument with no name is exit 2" test $? = 2
   "$gr/forge" gate "$gr/nowhere" "$gr/workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" > /dev/null 2>&1; check "a workspace that is not there is exit 3" test $? = 3
-  check "no runner outlived the run" sh -c "! pgrep -x gate_runner > /dev/null"
+  check "no runner outlived the run (the runner this gate may be running under is an ancestor, not a leak: scripts/procs.sh)" sh -c ". scripts/procs.sh; ! leftover -x gate_runner > /dev/null"
 else
   echo "gate run: did not build"
   fail=1

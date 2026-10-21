@@ -1,0 +1,265 @@
+edition 9;
+module forge.gate_env;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+
+// The operator's environment for a gate run (docs/self-hosting.md, D7). It reaches the gate runner as `grants.env` of the
+// `execute` request: a JSON array of `NAME=value` strings, built by Forge from what the operator typed, never from the
+// task's input. This module is the pure half: what an entry may be, the refusal, and the environment block the runner
+// starts the gate with. It opens no file and starts nothing.
+//
+// The names are a closed list; the values are absolute paths. Anything else is `env-invalid` (docs/architecture.md,
+// section 7), checked by Forge before anything runs and again by the runner, because a request may not come from Forge.
+
+// At most this many entries: one for each of the five names, and a name twice is refused anyway.
+pub fn max_entries() -> [] int {
+    return 5;
+}
+
+// The longest entry value: a path, or for `PATH` a list of them.
+pub fn max_value() -> [] int {
+    return 512;
+}
+
+pub fn max_path_value() -> [] int {
+    return 1024;
+}
+
+// The fixed `PATH` of the gate. An operator `PATH` goes in front of it; it is never removed.
+pub fn fixed_path() -> [] &static [byte] {
+    return "/usr/local/bin:/usr/bin:/bin";
+}
+
+// Is `name` one of the five names an operator may set?
+pub fn name_ok[&n](name: &n [byte]) -> [] bool {
+    return bytes.equal(name, "PATH") || bytes.equal(name, "HOME") || bytes.equal(name, "CANCHO_CACHE") || bytes.equal(name, "CARGO_HOME") || bytes.equal(name, "RUSTUP_HOME");
+}
+
+// An absolute directory path for the environment: 2 to 512 bytes, only letters, digits and `._/-`, no `..` and no
+// component that is just `.` (unlike a workspace path, a component may start with a dot: `~/.cargo/bin` is the usual
+// place of a toolchain), and it does not end in a slash.
+pub fn dir_ok[&p](path: &p [byte]) -> [] bool {
+    if len(path) < 2 || len(path) > max_value() || int_of(path[0]) != 47 {
+        return false;
+    }
+    if int_of(path[len(path) - 1]) == 47 {
+        return false;
+    }
+    var i = 0;
+    var component = 0;
+    var dots = 0;
+    while i < len(path) {
+        let c = int_of(path[i]);
+        let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        let punct = c == 46 || c == 47 || c == 45 || c == 95;
+        if !letter && !digit && !punct {
+            return false;
+        }
+        if c == 47 {
+            // an empty component (`//`) or one made only of dots (`.` or `..`)
+            if i > 0 && component == 0 {
+                return false;
+            }
+            if component > 0 && dots == component {
+                return false;
+            }
+            component = 0;
+            dots = 0;
+        } else {
+            component = component + 1;
+            if c == 46 {
+                dots = dots + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if component > 0 && dots == component {
+        return false;
+    }
+    return true;
+}
+
+// A `PATH` value: absolute directories, joined by `:`, at most 1024 bytes in all.
+pub fn path_list_ok[&p](value: &p [byte]) -> [] bool {
+    if len(value) < 2 || len(value) > max_path_value() {
+        return false;
+    }
+    var start = 0;
+    var i = 0;
+    while i <= len(value) {
+        if i == len(value) || int_of(value[i]) == 58 {
+            if !dir_ok(value[start..i]) {
+                return false;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The position of the first `=` of `entry`, or -1.
+pub fn equals_at[&e](entry: &e [byte]) -> [] int {
+    var i = 0;
+    while i < len(entry) {
+        if int_of(entry[i]) == 61 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Is `entry` `NAME=value` with a name from the list and a value that fits it?
+pub fn entry_ok[&e](entry: &e [byte]) -> [] bool {
+    let at = equals_at(entry);
+    if at < 1 {
+        return false;
+    }
+    let name = entry[0..at];
+    let value = entry[at + 1..len(entry)];
+    if !name_ok(name) {
+        return false;
+    }
+    if bytes.equal(name, "PATH") {
+        return path_list_ok(value);
+    }
+    return dir_ok(value);
+}
+
+// Do two entries name the same variable?
+fn same_name[&a, &b](a: &a [byte], b: &b [byte]) -> [] bool {
+    let x = equals_at(a);
+    let y = equals_at(b);
+    if x < 1 || y < 1 || x != y {
+        return false;
+    }
+    return bytes.equal(a[0..x], b[0..y]);
+}
+
+// The refusals of an environment, in a fixed order: not an array of strings, too many entries, an entry that is not
+// allowed, a name twice. 0 is none.
+pub enum Fault {
+    Held,
+    NotAnArray,
+    TooMany,
+    BadEntry,
+    Twice,
+}
+
+// Check the array at `node` of a parsed document. A node of -1 (no `env` at all) holds: no operator environment.
+pub fn check_node[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] Fault {
+    if node < 0 {
+        return Fault::Held;
+    }
+    if !json.is_array(tape, node) {
+        return Fault::NotAnArray;
+    }
+    let n = json.count(tape, node);
+    if n > max_entries() {
+        return Fault::TooMany;
+    }
+    var i = 0;
+    while i < n {
+        let item = json.at(tape, node, i);
+        if item < 0 || !json.is_string(tape, item) || !json.string_plain(tape, item) {
+            return Fault::BadEntry;
+        }
+        if !entry_ok(json.string_view(src, tape, item)) {
+            return Fault::BadEntry;
+        }
+        var k = 0;
+        while k < i {
+            if same_name(json.string_view(src, tape, item), json.string_view(src, tape, json.at(tape, node, k))) {
+                return Fault::Twice;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return Fault::Held;
+}
+
+pub fn is_held(f: Fault) -> [] bool {
+    match f {
+        Fault::Held => {
+            return true;
+        }
+        Fault::NotAnArray => {
+            return false;
+        }
+        Fault::TooMany => {
+            return false;
+        }
+        Fault::BadEntry => {
+            return false;
+        }
+        Fault::Twice => {
+            return false;
+        }
+    }
+}
+
+// Check the text of a JSON array (what Forge builds from the operator's arguments).
+pub fn check_text[&h, &j](heap: &!h Heap, text: &j [byte]) -> [heap] Fault {
+    var fault = Fault::NotAnArray;
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(text, tp) > 0 {
+            fault = check_node(text, tp, 0);
+        }
+    }
+    unbox_slice(heap, tape);
+    return fault;
+}
+
+// The value of variable `name` among the entries of the array at `node`, or the empty text.
+fn value_of[&s, &t, &n](src: &s [byte], tape: &t [int], node: int, name: &n [byte]) -> [] &s [byte] {
+    if node < 0 {
+        return "";
+    }
+    let count = json.count(tape, node);
+    var i = 0;
+    while i < count {
+        let entry = json.string_view(src, tape, json.at(tape, node, i));
+        let at = equals_at(entry);
+        if at > 0 && bytes.equal(entry[0..at], name) {
+            return entry[at + 1..len(entry)];
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// The environment block the gate is started with: `NAME=value` entries each ended by a NUL, `PATH` first. `PATH` is the
+// operator's directories in front of the fixed ones, or the fixed ones alone. Call it only on a node that `check_node`
+// held.
+pub fn block[&h, &s, &t](heap: &!h Heap, src: &s [byte], tape: &t [int], node: int) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 128), "PATH=");
+    let operator = value_of(src, tape, node, "PATH");
+    if len(operator) > 0 {
+        b = buffer.append(heap, b, operator);
+        b = buffer.push(heap, b, byte_of(58));
+    }
+    b = buffer.append(heap, b, fixed_path());
+    b = buffer.push(heap, b, byte_of(0));
+    if node < 0 {
+        return b;
+    }
+    let count = json.count(tape, node);
+    var i = 0;
+    while i < count {
+        let entry = json.string_view(src, tape, json.at(tape, node, i));
+        let at = equals_at(entry);
+        if at > 0 && !bytes.equal(entry[0..at], "PATH") {
+            b = buffer.append(heap, b, entry);
+            b = buffer.push(heap, b, byte_of(0));
+        }
+        i = i + 1;
+    }
+    return b;
+}

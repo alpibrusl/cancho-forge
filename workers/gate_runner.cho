@@ -5,6 +5,7 @@ import std.bytes;
 import std.io;
 import std.json;
 import std.process;
+import forge.gate_env;
 import forge.gate_task;
 import forge.journal_io;
 import forge.snapshot;
@@ -35,11 +36,6 @@ fn log_cap() -> [] int {
     return 8388608;
 }
 
-// The gate's environment: a fixed PATH and nothing else (docs/self-hosting.md, D7).
-fn gate_env() -> [] &static [byte] {
-    return "PATH=/usr/local/bin:/usr/bin:/bin\0";
-}
-
 fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] (buffer.Buffer, bool) {
     var all = buffer.empty(heap, 1024);
     var c = getchar(io);
@@ -62,16 +58,16 @@ fn shell_args[&h, &s](heap: &!h Heap, script: &s [byte]) -> [heap] buffer.Buffer
     return buffer.push(heap, b, byte_of(0));
 }
 
-fn begin[&x, &a](exec: &x Exec("/bin/sh"), detached: bool, args: &a [byte], child_in: ChildEnd, child_out: ChildEnd) -> [exec("/bin/sh"), exec_detached] Spawned {
+fn begin[&x, &a, &v](exec: &x Exec("/bin/sh"), detached: bool, args: &a [byte], env: &v [byte], child_in: ChildEnd, child_out: ChildEnd) -> [exec("/bin/sh"), exec_detached] Spawned {
     if detached {
-        return exec_spawn_detached(exec, "/bin/sh", args, gate_env(), Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+        return exec_spawn_detached(exec, "/bin/sh", args, env, Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
     }
-    return exec_spawn(exec, "/bin/sh", args, gate_env(), Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+    return exec_spawn(exec, "/bin/sh", args, env, Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
 }
 
 // `/bin/sh -c script`, its stdout (the script joins stderr to it) captured under `most` bytes and `deadline_ms`
 // milliseconds. Detached means the shell leads a group of its own, and the deadline kills the group.
-fn run_sh[&h, &x, &c, &s](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, script: &s [byte], detached: bool, most: int, deadline_ms: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll] (buffer.Buffer, process.Ran) {
+fn run_sh[&h, &x, &c, &s, &v](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, script: &s [byte], env: &v [byte], detached: bool, most: int, deadline_ms: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll] (buffer.Buffer, process.Ran) {
     match process.channels() {
         process.Channels::Failed(e) => {
             return (buffer.empty(heap, 1), process.Ran::Failed(e));
@@ -81,7 +77,7 @@ fn run_sh[&h, &x, &c, &s](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Cl
             var out = buffer.empty(heap, 1);
             var ended = process.Ran::Failed(0 - 1);
             borrow args as &ab in {
-                match begin(exec, detached, buffer.bytes(ab), child_in, child_out) {
+                match begin(exec, detached, buffer.bytes(ab), env, child_in, child_out) {
                     Spawned::Failed(e) => {
                         process.close(to_child, from_child);
                         ended = process.Ran::Failed(e);
@@ -271,11 +267,11 @@ fn finish[&h, &i, &f, &r, &k, &p, &q, &l, &g](heap: &!h Heap, io: &!i Io, fs: &f
 
 // What the check that the checkout is at the revision found: 0 it is, 1 it is at another revision, 2 the workspace
 // cannot be used, 3 the check passed its deadline, 4 the shell would not start.
-fn check_head[&h, &x, &c, &w, &v](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, workspace: &w [byte], revision: &v [byte], deadline_ms: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll] int {
+fn check_head[&h, &x, &c, &w, &v, &y](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, workspace: &w [byte], revision: &v [byte], env: &y [byte], deadline_ms: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll] int {
     let script = gate_task.head_script(heap, workspace);
     var found = 4;
     borrow script as &sb in {
-        let (out, ran) = run_sh(heap, exec, clock, buffer.bytes(sb), true, 4096, deadline_ms);
+        let (out, ran) = run_sh(heap, exec, clock, buffer.bytes(sb), env, true, 4096, deadline_ms);
         match ran {
             process.Ran::Code(n) => {
                 found = 2;
@@ -308,10 +304,10 @@ fn check_head[&h, &x, &c, &w, &v](heap: &!h Heap, exec: &x Exec("/bin/sh"), cloc
 }
 
 // A task that has passed `gate_task.check`: check the checkout, run the gate, write the evidence, answer.
-fn execute_task[&h, &i, &f, &c, &x, &r, &k, &q, &l, &w, &e](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), request_id: &r [byte], task_id: &k [byte], repo: &q [byte], revision: &l [byte], workspace: &w [byte], exec_dir: &e [byte], timeout_ms: int) -> [heap, io_write, fs_write(""), file_write, exec("/bin/sh"), exec_detached, clock, poll] int {
+fn execute_task[&h, &i, &f, &c, &x, &r, &k, &q, &l, &w, &e, &v](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), request_id: &r [byte], task_id: &k [byte], repo: &q [byte], revision: &l [byte], workspace: &w [byte], exec_dir: &e [byte], env: &v [byte], timeout_ms: int) -> [heap, io_write, fs_write(""), file_write, exec("/bin/sh"), exec_detached, clock, poll] int {
     let total = gate_task.runner_deadline_ms(timeout_ms);
     let start = clock_ms(clock);
-    let found = check_head(heap, exec, clock, workspace, revision, gate_task.head_deadline_ms(total));
+    let found = check_head(heap, exec, clock, workspace, revision, env, gate_task.head_deadline_ms(total));
     if found != 0 {
         var code = "gate-unavailable";
         var message = "the shell for the revision check could not be started";
@@ -343,7 +339,7 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &q, &l, &w, &e](heap: &!h Heap, io: 
     var signal = 0;
     var log = buffer.empty(heap, 1);
     borrow script as &sb in {
-        let (out, ran) = run_sh(heap, exec, clock, buffer.bytes(sb), true, log_cap(), remaining);
+        let (out, ran) = run_sh(heap, exec, clock, buffer.bytes(sb), env, true, log_cap(), remaining);
         buffer.drop(heap, log);
         log = out;
         match ran {
@@ -356,6 +352,14 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &q, &l, &w, &e](heap: &!h Heap, io: 
                     verdict = "pass";
                 } else {
                     verdict = "fail";
+                }
+                // The shell could not find or run a command: the environment failed, not the project, so no verdict is
+                // claimed (docs/self-hosting.md D7). The log and the report are written all the same.
+                if gate_task.environment_failure(n) {
+                    verdict = "incomplete";
+                    ending = "environment";
+                    code = "gate-environment";
+                    message = "the shell could not find or run a command of the gate (exit 126 or 127): the environment is incomplete, no verdict";
                 }
             }
             process.Ran::Signaled(s) => {
@@ -427,7 +431,19 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                             answer(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), gate_task.rule_name(why), "the task was refused before anything ran", false, "", 0, "", 0);
                         }
                         gate_task.Checked::Held => {
-                            execute_task(heap, io, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), repo, revision, workspace, exec_dir, timeout_ms);
+                            let envn = json.get(src, tp, grants, "env");
+                            match gate_task.env_checked(gate_env.check_node(src, tp, envn)) {
+                                gate_task.Checked::Refused(why) => {
+                                    answer(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), gate_task.rule_name(why), "the task was refused before anything ran", false, "", 0, "", 0);
+                                }
+                                gate_task.Checked::Held => {
+                                    let env = gate_env.block(heap, src, tp, envn);
+                                    borrow env as &eb in {
+                                        execute_task(heap, io, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), repo, revision, workspace, exec_dir, buffer.bytes(eb), timeout_ms);
+                                    }
+                                    buffer.drop(heap, env);
+                                }
+                            }
                         }
                     }
                 }

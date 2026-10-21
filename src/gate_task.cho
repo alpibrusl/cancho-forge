@@ -3,6 +3,7 @@ module forge.gate_task;
 
 import std.buffer;
 import std.bytes;
+import forge.gate_env;
 
 // The `repo.gate` task (docs/self-hosting.md, section 3.1): given a repository from the allow-list and a 40-hex
 // revision, run the repository's own gate. This module is the pure half: what a task may name, the refusals with their
@@ -25,6 +26,8 @@ pub enum Refusal {
     PathInvalid,
     // `limits.timeout_ms` is outside what a gate run can be given.
     LimitsInvalid,
+    // `grants.env`, the operator's environment for the gate, is not allowed (`forge.gate_env`; docs/self-hosting.md D7).
+    EnvInvalid,
 }
 
 pub enum Checked {
@@ -48,6 +51,9 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         }
         Refusal::LimitsInvalid => {
             return "limits-invalid";
+        }
+        Refusal::EnvInvalid => {
+            return "env-invalid";
         }
     }
 }
@@ -153,6 +159,15 @@ pub fn check[&y, &r, &v, &w, &e](task_type_text: &y [byte], repo: &r [byte], rev
     return Checked::Held;
 }
 
+// The operator's environment, after `check` held: `forge.gate_env` says whether `grants.env` may be used. It is checked
+// last, so a task with two faults is refused for the first of the order type, scope, revision, paths, limits, env.
+pub fn env_checked(f: gate_env.Fault) -> [] Checked {
+    if gate_env.is_held(f) {
+        return Checked::Held;
+    }
+    return Checked::Refused(Refusal::EnvInvalid);
+}
+
 // The runner's own deadline for the whole job, four fifths of Forge's. Forge's deadline kills only the runner's pid, and
 // a gate the runner started detached survives that (spike S11): so the runner must have ended, and killed the gate's
 // group, before Forge's deadline fires. The fifth left over is the margin for the group kill and for writing the
@@ -187,6 +202,12 @@ pub fn gate_script[&h, &w, &c](heap: &!h Heap, workspace: &w [byte], command: &c
     b = buffer.append(heap, b, " && ");
     b = buffer.append(heap, b, command);
     return buffer.append(heap, b, "; exit $?");
+}
+
+// Did the gate end because the shell could not run or find a command? 126 (found, not executable) and 127 (not found) are
+// the shell's own statuses for that: the environment failed, not the project (docs/self-hosting.md, D7).
+pub fn environment_failure(exit_status: int) -> [] bool {
+    return exit_status == 126 || exit_status == 127;
 }
 
 // Is `printed` (what `git rev-parse HEAD` wrote) the revision asked for? One line: the 40 digits and a newline.
