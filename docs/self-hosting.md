@@ -277,8 +277,8 @@ outcome recorded as claimed evidence. A task whose gate fails still ends
 |---|---|---|---|
 | This plan | #13 | all | this document |
 | `main` wiring of `worker.cho` | [#17](https://github.com/alpibrusl/cancho-forge/issues/17) | Stage 1 | **done for one verb**: `forge gate` links it; `docs/authority.txt` widened (architecture section 4.9). Not a general wiring: no other verb starts a worker |
-| Gate-runner worker | [#20](https://github.com/alpibrusl/cancho-forge/issues/20) | Stage 1 | **built**, wired into `forge gate`; run on a real repository once, see section 8 and D7 |
-| First self-hosted task | [#18](https://github.com/alpibrusl/cancho-forge/issues/18) | Stage 1 | **built** (`forge gate`, section 3.1); its first real run **disagrees with CI**, for reasons D7 names |
+| Gate-runner worker | [#20](https://github.com/alpibrusl/cancho-forge/issues/20) | Stage 1 | **built**, wired into `forge gate`; run on two real repositories, see section 8 and D7 |
+| First self-hosted task | [#18](https://github.com/alpibrusl/cancho-forge/issues/18) | Stage 1 | **built** (`forge gate`, section 3.1); run on `cancho-forge` and `cancho-ui` with the operator's environment it **agrees with CI** (one revision each, section 8); without it, `incomplete` (D7) |
 | `capabilities`/`cancel`/`status`/`result` | [#14](https://github.com/alpibrusl/cancho-forge/issues/14) | `status` and `cancel` of a long run; **not** a blocker of a sync runner | open |
 | `error.retryable` | [#15](https://github.com/alpibrusl/cancho-forge/issues/15) | policy retries; a gate that fails is not retried | open |
 | Cancho Code adapter | [#16](https://github.com/alpibrusl/cancho-forge/issues/16), blocked on [cancho#562](https://github.com/alpibrusl/cancho/issues/562) | Stage 3 | blocked |
@@ -332,6 +332,11 @@ settles it:
      find a command) end the run as **`incomplete`**, ending `environment`, worker error `gate-environment`, with the log
      and the report written: no verdict is claimed, the task is not moved to `verification`, and nothing says `fail`. The
      cost is that a gate that exits 127 for its own reasons is also `incomplete`; that errs on the side of not claiming.
+  2b. **A missing tool is found before the gate runs.** Found by measuring (section 8): `scripts/gate.sh` of this
+     repository, run without `cancho` on the `PATH`, counted its failed steps and exited 1, so rule 2 did not see it and the
+     run was claimed `fail`. `gate_task.required_tools` names the tools each row's gate certainly needs, and the runner's
+     shell checks them with `command -v` first, in the environment the gate is given, and ends with 127 naming the missing
+     one. It is a table row to extend, not a proof that nothing else is missing.
   3. **The oracles of the gates ask about their own children.** `pgrep -x gate_runner` (and `mock_worker`, `stub_llm`, the
      `sleep 79` and `git rev-parse HEAD` of the fixtures) saw the runner that was running the gate. They now go through
      `scripts/procs.sh`, which drops the **ancestors** of the asking process (read from `/proc`, no `ps`): the runner that
@@ -373,9 +378,32 @@ Measured in this repository:
 
 Also measured: the first self-hosted task (`forge gate`): 13 unit tests (`tests/flow_test.cho`, `tests/gate_run_test.cho`, `tests/event_test.cho`) and 29 checks on the built binary against real git checkouts and a real runner process (`scripts/check_gate_run.sh`): a pass and a fail are both claims in `verification` and never `accepted`; a checkout at another revision, a gate that never ends (nothing it started left running), a runner that is not there, a locked workspace and five refusals each end in the state and the journal records the document says. 28 of 29 deliberate breaks of `flow`, `gate_run`, `event` and `main` are killed and one is equivalent (`scripts/mutate_gate_run.py`; the first run had three survivors, all gaps in the oracles: the id of the task in the journal, and who proposed and approved it).
 
+**Measured 2026-10-21, after D7 (the change that carries this text), `scripts/self_host_gate.sh`, one run each, on the cloud container of `spike/RESULTS.md` (Linux, x86_64), compiler `7e4088b`:**
+
+| repository @ revision | environment given | what Forge recorded | wall clock | CI on that revision |
+|---|---|---|---|---|
+| cancho-forge @ `d35285f` (this change) | `PATH` (the compiler's directory), `CANCHO_CACHE`, `HOME` | claimed **pass**, task in `verification`, exit 0 | 140 s (an earlier run at `6890651`: 135 s; the gate run directly on the same machine: 84 to 110 s) | green (the `gate` run on the head `d35285f` of the pull request of this change, 110 s) |
+| cancho-ui @ `5e77f0b` | `PATH` (`~/.cargo/bin`), `HOME`, `CARGO_HOME`, `RUSTUP_HOME` | claimed **pass**, `verification`, exit 0 | 99 s (an earlier run: 84 s) | green (the `gate` run of that commit on `main`, 70 s) |
+| cancho-forge @ `d35285f` | none | **incomplete**, `environment`, exit 127: `the gate needs cancho, which is not on PATH`; the task is `blocked`, exit 4, no claim | 0.01 s | n/a |
+| cancho-ui @ `5e77f0b` | none | **incomplete**, `environment`, exit 127: `the gate needs cargo ...`; `blocked`, exit 4 | 0.02 s | n/a |
+
+So for these two revisions Forge's claim equals CI's, once the operator provides the environment, and an environment that is
+not provided is no longer claimed as the project's failure. **That is two data points, not N**: the other two repositories
+(`cancho`, `cancho-hdl`) were not run, no revision with a failing CI was run (so "Forge says fail when CI says fail" is
+unmeasured for a real gate), and the times are one run each.
+
+**What measuring found, and the change it caused.** The first run without `cancho` on the `PATH` (before the preflight below)
+was still claimed `fail`: `scripts/gate.sh` runs every step, counts the failed ones and exits 1, so the shell's 127 never
+reached the runner (`cancho: not found` twenty times in the log, exit status 1, 3 s). The exit-status rule of D7 sees only a
+gate that dies of the 126 or 127 itself. The fix is a **preflight**: `gate_task.required_tools` names, for each row of the
+allow-list, the tools its gate certainly needs (cancho-forge: `cancho git`; cancho-hdl: `git`; cancho and cancho-ui:
+`cargo`), and the shell text the runner starts checks each with `command -v` in the environment the gate is given and ends
+with 127, naming the tool. Limits: the list is the minimum, not a proof; a gate that needs another tool and wraps its commands
+is still `fail` when that tool is missing (the list is a table row to extend, with a test).
+
 Not measured, and not claimed:
 
-* a gate run of any of the four repositories through Forge in agreement with CI (first runs, 2026-10-21, one revision of two repositories, **all claimed `fail`, for the reasons of D7** (cancho-forge at `592421a`: 85.8 s, one check of the gate that is not re-entrant; cancho-ui at `e0a2217`: 6 ms, `cargo: not found`); the time per run beyond the first (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
+* a gate run of `cancho` or `cancho-hdl` through Forge; a gate that really fails, in agreement with CI; the time per run beyond one run (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
 * anything with a real worker, a real network, power loss, macOS, several
   workers at once, or a journal larger than the tests'.
 

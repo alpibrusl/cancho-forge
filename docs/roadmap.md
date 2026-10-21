@@ -180,7 +180,7 @@ the pilot's journal size and replay time.
 
 ## Self-hosting
 
-The plan for Forge managing the cancho project itself (the compiler, the language documents, the packages), in stages from a read-only gate report to maintained pins, with the authority each stage needs and what Forge never does unattended: [`self-hosting.md`](self-hosting.md) (a plan, nothing built). It leans on M2 (a worker linked into `main`), M3 (Forge-observed checks) and M4 (policy and approvals); its first task needs a gate-runner worker that is not Cancho Code.
+The plan for Forge managing the cancho project itself (the compiler, the language documents, the packages), in stages from a read-only gate report to maintained pins, with the authority each stage needs and what Forge never does unattended: [`self-hosting.md`](self-hosting.md) (Stage 1 is built: the gate runner and `forge gate`, with the operator's environment of D7, run on two real repositories in agreement with CI; the later stages are a plan). It leans on M2 (a worker linked into `main`), M3 (Forge-observed checks) and M4 (policy and approvals); its first task needs a gate-runner worker that is not Cancho Code.
 
 ## Dependencies on cancho, in one place
 
