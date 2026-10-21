@@ -224,7 +224,9 @@ the reader:
 Reconciling work that was in flight is a *policy*, not a mechanism:
 an `execution.started` with no `execution.finished` becomes
 `execution.lost` and the task returns to `ready` under its retry budget.
-Forge never silently re-dispatches (section 4.4).
+Forge never silently re-dispatches (section 4.4). The policy is built as
+`forge recover` (section 4.4.1); replaying a journal does not apply it, because
+looking must change nothing (section 4.9).
 
 ### 4.4 Exactly-once, as far as it can be
 
@@ -243,6 +245,42 @@ bounded**:
   here)*, and killing it by pid needs `/bin/kill` under an `Exec`
   (gap G4, still open: `child_kill_group` needs the `Child`, which died
   with the crashed Forge).
+
+#### 4.4.1 Recovery: `forge recover` *(issue #15; `src/recover.cho`, `src/recover_io.cho`)*
+
+A crash can stop Forge between the records of a run. The journal then says a task is `running` and the run it was in has
+no ending. `forge recover <dir>` takes the lock of the workspace, replays the journal (a torn tail is cut, as every writer
+does), and settles each `running` task from the records alone. Where a task stopped is read from the last record about it
+since it became `running` (`task.running`; any other `task.*` record ends the reading):
+
+| where it stopped | what Forge writes (every record is actor `forge`) | the task is |
+|---|---|---|
+| `task.running`, no `execution.started` after it: the intent was never written, so no worker was started | refusal `execution-unstarted` | `ready` |
+| `execution.started` and nothing after it: the worker may have run, and what it did is not known | `execution.lost`; then, if the worker was started fewer than `retry.max_attempts()` (3) times for this task, refusal `execution-lost` | `ready` |
+| the same, and the worker was started 3 times | `execution.lost`, refusal `retry-exhausted` | `blocked` |
+| `execution.finished` and no move after it: the worker's claim is recorded, the move was not (a finished record is written only for a `succeeded` reply, `forge gate` above) | nothing but the move | `verification` |
+| `execution.lost` and no move after it: a recovery that was itself cut short | as the rows above, without a second `execution.lost` | `ready` or `blocked` |
+
+The starts are counted from every `execution.started` of the task in the journal, so a task whose retries (section 4.9)
+were interrupted spends the same budget a task that was not interrupted would have. Four properties, each tested:
+
+* **Forge starts no worker.** `ready` is where the budget and the policy are consulted again (section 6). `forge gate`
+  records a new task on every call, so a recovered task waits for an operator; there is no verb yet that dispatches an
+  existing task (not done, below).
+* **It is idempotent.** After a recovery no task is `running` without an ending, so a second `forge recover` finds nothing,
+  writes nothing, and the journal is byte for byte what it was. A recovery cut short (a crash after `execution.lost`) is
+  finished by the next one, which does not write the loss twice; the one thing it may repeat (not tested) is the refusal record that
+  followed the loss, which is history, not state.
+* **It never writes into a journal the replay refuses.** A complete bad line is `journal-corrupt` (exit 1), nothing is cut and
+  nothing is appended, as for every writer (section 4.3).
+* **It is one record at a time, each synced** (`journal_io.append`), like `forge gate`, so a crash in the middle leaves a
+  journal that replays to the last record written.
+
+What is *not* done, and said plainly: the pid and the start token of the worker are not in `execution.started` yet, so Forge
+cannot ask whether the worker of a lost execution is still running (gap G4 above), and a `result.json` a worker finished
+writing before the crash is not accepted as the result. `execution.lost` therefore means "no ending was recorded", not "the
+worker did nothing"; the tag `execution-lost` says Forge did not guess. Authority: `docs/authority.txt` is unchanged (the
+verb uses only the journal's file capabilities that `forge gate` already needed).
 
 ### 4.5 Artifacts
 
@@ -442,8 +480,19 @@ task that `forge.gate_task` refuses (`scope-invalid`, `revision-invalid`, `task-
 journal was refused; 2 usage or a path that is not ok; 3 the workspace is locked (`workspace-locked`), a directory
 cannot be opened, or an I/O error; 4 the run ended without a claim. Measured by 13 unit tests (`tests/flow_test.cho`,
 `tests/gate_run_test.cho`, `tests/event_test.cho`) and 56 checks run on the built binary against real git checkouts and a
-real runner process (`scripts/check_gate_run.sh`, in the gate). Not done: the recovery that turns an `execution.started`
-with no `execution.finished` into `execution.lost` (section 4.4).
+real runner process (`scripts/check_gate_run.sh`, in the gate). The recovery that turns an `execution.started` with no
+`execution.finished` into `execution.lost` is `forge recover` (below, section 4.4.1).
+
+**`forge recover <dir>`** *(issue #15)* settles the tasks a crash left `running`: it takes the lock of the workspace
+(section 4.7), replays the journal (a torn tail is cut), writes what happened to each task and moves it out of `running`
+(section 4.4.1 has the table), prints one line for each task (`<id>: execution-lost, ...: running -> ready`) and
+`recovered: <n>`. It starts no worker. Exit status: 0 done (`recovered: 0` when nothing was running); 1 the journal is
+refused (the rule tag is printed, nothing is written); 2 usage, or a directory that is not absolute or has `..`; 3 the
+workspace is locked (`workspace-locked`), there is no `journal.jsonl`, or an I/O error. Measured by 13 unit tests of the
+plan (`tests/recover_test.cho`) and 27 checks on the built binary (`scripts/check_recover.sh`, in the gate), one of them a
+real crash: `forge gate` killed with SIGKILL after it wrote `execution.started`, then recovered. 40 of 40 deliberate
+breaks of the plan, the file layer and the verb are killed (`scripts/mutate_recover.py`; the first run left two alive, a
+finished and a lost record of a task that was not running, and a test was added for each).
 
 **Authority**, checked into `docs/authority.txt` and compared by the gate. It was `args`, `err_write`, `file_read`,
 `fs_read("")`, `heap`, `io_write` for `status` and `history`; **`forge gate` widened it** (issue #18), by `fs_write("")`
@@ -710,7 +759,8 @@ Designed, not implemented (no test reaches them yet; they are not claims):
 | `approval-missing` | a protected action without a granted approval |
 | `budget-exhausted` | a reservation would exceed a limit |
 | `worker-timeout`, `worker-output-overflow`, `worker-crashed`, `worker-error`, `worker-unavailable` | observed ending of a worker process (section 5 of the worker contract; the Cancho Code binding adds how an exit code is read, section 9.4) |
-| `retry-exhausted`, `retry-write-refused` | `forge.retry`: a worker said its failure is retryable (`error.retryable: true`) and no other attempt is made: the three allowed are used (`retry-exhausted`), or the task writes (`retry-write-refused`). The task is `blocked`. Reached by `tests/retry_test.cho` and, for the first, by `scripts/check_gate_run.sh` |
+| `execution-lost`, `execution-unstarted` | `forge.recover`: Forge found a task `running` with no ending and settled it (section 4.4.1). `execution-lost`: the intent (`execution.started`) was written and nothing after it, so the worker may have run; Forge writes `execution.lost`, does not re-dispatch, and the task is `ready`. `execution-unstarted`: the task was `running` and the intent was never written, so no worker was started; the task is `ready`. When the budget of starts is used up the tag is `retry-exhausted` (below) and the task is `blocked`. Reached by `tests/recover_test.cho` and `scripts/check_recover.sh` |
+| `retry-exhausted`, `retry-write-refused` | `forge.retry`: a worker said its failure is retryable (`error.retryable: true`) and no other attempt is made: the three allowed are used (`retry-exhausted`), or the task writes (`retry-write-refused`). The task is `blocked`. `retry-exhausted` is also what `forge recover` writes when a worker was started the whole budget and the last run has no ending. Reached by `tests/retry_test.cho`, `scripts/check_gate_run.sh` and, for the recovery, `scripts/check_recover.sh` |
 | `evidence-ref-invalid` (the file half) | `forge.evidence_io` opens each `ref` beneath the execution directory following no link and recomputes size and SHA-256: reasons `evidence-missing`, `evidence-unreadable` (a link, a directory), `evidence-too-large` (past 64 MiB), `evidence-bytes-mismatch`, `evidence-sha-mismatch` (`docs/worker-contract.md` 4.1; `tests/conformance/evidence_files.cho`, 24 cases; spike S10) |
 | `journal-sync-failed` | `fsync` failed; contents unknown; Forge stops (the file layer returns the errno today; the stop is M2) |
 

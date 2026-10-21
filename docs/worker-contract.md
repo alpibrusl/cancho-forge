@@ -475,7 +475,7 @@ a repository; they are `log`, never `patch`. All of it is `claimed`.
 | killed by Forge | `execution.cancelled` / `worker-timeout`; the verdict is absent |
 | signal, trap, or exit 143 not from Forge | `worker-crashed` |
 | verdict and exit code disagree, `build.json` missing or not an object, unknown verdict word | `worker-protocol` |
-| process gone with no verdict and Forge did not kill it | `execution.lost` after recovery (architecture 4.3) |
+| process gone with no verdict and Forge did not kill it | `execution.lost` after recovery (`forge recover`, architecture 4.4.1; the tag is `execution-lost`) |
 
 `stuck`, `gate_failed` and `plan_failed` are **outcomes**, not worker errors:
 they are the tool working, and they are never retried blindly.
