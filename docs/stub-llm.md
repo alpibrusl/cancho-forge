@@ -171,6 +171,6 @@ nothing in `main` links the stub.
 
 ## 10. Not done
 
-`capabilities` (the stub would answer it, Forge does not call it yet, worker-contract section 3.1), the `async`
+`capabilities` is answered (`repo.change`, `sync`; worker-contract section 3.6), but Forge does not call it at registration yet; the `async`
 verbs, `error.retryable` (a rule cannot choose it; it is always `false`), a script that reacts to the attempt number
 (a flaky worker that fails twice and then succeeds, for the retry budget of M4), and the Cancho Code binding.

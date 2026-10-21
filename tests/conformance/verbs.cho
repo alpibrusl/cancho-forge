@@ -1,0 +1,233 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.process;
+import forge.dispatch;
+import forge.response;
+import forge.support;
+import forge.verbs;
+import forge.worker;
+
+// The verbs besides `execute` against real workers (docs/worker-contract.md, sections 1.2 and 3.1 to 3.6): each is a real
+// child process started beneath a workers directory by `forge.worker.call`, once per case, and each case says how the
+// call ended in one line of text. The mock worker (tests/contract/mock_worker.cho) answers every verdict of `forge.verbs`
+// from the request id or the `target`; the stub LLM and the gate runner are `sync` workers that answer `capabilities`
+// and nothing else. Built and run by scripts/gate.sh.
+// Usage: verbs <workers directory holding mock_worker, stub_llm and gate_runner>
+
+// How a settled call is written: `cap:sync`, `cancel:too_late`, `status:running`, `result:not_ready`, `result:succeeded`,
+// `refused:<rule>:<reason>`, or `ended:<rule tag>`.
+fn describe[&h](heap: &!h Heap, s: verbs.Settled) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, 64);
+    match s {
+        verbs.Settled::Ended(e) => {
+            b = buffer.append(heap, b, "ended:");
+            return buffer.append(heap, b, dispatch.rule_tag(e));
+        }
+        verbs.Settled::Reply(j) => {
+            match j {
+                verbs.Judged::Capabilities(level) => {
+                    b = buffer.append(heap, b, "cap:");
+                    return buffer.append(heap, b, verbs.level_name(level));
+                }
+                verbs.Judged::Cancel(c) => {
+                    b = buffer.append(heap, b, "cancel:");
+                    return buffer.append(heap, b, verbs.cancel_name(c));
+                }
+                verbs.Judged::Status(st) => {
+                    b = buffer.append(heap, b, "status:");
+                    return buffer.append(heap, b, verbs.status_name(st));
+                }
+                verbs.Judged::Result(r) => {
+                    b = buffer.append(heap, b, "result:");
+                    match r {
+                        verbs.Resulted::NotReady => {
+                            return buffer.append(heap, b, "not_ready");
+                        }
+                        verbs.Resulted::Ready(state) => {
+                            return buffer.append(heap, b, response.state_name(state));
+                        }
+                    }
+                }
+                verbs.Judged::Refused(rule, reason) => {
+                    b = buffer.append(heap, b, "refused:");
+                    b = buffer.append(heap, b, verbs.rule_name(rule));
+                    b = buffer.append(heap, b, ":");
+                    match rule {
+                        verbs.Rule::EvidenceRefInvalid => {
+                            return buffer.append(heap, b, response.reason_name(reason));
+                        }
+                        verbs.Rule::Protocol => {
+                            if reason < 30 {
+                                return buffer.append(heap, b, response.reason_name(reason));
+                            }
+                            return buffer.append(heap, b, verbs.reason_name(reason));
+                        }
+                        verbs.Rule::ContractVersion => {
+                            return buffer.append(heap, b, verbs.reason_name(reason));
+                        }
+                        verbs.Rule::VerbUnsupported => {
+                            return buffer.append(heap, b, verbs.reason_name(reason));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// The request for `verb`: `capabilities` has no target.
+fn request_of[&h, &v, &r, &g](heap: &!h Heap, verb: &v [byte], rid: &r [byte], target: &g [byte]) -> [heap] buffer.Buffer {
+    if bytes.equal(verb, "capabilities") {
+        return verbs.build_capabilities(heap, rid);
+    }
+    return verbs.build_targeted(heap, verb, rid, target);
+}
+
+// One case: `verb` sent to the worker `name` (declared `level`) with request id `rid` and `target`, must end as `want`.
+fn case_within[&h, &x, &w, &c, &i, &n, &v, &r, &g](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], name: &n [byte], level: verbs.Level, verb: &v [byte], rid: &r [byte], target: &g [byte], want: &static [byte], most: int, timeout_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let req = request_of(heap, verb, rid, target);
+    var held = false;
+    borrow req as &qb in {
+        let settled = worker.call(heap, exec, workers, clock, name, level, verb, buffer.bytes(qb), rid, target, "t-1", most, timeout_ms);
+        let got = describe(heap, settled);
+        borrow got as &gb in {
+            held = bytes.equal(buffer.bytes(gb), want);
+            if !held {
+                io.write_all(io, "     got ");
+                io.write_all(io, buffer.bytes(gb));
+                io.newline(io);
+            }
+        }
+        buffer.drop(heap, got);
+    }
+    buffer.drop(heap, req);
+    return support.verdict(io, held, label);
+}
+
+fn case[&h, &x, &w, &c, &i, &n, &v, &r, &g](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], name: &n [byte], level: verbs.Level, verb: &v [byte], rid: &r [byte], target: &g [byte], want: &static [byte]) -> [heap, exec_under, clock, poll, io_write] int {
+    return case_within(heap, exec, workers, clock, io, label, name, level, verb, rid, target, want, 65536, 5000);
+}
+
+// The `capabilities` reply of `name` lists the task type `kind` and not `other`.
+fn lists[&h, &x, &w, &c, &i](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], name: &static [byte], kind: &static [byte], other: &static [byte]) -> [heap, exec_under, clock, poll, io_write] int {
+    let req = verbs.build_capabilities(heap, "r-1");
+    var held = false;
+    borrow req as &qb in {
+        let (out, ran) = worker.run(heap, exec, workers, clock, name, buffer.bytes(qb), 65536, 5000);
+        borrow out as &ob in {
+            held = verbs.lists_type(heap, buffer.bytes(ob), kind) && !verbs.lists_type(heap, buffer.bytes(ob), other);
+        }
+        buffer.drop(heap, out);
+    }
+    buffer.drop(heap, req);
+    return support.verdict(io, held, label);
+}
+
+fn run[&h, &x, &w, &c, &i](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io) -> [heap, exec_under, clock, poll, io_write] int {
+    var bad = 0;
+    // capabilities
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: a sync worker says so", "mock_worker", verbs.Level::Sync, "capabilities", "r-1", "", "cap:sync");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: an async worker says so", "mock_worker", verbs.Level::Sync, "capabilities", "r-async", "", "cap:async");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: no common version is worker-contract-version", "mock_worker", verbs.Level::Sync, "capabilities", "r-caps-noversion", "", "refused:worker-contract-version:supports");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: an unknown level", "mock_worker", verbs.Level::Sync, "capabilities", "r-caps-level", "", "refused:worker-protocol:level");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: a limit of zero", "mock_worker", verbs.Level::Sync, "capabilities", "r-caps-limits", "", "refused:worker-protocol:limits-max");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: a worker that is not an object", "mock_worker", verbs.Level::Sync, "capabilities", "r-caps-worker", "", "refused:worker-protocol:worker");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: task types that are not a list", "mock_worker", verbs.Level::Sync, "capabilities", "r-caps-types", "", "refused:worker-protocol:task-types");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: an empty supports list", "mock_worker", verbs.Level::Sync, "capabilities", "r-caps-supports", "", "refused:worker-protocol:supports");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: a worker that is not there is unavailable", "nope", verbs.Level::Sync, "capabilities", "r-1", "", "ended:worker-unavailable");
+    bad = bad + case(heap, exec, workers, clock, io, "capabilities: a name with .. is refused before the spawn", "../mock_worker", verbs.Level::Sync, "capabilities", "r-1", "", "ended:worker-unavailable");
+    // the bounds of a call are those it is given
+    bad = bad + case_within(heap, exec, workers, clock, io, "a worker that never answers a verb ends by the deadline", "mock_worker", verbs.Level::Async, "status", "r-3", "v-hang", "ended:worker-timeout", 65536, 400);
+    bad = bad + case_within(heap, exec, workers, clock, io, "a worker that writes more than the cap ends by the cap", "mock_worker", verbs.Level::Async, "status", "r-3", "v-overflow", "ended:worker-output-overflow", 200, 5000);
+    // cancel
+    bad = bad + case(heap, exec, workers, clock, io, "cancel: cancelled", "mock_worker", verbs.Level::Async, "cancel", "r-2", "c-cancelled", "cancel:cancelled");
+    bad = bad + case(heap, exec, workers, clock, io, "cancel: not running", "mock_worker", verbs.Level::Async, "cancel", "r-2", "c-none", "cancel:not_running");
+    bad = bad + case(heap, exec, workers, clock, io, "cancel: too late", "mock_worker", verbs.Level::Async, "cancel", "r-2", "c-late", "cancel:too_late");
+    bad = bad + case(heap, exec, workers, clock, io, "cancel: a state that is not one of three", "mock_worker", verbs.Level::Async, "cancel", "r-2", "c-bad-state", "refused:worker-protocol:cancel-state");
+    bad = bad + case(heap, exec, workers, clock, io, "cancel: a reply about another target", "mock_worker", verbs.Level::Async, "cancel", "r-2", "c-wrong-target", "refused:worker-protocol:target");
+    bad = bad + case(heap, exec, workers, clock, io, "cancel: a reply with no target", "mock_worker", verbs.Level::Async, "cancel", "r-2", "c-no-target", "refused:worker-protocol:target");
+    bad = bad + case(heap, exec, workers, clock, io, "cancel: a reply to another request", "mock_worker", verbs.Level::Async, "cancel", "r-2", "c-wrong-id", "refused:worker-protocol:request-id");
+    // status
+    bad = bad + case(heap, exec, workers, clock, io, "status: queued", "mock_worker", verbs.Level::Async, "status", "r-3", "s-queued", "status:queued");
+    bad = bad + case(heap, exec, workers, clock, io, "status: running, with a progress and a time", "mock_worker", verbs.Level::Async, "status", "r-3", "s-running", "status:running");
+    bad = bad + case(heap, exec, workers, clock, io, "status: finished", "mock_worker", verbs.Level::Async, "status", "r-3", "s-finished", "status:finished");
+    bad = bad + case(heap, exec, workers, clock, io, "status: unknown", "mock_worker", verbs.Level::Async, "status", "r-3", "s-unknown", "status:unknown");
+    bad = bad + case(heap, exec, workers, clock, io, "status: a state that is not one of four", "mock_worker", verbs.Level::Async, "status", "r-3", "s-bad-state", "refused:worker-protocol:status-state");
+    bad = bad + case(heap, exec, workers, clock, io, "status: a fraction past 1", "mock_worker", verbs.Level::Async, "status", "r-3", "s-bad-fraction", "refused:worker-protocol:progress");
+    bad = bad + case(heap, exec, workers, clock, io, "status: a step that is a number", "mock_worker", verbs.Level::Async, "status", "r-3", "s-bad-step", "refused:worker-protocol:progress");
+    bad = bad + case(heap, exec, workers, clock, io, "status: a time that is a number", "mock_worker", verbs.Level::Async, "status", "r-3", "s-bad-updated", "refused:worker-protocol:updated");
+    bad = bad + case(heap, exec, workers, clock, io, "status: a reply about another target", "mock_worker", verbs.Level::Async, "status", "r-3", "s-wrong-target", "refused:worker-protocol:target");
+    // result
+    bad = bad + case(heap, exec, workers, clock, io, "result: not ready", "mock_worker", verbs.Level::Async, "result", "r-4", "x-notready", "result:not_ready");
+    bad = bad + case(heap, exec, workers, clock, io, "result: the final response, a claim", "mock_worker", verbs.Level::Async, "result", "r-4", "x-ok", "result:succeeded");
+    bad = bad + case(heap, exec, workers, clock, io, "result: the worker's own failure", "mock_worker", verbs.Level::Async, "result", "r-4", "x-failed", "result:failed");
+    bad = bad + case(heap, exec, workers, clock, io, "result: accepted is never a result", "mock_worker", verbs.Level::Async, "result", "r-4", "x-accepted", "refused:worker-protocol:state");
+    bad = bad + case(heap, exec, workers, clock, io, "result: a reply to another request", "mock_worker", verbs.Level::Async, "result", "r-4", "x-bad-id", "refused:worker-protocol:request-id");
+    bad = bad + case(heap, exec, workers, clock, io, "result: not JSON", "mock_worker", verbs.Level::Async, "result", "r-4", "x-garbage", "refused:worker-protocol:not-json");
+    bad = bad + case(heap, exec, workers, clock, io, "result: an escaped evidence ref keeps its own rule", "mock_worker", verbs.Level::Async, "result", "r-4", "x-bad-ref", "refused:evidence-ref-invalid:evidence-ref");
+    // which verb a level has: nothing is started for the ones it has not (the worker named does not exist, so a start
+    // would be `worker-unavailable`)
+    bad = bad + case(heap, exec, workers, clock, io, "a sync worker is sent no cancel, and nothing is started", "nope", verbs.Level::Sync, "cancel", "r-2", "c-cancelled", "refused:worker-verb-unsupported:verb");
+    bad = bad + case(heap, exec, workers, clock, io, "a sync worker is sent no status, and nothing is started", "nope", verbs.Level::Sync, "status", "r-3", "s-queued", "refused:worker-verb-unsupported:verb");
+    bad = bad + case(heap, exec, workers, clock, io, "a sync worker is sent no result, and nothing is started", "nope", verbs.Level::Sync, "result", "r-4", "x-ok", "refused:worker-verb-unsupported:verb");
+    bad = bad + case(heap, exec, workers, clock, io, "a verb the contract has not is refused, and nothing is started", "nope", verbs.Level::Async, "execute", "r-5", "", "refused:worker-verb-unsupported:verb");
+    bad = bad + case(heap, exec, workers, clock, io, "an async worker is sent the verbs of its level", "nope", verbs.Level::Async, "status", "r-3", "s-queued", "ended:worker-unavailable");
+    // the real sync workers
+    bad = bad + case(heap, exec, workers, clock, io, "stub LLM: capabilities, sync", "stub_llm", verbs.Level::Sync, "capabilities", "r-1", "", "cap:sync");
+    bad = bad + case(heap, exec, workers, clock, io, "gate runner: capabilities, sync", "gate_runner", verbs.Level::Sync, "capabilities", "r-1", "", "cap:sync");
+    bad = bad + case(heap, exec, workers, clock, io, "stub LLM: a status it is forced to is not answered (exit 4)", "stub_llm", verbs.Level::Async, "status", "r-3", "s-queued", "ended:worker-error");
+    bad = bad + case(heap, exec, workers, clock, io, "gate runner: a result it is forced to is not answered (exit 4)", "gate_runner", verbs.Level::Async, "result", "r-4", "x-ok", "ended:worker-error");
+    bad = bad + lists(heap, exec, workers, clock, io, "mock worker lists repo.change and not repo.gate", "mock_worker", "repo.change", "repo.gate");
+    bad = bad + lists(heap, exec, workers, clock, io, "stub LLM lists repo.change and not repo.gate", "stub_llm", "repo.change", "repo.gate");
+    bad = bad + lists(heap, exec, workers, clock, io, "gate runner lists repo.gate and not repo.change", "gate_runner", "repo.gate", "repo.change");
+    return bad;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow exec as &x in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        borrow args as &g in {
+                            if arg_count(g) == 2 {
+                                match open_dir(f, arg(g, 1)) {
+                                    DirOpened::Ok(d) => {
+                                        var workers = d;
+                                        borrow workers as &w in {
+                                            status = run(h, x, w, c, i);
+                                        }
+                                        dir_close(workers);
+                                    }
+                                    DirOpened::Failed(e) => {
+                                        io.error_all(i, "verbs: cannot open the workers directory\n");
+                                    }
+                                }
+                            } else {
+                                io.error_all(i, "usage: verbs <workers directory>\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

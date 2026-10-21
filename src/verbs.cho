@@ -1,0 +1,663 @@
+edition 9;
+module forge.verbs;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.process;
+import forge.dispatch;
+import forge.response;
+
+// The four verbs besides `execute` (docs/worker-contract.md, sections 1.2, 3.1, 3.3 to 3.5 and 3.6): the requests Forge
+// writes and, as pure functions, the checks on what a worker answers. Like `forge.response` it opens no file and starts
+// no process; `forge.worker.call` is the process half. A reply is judged before any field is used, a parse error is a
+// value, and nothing here reads a worker's text except to see that it is text.
+//
+// Which verb a worker is sent depends on the level it declared (section 1.2): a `sync` worker answers `capabilities` and
+// `execute` only, so Forge sends it nothing else (`verb_allowed`, `worker-verb-unsupported`); `cancel`, `status` and
+// `result` are the `async` level's.
+
+// The rules this module answers (docs/architecture.md, section 7).
+pub enum Rule {
+    // `worker-protocol`: the reply is not valid for the verb.
+    Protocol,
+    // `worker-contract-version`: `supports` does not list a version Forge speaks.
+    ContractVersion,
+    // `worker-verb-unsupported`: Forge would send a verb the worker's declared level does not have. Nothing is started.
+    VerbUnsupported,
+    // `evidence-ref-invalid`: the evidence of a `result` that is not a safe reference with a well-formed hash and size.
+    EvidenceRefInvalid,
+}
+
+pub fn rule_name(r: Rule) -> [] &static [byte] {
+    match r {
+        Rule::Protocol => {
+            return "worker-protocol";
+        }
+        Rule::ContractVersion => {
+            return "worker-contract-version";
+        }
+        Rule::VerbUnsupported => {
+            return "worker-verb-unsupported";
+        }
+        Rule::EvidenceRefInvalid => {
+            return "evidence-ref-invalid";
+        }
+    }
+}
+
+// The level a worker declared (section 1.2).
+pub enum Level {
+    Sync,
+    Async,
+}
+
+pub fn level_name(l: Level) -> [] &static [byte] {
+    match l {
+        Level::Sync => {
+            return "sync";
+        }
+        Level::Async => {
+            return "async";
+        }
+    }
+}
+
+// What a worker said of a `cancel` (section 3.3).
+pub enum CancelState {
+    Cancelled,
+    NotRunning,
+    TooLate,
+}
+
+pub fn cancel_name(c: CancelState) -> [] &static [byte] {
+    match c {
+        CancelState::Cancelled => {
+            return "cancelled";
+        }
+        CancelState::NotRunning => {
+            return "not_running";
+        }
+        CancelState::TooLate => {
+            return "too_late";
+        }
+    }
+}
+
+// What a worker said of a `status` (section 3.4). Advisory: only `result` is evidence of an ending.
+pub enum StatusState {
+    Queued,
+    Running,
+    Finished,
+    Unknown,
+}
+
+pub fn status_name(s: StatusState) -> [] &static [byte] {
+    match s {
+        StatusState::Queued => {
+            return "queued";
+        }
+        StatusState::Running => {
+            return "running";
+        }
+        StatusState::Finished => {
+            return "finished";
+        }
+        StatusState::Unknown => {
+            return "unknown";
+        }
+    }
+}
+
+// The answer to a `result` (section 3.5): nothing yet, or the final response with the state it carries.
+pub enum Resulted {
+    NotReady,
+    Ready(response.State),
+}
+
+// A reply judged.
+pub enum Judged {
+    Capabilities(Level),
+    Cancel(CancelState),
+    Status(StatusState),
+    Result(Resulted),
+    Refused(Rule, int),
+}
+
+// What came of one call: the process did not give a reply (the same endings as `execute`, with the same rule tags), or it
+// did and this is the verdict on it.
+pub enum Settled {
+    Ended(dispatch.Ending),
+    Reply(Judged),
+}
+
+// ---- reasons ---------------------------------------------------------------------------------------------
+
+pub fn r_not_json() -> [] int {
+    return 1;
+}
+
+pub fn r_not_object() -> [] int {
+    return 2;
+}
+
+pub fn r_contract() -> [] int {
+    return 3;
+}
+
+pub fn r_request_id() -> [] int {
+    return 4;
+}
+
+pub fn r_worker() -> [] int {
+    return 30;
+}
+
+pub fn r_supports() -> [] int {
+    return 31;
+}
+
+pub fn r_level() -> [] int {
+    return 32;
+}
+
+pub fn r_task_types() -> [] int {
+    return 33;
+}
+
+pub fn r_task_type() -> [] int {
+    return 34;
+}
+
+pub fn r_limits_max() -> [] int {
+    return 35;
+}
+
+pub fn r_target() -> [] int {
+    return 36;
+}
+
+pub fn r_cancel_state() -> [] int {
+    return 37;
+}
+
+pub fn r_status_state() -> [] int {
+    return 38;
+}
+
+pub fn r_progress() -> [] int {
+    return 39;
+}
+
+pub fn r_updated() -> [] int {
+    return 40;
+}
+
+pub fn r_verb() -> [] int {
+    return 41;
+}
+
+pub fn reason_name(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "not-json";
+    }
+    if code == 2 {
+        return "not-an-object";
+    }
+    if code == 3 {
+        return "contract";
+    }
+    if code == 4 {
+        return "request-id";
+    }
+    if code == 30 {
+        return "worker";
+    }
+    if code == 31 {
+        return "supports";
+    }
+    if code == 32 {
+        return "level";
+    }
+    if code == 33 {
+        return "task-types";
+    }
+    if code == 34 {
+        return "task-type";
+    }
+    if code == 35 {
+        return "limits-max";
+    }
+    if code == 36 {
+        return "target";
+    }
+    if code == 37 {
+        return "cancel-state";
+    }
+    if code == 38 {
+        return "status-state";
+    }
+    if code == 39 {
+        return "progress";
+    }
+    if code == 40 {
+        return "updated";
+    }
+    if code == 41 {
+        return "verb";
+    }
+    return "unknown";
+}
+
+// ---- limits ----------------------------------------------------------------------------------------------
+
+// A worker name, a version, a task type, a progress step and the timestamp are text of bounded length.
+pub fn max_name_bytes() -> [] int {
+    return 128;
+}
+
+pub fn max_step_bytes() -> [] int {
+    return 256;
+}
+
+pub fn max_supports() -> [] int {
+    return 16;
+}
+
+pub fn max_task_types() -> [] int {
+    return 64;
+}
+
+// ---- the requests ----------------------------------------------------------------------------------------
+
+// `{"contract":"forge-worker/1","verb":"capabilities","request_id":...}` (section 3.1).
+pub fn build_capabilities[&h, &a](heap: &!h Heap, request_id: &a [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "verb");
+    w = json.put_string(heap, w, "capabilities");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// `cancel`, `status` and `result` (sections 3.3 to 3.5) name the request they are about: `{"verb":...,"request_id":...,
+// "target":...}`. `verb` is one of those three; anything else is not built (an empty buffer), so a wrong name cannot
+// reach a worker.
+pub fn build_targeted[&h, &v, &a, &t](heap: &!h Heap, verb: &v [byte], request_id: &a [byte], target: &t [byte]) -> [heap] buffer.Buffer {
+    if !(bytes.equal(verb, "cancel") || bytes.equal(verb, "status") || bytes.equal(verb, "result")) {
+        return buffer.empty(heap, 1);
+    }
+    var w = json.writer(heap, 160);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "verb");
+    w = json.put_string(heap, w, verb);
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "target");
+    w = json.put_string(heap, w, target);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The `capabilities` reply of a worker (section 3.1): its name and version, the one contract version it speaks, its level,
+// and the one task type it serves with the largest limits it will take (no task type when `task_type` is empty). The three
+// workers of this repository answer with this; `judge` is its inverse.
+pub fn capabilities_reply[&h, &a, &n, &v, &l, &t](heap: &!h Heap, request_id: &a [byte], name: &n [byte], version: &v [byte], level: &l [byte], task_type: &t [byte], timeout_max: int, output_max: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "worker");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "name");
+    w = json.put_string(heap, w, name);
+    w = json.put_key(heap, w, "version");
+    w = json.put_string(heap, w, version);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "supports");
+    w = json.begin_array(heap, w);
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.end_array(heap, w);
+    w = json.put_key(heap, w, "level");
+    w = json.put_string(heap, w, level);
+    w = json.put_key(heap, w, "task_types");
+    w = json.begin_array(heap, w);
+    if len(task_type) > 0 {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "type");
+        w = json.put_string(heap, w, task_type);
+        w = json.put_key(heap, w, "limits_max");
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "timeout_ms");
+        w = json.put_int(heap, w, timeout_max);
+        w = json.put_key(heap, w, "max_output_bytes");
+        w = json.put_int(heap, w, output_max);
+        w = json.end_object(heap, w);
+        w = json.end_object(heap, w);
+    }
+    w = json.end_array(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// ---- which verb for which level --------------------------------------------------------------------------
+
+// Does a worker of `level` have `verb`? Every worker has `capabilities` and `execute`; only an `async` one has the rest
+// (section 1.2). An unknown verb is nobody's.
+pub fn verb_allowed[&v](level: Level, verb: &v [byte]) -> [] bool {
+    if bytes.equal(verb, "capabilities") || bytes.equal(verb, "execute") {
+        return true;
+    }
+    if bytes.equal(verb, "cancel") || bytes.equal(verb, "status") || bytes.equal(verb, "result") {
+        match level {
+            Level::Async => {
+                return true;
+            }
+            Level::Sync => {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+// The refusal for a verb the level does not have (`worker-verb-unsupported`). Forge asks `verb_allowed` before it starts
+// anything, and answers this when it is false.
+pub fn refuse_verb() -> [] Judged {
+    return Judged::Refused(Rule::VerbUnsupported, r_verb());
+}
+
+// ---- the replies -----------------------------------------------------------------------------------------
+
+fn protocol(reason: int) -> [] Judged {
+    return Judged::Refused(Rule::Protocol, reason);
+}
+
+fn is_text[&s, &t, &k](src: &s [byte], tape: &t [int], node: int, text: &k [byte]) -> [] bool {
+    return json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+// A plain string of 1 to `most` bytes.
+fn name_ok[&s, &t](src: &s [byte], tape: &t [int], node: int, most: int) -> [] bool {
+    return json.is_string(tape, node) && json.string_plain(tape, node) && json.string_length(src, tape, node) >= 1 && json.string_length(src, tape, node) <= most;
+}
+
+// Contract and request id: the start of every reply.
+fn envelope[&s, &t, &r](src: &s [byte], tape: &t [int], request_id: &r [byte]) -> [] int {
+    if !json.is_object(tape, 0) {
+        return r_not_object();
+    }
+    if !is_text(src, tape, json.get(src, tape, 0, "contract"), "forge-worker/1") {
+        return r_contract();
+    }
+    if !is_text(src, tape, json.get(src, tape, 0, "request_id"), request_id) {
+        return r_request_id();
+    }
+    return 0;
+}
+
+// `limits_max`: an object whose `timeout_ms` and `max_output_bytes` are positive integers (section 3.1).
+fn limits_ok[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] bool {
+    if !json.is_object(tape, node) {
+        return false;
+    }
+    let timeout = json.get(src, tape, node, "timeout_ms");
+    let most = json.get(src, tape, node, "max_output_bytes");
+    if !json.is_int(tape, timeout) || !json.fits_int(src, tape, timeout) || json.to_int(src, tape, timeout) < 1 {
+        return false;
+    }
+    return json.is_int(tape, most) && json.fits_int(src, tape, most) && json.to_int(src, tape, most) >= 1;
+}
+
+fn judge_capabilities[&s, &t, &r](src: &s [byte], tape: &t [int], request_id: &r [byte]) -> [] Judged {
+    let e = envelope(src, tape, request_id);
+    if e != 0 {
+        return protocol(e);
+    }
+    let worker = json.get(src, tape, 0, "worker");
+    if !json.is_object(tape, worker) || !name_ok(src, tape, json.get(src, tape, worker, "name"), max_name_bytes()) || !name_ok(src, tape, json.get(src, tape, worker, "version"), max_name_bytes()) {
+        return protocol(r_worker());
+    }
+    let supports = json.get(src, tape, 0, "supports");
+    if !json.is_array(tape, supports) || json.count(tape, supports) < 1 || json.count(tape, supports) > max_supports() {
+        return protocol(r_supports());
+    }
+    var common = false;
+    var i = 0;
+    while i < json.count(tape, supports) {
+        let v = json.at(tape, supports, i);
+        if !json.is_string(tape, v) {
+            return protocol(r_supports());
+        }
+        if json.string_equals(src, tape, v, "forge-worker/1") {
+            common = true;
+        }
+        i = i + 1;
+    }
+    var level = Level::Sync;
+    let l = json.get(src, tape, 0, "level");
+    if is_text(src, tape, l, "async") {
+        level = Level::Async;
+    } else if !is_text(src, tape, l, "sync") {
+        return protocol(r_level());
+    }
+    let types = json.get(src, tape, 0, "task_types");
+    if !json.is_array(tape, types) || json.count(tape, types) > max_task_types() {
+        return protocol(r_task_types());
+    }
+    var k = 0;
+    while k < json.count(tape, types) {
+        let entry = json.at(tape, types, k);
+        if !json.is_object(tape, entry) || !name_ok(src, tape, json.get(src, tape, entry, "type"), max_name_bytes()) {
+            return protocol(r_task_type());
+        }
+        if !limits_ok(src, tape, json.get(src, tape, entry, "limits_max")) {
+            return protocol(r_limits_max());
+        }
+        k = k + 1;
+    }
+    // Well-formed. No common version is a refusal of its own, and it is decided last so that a malformed reply is never
+    // taken for a version mismatch.
+    if !common {
+        return Judged::Refused(Rule::ContractVersion, r_supports());
+    }
+    return Judged::Capabilities(level);
+}
+
+fn target_ok[&s, &t, &g](src: &s [byte], tape: &t [int], target: &g [byte]) -> [] bool {
+    return is_text(src, tape, json.get(src, tape, 0, "target"), target);
+}
+
+fn judge_cancel[&s, &t, &r, &g](src: &s [byte], tape: &t [int], request_id: &r [byte], target: &g [byte]) -> [] Judged {
+    let e = envelope(src, tape, request_id);
+    if e != 0 {
+        return protocol(e);
+    }
+    if !target_ok(src, tape, target) {
+        return protocol(r_target());
+    }
+    let s = json.get(src, tape, 0, "state");
+    if is_text(src, tape, s, "cancelled") {
+        return Judged::Cancel(CancelState::Cancelled);
+    }
+    if is_text(src, tape, s, "not_running") {
+        return Judged::Cancel(CancelState::NotRunning);
+    }
+    if is_text(src, tape, s, "too_late") {
+        return Judged::Cancel(CancelState::TooLate);
+    }
+    return protocol(r_cancel_state());
+}
+
+// `progress`: an object whose `step`, if present, is text of at most `max_step_bytes`, and whose `fraction`, if present,
+// is a number from 0 to 1 inclusive.
+fn progress_ok[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] bool {
+    if !json.is_object(tape, node) {
+        return false;
+    }
+    let step = json.get(src, tape, node, "step");
+    if step >= 0 && !(json.is_string(tape, step) && json.string_length(src, tape, step) <= max_step_bytes()) {
+        return false;
+    }
+    let fraction = json.get(src, tape, node, "fraction");
+    if fraction >= 0 {
+        if !json.is_number(tape, fraction) {
+            return false;
+        }
+        let f = json.to_float(src, tape, fraction);
+        if !(f >= 0.0 && f <= 1.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn judge_status[&s, &t, &r, &g](src: &s [byte], tape: &t [int], request_id: &r [byte], target: &g [byte]) -> [] Judged {
+    let e = envelope(src, tape, request_id);
+    if e != 0 {
+        return protocol(e);
+    }
+    if !target_ok(src, tape, target) {
+        return protocol(r_target());
+    }
+    let progress = json.get(src, tape, 0, "progress");
+    if progress >= 0 && !progress_ok(src, tape, progress) {
+        return protocol(r_progress());
+    }
+    let updated = json.get(src, tape, 0, "updated");
+    if updated >= 0 && !name_ok(src, tape, updated, max_name_bytes()) {
+        return protocol(r_updated());
+    }
+    let s = json.get(src, tape, 0, "state");
+    if is_text(src, tape, s, "queued") {
+        return Judged::Status(StatusState::Queued);
+    }
+    if is_text(src, tape, s, "running") {
+        return Judged::Status(StatusState::Running);
+    }
+    if is_text(src, tape, s, "finished") {
+        return Judged::Status(StatusState::Finished);
+    }
+    if is_text(src, tape, s, "unknown") {
+        return Judged::Status(StatusState::Unknown);
+    }
+    return protocol(r_status_state());
+}
+
+// Is `body` the `{"state":"not_ready"}` answer to a `result` (section 3.5), with a right contract and request id?
+fn judge_result_not_ready[&s, &t, &r](src: &s [byte], tape: &t [int], request_id: &r [byte]) -> [] bool {
+    if !json.is_object(tape, 0) {
+        return false;
+    }
+    if !is_text(src, tape, json.get(src, tape, 0, "state"), "not_ready") {
+        return false;
+    }
+    return is_text(src, tape, json.get(src, tape, 0, "contract"), "forge-worker/1") && is_text(src, tape, json.get(src, tape, 0, "request_id"), request_id);
+}
+
+fn judged_of_response(v: response.Verdict) -> [] Judged {
+    match v {
+        response.Verdict::Valid(state) => {
+            return Judged::Result(Resulted::Ready(state));
+        }
+        response.Verdict::Refused(rule, reason) => {
+            // The reason codes are those of `forge.response` (1 to 22); the rule is the response's own, kept.
+            match rule {
+                response.Rule::WorkerProtocol => {
+                    return Judged::Refused(Rule::Protocol, reason);
+                }
+                response.Rule::EvidenceRefInvalid => {
+                    return Judged::Refused(Rule::EvidenceRefInvalid, reason);
+                }
+            }
+        }
+    }
+}
+
+// The verdict on `body`, what a worker wrote for `verb`. `request_id` is the id of this request and `target` the request
+// the verb is about (`cancel`, `status`, `result`; ignored for `capabilities`); `task_id` is the task a `result` is about.
+// An unknown verb is `worker-verb-unsupported`: nothing here answers a verb the contract does not have.
+pub fn judge[&h, &b, &v, &r, &g, &k](heap: &!h Heap, verb: &v [byte], body: &b [byte], request_id: &r [byte], target: &g [byte], task_id: &k [byte]) -> [heap] Judged {
+    if !(bytes.equal(verb, "capabilities") || bytes.equal(verb, "cancel") || bytes.equal(verb, "status") || bytes.equal(verb, "result")) {
+        return refuse_verb();
+    }
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    var out = protocol(r_not_json());
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(body, tp) > 0 {
+            if bytes.equal(verb, "capabilities") {
+                out = judge_capabilities(body, tp, request_id);
+            } else if bytes.equal(verb, "cancel") {
+                out = judge_cancel(body, tp, request_id, target);
+            } else if bytes.equal(verb, "status") {
+                out = judge_status(body, tp, request_id, target);
+            } else if judge_result_not_ready(body, tp, request_id) {
+                out = Judged::Result(Resulted::NotReady);
+            } else {
+                // The final response: the one of `execute`, section 3.2, never `accepted` (a result is not a
+                // promise), so judged as a `sync` reply.
+                out = judged_of_response(response.validate(heap, body, request_id, task_id, false));
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
+
+// Does the (valid) `capabilities` reply `body` list the task type `task_type`? A body that is not valid lists nothing.
+pub fn lists_type[&h, &b, &y](heap: &!h Heap, body: &b [byte], task_type: &y [byte]) -> [heap] bool {
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    var found = false;
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(body, tp) > 0 && json.is_object(tp, 0) {
+            let types = json.get(body, tp, 0, "task_types");
+            if json.is_array(tp, types) {
+                var i = 0;
+                while i < json.count(tp, types) && i < max_task_types() {
+                    let entry = json.at(tp, types, i);
+                    if json.is_object(tp, entry) && is_text(body, tp, json.get(body, tp, entry, "type"), task_type) {
+                        found = true;
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return found;
+}
+
+// How one call ended: `ran` and the bytes `out` the worker wrote. Anything but a clean exit is the ending of
+// `forge.dispatch` (rows 1 to 5 of section 5), with its rule tag; exit 0 is judged by `judge`.
+pub fn settle[&h, &b, &v, &r, &g, &k](heap: &!h Heap, ran: process.Ran, verb: &v [byte], out: &b [byte], request_id: &r [byte], target: &g [byte], task_id: &k [byte]) -> [heap] Settled {
+    match ran {
+        process.Ran::Code(n) => {
+            if n == 0 {
+                return Settled::Reply(judge(heap, verb, out, request_id, target, task_id));
+            }
+            return Settled::Ended(dispatch.Ending::Error(n));
+        }
+        process.Ran::Failed(e) => {
+            return Settled::Ended(dispatch.Ending::Unavailable(e));
+        }
+        process.Ran::TimedOut => {
+            return Settled::Ended(dispatch.Ending::Timeout);
+        }
+        process.Ran::TooMuch => {
+            return Settled::Ended(dispatch.Ending::Overflow);
+        }
+        process.Ran::Signaled(s) => {
+            return Settled::Ended(dispatch.Ending::Crashed(s));
+        }
+    }
+}

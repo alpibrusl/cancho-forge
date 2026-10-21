@@ -5,6 +5,7 @@
 #   cancho test          every `fn test_*` passes (pure logic: tasks, journal replay)
 #   forge gate           `forge gate` end to end against real git checkouts and a real runner (scripts/check_gate_run.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
+#   verbs                capabilities, cancel, status and result against the mock worker (every verdict) and the stub LLM and gate runner (capabilities), real child processes
 #   conformance          tests/conformance/*.cho, programs that need an Fs, which
 #                        `cancho test` cannot hand a test: built, run against a
 #                        scratch directory made here and removed, exit 0 = held
@@ -85,6 +86,24 @@ if $C build tests/contract/mock_worker.cho tests/conformance/support.cho $libs -
   if (. scripts/procs.sh; leftover -x mock_worker > /dev/null); then echo "FAIL a mock worker outlived the run"; fail=1; fi
 else
   echo "worker contract: did not build"
+  fail=1
+fi
+
+echo "== worker contract verbs (capabilities, cancel, status, result: every verdict, against real workers started by forge.worker.call)"
+# The mock answers every verdict of forge.verbs from the request id or the target; the stub LLM and the gate runner are sync
+# workers that answer capabilities and nothing else. They are built into the workers directory of the section above.
+$C check workers/stub_llm.cho $libs --std || fail=1
+$C check workers/gate_runner.cho $libs --std || fail=1
+$C check tests/conformance/verbs.cho tests/conformance/support.cho $libs --std || fail=1
+if $C build workers/stub_llm.cho $libs --std -o "$wdir/stub_llm" \
+  && $C build workers/gate_runner.cho $libs --std -o "$wdir/gate_runner" \
+  && $C build tests/conformance/verbs.cho tests/conformance/support.cho $libs --std -o "$scratch/verbs"; then
+  "$scratch/verbs" "$wdir" > "$scratch/verbs.out" || fail=1
+  cat "$scratch/verbs.out"
+  if grep -q '^FAIL ' "$scratch/verbs.out"; then fail=1; fi
+  if (. scripts/procs.sh; leftover -x mock_worker > /dev/null) || (. scripts/procs.sh; leftover -x stub_llm > /dev/null) || (. scripts/procs.sh; leftover -x gate_runner > /dev/null); then echo "FAIL a worker outlived the verbs run"; fail=1; fi
+else
+  echo "worker contract verbs: did not build"
   fail=1
 fi
 

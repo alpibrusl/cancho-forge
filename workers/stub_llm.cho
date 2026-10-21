@@ -8,6 +8,7 @@ import std.option;
 import forge.journal_io;
 import forge.snapshot;
 import forge.stub_script;
+import forge.verbs;
 
 // The stub LLM worker (docs/stub-llm.md): a `sync` worker of the contract (docs/worker-contract.md, section 3.2) that
 // answers the way a model-backed worker would, from a script instead of a model, so that every flow of Forge that ends
@@ -527,7 +528,14 @@ fn serve[&h, &i, &f, &c](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Cl
                 }
                 // A request that is not an `execute` of this contract, or that names no request and no task, is not
                 // answered: the worker has nothing to say that Forge could match to a call.
-                if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(rid) == 0 || len(tid) == 0 {
+                if is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") && is(src, tp, json.get(src, tp, 0, "verb"), "capabilities") && len(rid) > 0 {
+                    // The only other verb of a `sync` worker (docs/worker-contract.md, 1.2 and 3.1).
+                    let reply = verbs.capabilities_reply(heap, rid, "stub-llm", "0.1.0", "sync", "repo.change", 600000, 1048576);
+                    borrow reply as &yb in {
+                        send(io, buffer.bytes(yb));
+                    }
+                    buffer.drop(heap, reply);
+                } else if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(rid) == 0 || len(tid) == 0 {
                     code = 4;
                 } else if prompt_node < 0 || !json.is_string(tp, prompt_node) || len(exec_dir) == 0 || !journal_io.path_ok(fs, exec_dir) {
                     let reply = failure(heap, rid, tid, stub_script.code_bad_request(), "the request has no prompt, or no usable execution directory");
