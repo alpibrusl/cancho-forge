@@ -36,6 +36,7 @@ findings".)
 | Ask whether a path is inside a bound, before a trap | **PASS** (`fs_covers`): and it found a **defect in Forge's own copy of the rule** (`/tmp/a..b/j` passed `path_ok` and killed the process), now fixed | S8 |
 | Start a worker beneath a directory chosen at deployment | **PASS** (`exec_spawn_under`, row `exec_under`, no path in the report); a name the guard refuses is never spawned | S9 |
 | Open a worker's file without following its symlink | **FAIL through `Fs`, PASS through `Dir`** (`open_read` followed a link to a file and a path through a linked directory; `std.dirs.open_file` refused both, `ELOOP` and `ENOTDIR`, and `..` is not a component it opens) | S10 |
+| A deadline kill of a worker started with `exec_spawn_under` leaves what the worker started running | **CONFIRMED (a leak) for the under form**; **cleaned only if the worker starts the gate detached and enforces a deadline of its own shorter than Forge's**; Forge's kill is a backstop that leaks (gap G10) | S11 |
 | Pass a narrowed `Exec` | **PASS**: allowed spawns run; outside spawn and `..` path **trap** (SIGILL, exit 132) -- a refusal-as-value does not exist | S3 |
 | `cancho authority` reports it | **PASS**: `exec("/bin/echo")`, `exec("/usr/bin")`; Forge's S6 dispatcher reports no filesystem, no network, no foreign code | S3, S6 |
 | Append + sync a journal | **PASS** | S5 |
@@ -404,6 +405,84 @@ it), `dirlink` (a symlink to a directory outside it) and no `missing`.
 `worker-contract.md` section 4 ("a relative path inside `execution_dir`") cannot be kept by `Fs` plus a path check;
 `evidence_io` opens the directory once with `open_dir` and walks every `ref` beneath it. Nothing is needed from the
 compiler: `Dir` was already there (cancho #546), unused by Forge until now.
+
+## S11 -- a deadline kill of a gate runner: does what the gate started survive?
+
+`docs/self-hosting.md` D3 asked it before the first self-hosted task was built: the first real worker is a **gate runner**
+(it starts a repository's gate, which starts compilers), Forge starts a worker with `exec_spawn_under` (the worker is a
+name beneath a run-time `Dir`), and `exec_spawn_under` has no detached form (gap G10, cancho #562). S7 measured the plain
+`exec_spawn`; the under form was "the same code path, not re-measured". This re-measures it for the shape that matters
+and tries the mitigation D3 proposed.
+
+`spike/s11_runner.cho` stands in for the runner: it starts `/bin/sh -c 'sleep 78 & wait'` (a script that starts a
+compiler) and waits. `spike/s11_forge.cho` starts the runner the way Forge does and kills it at a 1000 ms deadline
+(`process.capture`). `spike/run.sh` looks at the process table afterwards with `ps` (the oracle is outside the
+programs). Two variables, six runs:
+
+* how **Forge** starts the runner: `exec_spawn_under` (`u`, what `src/worker.cho` does), or `exec_spawn_detached` of the
+  absolute path (`d`, a group leader, which needs no `Dir` form but names the program by path);
+* how the **runner** starts the gate: plain `exec_spawn` with no deadline of its own (`p`, the control); detached with its
+  own deadline of 200 ms, shorter than Forge's (`d`, the mitigation of D3); detached with no deadline of its own (`l`,
+  Forge's kill is the only kill).
+
+Verbatim, from `spike/run.sh` (compiler rev `7e4088b`):
+
+```
+=== S11 a deadline kill of a gate runner: does what the gate started survive? (the grandchild is 'sleep 78')
+--- Forge starts the runner: exec_spawn_under (not a group leader); the runner starts the gate: plain, no deadline of its own
+forge: runner timed out; killed and reaped after 1001 ms
+'sleep 78' processes (pid pgid sid state; none = nothing leaked):
+  3885 3314 3311 S
+--- Forge starts the runner: exec_spawn_under (not a group leader); the runner starts the gate: detached, its own deadline 200 ms < 1000 ms
+forge: runner exited 0
+'sleep 78' processes (pid pgid sid state; none = nothing leaked):
+--- Forge starts the runner: exec_spawn_under (not a group leader); the runner starts the gate: detached, no deadline of its own
+forge: runner timed out; killed and reaped after 1002 ms
+'sleep 78' processes (pid pgid sid state; none = nothing leaked):
+  3925 3923 3923 S
+--- Forge starts the runner: exec_spawn_detached (a group leader); the runner starts the gate: plain, no deadline of its own
+forge: runner timed out; killed and reaped after 1002 ms
+'sleep 78' processes (pid pgid sid state; none = nothing leaked):
+--- Forge starts the runner: exec_spawn_detached (a group leader); the runner starts the gate: detached, its own deadline 200 ms < 1000 ms
+forge: runner exited 0
+'sleep 78' processes (pid pgid sid state; none = nothing leaked):
+--- Forge starts the runner: exec_spawn_detached (a group leader); the runner starts the gate: detached, no deadline of its own
+forge: runner timed out; killed and reaped after 1001 ms
+'sleep 78' processes (pid pgid sid state; none = nothing leaked):
+  4014 4013 4013 S
+```
+
+| Forge starts the runner | the runner starts the gate | gate left running after the kill? |
+|---|---|---|
+| `exec_spawn_under` | plain, no deadline of its own | **yes** (pgid 3314 = the parent's: the control, G10 confirmed for the under form) |
+| `exec_spawn_under` | detached, own deadline 200 ms < 1000 ms | **no**; the runner exited 0 on its own |
+| `exec_spawn_under` | detached, no deadline of its own | **yes** (a group and session of its own: the outer kill cannot reach it) |
+| `exec_spawn_detached` | plain, no deadline | no (the gate is in the runner's group, `capture` kills the group) |
+| `exec_spawn_detached` | detached, own deadline | no |
+| `exec_spawn_detached` | detached, no deadline | **yes** (a detached child leaves the outer group: `setsid`) |
+
+**What it says.**
+
+1. **G10 is real for the shape that matters.** A runner started with `exec_spawn_under` and killed by Forge's deadline
+   leaves its gate running (row 1), whether the runner started the gate plain or detached (rows 1 and 3).
+2. **The mitigation works only as the primary mechanism, not as a backstop.** If the runner starts the gate detached and
+   enforces a deadline of its own that is **shorter than Forge's** (row 2), nothing is left. If Forge's deadline is the
+   shorter one, or the runner has none (row 3), the gate leaks: Forge's kill cannot reach a session the runner created.
+   So the runner's own deadline must be strictly less than Forge's by a margin that covers the group kill and the
+   evidence writing, and Forge's deadline is a *backstop that leaks*, not one that cleans.
+3. **A Forge-side detached start (rows 4 to 6) would clean up a plain gate (row 4) but breaks on the runner's own detach
+   (row 6)**, and it names the program by absolute path under `Exec("")` where `exec_spawn_under` is held beneath a
+   `Dir` (S9, S10): it trades the symlink/escape protection for the group. Not adopted. The two starts also differ in the
+   authority row (`exec_under` against `exec_detached` plus `exec("")`).
+4. **A runner that dies mid-gate** (a trap, an OOM kill) leaves a detached gate running for the same reason as row 3.
+   Not measured separately: it is row 3 with the kill coming from the kernel.
+
+**Not measured, and not claimed.** A real gate (it starts many processes, some of which may `setsid` themselves; only a
+descendant that stayed in the gate's group is reached by `child_kill_group`, cancho `docs/processes.md` section 9); a
+Forge crash (G4); macOS; the time the group kill takes against a loaded machine; the margin between the two deadlines
+(200 ms against 1000 ms here is a spike, not a recommendation).
+
+---
 
 ## M1 findings -- what building the core measured
 

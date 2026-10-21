@@ -277,14 +277,18 @@ settles it:
   it; the Cancho Code adapter (#16) is for Stage 3. Its sync/async level: a
   gate run is minutes (section 8), which a `sync` worker can do inside a
   deadline of the same order, so #14 is not a prerequisite.
-* **D3. G10 applies to the gate runner, not only to Cancho Code.** A gate
-  starts compilers; if Forge's deadline kills the runner, what the runner
-  started is leaked, because `exec_spawn_under` has no detached form
-  ([cancho#562](https://github.com/alpibrusl/cancho/issues/562); S7
-  measured the plain start, the under form is the same code path and was not
-  re-measured). Mitigation to try, *unmeasured*: the runner starts the gate
-  with `exec_spawn_detached` and kills its group on its own, shorter,
-  deadline, so the outer kill is only the backstop.
+* **D3. G10 applies to the gate runner, not only to Cancho Code. Measured 2026-10-21 (spike S11, `spike/RESULTS.md`).**
+  A gate starts compilers; if Forge's deadline kills the runner, what the runner started is leaked, because
+  `exec_spawn_under` has no detached form ([cancho#562](https://github.com/alpibrusl/cancho/issues/562)). S11 measured the
+  under form: **the leak is real** (a runner killed by Forge's deadline leaves its gate running, whether the runner
+  started the gate plain or detached). The mitigation proposed here before it was measured, "the runner starts the gate
+  with `exec_spawn_detached` and kills its group on its own, shorter, deadline, so the outer kill is only the backstop",
+  **half holds**: with the runner's own deadline shorter than Forge's, nothing is left; but the outer kill is **not** a
+  backstop, because a detached gate leaves the runner's group and session, so when Forge's deadline is the one that
+  fires the gate leaks. The design rule that follows: the runner's deadline is strictly less than Forge's, with a margin
+  for the group kill and the evidence; Forge's deadline is the last resort and leaks. Corrected in place from the
+  earlier text of this item, in the commit that carries spike S11. Not measured: a real gate (descendants that
+  `setsid`), a runner that dies mid-gate, a Forge crash (G4).
 * **D4. Stage 4's push path:** `net` narrowed to a host, or a narrowed
   `exec` of a client run as a worker. Decide with M6's authority review.
 * **D5. Where the allow-list and policy live,** and how a change to them is
@@ -309,7 +313,7 @@ Measured in this repository:
 Not measured, and not claimed:
 
 * a gate run of any of the four repositories through Forge: its time, its
-  agreement with CI, the leak of section 7 (D3);
+  agreement with CI (the leak of section 7, D3, is measured for a stand-in gate, spike S11);
 * anything with a real worker, a real network, power loss, macOS, several
   workers at once, or a journal larger than the tests'.
 

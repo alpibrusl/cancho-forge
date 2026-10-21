@@ -13,7 +13,7 @@ say() { printf '\n=== %s\n' "$*"; }
 
 say "gate: fmt, check"
 $C fmt --check .. && echo "fmt: ok"
-for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under s10_symlink mock_worker; do
+for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under s10_symlink s11_runner s11_forge mock_worker; do
   $C check $f.cho --std && echo "check $f: ok"
 done
 
@@ -86,3 +86,20 @@ done 2>&1
 for r in plain link dirlink/s.txt missing; do
   printf -- '--- Fs: %s\n' "$r"; "$D/s10" f "$D/s10dir/exec/$r"
 done 2>&1
+
+say "S11 a deadline kill of a gate runner: does what the gate started survive? (the grandchild is 'sleep 78')"
+$C build s11_runner.cho --std -o "$D/bin/runner" || exit 1
+$C build s11_forge.cho --std -o "$D/s11" || exit 1
+for how in u d; do
+  for m in p d l; do
+    printf -- '--- Forge starts the runner: %s; the runner starts the gate: %s\n' \
+      "$([ $how = u ] && echo 'exec_spawn_under (not a group leader)' || echo 'exec_spawn_detached (a group leader)')" \
+      "$(case $m in p) echo 'plain, no deadline of its own';; d) echo 'detached, its own deadline 200 ms < 1000 ms';; l) echo 'detached, no deadline of its own';; esac)"
+    if [ $how = u ]; then "$D/s11" u "$D/bin" runner $m none; else "$D/s11" d "$D/bin" runner $m "$D/bin/runner"; fi
+    sleep 0.4
+    echo "'sleep 78' processes (pid pgid sid state; none = nothing leaked):"
+    ps -eo pid,pgid,sid,stat,args | awk '$5 == "sleep" && $6 == "78" { print "  " $1, $2, $3, $4 }'
+    pkill -f '^sleep 78$' 2>/dev/null || true
+    pkill -x runner 2>/dev/null || true
+  done
+done
