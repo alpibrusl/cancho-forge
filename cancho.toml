@@ -41,3 +41,8 @@ std = true
 name = "dispatch"
 sources = ["tests/dispatch_test.cho", "src/dispatch.cho", "src/response.cho"]
 std = true
+
+[[test]]
+name = "gate_task"
+sources = ["tests/gate_task_test.cho", "src/gate_task.cho"]
+std = true

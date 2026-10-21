@@ -1,0 +1,237 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import std.process;
+import forge.dispatch;
+import forge.support;
+import forge.worker;
+
+// The gate runner against real repositories and real child processes (docs/self-hosting.md 3.1, worker-contract 10).
+// `scripts/gate.sh` builds git checkouts whose `scripts/gate.sh` do one thing each (pass, fail, hang, write too much,
+// kill their shell), starts this program, and then looks at the evidence files itself (the oracle is outside the
+// programs). This program checks what only it can see: the worker's reply (its state and error code), the time it took,
+// and that Forge's own path (`forge.worker.execute`) accepts a good run's evidence.
+//
+// Usage: gate_runner <workers directory holding gate_runner> <scratch directory> <revision of each of ws_pass ws_fail
+//        ws_hang ws_noisy ws_sig>. Execution directories `ev_*` exist under the scratch directory.
+
+fn forge_repo() -> [] &static [byte] {
+    return "alpibrusl/cancho-forge";
+}
+
+fn a_revision() -> [] &static [byte] {
+    return "0123456789abcdef0123456789abcdef01234567";
+}
+
+// The `repo.gate` input.
+fn input[&h, &r, &v](heap: &!h Heap, repo_key: &r [byte], revision: &v [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 96), "{\"repo\":\"");
+    b = buffer.append(heap, b, repo_key);
+    b = buffer.append(heap, b, "\",\"revision\":\"");
+    b = buffer.append(heap, b, revision);
+    return buffer.append(heap, b, "\"}");
+}
+
+// Does the reply say `state` and, when `code` is not empty, carry that `error.code`? An empty `code` means `error` is
+// null; `evidence` is how many evidence entries it must have.
+fn reply_is[&h, &b](heap: &!h Heap, out: &b [byte], state: &static [byte], code: &static [byte], evidence: int) -> [heap] bool {
+    var held = false;
+    let tape = box_slice(heap, json.tape_len(out), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(out, tp) > 0 && json.is_object(tp, 0) {
+            let s = json.get(out, tp, 0, "state");
+            let ev = json.get(out, tp, 0, "evidence");
+            let er = json.get(out, tp, 0, "error");
+            held = json.is_string(tp, s) && json.string_equals(out, tp, s, state) && json.is_array(tp, ev) && json.count(tp, ev) == evidence;
+            if len(code) == 0 {
+                held = held && json.is_null(tp, er);
+            } else {
+                let c = json.get(out, tp, er, "code");
+                held = held && json.is_object(tp, er) && json.is_string(tp, c) && json.string_equals(out, tp, c, code);
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return held;
+}
+
+// One case through `worker.run`: the reply must be `state`/`code` with `evidence` entries, within `within_ms`.
+fn case[&h, &x, &w, &c, &i, &d, &r, &v, &s](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], task_type: &static [byte], repo_key: &r [byte], revision: &v [byte], workspace: &s [byte], exec_dir: &d [byte], timeout_ms: int, state: &static [byte], code: &static [byte], evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let inp = input(heap, repo_key, revision);
+    let began = clock_ms(clock);
+    var held = false;
+    borrow inp as &ib in {
+        let req = worker.build_execute(heap, "r-1", 1, "t-1", task_type, buffer.bytes(ib), timeout_ms, 1048576, workspace, exec_dir);
+        borrow req as &qb in {
+            let (out, ran) = worker.run(heap, exec, workers, clock, "gate_runner", buffer.bytes(qb), 1048576, timeout_ms);
+            borrow out as &ob in {
+                match ran {
+                    process.Ran::Code(n) => {
+                        held = n == 0 && reply_is(heap, buffer.bytes(ob), state, code, evidence);
+                    }
+                    process.Ran::Signaled(sig) => {
+                        held = false;
+                    }
+                    process.Ran::TimedOut => {
+                        held = false;
+                    }
+                    process.Ran::TooMuch => {
+                        held = false;
+                    }
+                    process.Ran::Failed(e) => {
+                        held = false;
+                    }
+                }
+            }
+            buffer.drop(heap, out);
+        }
+        buffer.drop(heap, req);
+    }
+    buffer.drop(heap, inp);
+    return support.verdict(io, held && clock_ms(clock) - began <= within_ms, label);
+}
+
+// A raw request (not a task): the runner must end with exit status `exit` and write nothing.
+fn raw[&h, &x, &w, &c, &i, &q](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], request: &q [byte], exit: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let (out, ran) = worker.run(heap, exec, workers, clock, "gate_runner", request, 1048576, 5000);
+    var held = false;
+    borrow out as &ob in {
+        match ran {
+            process.Ran::Code(n) => {
+                held = n == exit && len(buffer.bytes(ob)) == 0;
+            }
+            process.Ran::Signaled(sig) => {
+                held = false;
+            }
+            process.Ran::TimedOut => {
+                held = false;
+            }
+            process.Ran::TooMuch => {
+                held = false;
+            }
+            process.Ran::Failed(e) => {
+                held = false;
+            }
+        }
+    }
+    buffer.drop(heap, out);
+    return support.verdict(io, held, label);
+}
+
+// Forge's own path: `worker.execute` starts the runner, classifies the ending and recomputes the evidence of a good
+// run against the files. A good run reaches `verification`, never acceptance.
+fn forge_path[&h, &x, &w, &f, &c, &i, &v, &s, &d](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, revision: &v [byte], workspace: &s [byte], exec_dir: &d [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read, io_write] int {
+    let inp = input(heap, forge_repo(), revision);
+    var held = false;
+    borrow inp as &ib in {
+        let req = worker.build_execute(heap, "r-1", 1, "t-1", "repo.gate", buffer.bytes(ib), 20000, 1048576, workspace, exec_dir);
+        borrow req as &qb in {
+            let e = worker.execute(heap, exec, workers, fs, clock, "gate_runner", buffer.bytes(qb), "r-1", "t-1", exec_dir, 1048576, 20000, false);
+            held = bytes.equal(dispatch.rule_tag(e), "") && bytes.equal(dispatch.consequence_name(dispatch.consequence(e)), "verification");
+        }
+        buffer.drop(heap, req);
+    }
+    buffer.drop(heap, inp);
+    return support.verdict(io, held, "forge's path: the evidence of a good run is recomputed and held, and the task goes to verification");
+}
+
+// `case` with the workspace `ws_*` and the execution directory `ev_*` beneath the scratch directory.
+fn go[&h, &x, &w, &c, &i, &s, &r, &v](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, scratch: &s [byte], label: &static [byte], task_type: &static [byte], repo_key: &r [byte], revision: &v [byte], ws_name: &static [byte], ev_name: &static [byte], timeout_ms: int, state: &static [byte], code: &static [byte], evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let workspace = support.under(heap, scratch, ws_name);
+    let exec_dir = support.under(heap, scratch, ev_name);
+    var bad = 0;
+    borrow workspace as &wb in {
+        borrow exec_dir as &eb in {
+            bad = case(heap, exec, workers, clock, io, label, task_type, repo_key, revision, buffer.bytes(wb), buffer.bytes(eb), timeout_ms, state, code, evidence, within_ms);
+        }
+    }
+    buffer.drop(heap, workspace);
+    buffer.drop(heap, exec_dir);
+    return bad;
+}
+
+fn run[&h, &x, &w, &f, &c, &i, &s, &a, &b, &d, &e, &g](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, scratch: &s [byte], rev_pass: &a [byte], rev_fail: &b [byte], rev_hang: &d [byte], rev_noisy: &e [byte], rev_sig: &g [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read, io_write] int {
+    var bad = 0;
+    let repo = forge_repo();
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a gate that passes: succeeded, a log and a report", "repo.gate", repo, rev_pass, "ws_pass", "ev_pass", 20000, "succeeded", "", 2, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a gate that fails is still a report: succeeded, not a runner error", "repo.gate", repo, rev_fail, "ws_fail", "ev_fail", 20000, "succeeded", "", 2, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a gate whose shell is killed is a report with a signal", "repo.gate", repo, rev_sig, "ws_sig", "ev_sig", 20000, "succeeded", "", 2, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a checkout at another revision: failed, revision-mismatch, nothing run", "repo.gate", repo, rev_fail, "ws_pass", "ev_mismatch", 20000, "failed", "revision-mismatch", 0, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a workspace that is not a checkout: failed, workspace-unusable", "repo.gate", repo, a_revision(), "ws_nowhere", "ev_unusable", 20000, "failed", "workspace-unusable", 0, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a gate that hangs: the runner's own deadline fires before Forge's, the group is killed", "repo.gate", repo, rev_hang, "ws_hang", "ev_hang", 3000, "failed", "gate-timeout", 2, 2900);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a revision check that never returns: failed, head-timeout, inside the runner's deadline", "repo.gate", repo, a_revision(), "ws_headhang", "ev_headhang", 2000, "failed", "head-timeout", 0, 2000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a gate that writes past the cap: failed, gate-output-overflow", "repo.gate", repo, rev_noisy, "ws_noisy", "ev_noisy", 60000, "failed", "gate-output-overflow", 2, 55000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a result that cannot be written: failed, evidence-unwritable", "repo.gate", repo, rev_pass, "ws_pass", "ev_nowhere", 20000, "failed", "evidence-unwritable", 0, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a repository not on the list: failed, scope-invalid", "repo.gate", "alpibrusl/cancho-mqtt", rev_pass, "ws_pass", "ev_refuse", 20000, "failed", "scope-invalid", 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a revision that is not 40 hex digits: failed, revision-invalid", "repo.gate", repo, "main", "ws_pass", "ev_refuse", 20000, "failed", "revision-invalid", 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "another task type: failed, task-type-invalid", "repo.change", repo, rev_pass, "ws_pass", "ev_refuse", 20000, "failed", "task-type-invalid", 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a timeout under two seconds: failed, limits-invalid", "repo.gate", repo, rev_pass, "ws_pass", "ev_refuse", 1999, "failed", "limits-invalid", 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a shell metacharacter in a path: failed, path-invalid, nothing run", "repo.gate", repo, rev_pass, "ws_pass;x", "ev_refuse", 20000, "failed", "path-invalid", 0, 5000);
+    bad = bad + raw(heap, exec, workers, clock, io, "garbage on stdin: no answer, exit 4", "this is not json", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "a verb that is not execute: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"capabilities\",\"request_id\":\"r-0\"}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "a complete task under another verb: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-0\",\"task\":{\"id\":\"t\",\"type\":\"repo.gate\",\"input\":{\"repo\":\"alpibrusl/cancho-forge\",\"revision\":\"0123456789abcdef0123456789abcdef01234567\"}},\"limits\":{\"timeout_ms\":20000},\"grants\":{\"workspace\":\"/nonexistent-forge\",\"execution_dir\":\"/nonexistent-forge\"}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "another contract version: no answer, exit 4", "{\"contract\":\"forge-worker/2\",\"verb\":\"execute\",\"request_id\":\"r-0\",\"task\":{\"id\":\"t\"}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "no request id: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"task\":{\"id\":\"t\"}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "no task id: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r\",\"task\":{}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "an empty request: no answer, exit 4", "", 4);
+    let workspace = support.under(heap, scratch, "ws_pass");
+    let exec_dir = support.under(heap, scratch, "ev_forge");
+    borrow workspace as &wb in {
+        borrow exec_dir as &eb in {
+            bad = bad + forge_path(heap, exec, workers, fs, clock, io, rev_pass, buffer.bytes(wb), buffer.bytes(eb));
+        }
+    }
+    buffer.drop(heap, workspace);
+    buffer.drop(heap, exec_dir);
+    return bad;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow exec as &x in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        borrow args as &g in {
+                            if arg_count(g) == 8 {
+                                match open_dir(f, arg(g, 1)) {
+                                    DirOpened::Ok(d) => {
+                                        var workers = d;
+                                        borrow workers as &w in {
+                                            status = run(h, x, w, f, c, i, arg(g, 2), arg(g, 3), arg(g, 4), arg(g, 5), arg(g, 6), arg(g, 7));
+                                        }
+                                        dir_close(workers);
+                                    }
+                                    DirOpened::Failed(e) => {
+                                        io.error_all(i, "gate_runner: cannot open the workers directory\n");
+                                    }
+                                }
+                            } else {
+                                io.error_all(i, "usage: gate_runner <workers dir> <scratch dir> <5 revisions>\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

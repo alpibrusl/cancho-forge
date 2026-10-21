@@ -662,13 +662,16 @@ ones by `tests/conformance/journal_files.cho`):
 | `worker-protocol` | a worker's reply that is not valid for the contract: not JSON, not an object, a wrong `contract`, `request_id` or `task_id`, an unknown `state` or evidence `kind`, a missing or mistyped field, more than 256 evidence entries, a duplicate or escaped evidence id, a `failed` or `partial` response with no `error`, a `succeeded` one with an error. The reason is a code (`response.reason_name`) | `tests/response_test.cho`: one test per group of reasons, and the sweep of every prefix and single-byte change |
 | `evidence-ref-invalid` | an evidence `ref` that is empty, absolute, longer than 512 bytes, escaped, holds a NUL or two dots in a row; a `sha256` that is not 64 lower-case hex digits; a negative `bytes`. (A hash or size that does not match the file is `forge.evidence_io`, below.) | `test_a_reference_that_leaves_the_execution_directory_is_evidence_ref_invalid`, `..._at_most_512_bytes`, `..._a_hash_is_64_lower_case_hex_digits`, `..._a_size_is_a_non_negative_integer` |
 | `path-invalid` | a journal path that is not absolute, has two dots in a row anywhere (`..` as a component or inside a name), a NUL, or is longer than 512 bytes: refused before the file capability (which traps on the byte pair) is reached. *Corrected after spike S8: this row said "a `..` component", which is what Forge's hand-written check tested and the capability does not: `/a/..b` passed the check and trapped.* | conformance `path:` (two cases), `recover: a .. path`, `append: a .. path`, `recover/append/exists: a name with .. inside` |
+| `scope-invalid` | a `repo.gate` task names a repository that is not in the allow-list (`forge.gate_task`, `docs/self-hosting.md` section 6). The gate runner answers `failed` with this as `error.code`; Forge's own task validation will call the same function (#17) | `test_a_repository_that_is_not_listed_is_scope_invalid`, `test_every_repository_of_the_allow_list_...`; conformance `gate_runner`: `a repository not on the list` |
+| `revision-invalid` | a revision that is not exactly 40 lower-case hexadecimal digits | `test_a_revision_is_exactly_forty_lower_case_hex_digits`, `test_a_revision_that_is_not_one_is_revision_invalid`; conformance `a revision that is not 40 hex digits` |
+| `task-type-invalid` | a task whose `type` is not `repo.gate`, sent to the gate runner | `test_a_task_of_another_type_is_task_type_invalid`; conformance `another task type` |
+| `limits-invalid` | a `repo.gate` task whose `timeout_ms` is under 2 seconds or over one day | `test_a_timeout_outside_two_seconds_to_a_day_is_limits_invalid`; conformance `a timeout under two seconds` |
+| `path-invalid` (the runner's half) | a `grants.workspace` or `grants.execution_dir` that is not absolute, 2 to 512 bytes of letters, digits and `._/-`, with no two dots in a row and no component starting with a dot or a dash: refused before anything is put in a shell command | `test_a_path_goes_into_a_shell_command_only_if_the_shell_leaves_it_alone` (25 paths), `test_a_path_has_a_length_bound`; conformance `a shell metacharacter in a path` |
 
 Designed, not implemented (no test reaches them yet; they are not claims):
 
 | rule | meaning |
 |---|---|
-| `scope-invalid` | a task names a repository or path that is not in the policy allow-list (`docs/self-hosting.md` section 6) |
-| `revision-invalid` | a revision that is not exactly 40 lower-case hexadecimal digits (`docs/self-hosting.md` section 6) |
 | `policy-denied` | policy decision `Deny`, with the policy version |
 | `policy-missing` | no policy loaded or it did not parse (fail closed) |
 | `approval-missing` | a protected action without a granted approval |
