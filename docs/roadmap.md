@@ -178,6 +178,10 @@ data and state uncertainty; expansion justified by measured performance,
 not demo quality. Revisit the "no database" decision (ADR section 2.2) with
 the pilot's journal size and replay time.
 
+## Self-hosting
+
+The plan for Forge managing the cancho project itself (the compiler, the language documents, the packages), in stages from a read-only gate report to maintained pins, with the authority each stage needs and what Forge never does unattended: [`self-hosting.md`](self-hosting.md) (a plan, nothing built). It leans on M2 (a worker linked into `main`), M3 (Forge-observed checks) and M4 (policy and approvals); its first task needs a gate-runner worker that is not Cancho Code.
+
 ## Dependencies on cancho, in one place
 
 | need | milestone | status in cancho |
