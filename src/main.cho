@@ -9,6 +9,7 @@ import forge.gate_env;
 import forge.gate_run;
 import forge.gate_task;
 import forge.journal_io;
+import forge.retry;
 import forge.lock;
 import forge.report;
 import forge.task;
@@ -188,6 +189,19 @@ fn show_gate[&h, &i, &r](heap: &!h Heap, io: &!i Io, revision: &r [byte], done: 
                     line(io, "refusal: ", tag);
                 }
                 line(io, "ending: ", dispatch.consequence_name(dispatch.consequence(ending)));
+                if done.attempts > 1 {
+                    io.write_all(io, "attempts: ");
+                    var n = buffer.push_nat(heap, buffer.empty(heap, 4), done.attempts);
+                    borrow n as &nb in {
+                        io.write_all(io, buffer.bytes(nb));
+                    }
+                    buffer.drop(heap, n);
+                    io.newline(io);
+                }
+                let again = retry.rule_tag(retry.decide(dispatch.consequence(ending), done.attempts, true));
+                if len(again) > 0 {
+                    line(io, "refusal: ", again);
+                }
                 if claim > 0 {
                     line(io, "claimed verdict: ", gate_run.verdict_name(claim));
                     io.write_all(io, "(a worker's claim: the task is in verification, not accepted)\n");

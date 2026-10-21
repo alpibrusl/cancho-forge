@@ -1,0 +1,114 @@
+edition 9;
+module forge.retry;
+
+import forge.dispatch;
+import forge.flow;
+import forge.task;
+
+// The policy that follows a worker's `error.retryable` (docs/worker-contract.md sections 3.2 and 5, row 7; issue #15).
+// `forge.dispatch` reads what the worker said; `forge.flow` says where the task goes for each consequence; this says
+// whether another attempt is made. Pure: the effect row is empty, so every branch is a unit test.
+//
+// Three rules, and nothing else retries:
+//   * only `worker-retryable` is retried: a deadline, a crash and a non-zero exit stay in `ready` for an operator
+//     (retrying a gate that took its whole deadline would spend it again), and a gate that fails is a claim for
+//     verification, never a retry;
+//   * a task that writes is never retried by default (`retry-write-refused`): the caller says whether the task is
+//     read-only, and nothing here assumes it;
+//   * the attempts are bounded (`max_attempts`); past them the task is `blocked` with `retry-exhausted`.
+
+// How many times a worker is started for one task, the first included.
+pub fn max_attempts() -> [] int {
+    return 3;
+}
+
+pub enum Decision {
+    // Not a retry: the consequence is not `worker-retryable`, and `flow.target_of` decides alone.
+    NotRetryable,
+    // Another attempt: the task goes `running -> ready -> running`, and an `execution.retry` is journalled.
+    Again,
+    // A retryable failure, and the attempts are used up.
+    Exhausted,
+    // A retryable failure of a task that writes.
+    WriteRefused,
+}
+
+fn retryable(c: dispatch.Consequence) -> [] bool {
+    match c {
+        dispatch.Consequence::WorkerRetryable => {
+            return true;
+        }
+        dispatch.Consequence::Blocked => {
+            return false;
+        }
+        dispatch.Consequence::RetryOrFail => {
+            return false;
+        }
+        dispatch.Consequence::Failed => {
+            return false;
+        }
+        dispatch.Consequence::Verification => {
+            return false;
+        }
+        dispatch.Consequence::WorkerSaid => {
+            return false;
+        }
+        dispatch.Consequence::Cancelled => {
+            return false;
+        }
+        dispatch.Consequence::Poll => {
+            return false;
+        }
+    }
+}
+
+// What to do after attempt number `attempt` (1 for the first) ended with `c`, for a task that is `read_only` or not.
+pub fn decide(c: dispatch.Consequence, attempt: int, read_only: bool) -> [] Decision {
+    if !retryable(c) {
+        return Decision::NotRetryable;
+    }
+    if !read_only {
+        return Decision::WriteRefused;
+    }
+    if attempt >= max_attempts() {
+        return Decision::Exhausted;
+    }
+    return Decision::Again;
+}
+
+// The rule tag of a decision that is a refusal (architecture section 7), or "".
+pub fn rule_tag(d: Decision) -> [] &static [byte] {
+    match d {
+        Decision::NotRetryable => {
+            return "";
+        }
+        Decision::Again => {
+            return "";
+        }
+        Decision::Exhausted => {
+            return "retry-exhausted";
+        }
+        Decision::WriteRefused => {
+            return "retry-write-refused";
+        }
+    }
+}
+
+// The state the task is in once the run is over for good, that is, once `decide` did not say `Again`. A retryable
+// failure that is refused waits for an operator, like every other failure that is not retried (`blocked`).
+pub fn target_after(c: dispatch.Consequence, d: Decision) -> [] task.State {
+    match d {
+        Decision::Exhausted => {
+            return task.State::Blocked;
+        }
+        Decision::WriteRefused => {
+            return task.State::Blocked;
+        }
+        Decision::NotRetryable => {
+            return flow.target_of(c);
+        }
+        Decision::Again => {
+            return task.State::Ready;
+        }
+    }
+}

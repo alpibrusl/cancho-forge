@@ -139,6 +139,9 @@ fn ended[&h, &b](heap: &!h Heap, ran: process.Ran, body: &b [byte]) -> [heap] in
                 dispatch.Ending::Setup(errno) => {
                     return 6;
                 }
+                dispatch.Ending::Said(s, retry) => {
+                    return 8;
+                }
                 dispatch.Ending::Reply(v) => {
                     return 7;
                 }

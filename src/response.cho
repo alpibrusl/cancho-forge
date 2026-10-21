@@ -330,6 +330,28 @@ fn error_ok[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] bool {
     return json.is_string(tape, code) && json.is_string(tape, message) && json.is_bool(tape, retry);
 }
 
+// Does the reply in `body` say that retrying can help (`error.retryable` true)? False for a reply with no error, an
+// error that says false, and anything that is not an object: a missing or non-boolean value never reaches here, because
+// `validate` refused it (`worker-protocol`, reason `r_error`). Call it only on a body `validate` found valid.
+pub fn retryable[&h, &b](heap: &!h Heap, body: &b [byte]) -> [heap] bool {
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    var yes = false;
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(body, tp) > 0 && json.is_object(tp, 0) {
+            let error = json.get(body, tp, 0, "error");
+            if error >= 0 && json.is_object(tp, error) {
+                let flag = json.get(body, tp, error, "retryable");
+                if flag >= 0 && json.is_bool(tp, flag) {
+                    yes = json.to_bool(tp, flag);
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return yes;
+}
+
 // `cost` is {unit: string, amount: int >= 0, source: worker-reported | derived-from-tokens | forge-measured}.
 fn cost_ok[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] bool {
     if !json.is_object(tape, node) {

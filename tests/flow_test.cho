@@ -29,6 +29,11 @@ fn test_what_needs_an_operator_is_blocked() -> [] int {
     return 0;
 }
 
+fn test_a_retryable_failure_goes_back_to_ready() -> [] int {
+    test.assert_eq(code_of(dispatch.Consequence::WorkerRetryable), task.state_code(task.State::Ready));
+    return 0;
+}
+
 fn test_a_cancelled_run_is_cancelled_and_a_poll_moves_nothing() -> [] int {
     test.assert_eq(code_of(dispatch.Consequence::Cancelled), task.state_code(task.State::Cancelled));
     test.assert_eq(code_of(dispatch.Consequence::Poll), task.state_code(task.State::Running));
@@ -42,6 +47,7 @@ fn test_no_ending_accepts_a_task() -> [] int {
     test.assert(code_of(dispatch.Consequence::Failed) != accepted);
     test.assert(code_of(dispatch.Consequence::Verification) != accepted);
     test.assert(code_of(dispatch.Consequence::WorkerSaid) != accepted);
+    test.assert(code_of(dispatch.Consequence::WorkerRetryable) != accepted);
     test.assert(code_of(dispatch.Consequence::Cancelled) != accepted);
     test.assert(code_of(dispatch.Consequence::Poll) != accepted);
     return 0;
@@ -54,6 +60,7 @@ fn test_every_move_a_run_makes_from_running_is_an_edge_of_the_table() -> [] int 
     test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::Failed)));
     test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::Verification)));
     test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::WorkerSaid)));
+    test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::WorkerRetryable)));
     test.assert(task.can_move(task.State::Running, flow.target_of(dispatch.Consequence::Cancelled)));
     return 0;
 }

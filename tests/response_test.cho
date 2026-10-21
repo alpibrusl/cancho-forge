@@ -440,3 +440,30 @@ fn test_the_reasons_the_file_layer_adds_have_names() -> [] int {
     test.assert(bytes.equal(response.reason_name(response.r_evidence_sha_mismatch()), "evidence-sha-mismatch"));
     return 0;
 }
+
+fn reply_with[&h](heap: &!h Heap, error: &static [byte]) -> [heap] bool {
+    var b = buffer.append(heap, buffer.empty(heap, 256), "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"failed\",\"task_id\":\"t-1\",\"evidence\":[],\"error\":");
+    b = buffer.append(heap, b, error);
+    b = buffer.append(heap, b, "}");
+    var yes = false;
+    borrow b as &bb in {
+        yes = response.retryable(heap, buffer.bytes(bb));
+    }
+    buffer.drop(heap, b);
+    return yes;
+}
+
+fn test_retryable_reads_the_flag_of_the_error[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(reply_with(heap, "{\"code\":\"c\",\"message\":\"m\",\"retryable\":true}"));
+    test.assert(!reply_with(heap, "{\"code\":\"c\",\"message\":\"m\",\"retryable\":false}"));
+    return 0;
+}
+
+fn test_retryable_is_false_for_everything_that_is_not_a_true_flag[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(!reply_with(heap, "null"));
+    test.assert(!reply_with(heap, "{\"code\":\"c\",\"message\":\"m\"}"));
+    test.assert(!reply_with(heap, "{\"code\":\"c\",\"message\":\"m\",\"retryable\":\"true\"}"));
+    test.assert(!reply_with(heap, "{\"code\":\"c\",\"message\":\"m\",\"retryable\":1}"));
+    test.assert(!reply_with(heap, "[true]"));
+    return 0;
+}

@@ -22,6 +22,8 @@ G = "src/gate_run.cho"
 E = "src/event.cho"
 M_ = "src/main.cho"
 R = "workers/gate_runner.cho"
+ind = " " * 40
+T = "src/retry.cho"
 # (name, file, old, new, what it breaks); `old` must occur exactly once in the file.
 M = [
     ("flow-verification-accepted", F, "dispatch.Consequence::Verification => {\n            return task.State::Verification;", "dispatch.Consequence::Verification => {\n            return task.State::Accepted;", "a worker's success accepts the task"),
@@ -40,13 +42,14 @@ M = [
     ("verdict-pass", G, 'if json.string_equals(report, tp, v, "pass") {\n                    code = 1;', 'if json.string_equals(report, tp, v, "pass") {\n                    code = 2;', "a pass is recorded as a fail"),
     ("verdict-fail", G, 'if json.string_equals(report, tp, v, "fail") {\n                    code = 2;', 'if json.string_equals(report, tp, v, "fail") {\n                    code = 1;', "a fail is recorded as a pass"),
     ("started-not-written", G, 'seq = note_execution(heap, fs, journal_path, s4, "execution.started", tid, "");', "seq = s4;", "the intent is not written before the worker starts"),
-    ("finished-always", G, "if succeeded(ending) {", "if true {", "a claim is written for a run that produced none"),
-    ("finished-never", G, "if succeeded(ending) {", "if false {", "the runner's verdict is not recorded"),
+    ("finished-always", G, "fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(\"\"), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(\"\"), fs_write(\"\"), file_read, file_write] int {\n    if succeeded(e) {", "fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(\"\"), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(\"\"), fs_write(\"\"), file_read, file_write] int {\n    if true {", "a claim is written for a run that produced none"),
+    ("finished-never", G, "fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(\"\"), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(\"\"), fs_write(\"\"), file_read, file_write] int {\n    if succeeded(e) {", "fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(\"\"), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(\"\"), fs_write(\"\"), file_read, file_write] int {\n    if false {", "the runner's verdict is not recorded"),
+    ("claim-never-reported", G, "fn claimed_of[&h, &f, &d](heap: &!h Heap, fs: &f Fs(\"\"), e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(\"\"), file_read] int {\n    if succeeded(e) {", "fn claimed_of[&h, &f, &d](heap: &!h Heap, fs: &f Fs(\"\"), e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(\"\"), file_read] int {\n    if false {", "the output never names the claimed verdict"),
     ("ending-refusal-not-written", G, "seq = note(heap, fs, journal_path, seq, tid, tag, false);", "seq = seq;", "the rule tag of a refused ending is not journalled"),
     ("check-refusal-not-written", G, "seq = note(heap, fs, journal_path, seq, tid, gate_task.rule_name(why), false);", "seq = seq;", "the rule tag of a refused task is not journalled"),
-    ("move-always-verification", G, "flow.target_of(dispatch.consequence(ending))", "task.State::Verification", "every ending leaves the task in verification"),
+    ("move-always-verification", G, "retry.target_after(consequence, decision), task.Actor::Forge, false);\n                                            tasks = t5;\n                                            seq = s5;\n                                            outcome = Outcome::Ended(ending, claimed_of(", "task.State::Verification, task.Actor::Forge, false);\n                                            tasks = t5;\n                                            seq = s5;\n                                            outcome = Outcome::Ended(ending, claimed_of(", "every ending leaves the task in verification"),
     ("task-number", G, "let id = task_id(heap, revision, report.tasks + 1);", "let id = task_id(heap, revision, report.tasks + 0);", "the first task is numbered 0"),
-    ("task-number-reported", G, "number: report.tasks + 1, records: records };", "number: report.tasks, records: records };", "the number reported is not the one used"),
+    ("task-number-reported", G, "number: report.tasks + 1, records: records, attempts: attempts };", "number: report.tasks, records: records, attempts: attempts };", "the number reported is not the one used"),
     ("approved-by-forge", G, "tid, task.State::Approved, task.Actor::Human, false);", "tid, task.State::Approved, task.Actor::Forge, false);", "the approval is Forge's own"),
     ("proposed-by-forge", G, "tid, task.State::Proposed, task.Actor::Human, fresh);", "tid, task.State::Proposed, task.Actor::Forge, fresh);", "the proposal is Forge's own"),
     ("fresh-file-not-synced", G, "let fresh = report.records == 0;", "let fresh = false;", "(equivalent for the cases run: the directory sync is not observable)"),
@@ -57,7 +60,30 @@ M = [
     ("timeout-not-checked", M_, "        timeout = nat_of(arg(args, 8));\n        if timeout < 0 {\n            return usage(io);\n        }", "        timeout = nat_of(arg(args, 8));", "a timeout that is not a number is taken as -1"),
     ("timeout-default", M_, "var timeout = 900000;", "var timeout = 1000;", "the default timeout is under the least a run is given"),
     ("claim-line", M_, 'line(io, "claimed verdict: ", gate_run.verdict_name(claim));', 'line(io, "verdict: ", gate_run.verdict_name(claim));', "the output does not say the verdict is a claim"),
-]
+    ("retry-max-two", T, "    return 3;", "    return 2;", "only two attempts are made"),
+    ("retry-max-four", T, "    return 3;", "    return 4;", "four attempts are made"),
+    ("retry-boundary", T, "    if attempt >= max_attempts() {", "    if attempt > max_attempts() {", "one attempt too many"),
+    ("retry-write-allowed", T, "    if !read_only {\n        return Decision::WriteRefused;", "    if read_only {\n        return Decision::WriteRefused;", "a task that writes is retried"),
+    ("retry-timeout-retried", T, "        dispatch.Consequence::RetryOrFail => {\n            return false;", "        dispatch.Consequence::RetryOrFail => {\n            return true;", "a deadline is retried"),
+    ("retry-verification-retried", T, "        dispatch.Consequence::Verification => {\n            return false;", "        dispatch.Consequence::Verification => {\n            return true;", "a claim is retried"),
+    ("retry-workersaid-retried", T, "        dispatch.Consequence::WorkerSaid => {\n            return false;", "        dispatch.Consequence::WorkerSaid => {\n            return true;", "a failure that cannot be helped is retried"),
+    ("retry-never", T, "        dispatch.Consequence::WorkerRetryable => {\n            return true;", "        dispatch.Consequence::WorkerRetryable => {\n            return false;", "a retryable failure is not retried"),
+    ("retry-tag-exhausted", T, 'return "retry-exhausted";', 'return "retry-write-refused";', "an exhausted budget is tagged as a refused write"),
+    ("retry-tag-write", T, 'return "retry-write-refused";', 'return "retry-exhausted";', "a refused write is tagged as an exhausted budget"),
+    ("retry-after-exhausted-ready", T, "        Decision::Exhausted => {\n            return task.State::Blocked;", "        Decision::Exhausted => {\n            return task.State::Ready;", "a task out of attempts is left ready"),
+    ("retry-after-write-ready", T, "        Decision::WriteRefused => {\n            return task.State::Blocked;", "        Decision::WriteRefused => {\n            return task.State::Ready;", "a refused write is left ready"),
+    ("retry-after-again-running", T, "        Decision::Again => {\n            return task.State::Ready;", "        Decision::Again => {\n            return task.State::Blocked;", "a task about to be retried is blocked"),
+    ("flow-retryable-blocked", F, "dispatch.Consequence::WorkerRetryable => {\n            return task.State::Ready;", "dispatch.Consequence::WorkerRetryable => {\n            return task.State::Blocked;", "a retryable failure is blocked"),
+    ("loop-retry-not-written", G, "seq = note_retry(heap, fs, journal_path, seq, tid, attempts);", "seq = seq;", "the journal does not say why the task ran twice"),
+    ("loop-no-ready", G, "let (t5, s5) = move_to(heap, fs, journal_path, tasks, seq, tid, task.State::Ready, task.Actor::Forge, false);", "let (t5, s5) = (tasks, seq);", "the task is not moved back to ready"),
+    ("loop-started-not-written", G, 'seq = note_execution(heap, fs, journal_path, s6, "execution.started", tid, "");', "seq = s6;", "the second attempt has no intent in the journal"),
+    ("loop-same-request-id", G, "    if attempt > 1 {", "    if attempt > 100 {", "every attempt has the request id of the first"),
+    ("loop-attempt-not-sent", G, "buffer.bytes(rb), attempts, tid,", "buffer.bytes(rb), 1, tid,", "the worker is always told it is the first attempt"),
+    ("loop-write-task", G, "retry.decide(consequence, attempts, true)", "retry.decide(consequence, attempts, false)", "the gate is treated as a task that writes"),
+    ("loop-attempts-not-counted", G, "attempts = attempts + 1;", "attempts = 1;", "the attempts are not counted"),
+    ("loop-exhausted-tag-not-written", G, ind+"retry.Decision::Exhausted => {\n"+ind+"    seq = note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);", ind+"retry.Decision::Exhausted => {\n"+ind+"    seq = seq;", "the refusal of an exhausted budget is not journalled"),
+    ("show-attempts", M_, "if done.attempts > 1 {", "if done.attempts > 5 {", "the output does not say how many attempts were made"),
+    ("show-retry-tag", M_, "if len(again) > 0 {", "if false {", "the output does not name the retry refusal"),]
 
 # Breaks that cannot change an answer, with the reason; reported EQUIVALENT instead of SURVIVED.
 EQUIVALENT = {
@@ -66,7 +92,7 @@ EQUIVALENT = {
 
 
 def unit(name):
-    return name.startswith("flow-")
+    return name.startswith(("flow-", "retry-"))
 
 
 def one(m):
@@ -83,7 +109,8 @@ def one(m):
         if unit(name):
             r = subprocess.run([CANCHO, "test"], capture_output=True, text=True, cwd=work, env=env)
             out = r.stdout + r.stderr
-            section = out.split("== test flow")[-1] if "== test flow" in out else out
+            head = "== test retry" if name.startswith("retry-") else "== test flow"
+            section = out.split(head)[-1] if head in out else out
             if "test result: ok" in section and "FAILED" not in section:
                 return name, what, "SURVIVED"
             if "error:" in section and "test result" not in section:

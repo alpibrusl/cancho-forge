@@ -12,6 +12,7 @@ import forge.flow;
 import forge.gate_task;
 import forge.journal;
 import forge.journal_io;
+import forge.retry;
 import forge.task;
 import forge.worker;
 
@@ -53,6 +54,8 @@ pub struct Finished {
     number: int,
     // How many records the journal holds at the end.
     records: int,
+    // How many times the worker was started for the task (0: it never was).
+    attempts: int,
 }
 
 pub fn verdict_name(code: int) -> [] &static [byte] {
@@ -163,6 +166,34 @@ fn note_execution[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]
     return seq + 1;
 }
 
+// The `execution.retry` of task `id` after attempt `attempt`, written.
+fn note_retry[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], attempt: int) -> [heap, fs_read(""), fs_write(""), file_write] int {
+    if seq < 0 {
+        return seq;
+    }
+    let record = event.retry(heap, seq, id, attempt);
+    var status = 0 - 1;
+    borrow record as &rb in {
+        status = write_record(fs, path, buffer.bytes(rb), false);
+    }
+    buffer.drop(heap, record);
+    if status != 0 {
+        return 0 - 1;
+    }
+    return seq + 1;
+}
+
+// The id of the request of attempt `attempt`: `r-` and the task id for the first, and `-n` more for the others, so that
+// a reply to an earlier attempt can never be taken for the answer to a later one.
+fn request_id_of[&h, &i](heap: &!h Heap, id: &i [byte], attempt: int) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 32), "r-"), id);
+    if attempt > 1 {
+        b = buffer.push(heap, b, byte_of(45));
+        b = buffer.push_nat(heap, b, attempt);
+    }
+    return b;
+}
+
 // The input of a `repo.gate` task, as JSON text. The repository is a key of the allow-list and the revision 40 hex
 // digits by the time this is called, so neither needs escaping.
 fn gate_input[&h, &r, &v](heap: &!h Heap, repo: &r [byte], revision: &v [byte]) -> [heap] buffer.Buffer {
@@ -209,6 +240,9 @@ fn succeeded(e: dispatch.Ending) -> [] bool {
         dispatch.Consequence::WorkerSaid => {
             return false;
         }
+        dispatch.Consequence::WorkerRetryable => {
+            return false;
+        }
         dispatch.Consequence::Cancelled => {
             return false;
         }
@@ -216,6 +250,22 @@ fn succeeded(e: dispatch.Ending) -> [] bool {
             return false;
         }
     }
+}
+
+// The claimed verdict of the run that ended with `e`: 0 unless it was a `succeeded` reply.
+fn claimed_of[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), file_read] int {
+    if succeeded(e) {
+        return claimed_verdict(heap, fs, execution_dir);
+    }
+    return 0;
+}
+
+// The `execution.finished` of a `succeeded` run, written with the verdict it claimed; nothing for any other ending.
+fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] int {
+    if succeeded(e) {
+        return note_execution(heap, fs, path, seq, "execution.finished", id, verdict_name(claimed_verdict(heap, fs, execution_dir)));
+    }
+    return seq;
 }
 
 // Run the task. `journal_path` is the journal of the workspace (the caller holds the lock); `workers` is the directory
@@ -231,11 +281,12 @@ pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &k, &e, &n](heap: &!h Heap, fs: &f Fs
         if rule == 0 {
             rule = 0 - 1;
         }
-        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, records: report.records };
+        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, records: report.records, attempts: 0 };
     }
     let id = task_id(heap, revision, report.tasks + 1);
     var state = 0;
     var records = report.records;
+    var attempts = 0;
     var outcome = Outcome::Journal(0 - 1);
     borrow id as &ib in {
         let tid = buffer.bytes(ib);
@@ -269,33 +320,64 @@ pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &k, &e, &n](heap: &!h Heap, fs: &f Fs
                 if seq < 0 {
                     outcome = Outcome::Journal(0 - 1);
                 } else {
-                    let rid = buffer.append(heap, buffer.empty(heap, 32), "r-");
-                    let request_id = buffer.append(heap, rid, tid);
                     let input = gate_input(heap, repo, revision);
-                    borrow request_id as &rb in {
-                        borrow input as &nb in {
-                            let req = worker.build_execute_env(heap, buffer.bytes(rb), 1, tid, gate_task.task_type(), buffer.bytes(nb), timeout_ms, 1048576, checkout, execution_dir, env);
-                            borrow req as &qb in {
-                                let ending = worker.execute(heap, exec, workers, fs, clock, "gate_runner", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, false);
-                                let tag = dispatch.rule_tag(ending);
-                                if len(tag) > 0 {
-                                    seq = note(heap, fs, journal_path, seq, tid, tag, false);
+                    borrow input as &nb in {
+                        // The attempts: a worker that says it failed and that retrying can help is started again, up to
+                        // `retry.max_attempts()` times in all (a gate is read-only). Everything else ends the loop.
+                        var again = true;
+                        while again {
+                            again = false;
+                            attempts = attempts + 1;
+                            let request_id = request_id_of(heap, tid, attempts);
+                            borrow request_id as &rb in {
+                                let req = worker.build_execute_env(heap, buffer.bytes(rb), attempts, tid, gate_task.task_type(), buffer.bytes(nb), timeout_ms, 1048576, checkout, execution_dir, env);
+                                borrow req as &qb in {
+                                    let ending = worker.execute(heap, exec, workers, fs, clock, "gate_runner", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, false);
+                                    let consequence = dispatch.consequence(ending);
+                                    let decision = retry.decide(consequence, attempts, true);
+                                    let tag = dispatch.rule_tag(ending);
+                                    if len(tag) > 0 {
+                                        seq = note(heap, fs, journal_path, seq, tid, tag, false);
+                                    }
+                                    match decision {
+                                        retry.Decision::Again => {
+                                            seq = note_retry(heap, fs, journal_path, seq, tid, attempts);
+                                            let (t5, s5) = move_to(heap, fs, journal_path, tasks, seq, tid, task.State::Ready, task.Actor::Forge, false);
+                                            let (t6, s6) = move_to(heap, fs, journal_path, t5, s5, tid, task.State::Running, task.Actor::Forge, false);
+                                            tasks = t6;
+                                            seq = note_execution(heap, fs, journal_path, s6, "execution.started", tid, "");
+                                            again = seq >= 0;
+                                            outcome = Outcome::Ended(ending, 0);
+                                        }
+                                        retry.Decision::NotRetryable => {
+                                            seq = finish_attempt(heap, fs, journal_path, seq, tid, ending, execution_dir);
+                                            let (t5, s5) = move_to(heap, fs, journal_path, tasks, seq, tid, retry.target_after(consequence, decision), task.Actor::Forge, false);
+                                            tasks = t5;
+                                            seq = s5;
+                                            outcome = Outcome::Ended(ending, claimed_of(heap, fs, ending, execution_dir));
+                                        }
+                                        retry.Decision::Exhausted => {
+                                            seq = note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);
+                                            let (t5, s5) = move_to(heap, fs, journal_path, tasks, seq, tid, retry.target_after(consequence, decision), task.Actor::Forge, false);
+                                            tasks = t5;
+                                            seq = s5;
+                                            outcome = Outcome::Ended(ending, 0);
+                                        }
+                                        retry.Decision::WriteRefused => {
+                                            seq = note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);
+                                            let (t5, s5) = move_to(heap, fs, journal_path, tasks, seq, tid, retry.target_after(consequence, decision), task.Actor::Forge, false);
+                                            tasks = t5;
+                                            seq = s5;
+                                            outcome = Outcome::Ended(ending, 0);
+                                        }
+                                    }
                                 }
-                                var claim = 0;
-                                if succeeded(ending) {
-                                    claim = claimed_verdict(heap, fs, execution_dir);
-                                    seq = note_execution(heap, fs, journal_path, seq, "execution.finished", tid, verdict_name(claim));
-                                }
-                                let (t5, s5) = move_to(heap, fs, journal_path, tasks, seq, tid, flow.target_of(dispatch.consequence(ending)), task.Actor::Forge, false);
-                                tasks = t5;
-                                seq = s5;
-                                outcome = Outcome::Ended(ending, claim);
+                                buffer.drop(heap, req);
                             }
-                            buffer.drop(heap, req);
+                            buffer.drop(heap, request_id);
                         }
-                        buffer.drop(heap, input);
                     }
-                    buffer.drop(heap, request_id);
+                    buffer.drop(heap, input);
                 }
             }
         }
@@ -309,5 +391,5 @@ pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &k, &e, &n](heap: &!h Heap, fs: &f Fs
         records = seq - 1;
     }
     buffer.drop(heap, id);
-    return Finished { outcome: outcome, state: state, number: report.tasks + 1, records: records };
+    return Finished { outcome: outcome, state: state, number: report.tasks + 1, records: records, attempts: attempts };
 }

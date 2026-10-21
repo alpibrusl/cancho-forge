@@ -78,6 +78,9 @@ fn reason_of(e: dispatch.Ending) -> [] int {
                 }
             }
         }
+        dispatch.Ending::Said(state, retry) => {
+            return 0 - 1;
+        }
         dispatch.Ending::Unavailable(errno) => {
             return errno;
         }

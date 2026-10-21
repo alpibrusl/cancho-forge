@@ -14,6 +14,7 @@ import forge.verbs;
 //   inject        what the mock does
 //   ok            writes `out.txt` ("abc") in `grants.execution_dir` and answers `succeeded` with it as evidence
 //   fail          answers `failed` with an `error` (retryable)
+//   fail_final    answers `failed` with an `error` that is not retryable
 //   partial       answers `partial`, with `out.txt` and an `error`
 //   hang          never answers
 //   garbage       exits 0 having written something that is not JSON
@@ -69,7 +70,7 @@ fn is[&s, &t](src: &s [byte], tape: &t [int], node: int, text: &static [byte]) -
 }
 
 // The response, written to stdout. `entry` says whether there is one evidence entry, with this `ref`, hash and size.
-fn answer[&h, &i, &r, &k, &p](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], state: &static [byte], entry: bool, path: &p [byte], sha: &static [byte], size: int, failing: bool) -> [heap, io_write] int {
+fn answer[&h, &i, &r, &k, &p](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], state: &static [byte], entry: bool, path: &p [byte], sha: &static [byte], size: int, failing: bool, retryable: bool) -> [heap, io_write] int {
     var w = json.writer(heap, 256);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "contract");
@@ -107,7 +108,7 @@ fn answer[&h, &i, &r, &k, &p](heap: &!h Heap, io: &!i Io, request_id: &r [byte],
         w = json.put_key(heap, w, "message");
         w = json.put_string(heap, w, "injected");
         w = json.put_key(heap, w, "retryable");
-        w = json.put_bool(heap, w, true);
+        w = json.put_bool(heap, w, retryable);
         w = json.end_object(heap, w);
     } else {
         w = json.put_null(heap, w);
@@ -316,15 +317,15 @@ fn reply_result[&h, &i, &r, &g](heap: &!h Heap, io: &!i Io, rid: &r [byte], targ
         id = "r-other";
     }
     if bytes.equal(target, "x-failed") {
-        return answer(heap, io, id, "t-1", "failed", false, "", abc_sha(), 0, true);
+        return answer(heap, io, id, "t-1", "failed", false, "", abc_sha(), 0, true, true);
     }
     if bytes.equal(target, "x-accepted") {
-        return answer(heap, io, id, "t-1", "accepted", false, "", abc_sha(), 0, false);
+        return answer(heap, io, id, "t-1", "accepted", false, "", abc_sha(), 0, false, true);
     }
     if bytes.equal(target, "x-bad-ref") {
-        return answer(heap, io, id, "t-1", "succeeded", true, "../x", abc_sha(), 3, false);
+        return answer(heap, io, id, "t-1", "succeeded", true, "../x", abc_sha(), 3, false, true);
     }
-    return answer(heap, io, id, "t-1", "succeeded", false, "", abc_sha(), 0, false);
+    return answer(heap, io, id, "t-1", "succeeded", false, "", abc_sha(), 0, false, true);
 }
 
 // Is this request one of the four verbs besides `execute` of this contract? If so it is answered here and this is true;
@@ -398,31 +399,34 @@ fn serve[&h, &i, &f, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), g: &g Args) 
                         }
                     }
                     if is(src, tp, inject, "ok") {
-                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", abc_sha(), 3, false);
+                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", abc_sha(), 3, false, true);
                     }
                     if is(src, tp, inject, "partial") {
-                        answer(heap, io, rid, tid, "partial", true, "out.txt", abc_sha(), 3, true);
+                        answer(heap, io, rid, tid, "partial", true, "out.txt", abc_sha(), 3, true, true);
                     }
                     if is(src, tp, inject, "fail") {
-                        answer(heap, io, rid, tid, "failed", false, "", abc_sha(), 0, true);
+                        answer(heap, io, rid, tid, "failed", false, "", abc_sha(), 0, true, true);
+                    }
+                    if is(src, tp, inject, "fail_final") {
+                        answer(heap, io, rid, tid, "failed", false, "", abc_sha(), 0, true, false);
                     }
                     if is(src, tp, inject, "wrong_id") {
-                        answer(heap, io, "r-other", tid, "succeeded", false, "", abc_sha(), 0, false);
+                        answer(heap, io, "r-other", tid, "succeeded", false, "", abc_sha(), 0, false, true);
                     }
                     if is(src, tp, inject, "bad_hash") {
-                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", empty_sha(), 3, false);
+                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", empty_sha(), 3, false, true);
                     }
                     if is(src, tp, inject, "bad_size") {
-                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", abc_sha(), 4, false);
+                        answer(heap, io, rid, tid, "succeeded", true, "out.txt", abc_sha(), 4, false, true);
                     }
                     if is(src, tp, inject, "missing") {
-                        answer(heap, io, rid, tid, "succeeded", true, "gone.txt", abc_sha(), 3, false);
+                        answer(heap, io, rid, tid, "succeeded", true, "gone.txt", abc_sha(), 3, false, true);
                     }
                     if is(src, tp, inject, "link") {
-                        answer(heap, io, rid, tid, "succeeded", true, "link", abc_sha(), 7, false);
+                        answer(heap, io, rid, tid, "succeeded", true, "link", abc_sha(), 7, false, true);
                     }
                     if is(src, tp, inject, "dotdot") {
-                        answer(heap, io, rid, tid, "succeeded", true, "../x", abc_sha(), 3, false);
+                        answer(heap, io, rid, tid, "succeeded", true, "../x", abc_sha(), 3, false, true);
                     }
                     if is(src, tp, inject, "garbage") {
                         io.write_all(io, "this is not json\n");

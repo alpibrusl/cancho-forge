@@ -160,6 +160,49 @@ if $C build src/*.cho --std -o "$gr/forge" && $C build workers/gate_runner.cho $
   "$gr/forge" gate "$gr/pass" "$gr/workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" 20000 HOME > /dev/null 2>&1; check "usage: an environment argument with no = is exit 2" test $? = 2
   "$gr/forge" gate "$gr/pass" "$gr/workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" =/x > /dev/null 2>&1; check "usage: an environment argument with no name is exit 2" test $? = 2
   "$gr/forge" gate "$gr/nowhere" "$gr/workers" $repo "$(rev ws_pass)" "$gr/ws_pass" "$gr/pass/ev" > /dev/null 2>&1; check "a workspace that is not there is exit 3" test $? = 3
+  # ---- error.retryable (issue #15): a worker that says it failed and that retrying can help is started again, three
+  # attempts in all; one that says it cannot be helped, or that has used its attempts, leaves the task blocked. The worker
+  # here is an oracle written in sh: it fails $left times in the way asked, then hands the request to the real runner.
+  mkfake() { # name, failures before it behaves, retryable (true|false)
+    d="$gr/$1"; mkdir "$d" && cp "$gr/workers/gate_runner" "$d/real_runner" && echo "$2" > "$d/left" || exit 1
+    cat > "$d/gate_runner" <<FAKE
+#!/bin/sh
+d=\$(dirname "\$0")
+req=\$(cat)
+printf '%s\n' "\$req" >> "\$d/requests"
+left=\$(cat "\$d/left")
+if [ "\$left" -gt 0 ]; then
+  echo \$((left - 1)) > "\$d/left"
+  rid=\$(printf '%s' "\$req" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+  tid=\$(printf '%s' "\$req" | sed -n 's/.*"task":{"id":"\([^"]*\)".*/\1/p')
+  printf '{"contract":"forge-worker/1","request_id":"%s","state":"failed","task_id":"%s","evidence":[],"error":{"code":"flaky","message":"transient","retryable":$3}}\n' "\$rid" "\$tid"
+  exit 0
+fi
+printf '%s' "\$req" | exec "\$d/real_runner"
+FAKE
+    chmod +x "$d/gate_runner"
+  }
+  rgate() { # ws, workers directory name, checkout name, revision
+    mkws "$1"
+    "$gr/forge" gate "$gr/$1" "$gr/$2" "$repo" "$4" "$gr/$3" "$gr/$1/ev" 20000 > "$gr/$1.out" 2> "$gr/$1.err"
+    echo $? > "$gr/$1.rc"
+  }
+  count() { grep -c "$1" "$gr/$2/journal.jsonl"; }
+  mkfake fk_once 1 true; rgate rt_once fk_once ws_pass "$(rev ws_pass)"
+  check "retry once: the second attempt passes: exit 0, a claimed pass, verification, two attempts in the output" sh -c "[ '$(rc rt_once)' = 0 ] && grep -q '^state: verification\$' '$gr/rt_once.out' && grep -q '^claimed verdict: pass\$' '$gr/rt_once.out' && grep -q '^attempts: 2\$' '$gr/rt_once.out' && ! grep -q 'retry-' '$gr/rt_once.out'"
+  check "retry once: the journal has one execution.retry (attempt 1, by forge), two execution.started and one execution.finished, eleven records" sh -c "[ \$(grep -c '\"kind\":\"execution.retry\",\"task\":\"gate-$(rev ws_pass | cut -c1-12)-1\",\"actor\":\"forge\",\"attempt\":1' '$gr/rt_once/journal.jsonl') -eq 1 ] && [ $(count execution.started rt_once) -eq 2 ] && [ $(count execution.finished rt_once) -eq 1 ] && '$gr/forge' status '$gr/rt_once' | grep -q '^records: 11\$'"
+  check "retry once: the task went running, ready, running again (two task.ready, two task.running) and was never accepted" sh -c "[ $(count '\"kind\":\"task.ready\"' rt_once) -eq 2 ] && [ $(count '\"kind\":\"task.running\"' rt_once) -eq 2 ] && ! grep -q 'task.accepted' '$gr/rt_once/journal.jsonl'"
+  check "retry once: the worker saw attempt 1 then 2, and a request id that differs" sh -c "[ \$(wc -l < '$gr/fk_once/requests') -eq 2 ] && sed -n 1p '$gr/fk_once/requests' | grep -q '\"attempt\":1' && sed -n 2p '$gr/fk_once/requests' | grep -q '\"attempt\":2' && sed -n 1p '$gr/fk_once/requests' | grep -q '\"request_id\":\"r-gate-[0-9a-f]*-1\"' && sed -n 2p '$gr/fk_once/requests' | grep -q '\"request_id\":\"r-gate-[0-9a-f]*-1-2\"'"
+  check "retry once: history shows the whole life, the retry between the two runs" sh -c "'$gr/forge' history '$gr/rt_once' | cut -d' ' -f2 | tr '\\n' ' ' | grep -q '^kind=task.proposed kind=task.approved kind=task.ready kind=task.running kind=execution.started kind=execution.retry kind=task.ready kind=task.running kind=execution.started kind=execution.finished kind=task.verification \$'"
+  mkfake fk_twice 2 true; rgate rt_twice fk_twice ws_pass "$(rev ws_pass)"
+  check "retry twice: the third attempt, the last allowed, is taken and passes" sh -c "[ '$(rc rt_twice)' = 0 ] && grep -q '^attempts: 3\$' '$gr/rt_twice.out' && grep -q '^claimed verdict: pass\$' '$gr/rt_twice.out' && [ $(count execution.retry rt_twice) -eq 2 ]"
+  mkfake fk_never 9 true; rgate rt_never fk_never ws_pass "$(rev ws_pass)"
+  check "retry exhausted: three attempts and no more (the worker is left with six failures), exit 4, blocked, the rule tag in the output" sh -c "[ '$(rc rt_never)' = 4 ] && [ \$(cat '$gr/fk_never/left') -eq 6 ] && grep -q '^state: blocked\$' '$gr/rt_never.out' && grep -q '^attempts: 3\$' '$gr/rt_never.out' && grep -q '^refusal: retry-exhausted\$' '$gr/rt_never.out' && ! grep -q 'claimed verdict' '$gr/rt_never.out'"
+  check "retry exhausted: the journal has two execution.retry, three execution.started, the refusal with its tag, no execution.finished" sh -c "[ $(count execution.retry rt_never) -eq 2 ] && [ $(count execution.started rt_never) -eq 3 ] && grep -q '\"kind\":\"refusal\".*\"rule\":\"retry-exhausted\"' '$gr/rt_never/journal.jsonl' && ! grep -q 'execution.finished' '$gr/rt_never/journal.jsonl' && '$gr/forge' status '$gr/rt_never' | grep -q '^  blocked: 1\$'"
+  mkfake fk_final 9 false; rgate rt_final fk_final ws_pass "$(rev ws_pass)"
+  check "not retryable: one attempt (the worker is left with eight failures), exit 4, blocked, no retry record, no retry tag" sh -c "[ '$(rc rt_final)' = 4 ] && [ \$(cat '$gr/fk_final/left') -eq 8 ] && grep -q '^state: blocked\$' '$gr/rt_final.out' && ! grep -q 'attempts:' '$gr/rt_final.out' && ! grep -q 'retry' '$gr/rt_final.out' && [ $(count execution.retry rt_final) -eq 0 ] && ! grep -q 'retry-' '$gr/rt_final/journal.jsonl'"
+  check "a gate that fails is not a retry: one attempt, a claimed fail in verification" sh -c "! grep -q 'execution.retry' '$gr/fail/journal.jsonl' && grep -q '^claimed verdict: fail\$' '$gr/fail.out'"
+
   check "no runner outlived the run (the runner this gate may be running under is an ancestor, not a leak: scripts/procs.sh)" sh -c ". scripts/procs.sh; ! leftover -x gate_runner > /dev/null"
 else
   echo "gate run: did not build"
