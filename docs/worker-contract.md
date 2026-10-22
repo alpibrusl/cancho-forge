@@ -587,7 +587,8 @@ checks, what it measured and what it does not do, in [`cancho-code-adapter.md`](
   passes, and keeps the directory so that the same request resumes the build.
 * **The task** carries only the brief (`task.input.brief`, written to `brief.txt`, never to an argument). The tools directory
   and the build configuration are `grants.tools_dir` and `grants.build`, the operator's, built by Forge from configuration
-  and never from `task.input` (9.1). **Forge does not build that request yet**; the adapter checks it again.
+  and never from `task.input` (9.1). `forge build` builds that request from the operator's command line
+  (`forge.build_task.request`, [`cancho-code-adapter.md`](cancho-code-adapter.md) section 10); the adapter checks it again.
 * **The reply** follows 9.4, with the corrections marked there. Only `provider-error` is `retryable: true`. The verdict is a
   claim; the exit code and the verdict in `build.json` must agree or the reply is `failed` with `build-protocol`.
 * **Evidence:** `build.json` (report), `build.out` (log: the tool's standard output), `run.log` (log), `project.cho` (file),

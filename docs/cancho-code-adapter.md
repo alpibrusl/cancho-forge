@@ -6,6 +6,7 @@
 > was measured is the adapter against a stand-in that ends the way [`cancho-code-audit.md`](cancho-code-audit.md) says the
 > real tool ends. Where the two differ, this document is wrong and is corrected in place.
 > Written before the code and corrected by it: section 9 says what the building changed.
+> `forge build` (section 10, issue #34) starts it from Forge, still against the stand-in tool.
 
 The audit ([`cancho-code-audit.md`](cancho-code-audit.md)) found that Cancho Code is a command-line build tool whose request
 is its arguments and a brief file, whose response is a directory of files plus an exit code, and which runs for minutes.
@@ -165,9 +166,8 @@ The harness itself had a defect found at the same time: it called a break INVALI
   worker. Section 1 says why the `sync` slice is what can be tested today.
 * **A real `cancho-build`.** Nothing here ran the real tool, a model or a key; the stand-in ends the way the audit measured the
   real one ends. Latency, token use, cost and the share of runs that end `done` are still unmeasured (worker-contract 9.5).
-* **Forge's side.** `forge.worker.build_execute*` builds the `repo.gate` and `repo.change` requests; nothing builds a
-  `project.build` request (`grants.tools_dir`, `grants.build`) from the operator's configuration, and no `forge` command starts
-  this adapter. The adapter checks its request again because a request may not come from Forge.
+* **Forge's side** is built since issue #34 (section 10): `forge build` builds the `project.build` request from the operator's
+  configuration and starts this adapter. The adapter still checks its request again, because a request may not come from Forge.
 * **Two builds in one directory.** The tool has no lock (audit 4). The adapter holds none either: exclusion is Forge's lock on
   the execution directory (`forge.lock`), as for the gate runner.
 * **Cost.** The tool records tokens in `usage.jsonl`; the adapter does not offer that file or derive a cost (worker-contract 9.2,
@@ -193,3 +193,133 @@ The harness itself had a defect found at the same time: it called a break INVALI
   a person running the check by hand must too.
 * **`pgrep -f 'cancho-build'` matched the oracle's own `sh -c`.** The oracles use the bracket form (`[c]ancho-build`), as the
   other checks do.
+
+## 10. `forge build`: Forge starts the adapter (issue #34)
+
+> **Status: built, checked against the stand-in tool only.** Written before the code; section 10.7 says what the building
+> changed.
+
+`forge build` does for the adapter what `forge gate` does for the gate runner: it takes the lock of a workspace, records a
+task, starts the worker as a real child process under a deadline and an output cap, recomputes the evidence against the files,
+and journals what happened. It builds the `project.build` request from the **operator's configuration**, which is the part
+that did not exist (`forge.build_task.request`; before it, nothing built a request with `grants.tools_dir` and `grants.build`).
+
+### 10.1 The command
+
+```
+forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]
+```
+
+`<dir>` is the workspace (the journal and the lock), `<workers>` the directory holding the adapter `cancho_code`, `<tools>` the
+directory holding `cancho-build`, `<brief-file>` the brief (at most 16 KiB), `<execution-dir>` an existing directory for the
+build. `<checker>` (an absolute path of the compiler), `<provider>`, `<model>` and `<agent>` (one argument: the shell command
+line the tool runs) are positional because a build cannot start without them; the optional trailing `guide=PATH`,
+`attempts=N`, `agent_seconds=N`, `rounds=N`, `plan_seconds=N`, `jobs=N` are the tool's ceilings, a **closed list** (a name twice,
+or not on it, or a value that is not a number, is bad usage). `timeout-ms` defaults to one hour. The same shape as `forge gate`:
+positional paths, an optional timeout, trailing `NAME=value`.
+
+### 10.2 Where the configuration lives
+
+**Decision: on the command line, like `forge gate`'s environment (self-hosting D7), not in a file.** A configuration file would
+need a format, a parser and a place to look for it, and each of those is more authority and more refusals; the command line
+needs none, and the closed list makes a typo a refusal instead of a silent default. The alternative, a file in the workspace,
+stays open for when the number of options makes the command line unwieldy.
+
+Three consequences, stated rather than hidden:
+
+* **The configuration is never journalled.** The journal holds the task, its states, the intent, the refusal tags and the
+  claimed verdict; the checker, the agent command, the provider and the model are in no record (checked: the journal of a
+  successful build contains none of them).
+* **A secret stays out of the journal and the request logs, not out of `ps`.** The tool takes its API key as **a file path
+  named inside the agent command** (audit 2.2), so what is on the command line is a path, never a key. But the agent command
+  line is visible to anyone who can read the process table while the build runs, as every argument is. If that is not
+  acceptable, the answer is a configuration file with restricted permissions, which is the open alternative above.
+* **The brief is not on the command line**, only its path; it reaches the adapter in the request (JSON-escaped) and the tool in
+  a file.
+
+### 10.3 What it does, and what it shares with `forge gate`
+
+Read the brief (before anything is journalled: a file that cannot be read, or is over 16 KiB, is `brief-unreadable`, exit 1,
+no journal); take the lock; then `forge.build_run.run`:
+
+```
+task.proposed, task.approved   (human: the operator who ran the command)
+the task is checked            (type, brief, paths, limits, then the operator's configuration; a refusal is a `refusal`
+                                record and the task stays `approved`: nothing is started, nothing written in <execution-dir>)
+task.ready, task.running       (forge)
+execution.started             (forge: the intent, before the adapter is started)
+the adapter is started         (forge.worker.execute; the evidence is recomputed, a symlink is not followed)
+a refusal record               (when the ending is a refusal, or the retry is refused)
+execution.finished             (worker, basis "claimed": the verdict of build.json, written only for a succeeded run)
+task.verification | task.blocked
+```
+
+**Shared**: the functions that write those records (`move_to`, `note`, `note_execution`, `note_retry`, `request_id_of`,
+`succeeded` of `forge.gate_run`, now `pub`), the lock, the journal replay, `forge.worker.execute`, `forge.dispatch`,
+`forge.flow` and `forge.retry`. **Not shared**: the loop around them, because each thing it decides differs (the checks, the
+id `build-N`, the request, the claim read from `build.json`, the retry policy). Sharing the loop would take a parameter for each
+of those; this duplicates about eighty lines instead, and leaves `forge gate` byte for byte as it was (its own checks and
+mutation harness untouched). If a third task type arrives, the loop is the thing to factor.
+
+### 10.4 A build is not retried by itself
+
+`forge.retry` retries only a worker's `retryable: true` failure, up to three attempts, and **never a task that writes**
+(`retry-write-refused`). `forge build` says the task writes. So the adapter's one retryable ending, `provider-error`, ends the
+task `blocked` with `retry-write-refused`, and the operator decides; to **resume**, run `forge build` again on the same
+`<execution-dir>` (a new task, `build-N+1`, over the same work: the tool resumes from `plan.json` and `state.txt`, the audit's
+claim, which the stand-in does not exercise).
+
+The reason is money, not safety: a build writes only inside its own directory and resumes, so a retry would be safe, but every
+attempt spends a model's tokens, and the decision to spend more is not Forge's. A policy that retries a build is a per-task-type
+flag in `forge.retry` and a budget; neither exists (milestone M4).
+
+### 10.5 Exit status and refusals
+
+| exit | when |
+|---|---|
+| 0 | a claim was recorded (`done`): the task is in `verification`, never accepted |
+| 1 | refused: the task (`task-type-invalid`, `input-invalid`, `path-invalid`, `limits-invalid`, `operator-invalid`: it stays `approved`, the tag is printed), the brief file (`brief-unreadable`: no journal), or the journal |
+| 2 | bad usage, or a path that is not absolute or has a `..` |
+| 3 | the workspace is locked, the workers directory cannot be opened, or an I/O error |
+| 4 | the run ended without a claim: the ending and the state (`blocked`) are printed |
+
+`brief-unreadable` is new (`docs/architecture.md` section 7); the others are the adapter's, now also reached through Forge.
+
+### 10.6 Authority of the forge binary
+
+**Unchanged**, measured: `cancho authority src/*.cho --std` prints the report that `docs/authority.txt` already holds, byte for
+byte, with `forge build` linked in. The command needs the same rows `forge gate` has: `exec_under` and `dir_read` (the adapter
+is a name beneath the workers directory), `fs_read("")` and `file_read` (the brief file, `build.json`), `fs_write("")` and
+`file_write` (the journal), a clock and a poller (the deadline). It starts no process by a path and holds no `exec("...")`; the
+tool is started by the *adapter*, whose authority is `docs/authority-cancho-code.txt` and is unchanged. (It was expected to widen
+and does not; the commit message says so.)
+
+### 10.7 Measured, and what the building changed
+
+Compiler `972099e`, Linux x86-64, one run each, against the **stand-in** `cancho-build` (`scripts/standin_cancho_build.sh`, shared
+with the adapter's own check). `scripts/check_build_run.sh`: **48 checks, all `ok`**: a build that ends `done` (seven records,
+the claim written by the worker, the brief byte for byte with quotes, a backslash and a tab, no configuration in the journal,
+the lock let go); the operator's options reaching the tool one argument each; every ending that is not a claim (`stuck`,
+`provider-error` with the retry refused and started once, `gate_failed`, `plan_failed`, an exit 2, a tool that lies, a hang whose
+group is killed with nothing left running, a noisy tool, a missing tool); every refusal and that it started nothing; the brief file
+cases (missing, 16 KiB and one byte, exactly 16 KiB, a directory); bad usage; and no process left behind. `cancho test`: 30
+unit tests for `build_task`. `scripts/mutate_build_run.py`: **27 deliberate breaks, 27 killed, none equivalent**, one per decision (the checks and their order, the intent before the worker, the retry policy and its journal record, the claim and where it is read, the worker's name, the brief, the work directory, the ceilings' order, the brief file's limit and path check, the id, the guide, the escaping of the brief, the closed option list and its duplicates, the default timeout, each exit status and what is printed). All 27 were killed on the first run, so this harness found no hole in the checks, unlike the adapter's (section 7); the two checks added while it was written (a brief path that is not absolute, the default timeout) were added because a break could not be written for them without one.
+
+What the building changed: the brief file limit was off by one on the first run (the read took a file of 16 KiB and one byte to
+the later `input-invalid` refusal instead of `brief-unreadable`; the check that found it is the one for that file); an
+unguarded `seen / bit` in the option parser was replaced by `bit_set`, which does not divide when `bit` is 0, though the closed
+list makes that unreachable (no input may reach a trap, even an unreachable one).
+
+### 10.8 Not done
+
+* **A real `cancho-build`** (issue #32): everything here is the stand-in.
+* **The worker's error code of a build that did not succeed is not journalled.** A `stuck` or `gate-failed` build ends the task
+  `blocked`, and the journal says so, with no `execution.finished`; the code is in the adapter's reply, which Forge does not
+  keep, and the verdict is in `build.json`, which is untrusted evidence Forge reads only for a succeeded run (a link in its
+  place is refused only then). Recording the claim of a failed build needs the evidence recomputed for that ending too.
+* **A refusal tag from `forge.dispatch`** (a reply that is not valid for the contract) is journalled by the same code as the
+  gate's, but the stand-in adapter never produces one: this check does not reach that line. The gate's checks cover the same
+  shape.
+* **The `async` level** (#33) and **the lock for two builds in one directory** (#35). `forge build` holds the workspace lock, not
+  a lock on the execution directory: two workspaces can point at one directory.
+* **Cost**, **a configuration file**, **`--retry`/`--patch`** (section 8).

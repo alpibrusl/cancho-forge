@@ -21,40 +21,8 @@ mkdir "$cc/ev_refuse" || exit 1
 # a brief.txt that is a directory: the brief cannot be written, while build.out could be
 mkdir "$cc/ev_briefdir" "$cc/ev_briefdir/brief.txt" || exit 1
 
-# The stand-in for `cancho-build <checker> <brief> <workdir> <agent> --provider P --model M ...`. The first line of the brief
-# says what to do. It is a test oracle's fixture, not product logic: nothing Forge decides is written in it.
-cat > "$tools/cancho-build" <<'STANDIN'
-#!/bin/sh
-brief=$2
-work=$3
-read -r mode < "$brief"
-log() { printf 'ran\n' > "$work/run.log"; }
-report() { # stage units_verified verdict
-  printf '{"brief":"b","stage":"%s","plan_valid":true,"units_total":2,"units_verified":%s,"verdict":"%s"}\n' "$1" "$2" "$3" > "$work/build.json"
-}
-case "$mode" in
-  done)      log; report done 2 done; printf 'product\n' > "$work/project.cho"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
-  stuck)     log; report done 1 stuck; printf 'product\n' > "$work/project.cho"; printf '[BUILD_VERDICT]\tstuck\n'; exit 1 ;;
-  stuck0)    log; report done 0 stuck; printf '[BUILD_VERDICT]\tstuck\n'; exit 1 ;;
-  gate)      log; report done 2 gate_failed; printf 'product\n' > "$work/project.cho"; printf '[BUILD_VERDICT]\tgate_failed\n'; exit 1 ;;
-  plan)      log; report plan 0 plan_failed; printf '[BUILD_VERDICT]\tplan_failed\n'; exit 3 ;;
-  provider)  log; report build 1 provider_error; printf 'product\n' > "$work/project.cho"; printf '[BUILD_VERDICT]\tprovider_error\n'; exit 4 ;;
-  usage)     echo 'usage: cancho-build ...' >&2; exit 2 ;;
-  disagree)  log; report done 2 done; printf '[BUILD_VERDICT]\tdone\n'; exit 1 ;;
-  disagree0) log; report done 1 stuck; printf '[BUILD_VERDICT]\tstuck\n'; exit 0 ;;
-  badjson)   log; printf 'this is not json\n' > "$work/build.json"; exit 0 ;;
-  nojson)    log; exit 0 ;;
-  link)      log; printf '{"verdict":"done","units_verified":9}\n' > "$work/../outside_secret.json"; ln -s "$work/../outside_secret.json" "$work/build.json"; exit 0 ;;
-  hang)      log; report build 0 ""; sleep 79 & wait ;;
-  noisy)     log; report build 0 ""; head -c 1100000 /dev/zero | tr '\0' x ;;
-  sig)       log; kill -9 $$ ;;
-  args)      log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
-  args2)     log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
-  env)       log; report done 2 done; printf 'product\n' > "$work/project.cho"; env > "$work/env.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
-  *)         log; report done 1 wat; exit 1 ;;
-esac
-STANDIN
-chmod +x "$tools/cancho-build" || exit 1
+# The stand-in for `cancho-build`: a fixture shared with scripts/check_build_run.sh (scripts/standin_cancho_build.sh).
+cp scripts/standin_cancho_build.sh "$tools/cancho-build" && chmod +x "$tools/cancho-build" || exit 1
 
 # The adapter's authority report is its review artefact (docs/authority-cancho-code.txt); a change that widens it changes that
 # file in the same commit and says so in the message.

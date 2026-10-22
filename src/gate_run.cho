@@ -110,9 +110,14 @@ pub fn task_id[&h, &r](heap: &!h Heap, revision: &r [byte], n: int) -> [heap] bu
     return buffer.push_nat(heap, id, n);
 }
 
+// The helpers from here to `gate_input` (`move_to`, `note`, `note_execution`, `note_retry`, `request_id_of`, and `succeeded`
+// below) are `pub` because `forge.build_run` (`forge build`, issue #34) writes the same records the same way; the
+// orchestration loop of `run` is not shared, because what differs (the checks, the id, the input, the request, the claim,
+// the retry policy) is most of it (docs/cancho-code-adapter.md section 10).
+
 // One transition of `id` by `actor`, written. The table and the next position; the position is -1 once a write failed or
 // the move was refused (a bug in the caller: the sequence of moves here is fixed).
-fn move_to[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], tasks: map.Map[int], seq: int, id: &i [byte], target: task.State, actor: task.Actor, new_file: bool) -> [heap, fs_read(""), fs_write(""), file_write] (map.Map[int], int) {
+pub fn move_to[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], tasks: map.Map[int], seq: int, id: &i [byte], target: task.State, actor: task.Actor, new_file: bool) -> [heap, fs_read(""), fs_write(""), file_write] (map.Map[int], int) {
     if seq < 0 {
         return (tasks, seq);
     }
@@ -133,7 +138,7 @@ fn write_record[&f, &p, &r](fs: &f Fs(""), path: &p [byte], record: &r [byte], n
 }
 
 // The refusal `tag` of task `id`, written.
-fn note[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], tag: &static [byte], new_file: bool) -> [heap, fs_read(""), fs_write(""), file_write] int {
+pub fn note[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], tag: &static [byte], new_file: bool) -> [heap, fs_read(""), fs_write(""), file_write] int {
     if seq < 0 {
         return seq;
     }
@@ -150,7 +155,7 @@ fn note[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int
 }
 
 // An `execution.*` record of task `id`, written.
-fn note_execution[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, kind: &static [byte], id: &i [byte], verdict: &static [byte]) -> [heap, fs_read(""), fs_write(""), file_write] int {
+pub fn note_execution[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, kind: &static [byte], id: &i [byte], verdict: &static [byte]) -> [heap, fs_read(""), fs_write(""), file_write] int {
     if seq < 0 {
         return seq;
     }
@@ -167,7 +172,7 @@ fn note_execution[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]
 }
 
 // The `execution.retry` of task `id` after attempt `attempt`, written.
-fn note_retry[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], attempt: int) -> [heap, fs_read(""), fs_write(""), file_write] int {
+pub fn note_retry[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], attempt: int) -> [heap, fs_read(""), fs_write(""), file_write] int {
     if seq < 0 {
         return seq;
     }
@@ -185,7 +190,7 @@ fn note_retry[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], se
 
 // The id of the request of attempt `attempt`: `r-` and the task id for the first, and `-n` more for the others, so that
 // a reply to an earlier attempt can never be taken for the answer to a later one.
-fn request_id_of[&h, &i](heap: &!h Heap, id: &i [byte], attempt: int) -> [heap] buffer.Buffer {
+pub fn request_id_of[&h, &i](heap: &!h Heap, id: &i [byte], attempt: int) -> [heap] buffer.Buffer {
     var b = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 32), "r-"), id);
     if attempt > 1 {
         b = buffer.push(heap, b, byte_of(45));
@@ -223,7 +228,7 @@ fn claimed_verdict[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), execution_dir: &d 
 }
 
 // Is the reply of this ending a `succeeded` one? Only then is there a report to read.
-fn succeeded(e: dispatch.Ending) -> [] bool {
+pub fn succeeded(e: dispatch.Ending) -> [] bool {
     match dispatch.consequence(e) {
         dispatch.Consequence::Verification => {
             return true;
