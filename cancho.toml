@@ -53,6 +53,11 @@ sources = ["tests/gate_task_test.cho", "src/gate_task.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]
+name = "build_task"
+sources = ["tests/build_task_test.cho", "src/build_task.cho", "src/gate_task.cho", "src/gate_env.cho"]
+std = true
+
+[[test]]
 name = "stub_script"
 sources = ["tests/stub_script_test.cho", "src/stub_script.cho"]
 std = true

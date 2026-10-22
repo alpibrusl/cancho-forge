@@ -1,0 +1,485 @@
+edition 9;
+module forge.build_task;
+
+import std.buffer;
+import std.bytes;
+import forge.gate_task;
+
+// The `project.build` task (docs/cancho-code-adapter.md): a brief becomes a verified new project, built by Cancho Code's
+// `cancho-build` (docs/cancho-code-audit.md, worker-contract section 9). This module is the pure half: what a task and
+// the operator's build configuration may say, the refusals with their rule tags, the deadline arithmetic, the argument
+// vector the build tool is started with, and how the tool's ending (its exit code and the verdict it wrote in
+// `build.json`) is read. It opens no file and starts nothing, so every decision is testable without a child;
+// `workers/cancho_code.cho` is the process half.
+//
+// Three things come from three places and none from another's: the BRIEF is the task's (`task.input.brief`, untrusted
+// text that ends up in a file the model reads); WHERE and WITH WHAT the build runs (the tools directory, the checker,
+// the agent command, provider, model, ceilings) is the operator's (`grants.tools_dir`, `grants.build`, built by Forge
+// from configuration, never from `task.input`: worker-contract 9.1); the execution directory is Forge's.
+
+// What a task is refused for. Each has a rule tag (docs/architecture.md, section 7) and a test that reaches it.
+pub enum Refusal {
+    // `task.type` is not `project.build`.
+    TaskTypeInvalid,
+    // `input.brief` is missing, not a string, empty, over 16 KiB, or holds a NUL.
+    InputInvalid,
+    // A path of the request is not one the adapter will use or put in an argument vector.
+    PathInvalid,
+    // `limits.timeout_ms` is outside what a build can be given.
+    LimitsInvalid,
+    // `grants.build`, the operator's configuration, is missing or not allowed.
+    OperatorInvalid,
+    // The tools directory cannot be opened, or `cancho-build` is not a name the `Exec` bound covers (decided by the
+    // process half; it is here so that the tag has one home).
+    ToolUnusable,
+    // The execution directory cannot be written or opened, so the brief cannot be put there or the evidence cannot be
+    // listed (decided by the process half).
+    WorkdirUnwritable,
+}
+
+pub enum Checked {
+    Held,
+    Refused(Refusal),
+}
+
+pub fn rule_name(r: Refusal) -> [] &static [byte] {
+    match r {
+        Refusal::TaskTypeInvalid => {
+            return "task-type-invalid";
+        }
+        Refusal::InputInvalid => {
+            return "input-invalid";
+        }
+        Refusal::PathInvalid => {
+            return "path-invalid";
+        }
+        Refusal::LimitsInvalid => {
+            return "limits-invalid";
+        }
+        Refusal::OperatorInvalid => {
+            return "operator-invalid";
+        }
+        Refusal::ToolUnusable => {
+            return "tool-unusable";
+        }
+        Refusal::WorkdirUnwritable => {
+            return "workdir-unwritable";
+        }
+    }
+}
+
+pub fn task_type() -> [] &static [byte] {
+    return "project.build";
+}
+
+// The build tool, by the name it is looked up under beneath the operator's tools directory. Fixed: a task cannot name
+// what runs.
+pub fn tool_name() -> [] &static [byte] {
+    return "cancho-build";
+}
+
+// The shortest and longest `timeout_ms` of a build: 10 seconds (below it the margin of `runner_deadline_ms` and the
+// tool's own start-up mean nothing) and one day.
+pub fn min_timeout_ms() -> [] int {
+    return 10000;
+}
+
+pub fn max_timeout_ms() -> [] int {
+    return 86400000;
+}
+
+// The longest brief, in bytes.
+pub fn max_brief_bytes() -> [] int {
+    return 16384;
+}
+
+// The most of the tool's standard output the adapter keeps (it is evidence `build.out`, never read for a verdict:
+// docs/cancho-code-audit.md 3.1).
+pub fn out_cap() -> [] int {
+    return 1048576;
+}
+
+// The most of a file the adapter reads to hash it or to read `build.json`.
+pub fn file_cap() -> [] int {
+    return 67108864;
+}
+
+// Exactly the bytes a brief may hold: 1 to 16 KiB, no NUL (the brief is written to a file, never to an argument, but a
+// NUL in it would end a C string somewhere downstream).
+pub fn brief_ok[&b](brief: &b [byte]) -> [] bool {
+    if len(brief) < 1 || len(brief) > max_brief_bytes() {
+        return false;
+    }
+    var i = 0;
+    while i < len(brief) {
+        if int_of(brief[i]) == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// A provider or a model: the tool splices them into a shell command line, and allows only letters, digits and
+// `. _ / + : = @ % , -` (docs/cancho-code-audit.md 2.1). 1 to 128 bytes.
+pub fn word_ok[&w](word: &w [byte]) -> [] bool {
+    if len(word) < 1 || len(word) > 128 {
+        return false;
+    }
+    var i = 0;
+    while i < len(word) {
+        let c = int_of(word[i]);
+        let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        let punct = c == 46 || c == 95 || c == 47 || c == 43 || c == 58 || c == 61 || c == 64 || c == 37 || c == 44 || c == 45;
+        if !letter && !digit && !punct {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The agent command: one argument, a shell command line the tool runs through `/bin/sh -c` (the operator's, never the
+// task's). 1 to 1024 bytes of printable ASCII: no NUL, no control byte, no byte over 126.
+pub fn agent_ok[&a](agent: &a [byte]) -> [] bool {
+    if len(agent) < 1 || len(agent) > 1024 {
+        return false;
+    }
+    var i = 0;
+    while i < len(agent) {
+        let c = int_of(agent[i]);
+        if c < 32 || c > 126 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The ceilings the tool takes, as `(low, high)` of each; the defaults are the tool's own (docs/build.md: attempts 4,
+// agent seconds 30, rounds 3, plan seconds 900, jobs 4).
+pub fn attempts_ok(n: int) -> [] bool {
+    return n >= 1 && n <= 20;
+}
+
+pub fn agent_seconds_ok(n: int) -> [] bool {
+    return n >= 1 && n <= 3600;
+}
+
+pub fn rounds_ok(n: int) -> [] bool {
+    return n >= 1 && n <= 10;
+}
+
+pub fn plan_seconds_ok(n: int) -> [] bool {
+    return n >= 1 && n <= 7200;
+}
+
+pub fn jobs_ok(n: int) -> [] bool {
+    return n >= 1 && n <= 64;
+}
+
+// The first thing wrong with a task, if anything, in a fixed order: type, input, paths, limits. The paths are the two
+// Forge grants, the execution directory and the tools directory; the operator's own (the checker, the guide) are
+// `operator_checked`'s. A task with two faults is refused for the first, so the answer does not depend on the order a
+// caller checks. `forge.gate_task.path_ok` is the rule for a path that is put in an argument vector and a file path.
+pub fn check[&y, &b, &e, &t](task_type_text: &y [byte], brief: &b [byte], execution_dir: &e [byte], tools_dir: &t [byte], timeout_ms: int) -> [] Checked {
+    if !bytes.equal(task_type_text, task_type()) {
+        return Checked::Refused(Refusal::TaskTypeInvalid);
+    }
+    if !brief_ok(brief) {
+        return Checked::Refused(Refusal::InputInvalid);
+    }
+    if !gate_task.path_ok(execution_dir) || !gate_task.path_ok(tools_dir) {
+        return Checked::Refused(Refusal::PathInvalid);
+    }
+    if timeout_ms < min_timeout_ms() || timeout_ms > max_timeout_ms() {
+        return Checked::Refused(Refusal::LimitsInvalid);
+    }
+    return Checked::Held;
+}
+
+// The operator's configuration, after `check` held: the checker (an absolute path of the compiler), the guide (a path, or
+// empty for none), the provider, the model, the agent command and the five ceilings. It is checked last, so a task with
+// two faults is refused for the first of the order type, input, paths, limits, operator; a `grants.build` that is
+// missing is every field empty, and so `operator-invalid`.
+pub fn operator_checked[&c, &g, &p, &m, &a](checker: &c [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [] Checked {
+    if !gate_task.path_ok(checker) {
+        return Checked::Refused(Refusal::OperatorInvalid);
+    }
+    if len(guide) > 0 && !gate_task.path_ok(guide) {
+        return Checked::Refused(Refusal::OperatorInvalid);
+    }
+    if !word_ok(provider) || !word_ok(model) || !agent_ok(agent) {
+        return Checked::Refused(Refusal::OperatorInvalid);
+    }
+    if !attempts_ok(attempts) || !agent_seconds_ok(agent_seconds) || !rounds_ok(rounds) || !plan_seconds_ok(plan_seconds) || !jobs_ok(jobs) {
+        return Checked::Refused(Refusal::OperatorInvalid);
+    }
+    return Checked::Held;
+}
+
+// The adapter's own deadline for the whole job, four fifths of Forge's. Forge's deadline kills only the adapter's pid,
+// and the build tool is started detached (a group of its own), which survives that (spike S11, S7): so the adapter must
+// have ended, and killed the build's group, before Forge's deadline fires.
+pub fn runner_deadline_ms(timeout_ms: int) -> [] int {
+    return timeout_ms / 5 * 4;
+}
+
+fn put_arg[&h, &a](heap: &!h Heap, b: buffer.Buffer, text: &a [byte]) -> [heap] buffer.Buffer {
+    return buffer.push(heap, buffer.append(heap, b, text), byte_of(0));
+}
+
+fn put_option[&h, &a](heap: &!h Heap, b: buffer.Buffer, name: &static [byte], text: &a [byte]) -> [heap] buffer.Buffer {
+    return put_arg(heap, put_arg(heap, b, name), text);
+}
+
+fn put_number[&h](heap: &!h Heap, b: buffer.Buffer, name: &static [byte], n: int) -> [heap] buffer.Buffer {
+    return buffer.push(heap, buffer.push_nat(heap, put_arg(heap, b, name), n), byte_of(0));
+}
+
+// The argument vector of `cancho-build` (docs/cancho-code-audit.md 2.1), each argument ended by a NUL:
+//
+//   <checker> <brief path> <workdir> <agent command> --provider P --model M [--guide G] --attempts N --agent-seconds N
+//   --rounds N --plan-seconds N --jobs N
+//
+// Every value has passed `check` / `operator_checked`; the agent command is one argument (the tool runs it through the
+// shell itself). Nothing in it comes from the task but the brief, and the brief is in a file.
+pub fn build_args[&h, &c, &b, &w, &a, &p, &m, &g](heap: &!h Heap, checker: &c [byte], brief_path: &b [byte], workdir: &w [byte], agent: &a [byte], provider: &p [byte], model: &m [byte], guide: &g [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [heap] buffer.Buffer {
+    var b2 = put_arg(heap, buffer.empty(heap, 256), checker);
+    b2 = put_arg(heap, b2, brief_path);
+    b2 = put_arg(heap, b2, workdir);
+    b2 = put_arg(heap, b2, agent);
+    b2 = put_option(heap, b2, "--provider", provider);
+    b2 = put_option(heap, b2, "--model", model);
+    if len(guide) > 0 {
+        b2 = put_option(heap, b2, "--guide", guide);
+    }
+    b2 = put_number(heap, b2, "--attempts", attempts);
+    b2 = put_number(heap, b2, "--agent-seconds", agent_seconds);
+    b2 = put_number(heap, b2, "--rounds", rounds);
+    b2 = put_number(heap, b2, "--plan-seconds", plan_seconds);
+    return put_number(heap, b2, "--jobs", jobs);
+}
+
+// The verdict word of `build.json`, as a number: 1 done, 2 stuck, 3 gate_failed, 4 plan_failed, 5 provider_error, and 0
+// for any other text (including none).
+pub fn verdict_id[&v](word: &v [byte]) -> [] int {
+    if bytes.equal(word, "done") {
+        return 1;
+    }
+    if bytes.equal(word, "stuck") {
+        return 2;
+    }
+    if bytes.equal(word, "gate_failed") {
+        return 3;
+    }
+    if bytes.equal(word, "plan_failed") {
+        return 4;
+    }
+    if bytes.equal(word, "provider_error") {
+        return 5;
+    }
+    return 0;
+}
+
+// How the tool ended, read from its exit code AND the verdict it wrote (worker-contract 9.4). The exit code is a
+// function of the verdict word in the tool (`code_of`: 0 done, 1 stuck / gate_failed, 3 plan_failed, 4 provider_error,
+// anything else 1), and the two must agree; the verdict is never taken from standard output.
+pub enum Ended {
+    // Exit 0 and `done`: every unit verified and the final gate held. A claim.
+    Done,
+    // Exit 1 and `stuck`, nothing verified.
+    Stuck,
+    // Exit 1 and `stuck`, with at least one unit verified: something usable exists.
+    StuckPartial,
+    // Exit 1 and `gate_failed`: every unit verified, the whole did not check.
+    GateFailed,
+    // Exit 3 and `plan_failed`: nothing built.
+    PlanFailed,
+    // Exit 4 and `provider_error`: what verified is kept; a new request resumes it.
+    ProviderError,
+    // Exit 2: the adapter composed an argument vector the tool refused. A bug of the adapter or of its configuration.
+    Usage,
+    // Any other combination: a verdict that is unknown or empty, an exit code the table does not have, an exit code and
+    // a verdict that disagree.
+    Disagree,
+}
+
+pub fn ended(exit_code: int, verdict: int, units_verified: int) -> [] Ended {
+    if exit_code == 2 {
+        return Ended::Usage;
+    }
+    if exit_code == 0 && verdict == 1 {
+        return Ended::Done;
+    }
+    if exit_code == 1 && verdict == 2 {
+        if units_verified > 0 {
+            return Ended::StuckPartial;
+        }
+        return Ended::Stuck;
+    }
+    if exit_code == 1 && verdict == 3 {
+        return Ended::GateFailed;
+    }
+    if exit_code == 3 && verdict == 4 {
+        return Ended::PlanFailed;
+    }
+    if exit_code == 4 && verdict == 5 {
+        return Ended::ProviderError;
+    }
+    return Ended::Disagree;
+}
+
+// The contract state of an ending: 0 `succeeded`, 1 `partial`, 2 `failed`.
+pub fn state_of(e: Ended) -> [] int {
+    match e {
+        Ended::Done => {
+            return 0;
+        }
+        Ended::StuckPartial => {
+            return 1;
+        }
+        Ended::GateFailed => {
+            return 1;
+        }
+        Ended::Stuck => {
+            return 2;
+        }
+        Ended::PlanFailed => {
+            return 2;
+        }
+        Ended::ProviderError => {
+            return 2;
+        }
+        Ended::Usage => {
+            return 2;
+        }
+        Ended::Disagree => {
+            return 2;
+        }
+    }
+}
+
+// The `error.code` of an ending (empty for `Done`). Kebab-case, as the contract says; the tool's own words
+// (`gate_failed`, `plan_failed`, `provider_error`) have underscores.
+pub fn code_of(e: Ended) -> [] &static [byte] {
+    match e {
+        Ended::Done => {
+            return "";
+        }
+        Ended::Stuck => {
+            return "stuck";
+        }
+        Ended::StuckPartial => {
+            return "stuck";
+        }
+        Ended::GateFailed => {
+            return "gate-failed";
+        }
+        Ended::PlanFailed => {
+            return "plan-failed";
+        }
+        Ended::ProviderError => {
+            return "provider-error";
+        }
+        Ended::Usage => {
+            return "build-usage";
+        }
+        Ended::Disagree => {
+            return "build-protocol";
+        }
+    }
+}
+
+// Only a provider error is retryable: the agent could not be reached, what verified is kept, and the same request
+// resumes it. `stuck`, `gate_failed` and `plan_failed` are outcomes, never retried blindly (worker-contract 9.4).
+pub fn retryable_of(e: Ended) -> [] bool {
+    match e {
+        Ended::ProviderError => {
+            return true;
+        }
+        Ended::Done => {
+            return false;
+        }
+        Ended::Stuck => {
+            return false;
+        }
+        Ended::StuckPartial => {
+            return false;
+        }
+        Ended::GateFailed => {
+            return false;
+        }
+        Ended::PlanFailed => {
+            return false;
+        }
+        Ended::Usage => {
+            return false;
+        }
+        Ended::Disagree => {
+            return false;
+        }
+    }
+}
+
+pub fn message_of(e: Ended) -> [] &static [byte] {
+    match e {
+        Ended::Done => {
+            return "build report; the verdict is in build.json";
+        }
+        Ended::Stuck => {
+            return "a unit failed and nothing verified; the units are in plan.json and state.txt";
+        }
+        Ended::StuckPartial => {
+            return "a unit failed; the units that verified are kept in the directory";
+        }
+        Ended::GateFailed => {
+            return "every unit verified and the whole did not check";
+        }
+        Ended::PlanFailed => {
+            return "no valid plan was made; nothing was built";
+        }
+        Ended::ProviderError => {
+            return "the agent could not be reached or failed; what verified is kept, and a new request resumes the build";
+        }
+        Ended::Usage => {
+            return "the build tool refused its arguments (exit 2): a defect of the adapter or of the operator's configuration";
+        }
+        Ended::Disagree => {
+            return "the build tool's exit code and the verdict in build.json do not agree, or build.json is unusable";
+        }
+    }
+}
+
+// The evidence the adapter offers, in order, by file name beneath the execution directory and its kind. Each is offered
+// only if the file exists, is an ordinary file (no link) and is not over `file_cap`.
+pub fn evidence_name(i: int) -> [] &static [byte] {
+    if i == 0 {
+        return "build.json";
+    }
+    if i == 1 {
+        return "build.out";
+    }
+    if i == 2 {
+        return "run.log";
+    }
+    if i == 3 {
+        return "project.cho";
+    }
+    return "";
+}
+
+pub fn evidence_kind(i: int) -> [] &static [byte] {
+    if i == 0 {
+        return "report";
+    }
+    if i == 3 {
+        return "file";
+    }
+    return "log";
+}
+
+pub fn evidence_count() -> [] int {
+    return 4;
+}
