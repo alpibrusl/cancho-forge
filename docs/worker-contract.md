@@ -8,6 +8,8 @@
 > contract was written *ahead of* Cancho Code's real interface and the audit
 > showed it wrong in five places, listed next and fixed where they occur,
 > each marked **(corrected)**. Nothing here binds Cancho Code to internals.
+> The Cancho Code adapter is built as a `sync` slice (section 11, [`cancho-code-adapter.md`](cancho-code-adapter.md)), checked
+> against a stand-in for the tool, not the real one.
 > See [`architecture.md`](architecture.md) for why the transport is a child
 > process and how Forge limits what the child gets.
 
@@ -468,10 +470,10 @@ a repository; they are `log`, never `patch`. All of it is `claimed`.
 |---|---|
 | exit 0 and `verdict == "done"` | `state: succeeded` (a claim; the compiler and the unit's own examples are its evidence, Forge's are M3's) |
 | exit 1 and `verdict` `stuck` | `partial` if `units_verified > 0`, else `failed`; `error.code` `stuck`; the units are in `plan.json`, `state.txt`; **retryable only through `--retry`/`--patch`, which is a new request** |
-| exit 1 and `verdict` `gate_failed` | `partial`, `error.code` `gate_failed` |
-| exit 3, `plan_failed` | `failed`, `error.code` `plan_failed`, nothing built |
-| exit 4, `provider_error` | `failed`, `error.code` `provider_error`, `retryable: true` (kept units are kept) |
-| exit 2 | `worker-error` and a Forge bug: the arguments were wrong |
+| exit 1 and `verdict` `gate_failed` | `partial`, `error.code` `gate-failed` *(corrected: the tool's word has an underscore; the code is kebab-case, as section 3.2 says)* |
+| exit 3, `plan_failed` | `failed`, `error.code` `plan-failed`, nothing built |
+| exit 4, `provider_error` | `failed`, `error.code` `provider-error`, `retryable: true` (kept units are kept) |
+| exit 2 | `worker-error` and a Forge bug: the arguments were wrong *(built, corrected: the adapter composes the argument vector itself, so it answers `failed` with `error.code` `build-usage`, with the evidence there is; see [`cancho-code-adapter.md`](cancho-code-adapter.md) section 4)* |
 | killed by Forge | `execution.cancelled` / `worker-timeout`; the verdict is absent |
 | signal, trap, or exit 143 not from Forge | `worker-crashed` |
 | verdict and exit code disagree, `build.json` missing or not an object, unknown verdict word | `worker-protocol` |
@@ -572,3 +574,22 @@ The `async` level (a runner that answers `accepted` and is polled); a gate of a 
 leaves the gate's group (`setsid`: not reached by the group kill, cancho `docs/processes.md` section 9); a runner that
 dies in the middle of a gate (its detached gate is orphaned: spike S11, G4); the `exec`-in-place case (a shell that runs the gate's last command in its own process: dash does not, bash may; the trailing `exit $?` is there for it and only the unit test sees it); several runners at once; macOS.
 
+---
+
+## 11. The Cancho Code adapter: task type `project.build` *(built, `sync` slice: `workers/cancho_code.cho`)*
+
+The process-and-directory binding of section 9, implemented as the first worker that starts its tool **beneath a run-time
+`Dir` as a process-group leader** (`exec_spawn_detached_under`, cancho #588; spike S12). It is described in full, with what it
+checks, what it measured and what it does not do, in [`cancho-code-adapter.md`](cancho-code-adapter.md). In short:
+
+* **Level `sync`, not `async` as 9.1 and 1.2 say it should be.** The `async` flow is not built end to end (3.6), so the adapter
+  runs the build to completion inside its own deadline (four fifths of Forge's), kills the build's whole group when it
+  passes, and keeps the directory so that the same request resumes the build.
+* **The task** carries only the brief (`task.input.brief`, written to `brief.txt`, never to an argument). The tools directory
+  and the build configuration are `grants.tools_dir` and `grants.build`, the operator's, built by Forge from configuration
+  and never from `task.input` (9.1). **Forge does not build that request yet**; the adapter checks it again.
+* **The reply** follows 9.4, with the corrections marked there. Only `provider-error` is `retryable: true`. The verdict is a
+  claim; the exit code and the verdict in `build.json` must agree or the reply is `failed` with `build-protocol`.
+* **Evidence:** `build.json` (report), `build.out` (log: the tool's standard output), `run.log` (log), `project.cho` (file),
+  each only if it exists as an ordinary file beneath the execution directory.
+* **Not run against the real tool.** A stand-in `cancho-build` stands for it in the checks.

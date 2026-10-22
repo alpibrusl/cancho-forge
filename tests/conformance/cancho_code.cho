@@ -1,0 +1,367 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import std.process;
+import forge.dispatch;
+import forge.support;
+import forge.worker;
+
+// The Cancho Code adapter against a real child process and a stand-in for the build tool (docs/cancho-code-adapter.md,
+// worker-contract section 9). `scripts/check_cancho_code.sh` builds the adapter into a workers directory, writes a
+// stand-in `cancho-build` (a shell script that does one thing for each first line of the brief: finish, get stuck, hang,
+// write too much, be killed, lie) into a tools directory, creates the execution directories `ev_*`, starts this program,
+// and then looks at the files and the process table itself (the oracle is outside the programs). This program checks what
+// only it can see: the adapter's reply (its state, its error code and whether it is retryable, how many evidence entries
+// it offers), the time it took, and that Forge's own path (`forge.worker.execute`) accepts a good run's evidence.
+//
+// Usage: cancho_code <workers directory holding cancho_code> <scratch directory>. The scratch directory holds `tools/`
+// (the stand-in) and `ev_*` (execution directories).
+
+fn default_build() -> [] &static [byte] {
+    return "{\"checker\":\"/opt/cancho/bin/cancho\",\"agent\":\"stand-in-agent --x\",\"provider\":\"stand\",\"model\":\"m1\"}";
+}
+
+// The `execute` request. `brief_json` is JSON text (so that a brief that is not a string can be sent), `tools` and
+// `exec_dir` are paths, `build` is the text of `grants.build`.
+fn request[&h, &b, &t, &e, &y, &u](heap: &!h Heap, brief_json: &b [byte], tools: &t [byte], exec_dir: &e [byte], task_type: &y [byte], timeout_ms: int, build: &u [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "verb");
+    w = json.put_string(heap, w, "execute");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, "r-1");
+    w = json.put_key(heap, w, "attempt");
+    w = json.put_int(heap, w, 1);
+    w = json.put_key(heap, w, "task");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "id");
+    w = json.put_string(heap, w, "t-1");
+    w = json.put_key(heap, w, "type");
+    w = json.put_string(heap, w, task_type);
+    w = json.put_key(heap, w, "input");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "brief");
+    w = json.put_fragment(heap, w, brief_json);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "limits");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "timeout_ms");
+    w = json.put_int(heap, w, timeout_ms);
+    w = json.put_key(heap, w, "max_output_bytes");
+    w = json.put_int(heap, w, 1048576);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "grants");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "execution_dir");
+    w = json.put_string(heap, w, exec_dir);
+    w = json.put_key(heap, w, "tools_dir");
+    w = json.put_string(heap, w, tools);
+    if len(build) > 0 {
+        w = json.put_key(heap, w, "build");
+        w = json.put_fragment(heap, w, build);
+    }
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// Does the reply say `state`, carry `code` as `error.code` (empty: `error` is null) with `retryable` as its flag, and have
+// `evidence` evidence entries?
+fn reply_is[&h, &b](heap: &!h Heap, out: &b [byte], state: &static [byte], code: &static [byte], retryable: bool, evidence: int) -> [heap] bool {
+    var held = false;
+    let tape = box_slice(heap, json.tape_len(out), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(out, tp) > 0 && json.is_object(tp, 0) {
+            let s = json.get(out, tp, 0, "state");
+            let ev = json.get(out, tp, 0, "evidence");
+            let er = json.get(out, tp, 0, "error");
+            held = json.is_string(tp, s) && json.string_equals(out, tp, s, state) && json.is_array(tp, ev) && json.count(tp, ev) == evidence;
+            if len(code) == 0 {
+                held = held && json.is_null(tp, er);
+            } else {
+                let c = json.get(out, tp, er, "code");
+                let r = json.get(out, tp, er, "retryable");
+                held = held && json.is_object(tp, er) && json.is_string(tp, c) && json.string_equals(out, tp, c, code) && json.is_bool(tp, r) && json.to_bool(tp, r) == retryable;
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return held;
+}
+
+fn ran_with[&h, &x, &w, &c, &q](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, req: &q [byte], timeout_ms: int) -> [heap, exec_under, clock, poll] (buffer.Buffer, process.Ran) {
+    return worker.run(heap, exec, workers, clock, "cancho_code", req, 1048576, timeout_ms);
+}
+
+// One case through `worker.run`: the reply must be `state`/`code`/`retryable` with `evidence` entries, within `within_ms`.
+fn case[&h, &x, &w, &c, &i, &b, &t, &e, &u](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], task_type: &static [byte], brief_json: &b [byte], tools: &t [byte], exec_dir: &e [byte], build: &u [byte], timeout_ms: int, state: &static [byte], code: &static [byte], retryable: bool, evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let req = request(heap, brief_json, tools, exec_dir, task_type, timeout_ms, build);
+    let began = clock_ms(clock);
+    var held = false;
+    borrow req as &qb in {
+        let (out, ran) = ran_with(heap, exec, workers, clock, buffer.bytes(qb), timeout_ms);
+        borrow out as &ob in {
+            match ran {
+                process.Ran::Code(n) => {
+                    held = n == 0 && reply_is(heap, buffer.bytes(ob), state, code, retryable, evidence);
+                }
+                process.Ran::Signaled(sig) => {
+                    held = false;
+                }
+                process.Ran::TimedOut => {
+                    held = false;
+                }
+                process.Ran::TooMuch => {
+                    held = false;
+                }
+                process.Ran::Failed(e) => {
+                    held = false;
+                }
+            }
+        }
+        buffer.drop(heap, out);
+    }
+    buffer.drop(heap, req);
+    return support.verdict(io, held && clock_ms(clock) - began <= within_ms, label);
+}
+
+// `case` with the tools directory `tools` and the execution directory `ev_*` beneath the scratch directory.
+fn go[&h, &x, &w, &c, &i, &s, &b, &u](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, scratch: &s [byte], label: &static [byte], task_type: &static [byte], brief_json: &b [byte], tools_name: &static [byte], ev_name: &static [byte], build: &u [byte], timeout_ms: int, state: &static [byte], code: &static [byte], retryable: bool, evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let tools = support.under(heap, scratch, tools_name);
+    let exec_dir = support.under(heap, scratch, ev_name);
+    var bad = 0;
+    borrow tools as &tb in {
+        borrow exec_dir as &eb in {
+            bad = case(heap, exec, workers, clock, io, label, task_type, brief_json, buffer.bytes(tb), buffer.bytes(eb), build, timeout_ms, state, code, retryable, evidence, within_ms);
+        }
+    }
+    buffer.drop(heap, tools);
+    buffer.drop(heap, exec_dir);
+    return bad;
+}
+
+// A raw request (not a task): the adapter must end with exit status `exit`; with exit 4 it writes nothing.
+fn raw[&h, &x, &w, &c, &i, &q](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], req: &q [byte], exit: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let (out, ran) = ran_with(heap, exec, workers, clock, req, 5000);
+    var held = false;
+    borrow out as &ob in {
+        match ran {
+            process.Ran::Code(n) => {
+                held = n == exit && (exit == 0 || len(buffer.bytes(ob)) == 0);
+            }
+            process.Ran::Signaled(sig) => {
+                held = false;
+            }
+            process.Ran::TimedOut => {
+                held = false;
+            }
+            process.Ran::TooMuch => {
+                held = false;
+            }
+            process.Ran::Failed(e) => {
+                held = false;
+            }
+        }
+    }
+    buffer.drop(heap, out);
+    return support.verdict(io, held, label);
+}
+
+// `capabilities`: the adapter says what it is: a `sync` worker of the task type `project.build`, with the longest timeout
+// of a day.
+fn capabilities[&h, &x, &w, &c, &i](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io) -> [heap, exec_under, clock, poll, io_write] int {
+    let (out, ran) = ran_with(heap, exec, workers, clock, "{\"contract\":\"forge-worker/1\",\"verb\":\"capabilities\",\"request_id\":\"r-0\"}", 5000);
+    var held = false;
+    borrow out as &ob in {
+        match ran {
+            process.Ran::Code(n) => {
+                if n == 0 {
+                    let src = buffer.bytes(ob);
+                    let tape = box_slice(heap, json.tape_len(src), 0);
+                    borrow mut tape as &!t in {
+                        let tp = contents(t);
+                        if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                            let level = json.get(src, tp, 0, "level");
+                            let types = json.get(src, tp, 0, "task_types");
+                            held = json.is_string(tp, level) && json.string_equals(src, tp, level, "sync") && json.is_array(tp, types) && json.count(tp, types) == 1;
+                            if held {
+                                let first = json.at(tp, types, 0);
+                                let ty = json.get(src, tp, first, "type");
+                                let lim = json.get(src, tp, first, "limits_max");
+                                let to = json.get(src, tp, lim, "timeout_ms");
+                                held = json.is_string(tp, ty) && json.string_equals(src, tp, ty, "project.build") && json.is_int(tp, to) && json.to_int(src, tp, to) == 86400000;
+                            }
+                        }
+                    }
+                    unbox_slice(heap, tape);
+                }
+            }
+            process.Ran::Signaled(sig) => {
+                held = false;
+            }
+            process.Ran::TimedOut => {
+                held = false;
+            }
+            process.Ran::TooMuch => {
+                held = false;
+            }
+            process.Ran::Failed(e) => {
+                held = false;
+            }
+        }
+    }
+    buffer.drop(heap, out);
+    return support.verdict(io, held, "capabilities: a sync worker of project.build, a day at most");
+}
+
+// Forge's own path: `worker.execute` starts the adapter, classifies the ending and recomputes the evidence of a good run
+// against the files. A good run reaches `verification`, never acceptance.
+fn forge_path[&h, &x, &w, &f, &c, &i, &t, &d](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, tools: &t [byte], exec_dir: &d [byte]) -> [heap, exec_under, clock, poll, io_write, fs_read(""), dir_read, file_read] int {
+    let req = request(heap, "\"done\"", tools, exec_dir, "project.build", 20000, default_build());
+    var held = false;
+    borrow req as &qb in {
+        let e = worker.execute(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(qb), "r-1", "t-1", exec_dir, 1048576, 20000, false);
+        held = bytes.equal(dispatch.rule_tag(e), "") && bytes.equal(dispatch.consequence_name(dispatch.consequence(e)), "verification");
+    }
+    buffer.drop(heap, req);
+    return support.verdict(io, held, "forge's path: the evidence of a good run is recomputed and held, and the task goes to verification");
+}
+
+// A brief of `n` letters, as a JSON string.
+fn brief_of[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    var b = buffer.push(heap, buffer.empty(heap, n + 8), byte_of(34));
+    var k = 0;
+    while k < n {
+        b = buffer.push(heap, b, byte_of(100));
+        k = k + 1;
+    }
+    return buffer.push(heap, b, byte_of(34));
+}
+
+fn run[&h, &x, &w, &f, &c, &i, &s](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, io: &!i Io, scratch: &s [byte]) -> [heap, exec_under, clock, poll, io_write, fs_read(""), dir_read, file_read] int {
+    var bad = 0;
+    let task = "project.build";
+    let build = default_build();
+    // ---- how the tool can end (worker-contract 9.4)
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "done: succeeded, the four files offered", task, "\"done\"", "tools", "ev_done", build, 20000, "succeeded", "", false, 4, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "stuck with verified units: partial, stuck, not retryable", task, "\"stuck\"", "tools", "ev_stuck", build, 20000, "partial", "stuck", false, 4, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "stuck with nothing verified: failed, stuck", task, "\"stuck0\"", "tools", "ev_stuck0", build, 20000, "failed", "stuck", false, 3, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "gate_failed: partial, gate-failed", task, "\"gate\"", "tools", "ev_gate", build, 20000, "partial", "gate-failed", false, 4, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "plan_failed: failed, plan-failed, nothing built", task, "\"plan\"", "tools", "ev_plan", build, 20000, "failed", "plan-failed", false, 3, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "provider_error: failed, provider-error, the one retryable ending", task, "\"provider\"", "tools", "ev_provider", build, 20000, "failed", "provider-error", true, 4, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "exit 2: failed, build-usage", task, "\"usage\"", "tools", "ev_usage", build, 20000, "failed", "build-usage", false, 1, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "exit 1 with the verdict done: failed, build-protocol, never a success", task, "\"disagree\"", "tools", "ev_disagree", build, 20000, "failed", "build-protocol", false, 3, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "exit 0 with a verdict stuck: failed, build-protocol", task, "\"disagree0\"", "tools", "ev_disagree0", build, 20000, "failed", "build-protocol", false, 3, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "build.json that is not JSON: failed, build-protocol", task, "\"badjson\"", "tools", "ev_badjson", build, 20000, "failed", "build-protocol", false, 3, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "no build.json: failed, build-protocol", task, "\"nojson\"", "tools", "ev_nojson", build, 20000, "failed", "build-protocol", false, 2, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a verdict word the tool does not have: failed, build-protocol", task, "\"unknown\"", "tools", "ev_unknown", build, 20000, "failed", "build-protocol", false, 3, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a build.json that is a link to a file elsewhere: not read, not offered", task, "\"link\"", "tools", "ev_link", build, 20000, "failed", "build-protocol", false, 2, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a build that hangs: the adapter's own deadline fires before Forge's, the group is killed", task, "\"hang\"", "tools", "ev_hang", build, 10000, "failed", "build-timeout", false, 3, 9500);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a build that writes past the cap: failed, build-output-overflow", task, "\"noisy\"", "tools", "ev_noisy", build, 20000, "failed", "build-output-overflow", false, 3, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a build killed by a signal: failed, build-crashed", task, "\"sig\"", "tools", "ev_sig", build, 20000, "failed", "build-crashed", false, 2, 15000);
+    // ---- what the build is given
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "the argument vector is the operator's, and the brief is only in its file", task, "\"args\\nsecond line with \\\"quotes\\\"; $(x) `y` & | > <\\n\"", "tools", "ev_args", build, 20000, "succeeded", "", false, 4, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "the build is started with an empty environment", task, "\"env\"", "tools", "ev_env", build, 20000, "succeeded", "", false, 4, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a guide and the ceilings reach the argument vector", task, "\"args2\"", "tools", "ev_args2", "{\"checker\":\"/opt/cancho/bin/cancho\",\"guide\":\"/opt/guides/plan.md\",\"agent\":\"stand-in-agent --x\",\"provider\":\"stand\",\"model\":\"m1\",\"attempts\":7,\"agent_seconds\":31,\"rounds\":2,\"plan_seconds\":901,\"jobs\":5}", 20000, "succeeded", "", false, 4, 15000);
+    // ---- what cannot be started
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a tools directory without the tool: failed, build-unavailable", task, "\"done\"", "tools_empty", "ev_notool", build, 20000, "failed", "build-unavailable", false, 0, 15000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a tools directory that is not there: failed, tool-unusable", task, "\"done\"", "nowhere", "ev_refuse", build, 20000, "failed", "tool-unusable", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "an execution directory that cannot be written: failed, workdir-unwritable", task, "\"done\"", "tools", "ev_nowhere", build, 20000, "failed", "workdir-unwritable", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a brief that cannot be written while the rest of the directory can: failed, workdir-unwritable, the tool never ran", task, "\"done\"", "tools", "ev_briefdir", build, 20000, "failed", "workdir-unwritable", false, 0, 5000);
+    // ---- refusals, before anything runs
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "another task type: failed, task-type-invalid", "repo.gate", "\"done\"", "tools", "ev_refuse", build, 20000, "failed", "task-type-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "an empty brief: failed, input-invalid", task, "\"\"", "tools", "ev_refuse", build, 20000, "failed", "input-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a brief that is a number: failed, input-invalid", task, "7", "tools", "ev_refuse", build, 20000, "failed", "input-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a brief that is null: failed, input-invalid", task, "null", "tools", "ev_refuse", build, 20000, "failed", "input-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a brief with a NUL: failed, input-invalid", task, "\"a\\u0000b\"", "tools", "ev_refuse", build, 20000, "failed", "input-invalid", false, 0, 5000);
+    let big = brief_of(heap, 16385);
+    borrow big as &gb in {
+        bad = bad + go(heap, exec, workers, clock, io, scratch, "a brief of 16 KiB and one byte: failed, input-invalid, nothing written", task, buffer.bytes(gb), "tools", "ev_refuse", build, 20000, "failed", "input-invalid", false, 0, 5000);
+    }
+    buffer.drop(heap, big);
+    let limit = brief_of(heap, 16384);
+    borrow limit as &lb in {
+        bad = bad + go(heap, exec, workers, clock, io, scratch, "a brief of exactly 16 KiB is taken: the tool runs", task, buffer.bytes(lb), "tools", "ev_big", build, 20000, "failed", "build-protocol", false, 3, 15000);
+    }
+    buffer.drop(heap, limit);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a shell metacharacter in a path: failed, path-invalid, nothing run", task, "\"done\"", "tools;x", "ev_refuse", build, 20000, "failed", "path-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a timeout under ten seconds: failed, limits-invalid", task, "\"done\"", "tools", "ev_refuse", build, 9999, "failed", "limits-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "no grants.build: failed, operator-invalid", task, "\"done\"", "tools", "ev_refuse", "", 20000, "failed", "operator-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a provider with a shell metacharacter: failed, operator-invalid", task, "\"done\"", "tools", "ev_refuse", "{\"checker\":\"/opt/cancho/bin/cancho\",\"agent\":\"a\",\"provider\":\"a;b\",\"model\":\"m\"}", 20000, "failed", "operator-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a relative checker: failed, operator-invalid", task, "\"done\"", "tools", "ev_refuse", "{\"checker\":\"cancho\",\"agent\":\"a\",\"provider\":\"p\",\"model\":\"m\"}", 20000, "failed", "operator-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "jobs above the tool's range: failed, operator-invalid", task, "\"done\"", "tools", "ev_refuse", "{\"checker\":\"/opt/cancho/bin/cancho\",\"agent\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"jobs\":65}", 20000, "failed", "operator-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a ceiling that is not an integer: failed, operator-invalid", task, "\"done\"", "tools", "ev_refuse", "{\"checker\":\"/opt/cancho/bin/cancho\",\"agent\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"attempts\":\"four\"}", 20000, "failed", "operator-invalid", false, 0, 5000);
+    bad = bad + go(heap, exec, workers, clock, io, scratch, "a task with two faults is refused for the first (input before operator)", task, "\"\"", "tools", "ev_refuse", "", 20000, "failed", "input-invalid", false, 0, 5000);
+    // ---- what is not a task
+    bad = bad + capabilities(heap, exec, workers, clock, io);
+    bad = bad + raw(heap, exec, workers, clock, io, "garbage on stdin: no answer, exit 4", "this is not json", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "a verb that is not execute or capabilities: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-0\"}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "a complete task under another verb: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-0\",\"task\":{\"id\":\"t\",\"type\":\"project.build\",\"input\":{\"brief\":\"done\"}}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "another contract version: no answer, exit 4", "{\"contract\":\"forge-worker/2\",\"verb\":\"execute\",\"request_id\":\"r-0\",\"task\":{\"id\":\"t\"}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "no request id: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"task\":{\"id\":\"t\"}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "no task id: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r\",\"task\":{}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "an empty request: no answer, exit 4", "", 4);
+    let tools = support.under(heap, scratch, "tools");
+    let exec_dir = support.under(heap, scratch, "ev_forge");
+    borrow tools as &tb in {
+        borrow exec_dir as &eb in {
+            bad = bad + forge_path(heap, exec, workers, fs, clock, io, buffer.bytes(tb), buffer.bytes(eb));
+        }
+    }
+    buffer.drop(heap, tools);
+    buffer.drop(heap, exec_dir);
+    return bad;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow exec as &x in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        borrow args as &g in {
+                            if arg_count(g) == 3 {
+                                match open_dir(f, arg(g, 1)) {
+                                    DirOpened::Ok(d) => {
+                                        var workers = d;
+                                        borrow workers as &w in {
+                                            status = run(h, x, w, f, c, i, arg(g, 2));
+                                        }
+                                        dir_close(workers);
+                                    }
+                                    DirOpened::Failed(e) => {
+                                        io.error_all(i, "cancho_code: cannot open the workers directory\n");
+                                    }
+                                }
+                            } else {
+                                io.error_all(i, "usage: cancho_code <workers dir> <scratch dir>\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

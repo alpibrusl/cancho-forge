@@ -1,0 +1,298 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.build_task;
+
+// Unit tests for src/build_task.cho (docs/cancho-code-adapter.md): what a `project.build` task and the operator's
+// configuration may say, the refusals and their rule tags, the deadline arithmetic, the argument vector of the build tool
+// and how its ending is read. Run with `cancho test`.
+
+fn refusal(c: build_task.Checked) -> [] &static [byte] {
+    match c {
+        build_task.Checked::Held => {
+            return "";
+        }
+        build_task.Checked::Refused(r) => {
+            return build_task.rule_name(r);
+        }
+    }
+}
+
+fn good(timeout_ms: int) -> [] &static [byte] {
+    return refusal(build_task.check("project.build", "a calculator with a history", "/work/exec/e-1", "/opt/tools", timeout_ms));
+}
+
+fn operator(provider: &static [byte], model: &static [byte], agent: &static [byte], attempts: int, jobs: int) -> [] &static [byte] {
+    return refusal(build_task.operator_checked("/opt/cancho/bin/cancho", "", provider, model, agent, attempts, 30, 3, 900, jobs));
+}
+
+fn test_a_brief_for_a_build_in_the_limits_is_held() -> [] int {
+    test.assert(bytes.equal(good(600000), ""));
+    return 0;
+}
+
+fn test_the_task_type_is_project_build_and_nothing_else_is_held() -> [] int {
+    test.assert(bytes.equal(build_task.task_type(), "project.build"));
+    test.assert(bytes.equal(refusal(build_task.check("repo.gate", "a brief", "/work/exec/e-1", "/opt/tools", 600000)), "task-type-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("", "a brief", "/work/exec/e-1", "/opt/tools", 600000)), "task-type-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build ", "a brief", "/work/exec/e-1", "/opt/tools", 600000)), "task-type-invalid"));
+    return 0;
+}
+
+fn test_a_brief_is_one_to_sixteen_kib_and_holds_no_nul() -> [] int {
+    test.assert(build_task.brief_ok("x"));
+    test.assert(!build_task.brief_ok(""));
+    test.assert(!build_task.brief_ok("a\0b"));
+    test.assert(build_task.brief_ok("line one\nline two\ttabbed"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "", "/work/exec/e-1", "/opt/tools", 600000)), "input-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "a\0b", "/work/exec/e-1", "/opt/tools", 600000)), "input-invalid"));
+    return 0;
+}
+
+fn test_a_brief_of_exactly_sixteen_kib_is_held_and_one_byte_more_is_not[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 16400);
+    var i = 0;
+    while i < 16384 {
+        b = buffer.push(heap, b, byte_of(100));
+        i = i + 1;
+    }
+    borrow b as &bb in {
+        test.assert(build_task.brief_ok(buffer.bytes(bb)));
+    }
+    b = buffer.push(heap, b, byte_of(100));
+    borrow b as &cb in {
+        test.assert(!build_task.brief_ok(buffer.bytes(cb)));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_a_path_is_refused_before_anything_is_put_in_an_argument_vector() -> [] int {
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "work/exec", "/opt/tools", 600000)), "path-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "/work/exec", "tools", 600000)), "path-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "/work/../exec", "/opt/tools", 600000)), "path-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "/work/exec;x", "/opt/tools", 600000)), "path-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "/work/ex ec", "/opt/tools", 600000)), "path-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "/work/.hidden", "/opt/tools", 600000)), "path-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "/work/exec", "/opt/-tools", 600000)), "path-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "", "/opt/tools", 600000)), "path-invalid"));
+    return 0;
+}
+
+fn test_a_timeout_outside_ten_seconds_to_a_day_is_limits_invalid() -> [] int {
+    test.assert(bytes.equal(good(10000), ""));
+    test.assert(bytes.equal(good(86400000), ""));
+    test.assert(bytes.equal(good(9999), "limits-invalid"));
+    test.assert(bytes.equal(good(86400001), "limits-invalid"));
+    test.assert(bytes.equal(good(0), "limits-invalid"));
+    test.assert(bytes.equal(good(0 - 5), "limits-invalid"));
+    return 0;
+}
+
+fn test_a_task_with_two_faults_is_refused_for_the_first_of_the_fixed_order() -> [] int {
+    test.assert(bytes.equal(refusal(build_task.check("nope", "", "bad", "bad", 1)), "task-type-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "", "bad", "bad", 1)), "input-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "bad", "bad", 1)), "path-invalid"));
+    test.assert(bytes.equal(refusal(build_task.check("project.build", "b", "/ok/dir", "/ok/dir", 1)), "limits-invalid"));
+    return 0;
+}
+
+fn test_the_operators_configuration_is_checked_after_the_task() -> [] int {
+    test.assert(bytes.equal(operator("anthropic", "model-1", "cancho-agent --key-file /k/key", 4, 4), ""));
+    // a missing grants.build is every field empty
+    test.assert(bytes.equal(refusal(build_task.operator_checked("", "", "", "", "", 4, 30, 3, 900, 4)), "operator-invalid"));
+    test.assert(bytes.equal(operator("", "m", "agent", 4, 4), "operator-invalid"));
+    test.assert(bytes.equal(operator("p", "", "agent", 4, 4), "operator-invalid"));
+    test.assert(bytes.equal(operator("p", "m", "", 4, 4), "operator-invalid"));
+    return 0;
+}
+
+fn test_a_provider_and_a_model_hold_only_what_the_tool_allows_in_a_shell_line() -> [] int {
+    test.assert(build_task.word_ok("anthropic"));
+    test.assert(build_task.word_ok("claude-x_1.2/beta+rc:3=a@b%c,d"));
+    test.assert(!build_task.word_ok("a b"));
+    test.assert(!build_task.word_ok("a;b"));
+    test.assert(!build_task.word_ok("a'b"));
+    test.assert(!build_task.word_ok("a\"b"));
+    test.assert(!build_task.word_ok("a$b"));
+    test.assert(!build_task.word_ok("a`b"));
+    test.assert(!build_task.word_ok("a|b"));
+    test.assert(!build_task.word_ok("a&b"));
+    test.assert(!build_task.word_ok("a\nb"));
+    test.assert(!build_task.word_ok(""));
+    return 0;
+}
+
+fn test_the_agent_command_is_one_printable_ascii_argument() -> [] int {
+    test.assert(build_task.agent_ok("cancho-agent --key-file /k/key"));
+    test.assert(!build_task.agent_ok(""));
+    test.assert(!build_task.agent_ok("a\0b"));
+    test.assert(!build_task.agent_ok("a\nb"));
+    test.assert(!build_task.agent_ok("a\tb"));
+    return 0;
+}
+
+fn test_every_ceiling_has_a_range_and_the_edges_are_in() -> [] int {
+    test.assert(build_task.attempts_ok(1) && build_task.attempts_ok(20));
+    test.assert(!build_task.attempts_ok(0) && !build_task.attempts_ok(21));
+    test.assert(build_task.agent_seconds_ok(1) && build_task.agent_seconds_ok(3600));
+    test.assert(!build_task.agent_seconds_ok(0) && !build_task.agent_seconds_ok(3601));
+    test.assert(build_task.rounds_ok(1) && build_task.rounds_ok(10));
+    test.assert(!build_task.rounds_ok(0) && !build_task.rounds_ok(11));
+    test.assert(build_task.plan_seconds_ok(1) && build_task.plan_seconds_ok(7200));
+    test.assert(!build_task.plan_seconds_ok(0) && !build_task.plan_seconds_ok(7201));
+    test.assert(build_task.jobs_ok(1) && build_task.jobs_ok(64));
+    test.assert(!build_task.jobs_ok(0) && !build_task.jobs_ok(65));
+    test.assert(bytes.equal(operator("p", "m", "a", 0, 4), "operator-invalid"));
+    test.assert(bytes.equal(operator("p", "m", "a", 4, 65), "operator-invalid"));
+    test.assert(bytes.equal(operator("p", "m", "a", 0 - 1, 4), "operator-invalid"));
+    return 0;
+}
+
+fn test_a_checker_and_a_guide_are_paths_and_a_guide_may_be_absent() -> [] int {
+    test.assert(bytes.equal(refusal(build_task.operator_checked("cancho", "", "p", "m", "a", 4, 30, 3, 900, 4)), "operator-invalid"));
+    test.assert(bytes.equal(refusal(build_task.operator_checked("/opt/c;x", "", "p", "m", "a", 4, 30, 3, 900, 4)), "operator-invalid"));
+    test.assert(bytes.equal(refusal(build_task.operator_checked("/opt/c", "guide.md", "p", "m", "a", 4, 30, 3, 900, 4)), "operator-invalid"));
+    test.assert(bytes.equal(refusal(build_task.operator_checked("/opt/c", "/opt/guide.md", "p", "m", "a", 4, 30, 3, 900, 4)), ""));
+    return 0;
+}
+
+fn test_the_adapters_deadline_is_four_fifths_of_forges() -> [] int {
+    test.assert_eq(build_task.runner_deadline_ms(10000), 8000);
+    test.assert_eq(build_task.runner_deadline_ms(600000), 480000);
+    test.assert_eq(build_task.runner_deadline_ms(86400000), 69120000);
+    test.assert(build_task.runner_deadline_ms(build_task.min_timeout_ms()) < build_task.min_timeout_ms());
+    return 0;
+}
+
+fn test_the_argument_vector_is_the_tools_command_line_nul_ended[&h](heap: &!h Heap) -> [heap] int {
+    let v = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "agent --k /x", "prov", "mod", "", 4, 30, 3, 900, 4);
+    borrow v as &vb in {
+        test.assert(bytes.equal(buffer.bytes(vb), "/opt/c\0/w/e/brief.txt\0/w/e\0agent --k /x\0--provider\0prov\0--model\0mod\0--attempts\04\0--agent-seconds\030\0--rounds\03\0--plan-seconds\0900\0--jobs\04\0"));
+    }
+    buffer.drop(heap, v);
+    return 0;
+}
+
+fn test_a_guide_adds_its_option_only_when_there_is_one[&h](heap: &!h Heap) -> [heap] int {
+    let v = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "a", "p", "m", "/g/guide.md", 7, 31, 2, 901, 5);
+    borrow v as &vb in {
+        test.assert(bytes.equal(buffer.bytes(vb), "/opt/c\0/w/e/brief.txt\0/w/e\0a\0--provider\0p\0--model\0m\0--guide\0/g/guide.md\0--attempts\07\0--agent-seconds\031\0--rounds\02\0--plan-seconds\0901\0--jobs\05\0"));
+    }
+    buffer.drop(heap, v);
+    return 0;
+}
+
+fn test_a_verdict_word_is_one_of_five_and_everything_else_is_zero() -> [] int {
+    test.assert_eq(build_task.verdict_id("done"), 1);
+    test.assert_eq(build_task.verdict_id("stuck"), 2);
+    test.assert_eq(build_task.verdict_id("gate_failed"), 3);
+    test.assert_eq(build_task.verdict_id("plan_failed"), 4);
+    test.assert_eq(build_task.verdict_id("provider_error"), 5);
+    test.assert_eq(build_task.verdict_id(""), 0);
+    test.assert_eq(build_task.verdict_id("Done"), 0);
+    test.assert_eq(build_task.verdict_id("done "), 0);
+    test.assert_eq(build_task.verdict_id("gate-failed"), 0);
+    return 0;
+}
+
+fn named(e: build_task.Ended) -> [] &static [byte] {
+    return build_task.code_of(e);
+}
+
+fn test_each_pair_of_exit_code_and_verdict_of_the_tools_table_is_its_ending() -> [] int {
+    test.assert_eq(build_task.state_of(build_task.ended(0, 1, 3)), 0);
+    test.assert(bytes.equal(named(build_task.ended(0, 1, 3)), ""));
+    test.assert(bytes.equal(named(build_task.ended(1, 2, 0)), "stuck"));
+    test.assert_eq(build_task.state_of(build_task.ended(1, 2, 0)), 2);
+    test.assert(bytes.equal(named(build_task.ended(1, 2, 2)), "stuck"));
+    test.assert_eq(build_task.state_of(build_task.ended(1, 2, 2)), 1);
+    test.assert(bytes.equal(named(build_task.ended(1, 3, 3)), "gate-failed"));
+    test.assert_eq(build_task.state_of(build_task.ended(1, 3, 3)), 1);
+    test.assert(bytes.equal(named(build_task.ended(3, 4, 0)), "plan-failed"));
+    test.assert_eq(build_task.state_of(build_task.ended(3, 4, 0)), 2);
+    test.assert(bytes.equal(named(build_task.ended(4, 5, 1)), "provider-error"));
+    test.assert_eq(build_task.state_of(build_task.ended(4, 5, 1)), 2);
+    return 0;
+}
+
+fn test_exit_two_is_a_usage_error_whatever_build_json_says() -> [] int {
+    test.assert(bytes.equal(named(build_task.ended(2, 0, 0)), "build-usage"));
+    test.assert(bytes.equal(named(build_task.ended(2, 1, 0)), "build-usage"));
+    test.assert_eq(build_task.state_of(build_task.ended(2, 0, 0)), 2);
+    return 0;
+}
+
+fn test_an_exit_code_and_a_verdict_that_disagree_are_a_protocol_error_never_a_success() -> [] int {
+    // every pair outside the table: exit 0 with a failing verdict, a failing exit with `done`, an unknown word, no word
+    test.assert(bytes.equal(named(build_task.ended(0, 2, 0)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(0, 3, 0)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(0, 0, 0)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(1, 1, 3)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(1, 0, 3)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(3, 2, 0)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(4, 4, 0)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(5, 5, 0)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(143, 0, 0)), "build-protocol"));
+    test.assert(bytes.equal(named(build_task.ended(0 - 1, 1, 0)), "build-protocol"));
+    test.assert_eq(build_task.state_of(build_task.ended(0, 2, 0)), 2);
+    return 0;
+}
+
+fn test_only_a_provider_error_is_retryable() -> [] int {
+    test.assert(build_task.retryable_of(build_task.ended(4, 5, 0)));
+    test.assert(!build_task.retryable_of(build_task.ended(0, 1, 0)));
+    test.assert(!build_task.retryable_of(build_task.ended(1, 2, 0)));
+    test.assert(!build_task.retryable_of(build_task.ended(1, 2, 3)));
+    test.assert(!build_task.retryable_of(build_task.ended(1, 3, 3)));
+    test.assert(!build_task.retryable_of(build_task.ended(3, 4, 0)));
+    test.assert(!build_task.retryable_of(build_task.ended(2, 0, 0)));
+    test.assert(!build_task.retryable_of(build_task.ended(9, 9, 0)));
+    return 0;
+}
+
+fn test_every_ending_has_a_message_and_a_failing_one_has_a_code() -> [] int {
+    test.assert(len(build_task.message_of(build_task.ended(0, 1, 0))) > 0);
+    test.assert(len(build_task.message_of(build_task.ended(1, 2, 0))) > 0);
+    test.assert(len(build_task.message_of(build_task.ended(1, 2, 1))) > 0);
+    test.assert(len(build_task.message_of(build_task.ended(1, 3, 1))) > 0);
+    test.assert(len(build_task.message_of(build_task.ended(3, 4, 0))) > 0);
+    test.assert(len(build_task.message_of(build_task.ended(4, 5, 0))) > 0);
+    test.assert(len(build_task.message_of(build_task.ended(2, 0, 0))) > 0);
+    test.assert(len(build_task.message_of(build_task.ended(7, 7, 0))) > 0);
+    test.assert_eq(len(named(build_task.ended(0, 1, 0))), 0);
+    test.assert(len(named(build_task.ended(1, 2, 0))) > 0);
+    return 0;
+}
+
+fn test_the_evidence_is_four_named_files_of_three_kinds() -> [] int {
+    test.assert_eq(build_task.evidence_count(), 4);
+    test.assert(bytes.equal(build_task.evidence_name(0), "build.json"));
+    test.assert(bytes.equal(build_task.evidence_kind(0), "report"));
+    test.assert(bytes.equal(build_task.evidence_name(1), "build.out"));
+    test.assert(bytes.equal(build_task.evidence_kind(1), "log"));
+    test.assert(bytes.equal(build_task.evidence_name(2), "run.log"));
+    test.assert(bytes.equal(build_task.evidence_kind(2), "log"));
+    test.assert(bytes.equal(build_task.evidence_name(3), "project.cho"));
+    test.assert(bytes.equal(build_task.evidence_kind(3), "file"));
+    test.assert_eq(len(build_task.evidence_name(4)), 0);
+    return 0;
+}
+
+fn test_every_refusal_has_its_own_rule_tag() -> [] int {
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::TaskTypeInvalid), "task-type-invalid"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::InputInvalid), "input-invalid"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::PathInvalid), "path-invalid"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::LimitsInvalid), "limits-invalid"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::OperatorInvalid), "operator-invalid"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::ToolUnusable), "tool-unusable"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "workdir-unwritable"));
+    return 0;
+}
+
+fn test_the_tool_is_a_fixed_name_a_task_cannot_choose() -> [] int {
+    test.assert(bytes.equal(build_task.tool_name(), "cancho-build"));
+    return 0;
+}

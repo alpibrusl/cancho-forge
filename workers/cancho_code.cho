@@ -1,0 +1,565 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.dirs;
+import std.io;
+import std.json;
+import std.process;
+import forge.build_task;
+import forge.gate_task;
+import forge.journal_io;
+import forge.snapshot;
+import forge.verbs;
+
+// The Cancho Code adapter (docs/cancho-code-adapter.md; issue #16): a `sync` worker of the contract (worker-contract
+// section 9, the process-and-directory binding). One `execute` request on stdin, one response on stdout, exit 0. The task
+// is `project.build`: a brief becomes a verified new project. The adapter writes the brief to `brief.txt` in the
+// execution directory, starts `cancho-build` (Cancho Code's build tool) with that directory as its work directory,
+// waits for it, reads what it wrote, and answers with the contract's state for how it ended and the files it left as
+// evidence:
+//
+//   build.json   kind `report`  the tool's own record: stage, units, verdict (a CLAIM)
+//   build.out    kind `log`     the tool's standard output, up to 1 MiB (untrusted text, never read for a verdict)
+//   run.log      kind `log`     the tool's run log
+//   project.cho  kind `file`    the product, when it exists
+//
+// The tool is a name beneath the operator's tools directory (`grants.tools_dir`), started with
+// `exec_spawn_detached_under` (cancho #562, #588): the program is found beneath a directory chosen at run time and
+// leads a session and a process group of its own, so that the adapter, which has a deadline, can kill the build's whole
+// group when it passes (spike S12; spike S7 measured what a kill of the pid alone leaves running). Where and with what
+// the build runs (checker, agent command, provider, model, ceilings) is `grants.build`, the operator's, built by Forge
+// from configuration and never from `task.input`; the task supplies the brief and nothing else.
+//
+// The verdict is a CLAIM: `state` is `succeeded` only for the tool's `done` (a claim, which Forge moves to
+// `verification` and never to acceptance), `partial` for a `stuck` build with verified units or a failed final gate,
+// and `failed` for the rest. The tool's exit code and the verdict in `build.json` must agree (`build_task.ended`).
+//
+// Authority (`cancho authority`): `Exec("")` and a `Dir` for the tool (the report names no path), `Fs("")` for the
+// evidence, a clock for the deadline, no network, no signals. What the build does once started is the build's authority
+// (docs/architecture.md, G2): `cancho-build` itself holds `exec("")`.
+
+fn default_attempts() -> [] int {
+    return 4;
+}
+
+fn default_agent_seconds() -> [] int {
+    return 30;
+}
+
+fn default_rounds() -> [] int {
+    return 3;
+}
+
+fn default_plan_seconds() -> [] int {
+    return 900;
+}
+
+fn default_jobs() -> [] int {
+    return 4;
+}
+
+fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] (buffer.Buffer, bool) {
+    var all = buffer.empty(heap, 1024);
+    var c = getchar(io);
+    var n = 0;
+    while c >= 0 {
+        if n >= 1048576 {
+            return (all, false);
+        }
+        all = buffer.push(heap, all, byte_of(c));
+        n = n + 1;
+        c = getchar(io);
+    }
+    return (all, true);
+}
+
+fn begin[&x, &d, &a](exec: &x Exec(""), tools: &d Dir, args: &a [byte], child_in: ChildEnd, child_out: ChildEnd) -> [exec_under, exec_detached] Spawned {
+    return exec_spawn_detached_under(exec, tools, build_task.tool_name(), args, "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+}
+
+fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
+    if journal_io.path_ok(fs, path) == false {
+        return 0 - 2;
+    }
+    match open_write(fs, path) {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, contents);
+            }
+            file_close(file);
+            return rc;
+        }
+    }
+}
+
+fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of(47));
+    return buffer.append(heap, b, name);
+}
+
+// A file beneath the execution directory, opened one component at a time and following no link (spike S10: a build,
+// which is untrusted, can leave a symlink in its own directory), read up to `cap` bytes: the bytes and 0, or an errno
+// (2 absent), or -3 for a file past the cap (the buffer then holds the first `cap` bytes).
+fn read_beneath[&h, &d, &n](heap: &!h Heap, dir: &d Dir, name: &n [byte], cap: int) -> [heap, dir_read, file_read] (buffer.Buffer, int) {
+    var data = buffer.empty(heap, 256);
+    match dirs.open_file(dir, name) {
+        Opened::Failed(e) => {
+            return (data, e);
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var errno = 0;
+            borrow mut file as &!x in {
+                let (got, e) = journal_io.drain(heap, x, data, cap);
+                data = got;
+                errno = e;
+            }
+            file_close(file);
+            return (data, errno);
+        }
+    }
+}
+
+// What `build.json` says, or nothing usable: the verdict word as `build_task.verdict_id` numbers it (0 when the file is
+// absent, over the cap, not an object, or has no string `verdict`) and the number of verified units (0 when it is not an
+// integer from 0 to 2^31).
+fn read_report[&h, &d](heap: &!h Heap, dir: &d Dir) -> [heap, dir_read, file_read] (int, int) {
+    let (data, errno) = read_beneath(heap, dir, "build.json", 1048576);
+    var verdict = 0;
+    var verified = 0;
+    if errno == 0 {
+        borrow data as &db in {
+            let src = buffer.bytes(db);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            borrow mut tape as &!t in {
+                let tp = contents(t);
+                if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                    let v = json.get(src, tp, 0, "verdict");
+                    if v >= 0 && json.is_string(tp, v) && json.string_plain(tp, v) {
+                        verdict = build_task.verdict_id(json.string_view(src, tp, v));
+                    }
+                    let u = json.get(src, tp, 0, "units_verified");
+                    if u >= 0 && json.is_int(tp, u) && json.fits_int(src, tp, u) {
+                        let n = json.to_int(src, tp, u);
+                        if n >= 0 && n <= 2147483648 {
+                            verified = n;
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+    }
+    buffer.drop(heap, data);
+    return (verdict, verified);
+}
+
+fn entry[&h, &p, &s](heap: &!h Heap, w: json.Writer, id: &p [byte], kind: &static [byte], path: &static [byte], sha: &s [byte], size: int) -> [heap] json.Writer {
+    var x = json.begin_object(heap, w);
+    x = json.put_key(heap, x, "id");
+    x = json.put_string(heap, x, id);
+    x = json.put_key(heap, x, "kind");
+    x = json.put_string(heap, x, kind);
+    x = json.put_key(heap, x, "ref");
+    x = json.put_string(heap, x, path);
+    x = json.put_key(heap, x, "sha256");
+    x = json.put_string(heap, x, sha);
+    x = json.put_key(heap, x, "bytes");
+    x = json.put_int(heap, x, size);
+    return json.end_object(heap, x);
+}
+
+// The evidence array (JSON text): each of `build_task.evidence_name` that exists beneath `dir` as an ordinary file of at
+// most `file_cap` bytes, in order, hashed. A name that is absent, a link, a directory or too big is left out: the
+// evidence is what exists, and Forge recomputes it against the files anyway.
+fn evidence_array[&h, &d](heap: &!h Heap, dir: &d Dir) -> [heap, dir_read, file_read] buffer.Buffer {
+    var w = json.writer(heap, 512);
+    w = json.begin_array(heap, w);
+    var i = 0;
+    var n = 0;
+    while i < build_task.evidence_count() {
+        let (data, errno) = read_beneath(heap, dir, build_task.evidence_name(i), build_task.file_cap());
+        if errno == 0 {
+            n = n + 1;
+            let id = buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 8), "ev-"), n);
+            borrow data as &db in {
+                let sha = snapshot.hex_digest(heap, buffer.bytes(db));
+                borrow id as &ib in {
+                    borrow sha as &sb in {
+                        w = entry(heap, w, buffer.bytes(ib), build_task.evidence_kind(i), build_task.evidence_name(i), buffer.bytes(sb), buffer.size(db));
+                    }
+                }
+                buffer.drop(heap, sha);
+            }
+            buffer.drop(heap, id);
+        }
+        buffer.drop(heap, data);
+        i = i + 1;
+    }
+    w = json.end_array(heap, w);
+    return json.finish(w);
+}
+
+// The response. `state` is 0 `succeeded`, 1 `partial`, 2 `failed`; `code` is empty for `succeeded`. `evidence` is the
+// text of a JSON array.
+fn answer[&h, &i, &r, &k, &e](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], state: int, code: &static [byte], message: &static [byte], retryable: bool, evidence: &e [byte]) -> [heap, io_write] int {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "state");
+    if state == 0 {
+        w = json.put_string(heap, w, "succeeded");
+    } else if state == 1 {
+        w = json.put_string(heap, w, "partial");
+    } else {
+        w = json.put_string(heap, w, "failed");
+    }
+    w = json.put_key(heap, w, "task_id");
+    w = json.put_string(heap, w, task_id);
+    w = json.put_key(heap, w, "summary");
+    w = json.put_string(heap, w, message);
+    w = json.put_key(heap, w, "evidence");
+    w = json.put_fragment(heap, w, evidence);
+    w = json.put_key(heap, w, "error");
+    if len(code) == 0 {
+        w = json.put_null(heap, w);
+    } else {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "code");
+        w = json.put_string(heap, w, code);
+        w = json.put_key(heap, w, "message");
+        w = json.put_string(heap, w, message);
+        w = json.put_key(heap, w, "retryable");
+        w = json.put_bool(heap, w, retryable);
+        w = json.end_object(heap, w);
+    }
+    w = json.end_object(heap, w);
+    let out = json.finish(w);
+    borrow out as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, out);
+    return 0;
+}
+
+// A refusal or an ending that has no evidence.
+fn refuse[&h, &i, &r, &k](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], code: &static [byte], message: &static [byte]) -> [heap, io_write] int {
+    return answer(heap, io, request_id, task_id, 2, code, message, false, "[]");
+}
+
+// The text of a field when it is a plain string, else empty (`build_task.check` then refuses it).
+fn text_of[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] &s [byte] {
+    if node >= 0 && json.is_string(tape, node) && json.string_plain(tape, node) {
+        return json.string_view(src, tape, node);
+    }
+    return "";
+}
+
+fn is[&s, &t](src: &s [byte], tape: &t [int], node: int, text: &static [byte]) -> [] bool {
+    return node >= 0 && json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+// An optional integer field of an object: `fallback` when it is absent, the value when it is an integer that fits, and -1
+// (which no ceiling accepts) otherwise.
+fn int_or[&s, &t](src: &s [byte], tape: &t [int], node: int, fallback: int) -> [] int {
+    if node < 0 {
+        return fallback;
+    }
+    if json.is_int(tape, node) && json.fits_int(src, tape, node) {
+        return json.to_int(src, tape, node);
+    }
+    return 0 - 1;
+}
+
+// Is the build tool a name the `Exec` bound covers, by the rule the spawn traps on? (A name the capability would not take
+// must be refused, not attempted: a trap is how a bound is enforced, never what stops Forge.)
+fn tool_ok[&x](exec: &x Exec("")) -> [] bool {
+    return exec_covers(exec, build_task.tool_name());
+}
+
+// The tool has been found: write the brief, start the build detached beneath `tools`, wait for it under the deadline,
+// write its standard output, and answer with how it ended and the files it left. `args` is the argument vector
+// (`build_task.build_args`), whose brief path and work directory are beneath `exec_dir`.
+fn run_with[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+    if !tool_ok(exec) {
+        return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::ToolUnusable), "the build tool is not a name the Exec bound covers");
+    }
+    let brief_path = under(heap, exec_dir, "brief.txt");
+    var rc = 0;
+    borrow brief_path as &bp in {
+        rc = write_file(fs, buffer.bytes(bp), brief);
+    }
+    buffer.drop(heap, brief_path);
+    if rc != 0 {
+        return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the brief could not be written in the execution directory");
+    }
+    let start = clock_ms(clock);
+    var deadline = build_task.runner_deadline_ms(timeout_ms);
+    var out = buffer.empty(heap, 1);
+    var ended = process.Ran::Failed(0 - 1);
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            ended = process.Ran::Failed(e);
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match begin(exec, tools, args, child_in, child_out) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    ended = process.Ran::Failed(e);
+                }
+                Spawned::Ok(child) => {
+                    let (got, ran) = process.capture(heap, clock, child, to_child, from_child, "", build_task.out_cap(), deadline);
+                    buffer.drop(heap, out);
+                    out = got;
+                    ended = ran;
+                }
+            }
+        }
+    }
+    var spawned = true;
+    match ended {
+        process.Ran::Failed(e) => {
+            spawned = false;
+        }
+        _ => {
+        }
+    }
+    if spawned == false {
+        buffer.drop(heap, out);
+        return refuse(heap, io, request_id, task_id, "build-unavailable", "the build tool could not be started");
+    }
+    // The tool's standard output is evidence `build.out`; it is written whatever the ending was (it is what the tool said
+    // before it was stopped), and never read for a verdict.
+    let out_path = under(heap, exec_dir, "build.out");
+    borrow out_path as &op in {
+        borrow out as &ob in {
+            rc = write_file(fs, buffer.bytes(op), buffer.bytes(ob));
+        }
+    }
+    buffer.drop(heap, out_path);
+    buffer.drop(heap, out);
+    if rc != 0 {
+        return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the build output could not be written in the execution directory");
+    }
+    match open_dir(fs, exec_dir) {
+        DirOpened::Failed(e) => {
+            return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the execution directory could not be opened to list the evidence");
+        }
+        DirOpened::Ok(opened) => {
+            var wd = opened;
+            var done = 0;
+            borrow wd as &w in {
+                done = settle(heap, io, w, request_id, task_id, ended);
+            }
+            dir_close(wd);
+            return done;
+        }
+    }
+}
+
+// The ending of a build that was started, the work directory open: read `build.json` when the tool exited, name the
+// ending, list the evidence, answer.
+fn settle[&h, &i, &d, &r, &k](heap: &!h Heap, io: &!i Io, wd: &d Dir, request_id: &r [byte], task_id: &k [byte], ran: process.Ran) -> [heap, io_write, dir_read, file_read] int {
+    var state = 2;
+    var code = "build-unavailable";
+    var message = "the build tool could not be started";
+    var retryable = false;
+    match ran {
+        process.Ran::Code(n) => {
+            let (verdict, verified) = read_report(heap, wd);
+            let e = build_task.ended(n, verdict, verified);
+            state = build_task.state_of(e);
+            code = build_task.code_of(e);
+            message = build_task.message_of(e);
+            retryable = build_task.retryable_of(e);
+        }
+        process.Ran::Signaled(s) => {
+            code = "build-crashed";
+            message = "the build tool was ended by a signal it did not expect; its group is gone";
+        }
+        process.Ran::TimedOut => {
+            code = "build-timeout";
+            message = "the build did not finish inside the adapter's deadline; its group was killed and the directory is kept, so the same request resumes it";
+        }
+        process.Ran::TooMuch => {
+            code = "build-output-overflow";
+            message = "the build wrote more standard output than the cap; its group was killed";
+        }
+        process.Ran::Failed(e) => {
+            code = "build-unavailable";
+        }
+    }
+    let evidence = evidence_array(heap, wd);
+    borrow evidence as &eb in {
+        answer(heap, io, request_id, task_id, state, code, message, retryable, buffer.bytes(eb));
+    }
+    buffer.drop(heap, evidence);
+    return 0;
+}
+
+// A task that has passed `build_task.check` and `build_task.operator_checked`: open the tools directory, then run.
+fn execute_task[&h, &i, &f, &c, &x, &r, &k, &b, &e, &t, &a](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], tools_dir: &t [byte], args: &a [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+    match open_dir(fs, tools_dir) {
+        DirOpened::Failed(e) => {
+            return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::ToolUnusable), "the tools directory could not be opened");
+        }
+        DirOpened::Ok(opened) => {
+            var tools = opened;
+            var done = 0;
+            borrow tools as &td in {
+                done = run_with(heap, io, fs, clock, exec, td, request_id, task_id, brief, exec_dir, args, timeout_ms);
+            }
+            dir_close(tools);
+            return done;
+        }
+    }
+}
+
+// The brief, decoded: the bytes of `input.brief` when it is a string of 1 to 16 KiB, else empty (then
+// `build_task.check` refuses it as `input-invalid`).
+fn decode_brief[&h, &s, &t](heap: &!h Heap, src: &s [byte], tape: &t [int], node: int) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 1);
+    if node < 0 || !json.is_string(tape, node) {
+        return out;
+    }
+    let n = json.string_length(src, tape, node);
+    if n < 1 || n > build_task.max_brief_bytes() {
+        return out;
+    }
+    let raw = box_slice(heap, n, byte_of(0));
+    borrow mut raw as &!rw in {
+        let written = json.string_into(src, tape, node, contents(rw));
+        if written == n {
+            out = buffer.append(heap, out, contents(rw));
+        }
+    }
+    unbox_slice(heap, raw);
+    return out;
+}
+
+fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("")) -> [heap, io_read, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+    let (request, whole) = read_request(heap, io);
+    var code = 0;
+    if !whole {
+        code = 4;
+    }
+    borrow request as &rb in {
+        let src = buffer.bytes(rb);
+        let tape = box_slice(heap, json.tape_len(src), 0);
+        borrow mut tape as &!t in {
+            let tp = contents(t);
+            if whole && json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                let task = json.get(src, tp, 0, "task");
+                let input = json.get(src, tp, task, "input");
+                let limits = json.get(src, tp, 0, "limits");
+                let grants = json.get(src, tp, 0, "grants");
+                let build = json.get(src, tp, grants, "build");
+                let rid = json.get(src, tp, 0, "request_id");
+                let tid = json.get(src, tp, task, "id");
+                let timeout = json.get(src, tp, limits, "timeout_ms");
+                var timeout_ms = 0;
+                if timeout >= 0 && json.is_int(tp, timeout) && json.fits_int(src, tp, timeout) {
+                    timeout_ms = json.to_int(src, tp, timeout);
+                }
+                // A request that is not an `execute` of this contract, or that names no request and no task, is not
+                // answered: the worker has nothing to say that Forge could match to a call.
+                if is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") && is(src, tp, json.get(src, tp, 0, "verb"), "capabilities") && len(text_of(src, tp, rid)) > 0 {
+                    let reply = verbs.capabilities_reply(heap, text_of(src, tp, rid), "cancho-code-adapter", "0.1.0", "sync", "project.build", build_task.max_timeout_ms(), 1048576);
+                    borrow reply as &yb in {
+                        io.write_all(io, buffer.bytes(yb));
+                    }
+                    io.newline(io);
+                    buffer.drop(heap, reply);
+                } else if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
+                    code = 4;
+                } else {
+                    let brief = decode_brief(heap, src, tp, json.get(src, tp, input, "brief"));
+                    let exec_dir = text_of(src, tp, json.get(src, tp, grants, "execution_dir"));
+                    let tools_dir = text_of(src, tp, json.get(src, tp, grants, "tools_dir"));
+                    let kind = text_of(src, tp, json.get(src, tp, task, "type"));
+                    let checker = text_of(src, tp, json.get(src, tp, build, "checker"));
+                    let guide = text_of(src, tp, json.get(src, tp, build, "guide"));
+                    let provider = text_of(src, tp, json.get(src, tp, build, "provider"));
+                    let model = text_of(src, tp, json.get(src, tp, build, "model"));
+                    let agent = text_of(src, tp, json.get(src, tp, build, "agent"));
+                    let attempts = int_or(src, tp, json.get(src, tp, build, "attempts"), default_attempts());
+                    let agent_seconds = int_or(src, tp, json.get(src, tp, build, "agent_seconds"), default_agent_seconds());
+                    let rounds = int_or(src, tp, json.get(src, tp, build, "rounds"), default_rounds());
+                    let plan_seconds = int_or(src, tp, json.get(src, tp, build, "plan_seconds"), default_plan_seconds());
+                    let jobs = int_or(src, tp, json.get(src, tp, build, "jobs"), default_jobs());
+                    borrow brief as &bb in {
+                        match build_task.check(kind, buffer.bytes(bb), exec_dir, tools_dir, timeout_ms) {
+                            build_task.Checked::Refused(why) => {
+                                refuse(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), build_task.rule_name(why), "the task was refused before anything ran");
+                            }
+                            build_task.Checked::Held => {
+                                match build_task.operator_checked(checker, guide, provider, model, agent, attempts, agent_seconds, rounds, plan_seconds, jobs) {
+                                    build_task.Checked::Refused(why) => {
+                                        refuse(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), build_task.rule_name(why), "the task was refused before anything ran");
+                                    }
+                                    build_task.Checked::Held => {
+                                        let brief_path = under(heap, exec_dir, "brief.txt");
+                                        borrow brief_path as &bp in {
+                                            let args = build_task.build_args(heap, checker, buffer.bytes(bp), exec_dir, agent, provider, model, guide, attempts, agent_seconds, rounds, plan_seconds, jobs);
+                                            borrow args as &ab in {
+                                                execute_task(heap, io, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), buffer.bytes(bb), exec_dir, tools_dir, buffer.bytes(ab), timeout_ms);
+                                            }
+                                            buffer.drop(heap, args);
+                                        }
+                                        buffer.drop(heap, brief_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    buffer.drop(heap, brief);
+                }
+            } else {
+                code = 4;
+            }
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, request);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    release(args);
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow fs as &f in {
+        borrow clock as &c in {
+            borrow exec as &x in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        code = serve(h, i, f, c, x);
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(clock);
+    release(exec);
+    release(console);
+    release(memory);
+    return code;
+}
