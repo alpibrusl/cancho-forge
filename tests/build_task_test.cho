@@ -296,3 +296,67 @@ fn test_the_tool_is_a_fixed_name_a_task_cannot_choose() -> [] int {
     test.assert(bytes.equal(build_task.tool_name(), "cancho-build"));
     return 0;
 }
+
+fn test_a_build_task_is_numbered_build_and_its_number[&h](heap: &!h Heap) -> [heap] int {
+    let one = build_task.task_id(heap, 1);
+    borrow one as &ob in {
+        test.assert(bytes.equal(buffer.bytes(ob), "build-1"));
+    }
+    buffer.drop(heap, one);
+    let many = build_task.task_id(heap, 407);
+    borrow many as &mb in {
+        test.assert(bytes.equal(buffer.bytes(mb), "build-407"));
+    }
+    buffer.drop(heap, many);
+    return 0;
+}
+
+fn test_the_options_of_forge_build_are_a_closed_list_of_six() -> [] int {
+    test.assert(build_task.option_known("guide"));
+    test.assert(build_task.option_known("attempts"));
+    test.assert(build_task.option_known("agent_seconds"));
+    test.assert(build_task.option_known("rounds"));
+    test.assert(build_task.option_known("plan_seconds"));
+    test.assert(build_task.option_known("jobs"));
+    test.assert(!build_task.option_known("provider"));
+    test.assert(!build_task.option_known("brief"));
+    test.assert(!build_task.option_known("checker"));
+    test.assert(!build_task.option_known("Jobs"));
+    test.assert(!build_task.option_known(""));
+    return 0;
+}
+
+fn test_the_claimed_verdict_of_a_build_is_the_tools_own_word_or_nothing() -> [] int {
+    test.assert(bytes.equal(build_task.verdict_name(1), "done"));
+    test.assert(bytes.equal(build_task.verdict_name(2), "stuck"));
+    test.assert(bytes.equal(build_task.verdict_name(3), "gate_failed"));
+    test.assert(bytes.equal(build_task.verdict_name(4), "plan_failed"));
+    test.assert(bytes.equal(build_task.verdict_name(5), "provider_error"));
+    test.assert_eq(len(build_task.verdict_name(0)), 0);
+    test.assert_eq(len(build_task.verdict_name(6)), 0);
+    test.assert_eq(len(build_task.verdict_name(0 - 1)), 0);
+    return 0;
+}
+
+fn test_the_request_has_the_brief_as_input_and_the_operators_configuration_in_grants[&h](heap: &!h Heap) -> [heap] int {
+    let r = build_task.request(heap, "r-b-1", 1, "b-1", "make \"x\"\nthen y", 20000, 1048576, "/w/e", "/opt/tools", "/opt/c", "", "prov", "mod", "agent --k /x", 4, 30, 3, 900, 4);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r-b-1\",\"attempt\":1,\"task\":{\"id\":\"b-1\",\"type\":\"project.build\",\"input\":{\"brief\":\"make \\\"x\\\"\\nthen y\"}},\"limits\":{\"timeout_ms\":20000,\"max_output_bytes\":1048576},\"grants\":{\"execution_dir\":\"/w/e\",\"tools_dir\":\"/opt/tools\",\"build\":{\"checker\":\"/opt/c\",\"agent\":\"agent --k /x\",\"provider\":\"prov\",\"model\":\"mod\",\"attempts\":4,\"agent_seconds\":30,\"rounds\":3,\"plan_seconds\":900,\"jobs\":4}}}"));
+    }
+    buffer.drop(heap, r);
+    return 0;
+}
+
+fn test_a_guide_is_in_the_request_only_when_there_is_one[&h](heap: &!h Heap) -> [heap] int {
+    let r = build_task.request(heap, "r", 2, "t", "b", 10000, 1, "/e", "/t", "/c", "/g/guide.md", "p", "m", "a", 7, 31, 2, 901, 5);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r\",\"attempt\":2,\"task\":{\"id\":\"t\",\"type\":\"project.build\",\"input\":{\"brief\":\"b\"}},\"limits\":{\"timeout_ms\":10000,\"max_output_bytes\":1},\"grants\":{\"execution_dir\":\"/e\",\"tools_dir\":\"/t\",\"build\":{\"checker\":\"/c\",\"guide\":\"/g/guide.md\",\"agent\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"attempts\":7,\"agent_seconds\":31,\"rounds\":2,\"plan_seconds\":901,\"jobs\":5}}}"));
+    }
+    buffer.drop(heap, r);
+    return 0;
+}
+
+fn test_an_unreadable_brief_file_has_its_own_rule_tag() -> [] int {
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::BriefUnreadable), "brief-unreadable"));
+    return 0;
+}

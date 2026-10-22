@@ -3,6 +3,7 @@ module forge.build_task;
 
 import std.buffer;
 import std.bytes;
+import std.json;
 import forge.gate_task;
 
 // The `project.build` task (docs/cancho-code-adapter.md): a brief becomes a verified new project, built by Cancho Code's
@@ -35,6 +36,9 @@ pub enum Refusal {
     // The execution directory cannot be written or opened, so the brief cannot be put there or the evidence cannot be
     // listed (decided by the process half).
     WorkdirUnwritable,
+    // `forge build` could not read the brief file the operator named, or it is over 16 KiB (decided by `forge build`, before
+    // a task exists: nothing is journalled).
+    BriefUnreadable,
 }
 
 pub enum Checked {
@@ -64,6 +68,9 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         }
         Refusal::WorkdirUnwritable => {
             return "workdir-unwritable";
+        }
+        Refusal::BriefUnreadable => {
+            return "brief-unreadable";
         }
     }
 }
@@ -482,4 +489,107 @@ pub fn evidence_kind(i: int) -> [] &static [byte] {
 
 pub fn evidence_count() -> [] int {
     return 4;
+}
+
+// ---- the half `forge build` needs (docs/cancho-code-adapter.md section 10)
+
+// The id of the `n`th build task of a workspace: `build-` and `n`. Always a legal task id (`task.id_ok`).
+pub fn task_id[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    return buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 16), "build-"), n);
+}
+
+// The options `forge build` takes after its positional arguments, as `NAME=value`: a closed list. A name that is not here is
+// bad usage, not a task (nothing is journalled).
+pub fn option_known[&n](name: &n [byte]) -> [] bool {
+    return bytes.equal(name, "guide") || bytes.equal(name, "attempts") || bytes.equal(name, "agent_seconds") || bytes.equal(name, "rounds") || bytes.equal(name, "plan_seconds") || bytes.equal(name, "jobs");
+}
+
+// The verdict of a build as the claim the journal records (`execution.finished`, `claimed`): the tool's own word for the
+// number `verdict_id` gave, or empty for 0 (not a verdict of the tool: nothing is claimed).
+pub fn verdict_name(id: int) -> [] &static [byte] {
+    if id == 1 {
+        return "done";
+    }
+    if id == 2 {
+        return "stuck";
+    }
+    if id == 3 {
+        return "gate_failed";
+    }
+    if id == 4 {
+        return "plan_failed";
+    }
+    if id == 5 {
+        return "provider_error";
+    }
+    return "";
+}
+
+// The `execute` request of a `project.build` task, as the adapter reads it: the brief is the task's input (the JSON writer
+// escapes it); the tools directory and the build configuration are the operator's, in `grants`, and no field of `task.input`
+// carries any of them. Every value has passed `check` and `operator_checked`; `guide` is empty for none.
+pub fn request[&h, &r, &t, &b, &e, &u, &c, &g, &p, &m, &a](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &t [byte], brief: &b [byte], timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], tools_dir: &u [byte], checker: &c [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "verb");
+    w = json.put_string(heap, w, "execute");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "attempt");
+    w = json.put_int(heap, w, attempt);
+    w = json.put_key(heap, w, "task");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "id");
+    w = json.put_string(heap, w, task_id_text);
+    w = json.put_key(heap, w, "type");
+    w = json.put_string(heap, w, task_type());
+    w = json.put_key(heap, w, "input");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "brief");
+    w = json.put_string(heap, w, brief);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "limits");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "timeout_ms");
+    w = json.put_int(heap, w, timeout_ms);
+    w = json.put_key(heap, w, "max_output_bytes");
+    w = json.put_int(heap, w, max_output_bytes);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "grants");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "execution_dir");
+    w = json.put_string(heap, w, execution_dir);
+    w = json.put_key(heap, w, "tools_dir");
+    w = json.put_string(heap, w, tools_dir);
+    w = json.put_key(heap, w, "build");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "checker");
+    w = json.put_string(heap, w, checker);
+    if len(guide) > 0 {
+        w = json.put_key(heap, w, "guide");
+        w = json.put_string(heap, w, guide);
+    }
+    w = json.put_key(heap, w, "agent");
+    w = json.put_string(heap, w, agent);
+    w = json.put_key(heap, w, "provider");
+    w = json.put_string(heap, w, provider);
+    w = json.put_key(heap, w, "model");
+    w = json.put_string(heap, w, model);
+    w = json.put_key(heap, w, "attempts");
+    w = json.put_int(heap, w, attempts);
+    w = json.put_key(heap, w, "agent_seconds");
+    w = json.put_int(heap, w, agent_seconds);
+    w = json.put_key(heap, w, "rounds");
+    w = json.put_int(heap, w, rounds);
+    w = json.put_key(heap, w, "plan_seconds");
+    w = json.put_int(heap, w, plan_seconds);
+    w = json.put_key(heap, w, "jobs");
+    w = json.put_int(heap, w, jobs);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
 }
