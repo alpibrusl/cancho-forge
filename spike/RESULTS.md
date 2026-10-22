@@ -6,7 +6,7 @@ says so.
 
 | | |
 |---|---|
-| Compiler | `cancho 0.0.0 (rev 8411e9ade1805eedec64b8a217610efb0cd0cd4c, host x86_64-unknown-linux-gnu)`, `/home/user/cancho-bin/cancho`. The M0 spikes were first run on rev `2aa83b2`; the pin was bumped after M1's first commits (cancho #533 and #536) and every spike re-run: nothing the bump changed altered a result except S7, rewritten below |
+| Compiler | `cancho 0.0.0 (rev 8411e9ade1805eedec64b8a217610efb0cd0cd4c, host x86_64-unknown-linux-gnu)`, `/home/user/cancho-bin/cancho`. The M0 spikes were first run on rev `2aa83b2`; the pin was bumped after M1's first commits (cancho #533 and #536) and every spike re-run: nothing the bump changed altered a result except S7, rewritten below. **Bumped again to `972099e` (cancho #588, `exec_spawn_detached_under`): every spike and the gate re-run, nothing changed a result; S12 is new.** The transcript in the appendix and the S11 text above are from the older compilers and say which. |
 | Machine | Linux 6.18, x86_64, a cloud sandbox container (so: no init reaping orphans -- see S7) |
 | Backend | the compiler's default (LLVM via `clang`/`cc`); not cross-checked on Cranelift |
 | Not covered | macOS; a real Cancho Code; concurrency of several workers; large journals; anything over a network |
@@ -36,7 +36,7 @@ findings".)
 | Ask whether a path is inside a bound, before a trap | **PASS** (`fs_covers`): and it found a **defect in Forge's own copy of the rule** (`/tmp/a..b/j` passed `path_ok` and killed the process), now fixed | S8 |
 | Start a worker beneath a directory chosen at deployment | **PASS** (`exec_spawn_under`, row `exec_under`, no path in the report); a name the guard refuses is never spawned | S9 |
 | Open a worker's file without following its symlink | **FAIL through `Fs`, PASS through `Dir`** (`open_read` followed a link to a file and a path through a linked directory; `std.dirs.open_file` refused both, `ELOOP` and `ENOTDIR`, and `..` is not a component it opens) | S10 |
-| A deadline kill of a worker started with `exec_spawn_under` leaves what the worker started running | **CONFIRMED (a leak) for the under form**; **cleaned only if the worker starts the gate detached and enforces a deadline of its own shorter than Forge's**; Forge's kill is a backstop that leaks (gap G10) | S11 |
+| A deadline kill of a worker started with `exec_spawn_under` leaves what the worker started running | **CONFIRMED (a leak) for the under form**; **cleaned only if the worker starts the gate detached and enforces a deadline of its own shorter than Forge's**; Forge's kill is a backstop that leaks (gap G10). **Corrected by S12: closed for a worker started with `exec_spawn_detached_under` (cancho #588).** | S11, S12 |
 | Pass a narrowed `Exec` | **PASS**: allowed spawns run; outside spawn and `..` path **trap** (SIGILL, exit 132) -- a refusal-as-value does not exist | S3 |
 | `cancho authority` reports it | **PASS**: `exec("/bin/echo")`, `exec("/usr/bin")`; Forge's S6 dispatcher reports no filesystem, no network, no foreign code | S3, S6 |
 | Append + sync a journal | **PASS** | S5 |
@@ -481,6 +481,71 @@ forge: runner timed out; killed and reaped after 1001 ms
 descendant that stayed in the gate's group is reached by `child_kill_group`, cancho `docs/processes.md` section 9); a
 Forge crash (G4); macOS; the time the group kill takes against a loaded machine; the margin between the two deadlines
 (200 ms against 1000 ms here is a spike, not a recommendation).
+
+---
+
+## S12 -- G10 closed: a worker found beneath a run-time `Dir` that leads a group of its own
+
+S11 left one gap open: Forge starts a worker beneath a directory chosen at run time (`exec_spawn_under`, S9), which keeps
+the symlink and escape protection but does not make the worker a process-group leader, and `exec_spawn_detached` makes a
+group leader but names the program by absolute path under `Exec("")`. Cancho #562 asked for both at once and cancho #588
+built it: `exec_spawn_detached_under(&Exec(""), &Dir, name, args, env, stdin, stdout, stderr)`, the name rule and ceiling
+of `exec_spawn_under`, the session and process group of `exec_spawn_detached`, and `child_kill_group` and `capture` work
+on it unchanged (cancho `docs/processes.md` section 4.15).
+
+`spike/s12_detached_under.cho` opens its argument 2 as a `Dir`, starts a worker named `grandkid` beneath it (a script:
+`sleep 79 & wait`) under `Exec("")`, and lets `process.capture` end it at a 300 ms deadline. Mode `u` starts it with
+`exec_spawn_under` (the control), mode `d` with `exec_spawn_detached_under`. `spike/run.sh` looks at the process table with
+`ps` afterwards (the oracle is outside the programs). Compiler `972099e` (the revision that carries #588), Linux x86-64,
+LLVM, one run each. Verbatim:
+
+```
+=== S12 a worker found beneath a run-time Dir that leads a group of its own (G10, cancho #562 / #588): the grandchild is 'sleep 79'
+performs
+    args
+    child_signal
+    clock
+    exec_detached
+    exec_under
+    fs_read("")
+    heap
+    io_write
+    pipe_read
+    pipe_write
+    poll
+never touches
+--- exec_spawn_under (not a group leader): the control
+worker timed out; killed and reaped
+'sleep 79' processes (pid pgid sid state; none = nothing leaked):
+  13932 12529 12528 S
+--- exec_spawn_detached_under (a group leader)
+worker timed out; killed and reaped
+'sleep 79' processes (pid pgid sid state; none = nothing leaked):
+```
+
+| Forge starts the worker | the grandchild after `capture`'s deadline |
+|---|---|
+| `exec_spawn_under` | **left running** (pgid 12529 is the parent's group: the control; S11 row 1 again) |
+| `exec_spawn_detached_under` | **gone**: nothing left |
+
+**What it says.**
+
+1. **G10 is closed for the case it was filed for.** The worker is a name beneath a run-time `Dir` and its whole group
+   dies at the deadline: no `/bin/kill`, no path in the authority report. The report names `exec_under` and
+   `exec_detached` and no `exec("...")` (the performs list above), which is the acceptance the issue asked for.
+2. **S11's conclusion changes for Forge's own start.** S11 said the only clean path was a worker that starts what it runs
+   detached and enforces a deadline of its own shorter than Forge's, with Forge's kill a backstop that leaks. With this
+   form Forge's kill is no longer a backstop that leaks for a worker that starts plain children: `capture`'s deadline
+   reaches the worker's group. What this does **not** change: a worker that itself starts a detached descendant (S11 rows
+   3 and 6) still leaves it outside the group Forge kills, so the gate runner keeps its own deadline of four fifths of
+   Forge's (`gate_task.runner_deadline_ms`).
+3. `src/worker.cho` still starts workers with `exec_spawn_under`. Moving the dispatcher to the new form is a separate
+   change (the mock worker, the stub LLM and the gate runner start no children that need it, or manage their own group);
+   the first worker that needs it is the Cancho Code adapter (issue #16).
+
+**Not measured, and not claimed.** macOS (cancho's #588 says so too); the time the group kill takes against a loaded
+machine; a descendant that leaves the group by `setsid` (cancho `docs/processes.md` section 9); the appendix below is the
+transcript of the run on the older compiler and does not contain S12.
 
 ---
 
