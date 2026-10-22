@@ -19,8 +19,9 @@ import forge.verbs;
 // the directory, `exec_spawn_under`, so the report names no path), a `Clock` for the deadline, and the `Fs` and a `Dir`
 // of its own for the evidence. A worker is started with `exec_spawn_under`, which does NOT make it a process-group
 // leader: a worker's own subprocesses survive its kill (gap G10, docs/architecture.md; spike S7 measured it for the
-// plain start). The mock worker has none; the Cancho Code adapter cannot ship until `exec_spawn_detached` has a `Dir`
-// form.
+// plain start). The mock worker has none. The form that is both beneath a `Dir` and a group leader exists now
+// (`exec_spawn_detached_under`, cancho #588, spike S12); this dispatcher does not use it yet, and the Cancho Code adapter
+// is the first worker that does (docs/cancho-code-adapter.md).
 
 // Is `name` one the capability will take? Not empty, not rooted, and what `exec_covers` accepts: no two dots in a row
 // and under 4096 bytes. A name that is not ok would trap, so the caller is told instead (`Failed(-2)`).
