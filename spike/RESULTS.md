@@ -549,6 +549,67 @@ transcript of the run on the older compiler and does not contain S12.
 
 ---
 
+## S13 -- two builds in one execution directory, and what a lock does to the build it started (issue #35)
+
+Two questions, measured before any code. `spike/s13_two_builds.sh` starts the Cancho Code adapter twice on one execution
+directory against the stand-in tool (`scripts/standin_cancho_build.sh`, mode `slow`: it records the brief it read and its pid,
+waits for a file `release`, then ends `done` with a product naming the brief's second line). The second adapter starts while the
+first build still runs; the script prints the checksums before and after, the process table and the answers.
+`spike/s13_lock_inherit.cho` (driver `s13_lock_inherit.sh`) takes `file_lock` on a file, starts a detached child beneath a
+`Dir`, and is killed with SIGKILL while the child lives. Compiler `972099e`, Linux x86-64, LLVM. Verbatim, on the adapter as it
+was before this issue (no lock of any kind):
+
+```
+first build started: 1 build process(es) so far
+  before B: 2520370076 10 brief.txt
+  after B started: 535092989 11 brief.txt
+  after B started: 535092989 11 seen_brief.txt
+  (build.json and run.log unchanged; pids.txt grew from 1 line to 2)
+builds running now: 2; adapters running: 2
+brief.txt now says: second  (A's brief is 'first')
+adapter A exit 0, B exit 0
+A answered: ... "state":"succeeded" ...   B answered: ... "state":"succeeded" ...
+final project.cho: product of second          (run 1 of 4: product of first; runs 2 to 4: second)
+final build.out: [BUILD_VERDICT]	done second
+== two forge build commands, two workspaces, one execution directory
+builds running with two workspaces: 2; brief.txt says: second
+forge build exit codes: 0 and 0; states: state: verification state: verification
+```
+
+| question | measured |
+|---|---|
+| does a second adapter on a busy directory stop? | **No.** Both ran; two builds were live at once; the second one overwrote `brief.txt` under the first (10 bytes to 11 bytes, a different brief), with no error |
+| what do the files hold afterwards? | whichever build wrote last: `project.cho` and `build.out` said `first` in one run of four and `second` in the other three; the two builds had read different briefs |
+| what do the two answers say? | **both `succeeded`**, both with evidence recomputed against the same files, so each request got a claim whose files may be the other's |
+| does Forge's lock cover it? | **No.** `forge build` takes the lock of `<dir>` (the workspace), and `<execution-dir>` is another argument: two workspaces, one execution directory, two exit 0 and two tasks in `verification` |
+
+```
+refused, errno 11                                  (a second try while the holder lives)
+1. second try while the holder lives: exit 1
+   the build is in group 1519, the holder is pid 1517
+   descriptors of the build that name the lock file: 0
+   holder killed with SIGKILL; the build lives: 1 process(es) named sleep 77
+held
+2/3. try after the holder died, the build still running: exit 0 (0 = lock was free)
+```
+
+| question | measured |
+|---|---|
+| is a second `file_lock` refused while the holder lives? | yes, `EWOULDBLOCK` (errno 11) |
+| does the lock go with the holder when it is killed with SIGKILL? | yes: the next try took it at once; nothing to remove |
+| does the build the holder started inherit the descriptor? | **No**: the build has no descriptor naming the lock file (`exec_spawn_detached_under` starts it with the descriptors closed, as cancho's `docs/processes.md` says). So the lock does **not** outlive a killed adapter whose build is still running: that build is an orphan (G4) and the lock is free while it writes |
+
+**The same script after the lock was built (same compiler, one run):** one build live, `brief.txt` still `first`, B answered
+`failed` with `error.code` `execution-locked`, `project.cho` and `build.out` the first build's; through `forge build` with two
+workspaces the exit codes are 0 and 4 and the states `verification` and `blocked`. The `pids.txt` and checksums did not change
+when B started.
+
+**Not measured, not claimed.** macOS (`EWOULDBLOCK` is 35 there); a lock file on a network filesystem; a build that deletes or
+replaces the lock file in its own directory (argued in `docs/cancho-code-adapter.md` section 11, not run); the real
+`cancho-build`.
+
+---
+
 ## M1 findings -- what building the core measured
 
 Not spikes: these were found writing `src/task.cho`, `src/journal.cho`,

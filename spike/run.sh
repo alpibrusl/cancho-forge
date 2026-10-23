@@ -13,7 +13,7 @@ say() { printf '\n=== %s\n' "$*"; }
 
 say "gate: fmt, check"
 $C fmt --check .. && echo "fmt: ok"
-for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under s10_symlink s11_runner s11_forge s12_detached_under mock_worker; do
+for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under s10_symlink s11_runner s11_forge s12_detached_under s13_lock_inherit mock_worker; do
   $C check $f.cho --std && echo "check $f: ok"
 done
 
@@ -115,3 +115,11 @@ for m in u d; do
   ps -eo pid,pgid,sid,stat,args | awk '$5 == "sleep" && $6 == "79" { print "  " $1, $2, $3, $4 }'
   pkill -f '^sleep 79$' 2>/dev/null || true
 done
+
+say "S13 two builds in one execution directory (issue #35): the race, and what a lock does to a build it started"
+$C build ../workers/cancho_code.cho $(ls ../src/*.cho | grep -v '/main\.cho$') --std -o "$D/cancho_code" || exit 1
+$C build ../src/*.cho --std -o "$D/forge" || exit 1
+s13=$(mktemp -d /tmp/forge-s13.XXXXXX) || exit 1
+sh s13_two_builds.sh "$D/cancho_code" "$s13" "$D/forge"
+rm -rf "$s13"
+CANCHO="$C" sh s13_lock_inherit.sh
