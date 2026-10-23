@@ -323,3 +323,104 @@ list makes that unreachable (no input may reach a trap, even an unreachable one)
 * **The `async` level** (#33) and **the lock for two builds in one directory** (#35). `forge build` holds the workspace lock, not
   a lock on the execution directory: two workspaces can point at one directory.
 * **Cost**, **a configuration file**, **`--retry`/`--patch`** (section 8).
+
+## 11. Two builds in one directory (issue #35)
+
+> **Status: designed (this section is the first commit of the issue; the build follows in the next, and corrects what it
+> finds, in place).** The measurements are `spike/RESULTS.md`, S13.
+
+### 11.1 The race, measured (before any lock)
+
+Nothing stops a second adapter, or a second `forge build`, on a directory a build is using. `spike/s13_two_builds.sh` starts
+two adapters on one execution directory against the stand-in tool, the second while the first build still runs:
+
+* **both ran**: two builds live at once, and no error;
+* the second **overwrote `brief.txt` under the first** (a 10-byte brief became an 11-byte one), and the two builds had read
+  different briefs;
+* the files at the end were **whoever wrote last**: `project.cho` and `build.out` named the first build in one run of four
+  and the second in three;
+* **both answered `succeeded`**, each with evidence recomputed from the same files: a claim whose files may be another
+  request's, which Forge would move to `verification` without being able to tell;
+* **Forge's lock does not cover it**: `forge build` locks the *workspace* `<dir>`, and `<execution-dir>` is another argument.
+  Two workspaces and one execution directory gave two exit 0 and two tasks in `verification`. (Two commands on one workspace
+  are refused `workspace-locked`; that is `forge.lock`'s case and is not the question.)
+
+So the assumption in section 8, that exclusion is Forge's lock on the execution directory, was **false as written**: there is no
+lock on the execution directory, only on the workspace. And a retried request, a person running the worker by hand, or a
+second Forge never goes through the lock at all.
+
+### 11.2 Where the exclusion belongs: (b), the adapter, and Forge's lock stays
+
+The options of the issue, with the cost of each:
+
+| | what it excludes | cost |
+|---|---|---|
+| (a) Forge's lock only | two `forge build` on one workspace | **does not exclude the measured case** (two workspaces), a worker run by hand, or a second Forge |
+| (b) the adapter takes its own lock on the execution directory | every start of the adapter on that directory, whoever started it | a recovery rule, a file in the directory, and a refusal tag in the worker; **no new authority** (below) |
+| (c) both | (b) plus a refusal at Forge before anything is started | Forge's lock already exists; a new Forge-side check would read the execution directory, which Forge does not otherwise do before the worker runs |
+
+**Decision: (b).** The worker is the only party that sees every start, and the adapter is the one that writes the directory. The
+cost the issue names, "a write capability and a recovery rule in the worker, whose authority is reviewed", is smaller than it
+looks: the adapter **already holds** `fs_write("")` and `file_write` (it writes `brief.txt` and `build.out`), and the lock is
+`file_lock` on a file it opens with `open_append`, the same call `forge.lock` makes. So the authority report
+(`docs/authority-cancho-code.txt`) is expected not to change, and the gate compares it. The recovery rule is the one
+`forge.lock` already answers (below), not a pid file. Forge's workspace lock stays as it is: it protects the journal, which
+is a different thing.
+
+### 11.3 The primitive
+
+An exclusive, non-blocking `flock` on a file of its own, `forge-build.lock`, in the execution directory, held on an open
+file for the life of the adapter's build, and let go after the answer is written. Not "a lock file created exclusively and
+removed": that primitive is a *name*, and a name outlives a crash.
+
+* **Why `flock` and not exclusive create.** With exclusive create, the file existing means "locked", so a SIGKILL of the
+  adapter leaves a lock nobody removes, and the fix is a pid and a start token read back and compared (what a pid file needs),
+  which is a race of its own (pid reuse) and more code to be wrong. `flock` is released by the kernel when the descriptor
+  closes, however the process ends. Measured (S13): a second `file_lock` is refused with `EWOULDBLOCK` while the holder lives,
+  and is granted at once after the holder is killed with SIGKILL. The lock file is created if missing (`open_append`) and
+  never written.
+* **Create-race.** Two adapters that both find the file missing both create it (`O_CREAT` without `O_EXCL` returns the same
+  file to both), and only one gets the lock: the exclusion is on the file, not on its creation.
+* **Where.** Inside the execution directory, so that it travels with the directory (copied, removed or resumed with it), and
+  so that a second adapter finds it from the one path it was given. The refused start **writes nothing**: the file exists
+  already (the holder made it), opening it for append writes no byte, and the check is that every file in the directory,
+  `forge-build.lock` included, is byte for byte what it was and the mtime of none changed. A lock file beside the directory
+  (`<dir>.lock`) would keep the evidence directory clean, but it needs a writable parent the operator did not name, so it is
+  not chosen.
+* **The lock is taken after the task is checked and before the first write** (`brief.txt`): a refused start has done
+  nothing to the directory in use. A directory that cannot be opened or created for the lock is `workdir-unwritable`, as
+  before.
+* **The build does not hold it.** `exec_spawn_detached_under` starts the build with no descriptor of the adapter's open
+  (S13: the build has none naming the lock file). So the lock is the *adapter's*, and lasts as long as the adapter does.
+
+### 11.4 Stale locks, a deadline, a resume
+
+* **A crash of the adapter** (SIGKILL, the OOM killer, a power cut of the machine) frees the lock with the process. Nothing
+  is removed by anyone, and the next start takes it: the stale-lock case is settled, not stuck. **The residual, measured and
+  not hidden (S13): the build the killed adapter started is an orphan, in a group of its own, and may still be writing.** The
+  lock cannot follow it (it has no descriptor), so a second adapter started at that moment is *not* refused and would race
+  the orphan. This is gap G4 (children outlive a dead parent), not new; what closes it is the operator, who stops the orphan
+  (its group is not killed by anything) before resuming, and `forge recover` does not do it today. The check shows the
+  orphan alive, the second adapter taking the lock, and says so in its label.
+* **`build-timeout`.** The adapter's own deadline kills the build's group and *then* answers and exits, so the lock is let go
+  at the end of that request and "the same request after a deadline kill resumes" (section 10.4) takes it. The check runs the
+  hang case and then a second request on the same directory.
+* **A resumed build** is a new request on the same directory after the first ended, which is a sequence, not a conflict. A
+  resume while the first is still running **is** the conflict and is refused: that is the point.
+
+### 11.5 What a refused second start answers
+
+`failed`, `error.code` **`execution-locked`**, `retryable: false`, no evidence (`[]`), and exit 0 (it is a valid answer; a
+request the worker cannot answer is exit 4). Not retryable *by Forge*: a retry of a task that writes is refused anyway
+(`retry-write-refused`, section 10.4), and the operator, who can see the other build, decides. The tag is a worker `error.code`
+like the others of section 4, with a row in `architecture.md` section 7 and a conformance case. No file in the directory is
+written, and the first build is undisturbed: its files are byte-identical to a run without the second (the check compares
+them, with `cmp`, to a run of the same brief in another directory).
+
+### 11.6 What is not claimed
+
+* **A build that removes or replaces its own lock file** (it runs in that directory, as the agent's code) can make a later
+  adapter lock a different file and run beside it. The build is the build's authority (section 5), not a party to the
+  exclusion; the lock stops two *adapters*, not a build that works against it. Argued, not measured.
+* **Network filesystems, macOS** (`EWOULDBLOCK` is 35 there; `forge.lock` already carries both numbers). Linux ext4/tmpfs only.
+* **The real `cancho-build`** may care about an extra file in its work directory; the stand-in does not.

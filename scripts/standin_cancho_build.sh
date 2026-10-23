@@ -30,5 +30,11 @@ case "$mode" in
   args)      log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   args2)     log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   env)       log; report done 2 done; printf 'product\n' > "$work/project.cho"; env > "$work/env.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
+  slow)      # issue #35: a build that is still running when a second adapter starts on its directory. It records the brief it read
+             # and its pid, then waits for a file `release` in the work directory, then ends `done`; the product names the brief's
+             # second line, so the files say which build wrote them last.
+             log; report build 0 ""; tag=$(sed -n 2p "$brief"); cp "$brief" "$work/seen_brief.txt"; printf '%s\n' "$$" >> "$work/pids.txt"
+             while [ ! -e "$work/release" ]; do sleep 0.1; done
+             report done 2 done; printf 'product of %s\n' "$tag" > "$work/project.cho"; printf '[BUILD_VERDICT]\tdone %s\n' "$tag"; exit 0 ;;
   *)         log; report done 1 wat; exit 1 ;;
 esac

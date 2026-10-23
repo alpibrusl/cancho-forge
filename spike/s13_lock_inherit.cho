@@ -1,0 +1,136 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.process;
+
+// Spike 13 (issue #35): what an exclusive lock on an open file does to a build the adapter starts. The adapter would take
+// `file_lock` (flock LOCK_EX|LOCK_NB) on a file in the execution directory and then start the build with
+// `exec_spawn_detached_under`. Three questions, answered from outside by s13_lock_inherit.sh (which kills the holder):
+//   1. is a second `try` refused while the holder lives (EWOULDBLOCK, 11)?
+//   2. does the lock go with the holder when it is killed with SIGKILL?
+//   3. does the build the holder started inherit the descriptor, so that the lock outlives the holder as long as the
+//      build lives? (If so a killed adapter with a surviving build is still locked; if not, it is free while the build runs.)
+//
+//   argv[1] = hold | try        argv[2] = the lock file        argv[3] (hold only) = a directory holding the program `sleeper`
+
+fn say[&i](io: &!i Io, text: &i [byte], n: int) -> [io_write] int {
+    io.write_all(io, text);
+    io.print_int(io, n);
+    io.newline(io);
+    return 0;
+}
+
+enum Taken {
+    Held(File),
+    No(int),
+}
+
+// Open the lock file (created if missing) and take the lock; the file stays open in the returned value.
+fn take[&f, &i](fs: &f Fs(""), io: &!i Io, path: &i [byte]) -> [fs_write(""), file_write, io_write] Taken {
+    match open_append(fs, path) {
+        Opened::Failed(e) => {
+            say(io, "open failed errno ", e);
+            return Taken::No(2);
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var errno = 0;
+            borrow mut file as &!x in {
+                match file_lock(x) {
+                    Done::Ok(n) => {
+                        errno = 0;
+                    }
+                    Done::Failed(e) => {
+                        errno = e;
+                    }
+                }
+            }
+            if errno != 0 {
+                say(io, "refused, errno ", errno);
+                file_close(file);
+                return Taken::No(1);
+            }
+            io.write_all(io, "held\n");
+            return Taken::Held(file);
+        }
+    }
+}
+
+fn begin[&x, &d](exec: &x Exec(""), dir: &d Dir, child_in: ChildEnd, child_out: ChildEnd) -> [exec_under, exec_detached] Spawned {
+    return exec_spawn_detached_under(exec, dir, "sleeper", "", "", Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null);
+}
+
+fn hold[&h, &x, &d, &c, &i](heap: &!h Heap, exec: &x Exec(""), dir: &d Dir, clock: &c Clock, io: &!i Io) -> [heap, exec_under, exec_detached, clock, poll, io_write] int {
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            say(io, "channels failed ", e);
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match begin(exec, dir, child_in, child_out) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    say(io, "spawn failed errno ", e);
+                }
+                Spawned::Ok(child) => {
+                    io.write_all(io, "child started\n");
+                    let (out, ran) = process.capture(heap, clock, child, to_child, from_child, "", 4096, 60000);
+                    buffer.drop(heap, out);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow fs as &f in {
+        borrow exec as &x in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        borrow args as &g in {
+                            match take(f, i, arg(g, 2)) {
+                                Taken::No(n) => {
+                                    code = n;
+                                }
+                                Taken::Held(file) => {
+                                    if int_of(arg(g, 1)[0]) == 'h' {
+                                        match open_dir(f, arg(g, 3)) {
+                                            DirOpened::Ok(d) => {
+                                                var tools = d;
+                                                borrow tools as &t in {
+                                                    hold(h, x, t, c, i);
+                                                }
+                                                dir_close(tools);
+                                            }
+                                            DirOpened::Failed(e) => {
+                                                say(i, "cannot open the directory, errno ", e);
+                                            }
+                                        }
+                                    }
+                                    file_close(file);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return code;
+}
