@@ -139,6 +139,9 @@ fn ended[&h, &b](heap: &!h Heap, ran: process.Ran, body: &b [byte]) -> [heap] in
                 dispatch.Ending::Setup(errno) => {
                     return 6;
                 }
+                dispatch.Ending::Lost => {
+                    return 6;
+                }
                 dispatch.Ending::Said(s, retry) => {
                     return 8;
                 }
@@ -497,5 +500,59 @@ fn test_every_truncation_and_every_single_byte_change_of_each_reply_is_a_verdict
     sweep(heap, "cancel", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"cancelled\",\"target\":\"r-0\"}");
     sweep(heap, "status", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"running\",\"target\":\"r-0\",\"progress\":{\"step\":\"a\",\"fraction\":0.5},\"updated\":\"t\"}");
     sweep(heap, "result", "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"evidence\":[{\"id\":\"ev-1\",\"kind\":\"file\",\"ref\":\"out.txt\",\"sha256\":\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\",\"bytes\":3}]}");
+    return 0;
+}
+
+fn test_the_replies_a_worker_writes_are_the_ones_forge_judges_valid[&h](heap: &!h Heap) -> [heap] int {
+    let r1 = verbs.status_reply(heap, "r-1", "r-0", "running", "build");
+    borrow r1 as &a in {
+        same(judge(heap, "status", buffer.bytes(a)), 31, 0);
+    }
+    buffer.drop(heap, r1);
+    let r2 = verbs.status_reply(heap, "r-1", "r-0", "finished", "");
+    borrow r2 as &a in {
+        same(judge(heap, "status", buffer.bytes(a)), 32, 0);
+        test.assert(bytes.find(buffer.bytes(a), "progress") < 0);
+    }
+    buffer.drop(heap, r2);
+    let r3 = verbs.status_reply(heap, "r-1", "r-0", "unknown", "");
+    borrow r3 as &a in {
+        same(judge(heap, "status", buffer.bytes(a)), 33, 0);
+    }
+    buffer.drop(heap, r3);
+    let c1 = verbs.cancel_reply(heap, "r-1", "r-0", "cancelled");
+    borrow c1 as &a in {
+        same(judge(heap, "cancel", buffer.bytes(a)), 20, 0);
+    }
+    buffer.drop(heap, c1);
+    let c2 = verbs.cancel_reply(heap, "r-1", "r-0", "not_running");
+    borrow c2 as &a in {
+        same(judge(heap, "cancel", buffer.bytes(a)), 21, 0);
+    }
+    buffer.drop(heap, c2);
+    let c3 = verbs.cancel_reply(heap, "r-1", "r-0", "too_late");
+    borrow c3 as &a in {
+        same(judge(heap, "cancel", buffer.bytes(a)), 22, 0);
+    }
+    buffer.drop(heap, c3);
+    let n1 = verbs.not_ready_reply(heap, "r-1");
+    borrow n1 as &a in {
+        same(judge(heap, "result", buffer.bytes(a)), 40, 0);
+    }
+    buffer.drop(heap, n1);
+    return 0;
+}
+
+fn test_a_targeted_request_in_a_directory_names_the_directory_and_only_for_the_three_verbs[&h](heap: &!h Heap) -> [heap] int {
+    let q = verbs.build_targeted_in(heap, "status", "r-2", "r-1", "/tmp/ev");
+    borrow q as &a in {
+        test.assert(bytes.equal(buffer.bytes(a), "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-2\",\"target\":\"r-1\",\"grants\":{\"execution_dir\":\"/tmp/ev\"}}"));
+    }
+    buffer.drop(heap, q);
+    let none = verbs.build_targeted_in(heap, "execute", "r-2", "r-1", "/tmp/ev");
+    borrow none as &nb in {
+        test.assert_eq(len(buffer.bytes(nb)), 0);
+    }
+    buffer.drop(heap, none);
     return 0;
 }

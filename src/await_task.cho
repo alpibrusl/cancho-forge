@@ -1,0 +1,154 @@
+edition 9;
+module forge.await_task;
+
+import std.buffer;
+import std.bytes;
+import std.map;
+import forge.await_run;
+import forge.build_run;
+import forge.dispatch;
+import forge.gate_run;
+import forge.journal;
+import forge.journal_io;
+import forge.recover;
+import forge.retry;
+import forge.task;
+
+// Going on with a task whose `async` worker accepted the job (docs/async-level.md sections 5 and 6): the journal says the task
+// is `running` and holds an `execution.accepted` record (the request, the execution directory) with nothing after it. This
+// asks the worker (`forge.await_run`) and, when the run has ended, writes what `forge.build_run.run` would have written for
+// its ending, in the same order: the refusal tag of the ending, the retry decision, the claim, `execution.cancelled` when the
+// worker stopped it because it was asked to, and the move. It is what `forge await` runs, and `forge recover` for each task
+// that is awaiting.
+//
+// The caller holds the lock of the workspace. A task that is not awaiting is refused (`task-not-awaiting`) and nothing is
+// written; so is a task whose worker says it is still running when the caller did not ask to wait (`Running`).
+
+pub fn not_awaiting_tag() -> [] &static [byte] {
+    return "task-not-awaiting";
+}
+
+pub enum Outcome {
+    // The journal is refused (the rule code) or cannot be read or written (0 or less).
+    Journal(int),
+    // The task is not `running` with an `execution.accepted` and no ending after it.
+    NotAwaiting,
+    // The worker says the run is going on, and the caller did not wait.
+    Running,
+    // The run ended: how, and the verdict it claimed (0 for none).
+    Ended(dispatch.Ending, int),
+}
+
+pub struct Awaited {
+    outcome: Outcome,
+    // `task.state_code` of the task after this (0 when it was not looked up).
+    state: int,
+    records: int,
+}
+
+// Ask the worker about task `tid`. With `wait`, poll until the run ends or `budget_ms` is used up (then it is asked to stop
+// and the ending is `worker-timeout`); without, look once.
+pub fn run[&h, &f, &x, &w, &c, &j, &i](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], tid: &i [byte], budget_ms: int, wait: bool) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, clock, poll] Awaited {
+    let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
+    if report.rule != 0 || recovered.errno != 0 {
+        map.drop(heap, existing);
+        var rule = report.rule;
+        if rule == 0 {
+            rule = 0 - 1;
+        }
+        return Awaited { outcome: Outcome::Journal(rule), state: 0, records: report.records };
+    }
+    let (data, errno) = journal_io.read_all(heap, fs, journal_path);
+    if errno != 0 {
+        buffer.drop(heap, data);
+        map.drop(heap, existing);
+        return Awaited { outcome: Outcome::Journal(0 - 1), state: 0, records: report.records };
+    }
+    var phase = 0;
+    var request = buffer.empty(heap, 1);
+    var dir = buffer.empty(heap, 1);
+    borrow data as &db in {
+        let (p, r, d) = recover.accepted_of(heap, buffer.bytes(db), tid);
+        phase = p;
+        buffer.drop(heap, request);
+        buffer.drop(heap, dir);
+        request = r;
+        dir = d;
+    }
+    buffer.drop(heap, data);
+    var done = Awaited { outcome: Outcome::NotAwaiting, state: 0, records: report.records };
+    if phase == 5 {
+        borrow request as &rb in {
+            borrow dir as &eb in {
+                var ending = dispatch.Ending::Timeout;
+                var ended = true;
+                if wait {
+                    ending = await_run.finish(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(rb), tid, buffer.bytes(eb), budget_ms, build_run.poll_interval_ms());
+                } else {
+                    match await_run.probe(heap, exec, workers, clock, "cancho_code", buffer.bytes(rb), tid, buffer.bytes(eb)) {
+                        await_run.Probe::Running => {
+                            ended = false;
+                        }
+                        await_run.Probe::Finished => {
+                            ending = await_run.result_of(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(rb), tid, buffer.bytes(eb));
+                        }
+                        await_run.Probe::Ended(e) => {
+                            ending = e;
+                        }
+                    }
+                }
+                if !ended {
+                    map.drop(heap, existing);
+                    done = Awaited { outcome: Outcome::Running, state: 0, records: report.records };
+                } else {
+                    done = settle(heap, fs, journal_path, existing, report.records + 1, tid, ending, buffer.bytes(eb));
+                }
+            }
+        }
+        buffer.drop(heap, request);
+        buffer.drop(heap, dir);
+        return done;
+    }
+    buffer.drop(heap, request);
+    buffer.drop(heap, dir);
+    map.drop(heap, existing);
+    return done;
+}
+
+// Write the ending of the run of `tid`, in the order `build_run.run` writes it, and move the task. `tasks` is the replayed
+// table, consumed; `seq` the number of the next record.
+fn settle[&h, &f, &j, &i, &e](heap: &!h Heap, fs: &f Fs(""), journal_path: &j [byte], tasks: map.Map[int], seq: int, tid: &i [byte], ending: dispatch.Ending, execution_dir: &e [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] Awaited {
+    var s = seq;
+    let consequence = dispatch.consequence(ending);
+    let decision = retry.decide(consequence, 1, false);
+    let tag = dispatch.rule_tag(ending);
+    if len(tag) > 0 {
+        s = gate_run.note(heap, fs, journal_path, s, tid, tag, false);
+    }
+    let again = retry.rule_tag(decision);
+    if len(again) > 0 {
+        s = gate_run.note(heap, fs, journal_path, s, tid, again, false);
+    }
+    s = build_run.finish_attempt(heap, fs, journal_path, s, tid, ending, execution_dir);
+    if bytes_equal_cancelled(consequence) {
+        s = gate_run.note_execution(heap, fs, journal_path, s, "execution.cancelled", tid, "");
+    }
+    let (t2, s2) = gate_run.move_to(heap, fs, journal_path, tasks, s, tid, retry.target_after(consequence, decision), task.Actor::Forge, false);
+    var state = 0;
+    var records = s2 - 1;
+    if s2 < 0 {
+        records = s - 1;
+        map.drop(heap, t2);
+        return Awaited { outcome: Outcome::Journal(0 - 1), state: 0, records: records };
+    }
+    borrow t2 as &tb in {
+        state = journal.state_of(tb, tid);
+    }
+    map.drop(heap, t2);
+    let claim = build_run.claimed_of(heap, fs, ending, execution_dir);
+    return Awaited { outcome: Outcome::Ended(ending, claim), state: state, records: records };
+}
+
+fn bytes_equal_cancelled(c: dispatch.Consequence) -> [] bool {
+    return bytes.equal(dispatch.consequence_name(c), "cancelled");
+}

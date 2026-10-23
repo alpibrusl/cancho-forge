@@ -5,12 +5,16 @@ import std.bytes;
 import std.dirs;
 import std.io;
 import std.json;
+import std.option;
 import std.process;
 import forge.build_task;
 import forge.gate_task;
 import forge.journal_io;
 import forge.lock;
+import forge.run_files;
 import forge.snapshot;
+import forge.snapshot_io;
+import forge.supervise;
 import forge.task;
 import forge.verbs;
 
@@ -209,9 +213,10 @@ fn evidence_array[&h, &d](heap: &!h Heap, dir: &d Dir) -> [heap, dir_read, file_
     return json.finish(w);
 }
 
-// The response. `state` is 0 `succeeded`, 1 `partial`, 2 `failed`; `code` is empty for `succeeded`. `evidence` is the
-// text of a JSON array.
-fn answer[&h, &i, &r, &k, &e](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], state: int, code: &static [byte], message: &static [byte], retryable: bool, evidence: &e [byte]) -> [heap, io_write] int {
+// The response. `state` is 0 `succeeded`, 1 `partial`, 2 `failed`, 3 `cancelled`, 4 `accepted`; `code` is empty when there is
+// no error. `evidence` is the text of a JSON array. The reply as bytes, not yet written anywhere: `execute` prints it, the
+// supervisor stores it as `result.json` (docs/async-level.md section 4).
+fn answer[&h, &r, &k, &e](heap: &!h Heap, request_id: &r [byte], task_id: &k [byte], state: int, code: &static [byte], message: &static [byte], retryable: bool, evidence: &e [byte]) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 512);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "contract");
@@ -223,6 +228,10 @@ fn answer[&h, &i, &r, &k, &e](heap: &!h Heap, io: &!i Io, request_id: &r [byte],
         w = json.put_string(heap, w, "succeeded");
     } else if state == 1 {
         w = json.put_string(heap, w, "partial");
+    } else if state == 3 {
+        w = json.put_string(heap, w, "cancelled");
+    } else if state == 4 {
+        w = json.put_string(heap, w, "accepted");
     } else {
         w = json.put_string(heap, w, "failed");
     }
@@ -246,18 +255,22 @@ fn answer[&h, &i, &r, &k, &e](heap: &!h Heap, io: &!i Io, request_id: &r [byte],
         w = json.end_object(heap, w);
     }
     w = json.end_object(heap, w);
-    let out = json.finish(w);
-    borrow out as &o in {
-        buffer.write(io, o);
-    }
-    io.newline(io);
-    buffer.drop(heap, out);
-    return 0;
+    return json.finish(w);
 }
 
 // A refusal or an ending that has no evidence.
-fn refuse[&h, &i, &r, &k](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], code: &static [byte], message: &static [byte]) -> [heap, io_write] int {
-    return answer(heap, io, request_id, task_id, 2, code, message, false, "[]");
+fn refuse[&h, &r, &k](heap: &!h Heap, request_id: &r [byte], task_id: &k [byte], code: &static [byte], message: &static [byte]) -> [heap] buffer.Buffer {
+    return answer(heap, request_id, task_id, 2, code, message, false, "[]");
+}
+
+// Write a reply and a newline on standard output, and give the buffer back to the heap.
+fn emit[&h, &i](heap: &!h Heap, io: &!i Io, reply: buffer.Buffer) -> [heap, io_write] int {
+    borrow reply as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, reply);
+    return 0;
 }
 
 // The text of a field when it is a plain string, else empty (`build_task.check` then refuses it).
@@ -290,12 +303,13 @@ fn tool_ok[&x](exec: &x Exec("")) -> [] bool {
     return exec_covers(exec, build_task.tool_name());
 }
 
-// The lock of the execution directory is held and the tool has been found: write the brief, start the build detached beneath `tools`, wait for it under the deadline,
-// write its standard output, and answer with how it ended and the files it left. `args` is the argument vector
+// The lock of the execution directory is held and the tool has been found: write the brief, start the build detached beneath
+// `tools`, wait for it under the deadline and for a request to cancel it (`cancel_path`, naming `request_id`), write its
+// standard output, and give the reply of `execute`: how it ended and the files it left. `args` is the argument vector
 // (`build_task.build_args`), whose brief path and work directory are beneath `exec_dir`.
-fn run_locked[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+fn run_locked[&h, &f, &c, &x, &d, &r, &k, &b, &e, &a, &q](heap: &!h Heap, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int, cancel_path: &q [byte]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] buffer.Buffer {
     if !tool_ok(exec) {
-        return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::ToolUnusable), "the build tool is not a name the Exec bound covers");
+        return refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::ToolUnusable), "the build tool is not a name the Exec bound covers");
     }
     let brief_path = under(heap, exec_dir, "brief.txt");
     var rc = 0;
@@ -304,12 +318,13 @@ fn run_locked[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!
     }
     buffer.drop(heap, brief_path);
     if rc != 0 {
-        return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the brief could not be written in the execution directory");
+        return refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the brief could not be written in the execution directory");
     }
     let start = clock_ms(clock);
     var deadline = build_task.runner_deadline_ms(timeout_ms);
     var out = buffer.empty(heap, 1);
     var ended = process.Ran::Failed(0 - 1);
+    var cancelled = false;
     match process.channels() {
         process.Channels::Failed(e) => {
             ended = process.Ran::Failed(e);
@@ -321,10 +336,11 @@ fn run_locked[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!
                     ended = process.Ran::Failed(e);
                 }
                 Spawned::Ok(child) => {
-                    let (got, ran) = process.capture(heap, clock, child, to_child, from_child, "", build_task.out_cap(), deadline);
+                    let (got, ran, was_cancelled) = supervise.wait(heap, clock, fs, child, to_child, from_child, build_task.out_cap(), deadline, cancel_path, request_id);
                     buffer.drop(heap, out);
                     out = got;
                     ended = ran;
+                    cancelled = was_cancelled;
                 }
             }
         }
@@ -339,7 +355,7 @@ fn run_locked[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!
     }
     if spawned == false {
         buffer.drop(heap, out);
-        return refuse(heap, io, request_id, task_id, "build-unavailable", "the build tool could not be started");
+        return refuse(heap, request_id, task_id, "build-unavailable", "the build tool could not be started");
     }
     // The tool's standard output is evidence `build.out`; it is written whatever the ending was (it is what the tool said
     // before it was stopped), and never read for a verdict.
@@ -352,17 +368,18 @@ fn run_locked[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!
     buffer.drop(heap, out_path);
     buffer.drop(heap, out);
     if rc != 0 {
-        return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the build output could not be written in the execution directory");
+        return refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the build output could not be written in the execution directory");
     }
     match open_dir(fs, exec_dir) {
         DirOpened::Failed(e) => {
-            return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the execution directory could not be opened to list the evidence");
+            return refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the execution directory could not be opened to list the evidence");
         }
         DirOpened::Ok(opened) => {
             var wd = opened;
-            var done = 0;
+            var done = buffer.empty(heap, 1);
             borrow wd as &w in {
-                done = settle(heap, io, w, request_id, task_id, ended);
+                buffer.drop(heap, done);
+                done = settle(heap, w, request_id, task_id, ended, cancelled);
             }
             dir_close(wd);
             return done;
@@ -372,7 +389,7 @@ fn run_locked[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!
 
 // The ending of a build that was started, the work directory open: read `build.json` when the tool exited, name the
 // ending, list the evidence, answer.
-fn settle[&h, &i, &d, &r, &k](heap: &!h Heap, io: &!i Io, wd: &d Dir, request_id: &r [byte], task_id: &k [byte], ran: process.Ran) -> [heap, io_write, dir_read, file_read] int {
+fn settle[&h, &d, &r, &k](heap: &!h Heap, wd: &d Dir, request_id: &r [byte], task_id: &k [byte], ran: process.Ran, cancelled: bool) -> [heap, dir_read, file_read] buffer.Buffer {
     var state = 2;
     var code = "build-unavailable";
     var message = "the build tool could not be started";
@@ -402,61 +419,658 @@ fn settle[&h, &i, &d, &r, &k](heap: &!h Heap, io: &!i Io, wd: &d Dir, request_id
             code = "build-unavailable";
         }
     }
+    if cancelled {
+        // Asked for by a `cancel` (docs/async-level.md section 4): the whole group was killed, the directory is kept, no error.
+        state = 3;
+        code = "";
+        message = "the build was cancelled; its group was killed and the directory is kept, so a new request resumes it";
+        retryable = false;
+    }
     let evidence = evidence_array(heap, wd);
+    var reply = buffer.empty(heap, 1);
     borrow evidence as &eb in {
-        answer(heap, io, request_id, task_id, state, code, message, retryable, buffer.bytes(eb));
+        buffer.drop(heap, reply);
+        reply = answer(heap, request_id, task_id, state, code, message, retryable, buffer.bytes(eb));
     }
     buffer.drop(heap, evidence);
+    return reply;
+}
+
+// Wait `ms` milliseconds on a poller with nothing registered (the program has no sleep; spike S14 measured 256 ms for 250).
+fn nap[&h](heap: &!h Heap, ms: int) -> [heap, poll] int {
+    var slept = 0 - 1;
+    match poller_new() {
+        Polling::Failed(e) => {
+            slept = 0 - e;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            var events = box_slice(heap, 4, 0);
+            borrow mut poller as &!ph in {
+                borrow mut events as &!eb in {
+                    slept = poller_wait(ph, contents(eb), ms);
+                }
+            }
+            unbox_slice(heap, events);
+            poller_close(poller);
+        }
+    }
+    return slept;
+}
+
+// A file of the execution directory read up to `cap` bytes through the path (the build cannot be trusted with its own
+// directory, so what is read here is only ever compared, never obeyed): the bytes and 0, or an errno (2 absent).
+fn read_in[&h, &f, &d, &n](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte], cap: int) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
+    var data = buffer.empty(heap, 64);
+    var errno = 0;
+    let path = under(heap, dir, name);
+    borrow path as &pb in {
+        match open_read(fs, buffer.bytes(pb)) {
+            Opened::Failed(e) => {
+                errno = e;
+            }
+            Opened::Ok(opened) => {
+                var file = opened;
+                borrow mut file as &!x in {
+                    let (got, e) = journal_io.drain(heap, x, data, cap);
+                    data = got;
+                    errno = e;
+                }
+                file_close(file);
+            }
+        }
+    }
+    buffer.drop(heap, path);
+    return (data, errno);
+}
+
+// Remove a file of the execution directory; an absent file is not an error here.
+fn remove_in[&h, &f, &d, &n](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte]) -> [heap, fs_write("")] int {
+    let path = under(heap, dir, name);
+    borrow path as &pb in {
+        if journal_io.path_ok(fs, buffer.bytes(pb)) {
+            fs_remove(fs, buffer.bytes(pb));
+        }
+    }
+    buffer.drop(heap, path);
     return 0;
 }
 
-// Take the lock of the execution directory, run, and let the lock go after the answer is written (docs/cancho-code-adapter.md
-// section 11). `flock` on a file of its own beneath the directory: the kernel drops it when this process ends however it ends,
-// so a killed adapter leaves nothing to remove. It is taken after the task was checked and before the first write, so a
-// start that is refused has written nothing to the directory in use (the lock file exists already: the holder made it, and
-// opening it for append writes no byte). A second adapter on the same directory is `execution-locked`; a directory that
-// cannot be opened for the lock is `workdir-unwritable`, as it is for the brief.
-fn run_with[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+// `result.json`, written whole to a temporary name and renamed into place: a reader sees all of it or none. 0 or an errno.
+fn store_result[&h, &f, &d, &b](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], reply: &b [byte]) -> [heap, fs_write(""), file_write] int {
+    let tmp = under(heap, dir, run_files.result_tmp_name());
+    let final_path = under(heap, dir, run_files.result_name());
+    var rc = 0;
+    borrow tmp as &tb in {
+        borrow final_path as &fb in {
+            rc = write_file(fs, buffer.bytes(tb), reply);
+            if rc == 0 {
+                rc = snapshot_io.publish(fs, buffer.bytes(tb), buffer.bytes(fb));
+            }
+        }
+    }
+    buffer.drop(heap, tmp);
+    buffer.drop(heap, final_path);
+    return rc;
+}
+
+// The supervisor, the lock held: clear what an earlier run left, say who is running (`run.json`, with the start token
+// `execute` chose), run the build, and keep the reply as `result.json`. 0, 5 when the directory cannot be written, 6 when the
+// result could not be kept (the lock is let go all the same, and `result` then says the supervisor was lost).
+fn work_locked[&h, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int, token: int) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+    remove_in(heap, fs, exec_dir, run_files.run_name());
+    remove_in(heap, fs, exec_dir, run_files.result_name());
+    remove_in(heap, fs, exec_dir, run_files.result_tmp_name());
+    remove_in(heap, fs, exec_dir, run_files.cancel_name());
+    let rec = run_files.run_record(heap, request_id, task_id, token);
+    let run_path = under(heap, exec_dir, run_files.run_name());
+    var rc = 0;
+    borrow run_path as &rp in {
+        borrow rec as &rb in {
+            rc = write_file(fs, buffer.bytes(rp), buffer.bytes(rb));
+        }
+    }
+    buffer.drop(heap, run_path);
+    buffer.drop(heap, rec);
+    if rc != 0 {
+        return 5;
+    }
+    let cancel_path = under(heap, exec_dir, run_files.cancel_name());
+    var code = 6;
+    borrow cancel_path as &cp in {
+        let reply = run_locked(heap, fs, clock, exec, tools, request_id, task_id, brief, exec_dir, args, timeout_ms, buffer.bytes(cp));
+        borrow reply as &yb in {
+            if store_result(heap, fs, exec_dir, buffer.bytes(yb)) == 0 {
+                code = 0;
+            }
+        }
+        buffer.drop(heap, reply);
+    }
+    buffer.drop(heap, cancel_path);
+    return code;
+}
+
+// The supervisor (docs/async-level.md section 2): take the lock of the execution directory (a held one is tried three times,
+// 100 ms apart, because `status` and `result` hold it for an instant to find out that nobody does), then `work_locked`.
+// The exit code is what `execute` reads: 0 the run ended and its result is kept, 3 another run holds the directory, 4 the
+// path cannot be locked, 5 the directory cannot be written, 6 the result could not be kept.
+fn supervised[&h, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int, token: int) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
     let lock_path = under(heap, exec_dir, build_task.lock_name());
-    var done = 0;
-    borrow lock_path as &lp in {
-        match lock.acquire(fs, buffer.bytes(lp)) {
-            lock.Lock::Refused(rule) => {
-                if rule == task.rule_code(task.Rule::WorkspaceLocked) {
-                    done = refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::ExecutionLocked), "another build holds this execution directory; nothing was written");
-                } else {
-                    done = refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::PathInvalid), "the execution directory is not a path the adapter will lock");
+    var code = 3;
+    var tries = 0;
+    var finished = false;
+    while !finished && tries < 3 {
+        borrow lock_path as &lp in {
+            match lock.acquire(fs, buffer.bytes(lp)) {
+                lock.Lock::Refused(rule) => {
+                    if rule == task.rule_code(task.Rule::WorkspaceLocked) {
+                        tries = tries + 1;
+                        if tries < 3 {
+                            nap(heap, 100);
+                        }
+                    } else {
+                        code = 4;
+                        finished = true;
+                    }
                 }
-            }
-            lock.Lock::Failed(e) => {
-                done = refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the execution directory could not be opened for its lock");
-            }
-            lock.Lock::Held(file) => {
-                done = run_locked(heap, io, fs, clock, exec, tools, request_id, task_id, brief, exec_dir, args, timeout_ms);
-                lock.let_go(file);
+                lock.Lock::Failed(e2) => {
+                    code = 5;
+                    finished = true;
+                }
+                lock.Lock::Held(file) => {
+                    code = work_locked(heap, fs, clock, exec, tools, request_id, task_id, brief, exec_dir, args, timeout_ms, token);
+                    lock.let_go(file);
+                    finished = true;
+                }
             }
         }
     }
     buffer.drop(heap, lock_path);
-    return done;
+    return code;
 }
 
-// A task that has passed `build_task.check` and `build_task.operator_checked`: open the tools directory, then run.
-fn execute_task[&h, &i, &f, &c, &x, &r, &k, &b, &e, &t, &a](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], tools_dir: &t [byte], args: &a [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
-    match open_dir(fs, tools_dir) {
-        DirOpened::Failed(e) => {
-            return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::ToolUnusable), "the tools directory could not be opened");
+// Wait for the supervisor `child` in slices of 20 ms for at most `limit_ms`: 0 it ended, 1 `run.json` names this request and
+// this token (it holds the directory and the build is starting), 2 neither in time.
+fn await_start[&h, &f, &k, &p, &r](heap: &!h Heap, fs: &f Fs(""), child: &k Child, run_path: &p [byte], request_id: &r [byte], token: int, limit_ms: int) -> [heap, fs_read(""), file_read, poll] int {
+    var state = 2;
+    match poller_new() {
+        Polling::Failed(e) => {
+            state = 2;
         }
-        DirOpened::Ok(opened) => {
-            var tools = opened;
-            var done = 0;
-            borrow tools as &td in {
-                done = run_with(heap, io, fs, clock, exec, td, request_id, task_id, brief, exec_dir, args, timeout_ms);
+        Polling::Ok(po) => {
+            var poller = po;
+            var events = box_slice(heap, 4, 0);
+            borrow mut poller as &!ph in {
+                poller_add_child(ph, child, 3);
+                var i = 0;
+                var running = true;
+                while running && i * 20 < limit_ms {
+                    var n = 0;
+                    borrow mut events as &!eb in {
+                        n = poller_wait(ph, contents(eb), 20);
+                    }
+                    if n > 0 {
+                        state = 0;
+                        running = false;
+                    } else {
+                        let (data, errno) = read_in_path(heap, fs, run_path, 4096);
+                        borrow data as &db in {
+                            if errno == 0 && run_files.run_is(heap, buffer.bytes(db), request_id, token) {
+                                state = 1;
+                                running = false;
+                            }
+                        }
+                        buffer.drop(heap, data);
+                    }
+                    i = i + 1;
+                }
             }
-            dir_close(tools);
-            return done;
+            unbox_slice(heap, events);
+            poller_close(poller);
         }
     }
+    return state;
+}
+
+fn read_in_path[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], cap: int) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
+    var data = buffer.empty(heap, 64);
+    var errno = 0;
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            errno = e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                let (got, e) = journal_io.drain(heap, x, data, cap);
+                data = got;
+                errno = e;
+            }
+            file_close(file);
+        }
+    }
+    return (data, errno);
+}
+
+// The supervisor's name beneath the workers directory: the adapter itself.
+fn supervisor_name() -> [] &static [byte] {
+    return "cancho_code";
+}
+
+// `execute`: the task has passed its checks. Start the supervisor (this program, `supervise`, detached and released), give
+// it the request on its standard input, and answer `accepted` once `run.json` names this start; or what the supervisor
+// answered by ending first (docs/async-level.md section 4). Nothing is written to the execution directory here.
+fn start_supervisor[&h, &f, &c, &x, &r, &k, &q, &e, &w, &t](heap: &!h Heap, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), request_id: &r [byte], task_id: &k [byte], request: &q [byte], exec_dir: &e [byte], workers_dir: &w [byte], tools_dir: &t [byte]) -> [heap, fs_read(""), file_read, exec_under, exec_detached, child_signal, pipe_write, clock, poll] buffer.Buffer {
+    if !tool_ok(exec) || !exec_covers(exec, supervisor_name()) {
+        return refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::ToolUnusable), "the build tool is not a name the Exec bound covers");
+    }
+    var tools_ok = false;
+    match open_dir(fs, tools_dir) {
+        DirOpened::Failed(e2) => {
+        }
+        DirOpened::Ok(td) => {
+            tools_ok = true;
+            dir_close(td);
+        }
+    }
+    if !tools_ok {
+        return refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::ToolUnusable), "the tools directory could not be opened");
+    }
+    let token = clock_ms(clock);
+    var header = buffer.append(heap, buffer.empty(heap, 32), "supervise ");
+    header = buffer.push_nat(heap, header, token);
+    header = buffer.push(heap, header, byte_of(10));
+    let payload = buffer.append(heap, header, request);
+    var reply = buffer.empty(heap, 1);
+    match open_dir(fs, workers_dir) {
+        DirOpened::Failed(e2) => {
+            buffer.drop(heap, reply);
+            reply = refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::SupervisorUnavailable), "the workers directory could not be opened");
+        }
+        DirOpened::Ok(wd) => {
+            var workers = wd;
+            match pipe_open() {
+                Piped::Failed(e2) => {
+                    buffer.drop(heap, reply);
+                    reply = refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::SupervisorUnavailable), "the supervisor's input could not be opened");
+                }
+                Piped::Ok(to_child, child_in) => {
+                    borrow workers as &wq in {
+                        borrow payload as &ab in {
+                            match exec_spawn_detached_under(exec, wq, supervisor_name(), "", "", Stdio::Pipe(child_in), Stdio::Null, Stdio::Null) {
+                                Spawned::Failed(e2) => {
+                                    pipe_close(to_child);
+                                    buffer.drop(heap, reply);
+                                    reply = refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::SupervisorUnavailable), "the supervisor could not be started");
+                                }
+                                Spawned::Ok(child) => {
+                                    var written = 0;
+                                    var spins = 0;
+                                    var writing = true;
+                                    var tw = to_child;
+                                    let sent = buffer.bytes(ab);
+                                    while writing && written < len(sent) && spins < 2000 {
+                                        borrow mut tw as &!twb in {
+                                            match pipe_write(twb, sent[written..len(sent)]) {
+                                                Sent::Wrote(m) => {
+                                                    written = written + m;
+                                                }
+                                                Sent::Again => {
+                                                    spins = spins + 1;
+                                                }
+                                                Sent::Failed(e2) => {
+                                                    writing = false;
+                                                }
+                                            }
+                                        }
+                                        if writing && written < len(sent) {
+                                            nap(heap, 5);
+                                        }
+                                    }
+                                    pipe_close(tw);
+                                    let run_path = under(heap, exec_dir, run_files.run_name());
+                                    var how = 2;
+                                    borrow run_path as &rp in {
+                                        borrow child as &cw in {
+                                            how = await_start(heap, fs, cw, buffer.bytes(rp), request_id, token, 10000);
+                                        }
+                                        if how == 2 {
+                                            // Silent for ten seconds: stop it (its group is its own) and say so.
+                                            borrow child as &ck in {
+                                                child_kill_group(ck, 256);
+                                                child_kill(ck, 256);
+                                            }
+                                        }
+                                        if how == 1 {
+                                            child_release(child);
+                                            buffer.drop(heap, reply);
+                                            reply = answer(heap, request_id, task_id, 4, "", "the build was accepted; poll status and result", false, "[]");
+                                        } else {
+                                            var code = 0 - 1;
+                                            match child_wait(child) {
+                                                Exited::Code(n2) => {
+                                                    code = n2;
+                                                }
+                                                Exited::Signaled(s2) => {
+                                                    code = 0 - 2;
+                                                }
+                                                Exited::Failed(e2) => {
+                                                    code = 0 - 3;
+                                                }
+                                            }
+                                            // It may have ended after writing `run.json`: a start that finished is still a start.
+                                            let (data, errno) = read_in_path(heap, fs, buffer.bytes(rp), 4096);
+                                            var started = false;
+                                            borrow data as &db in {
+                                                started = errno == 0 && run_files.run_is(heap, buffer.bytes(db), request_id, token);
+                                            }
+                                            buffer.drop(heap, data);
+                                            buffer.drop(heap, reply);
+                                            if started && how == 0 {
+                                                reply = answer(heap, request_id, task_id, 4, "", "the build was accepted; poll status and result", false, "[]");
+                                            } else if code == 3 {
+                                                reply = refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::ExecutionLocked), "another build holds this execution directory; nothing was written");
+                                            } else if code == 5 {
+                                                reply = refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the execution directory could not be written");
+                                            } else {
+                                                reply = refuse(heap, request_id, task_id, build_task.rule_name(build_task.Refusal::SupervisorUnavailable), "the supervisor ended or stayed silent without taking the directory");
+                                            }
+                                        }
+                                    }
+                                    buffer.drop(heap, run_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            dir_close(workers);
+        }
+    }
+    buffer.drop(heap, payload);
+    return reply;
+}
+
+// ---- status, result, cancel: calls about a run that an earlier call started (docs/async-level.md section 4) -----------
+
+// The `stage` word of `build.json`, when it is a plain word of letters and underscores of at most 32 bytes (advisory
+// progress; never a verdict). Empty otherwise.
+fn stage_of[&h, &f, &e](heap: &!h Heap, fs: &f Fs(""), exec_dir: &e [byte]) -> [heap, fs_read(""), dir_read, file_read] buffer.Buffer {
+    var stage = buffer.empty(heap, 16);
+    match open_dir(fs, exec_dir) {
+        DirOpened::Failed(e2) => {
+        }
+        DirOpened::Ok(opened) => {
+            var wd = opened;
+            borrow wd as &w in {
+                let (data, errno) = read_beneath(heap, w, "build.json", 1048576);
+                if errno == 0 {
+                    borrow data as &db in {
+                        let src = buffer.bytes(db);
+                        let tape = box_slice(heap, json.tape_len(src), 0);
+                        borrow mut tape as &!t in {
+                            let tp = contents(t);
+                            if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                                let v = json.get(src, tp, 0, "stage");
+                                if v >= 0 && json.is_string(tp, v) && json.string_plain(tp, v) {
+                                    let word = json.string_view(src, tp, v);
+                                    var plain = len(word) >= 1 && len(word) <= 32;
+                                    var j = 0;
+                                    while plain && j < len(word) {
+                                        let ch = int_of(word[j]);
+                                        if !(ch >= 97 && ch <= 122 || ch == 95) {
+                                            plain = false;
+                                        }
+                                        j = j + 1;
+                                    }
+                                    if plain {
+                                        stage = buffer.append(heap, stage, word);
+                                    }
+                                }
+                            }
+                        }
+                        unbox_slice(heap, tape);
+                    }
+                }
+                buffer.drop(heap, data);
+            }
+            dir_close(wd);
+        }
+    }
+    return stage;
+}
+
+// Is there a run in `exec_dir` for `target`? Its task id, or an empty buffer.
+fn run_task[&h, &f, &e, &t](heap: &!h Heap, fs: &f Fs(""), exec_dir: &e [byte], target: &t [byte]) -> [heap, fs_read(""), file_read] buffer.Buffer {
+    let (data, errno) = read_in(heap, fs, exec_dir, run_files.run_name(), 4096);
+    var task_id = buffer.empty(heap, 1);
+    if errno == 0 {
+        borrow data as &db in {
+            if run_files.run_is(heap, buffer.bytes(db), target, 0 - 1) {
+                buffer.drop(heap, task_id);
+                task_id = run_files.run_task_id(heap, buffer.bytes(db));
+            }
+        }
+    }
+    buffer.drop(heap, data);
+    return task_id;
+}
+
+// The stored result for `target`, and its state word (1 to 4; see `run_files.result_state`), or nothing and 0 when there is
+// none, it is for another request, or it is not a result of this adapter.
+fn result_of[&h, &f, &e, &t](heap: &!h Heap, fs: &f Fs(""), exec_dir: &e [byte], target: &t [byte]) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
+    let (data, errno) = read_in(heap, fs, exec_dir, run_files.result_name(), run_files.max_file_bytes());
+    var state = 0;
+    if errno == 0 {
+        borrow data as &db in {
+            if bytes.equal(run_files.stored_id(buffer.bytes(db)), target) {
+                state = run_files.result_state(heap, buffer.bytes(db));
+            }
+        }
+    }
+    if state == 0 {
+        buffer.drop(heap, data);
+        return (buffer.empty(heap, 1), 0);
+    }
+    return (data, state);
+}
+
+fn control_status[&h, &f, &r, &t, &e](heap: &!h Heap, fs: &f Fs(""), request_id: &r [byte], target: &t [byte], exec_dir: &e [byte]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write] buffer.Buffer {
+    let task_id = run_task(heap, fs, exec_dir, target);
+    var known = false;
+    borrow task_id as &kb in {
+        known = len(buffer.bytes(kb)) > 0;
+    }
+    buffer.drop(heap, task_id);
+    if !known {
+        return verbs.status_reply(heap, request_id, target, "unknown", "");
+    }
+    let (stored, state) = result_of(heap, fs, exec_dir, target);
+    buffer.drop(heap, stored);
+    if state > 0 {
+        return verbs.status_reply(heap, request_id, target, "finished", "");
+    }
+    // No result yet: whether anybody holds the directory is whether the lock is taken.
+    var reply = buffer.empty(heap, 1);
+    let lock_path = under(heap, exec_dir, build_task.lock_name());
+    borrow lock_path as &lp in {
+        match lock.acquire(fs, buffer.bytes(lp)) {
+            lock.Lock::Held(file) => {
+                lock.let_go(file);
+                buffer.drop(heap, reply);
+                reply = verbs.status_reply(heap, request_id, target, "finished", "");
+            }
+            lock.Lock::Refused(rule) => {
+                buffer.drop(heap, reply);
+                if rule == task.rule_code(task.Rule::WorkspaceLocked) {
+                    let stage = stage_of(heap, fs, exec_dir);
+                    borrow stage as &sb in {
+                        reply = verbs.status_reply(heap, request_id, target, "running", buffer.bytes(sb));
+                    }
+                    buffer.drop(heap, stage);
+                } else {
+                    reply = verbs.status_reply(heap, request_id, target, "unknown", "");
+                }
+            }
+            lock.Lock::Failed(e2) => {
+                buffer.drop(heap, reply);
+                reply = verbs.status_reply(heap, request_id, target, "unknown", "");
+            }
+        }
+    }
+    buffer.drop(heap, lock_path);
+    return reply;
+}
+
+fn control_result[&h, &f, &r, &t, &e](heap: &!h Heap, fs: &f Fs(""), request_id: &r [byte], target: &t [byte], exec_dir: &e [byte]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write] buffer.Buffer {
+    let task_id = run_task(heap, fs, exec_dir, target);
+    var known = false;
+    borrow task_id as &kb in {
+        known = len(buffer.bytes(kb)) > 0;
+    }
+    if !known {
+        buffer.drop(heap, task_id);
+        return verbs.not_ready_reply(heap, request_id);
+    }
+    let (stored, state) = result_of(heap, fs, exec_dir, target);
+    var reply = buffer.empty(heap, 1);
+    if state > 0 {
+        borrow stored as &sb in {
+            buffer.drop(heap, reply);
+            reply = run_files.rebind(heap, buffer.bytes(sb), request_id);
+        }
+    }
+    buffer.drop(heap, stored);
+    var have = false;
+    borrow reply as &yb in {
+        have = len(buffer.bytes(yb)) > 0;
+    }
+    if have {
+        buffer.drop(heap, task_id);
+        return reply;
+    }
+    // No result: running, or the supervisor is gone. The lock tells which; a lost one is settled here, once, under the lock,
+    // so that the answer is the same every time and a new run cannot start in between.
+    let lock_path = under(heap, exec_dir, build_task.lock_name());
+    borrow lock_path as &lp in {
+        match lock.acquire(fs, buffer.bytes(lp)) {
+            lock.Lock::Held(file) => {
+                let evidence = lost_evidence(heap, fs, exec_dir);
+                borrow task_id as &kb2 in {
+                    borrow evidence as &eb in {
+                        let lost = answer(heap, target, buffer.bytes(kb2), 2, "build-supervisor-lost", "the process that supervised this build is gone and left no result; the build may still be running (it is not stopped by anything here), and the directory is kept", false, buffer.bytes(eb));
+                        borrow lost as &lb in {
+                            store_result(heap, fs, exec_dir, buffer.bytes(lb));
+                            buffer.drop(heap, reply);
+                            reply = run_files.rebind(heap, buffer.bytes(lb), request_id);
+                        }
+                        buffer.drop(heap, lost);
+                    }
+                }
+                buffer.drop(heap, evidence);
+                lock.let_go(file);
+            }
+            lock.Lock::Refused(rule) => {
+                buffer.drop(heap, reply);
+                reply = verbs.not_ready_reply(heap, request_id);
+            }
+            lock.Lock::Failed(e2) => {
+                buffer.drop(heap, reply);
+                reply = verbs.not_ready_reply(heap, request_id);
+            }
+        }
+    }
+    buffer.drop(heap, lock_path);
+    buffer.drop(heap, task_id);
+    return reply;
+}
+
+// The evidence that exists in a directory whose supervisor is gone: the array of `evidence_array`, or `[]` when the
+// directory cannot be opened.
+fn lost_evidence[&h, &f, &e](heap: &!h Heap, fs: &f Fs(""), exec_dir: &e [byte]) -> [heap, fs_read(""), dir_read, file_read] buffer.Buffer {
+    var evidence = buffer.append(heap, buffer.empty(heap, 4), "[]");
+    match open_dir(fs, exec_dir) {
+        DirOpened::Failed(e2) => {
+        }
+        DirOpened::Ok(opened) => {
+            var wd = opened;
+            borrow wd as &w in {
+                buffer.drop(heap, evidence);
+                evidence = evidence_array(heap, w);
+            }
+            dir_close(wd);
+        }
+    }
+    return evidence;
+}
+
+// `cancel`: ask the supervisor of a live run to stop its build, and say what came of it. No answer (the caller gets `None`)
+// when the supervisor did not write its result in ten seconds.
+fn control_cancel[&h, &f, &r, &t, &e](heap: &!h Heap, fs: &f Fs(""), request_id: &r [byte], target: &t [byte], exec_dir: &e [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, poll] option.Option[buffer.Buffer] {
+    let task_id = run_task(heap, fs, exec_dir, target);
+    var known = false;
+    borrow task_id as &kb in {
+        known = len(buffer.bytes(kb)) > 0;
+    }
+    buffer.drop(heap, task_id);
+    if !known {
+        return option.Option::Some(verbs.cancel_reply(heap, request_id, target, "not_running"));
+    }
+    let (first, state) = result_of(heap, fs, exec_dir, target);
+    buffer.drop(heap, first);
+    if state == 4 {
+        return option.Option::Some(verbs.cancel_reply(heap, request_id, target, "cancelled"));
+    }
+    if state > 0 {
+        return option.Option::Some(verbs.cancel_reply(heap, request_id, target, "too_late"));
+    }
+    // Alive? A free lock means nobody is running it.
+    var alive = false;
+    let lock_path = under(heap, exec_dir, build_task.lock_name());
+    borrow lock_path as &lp in {
+        match lock.acquire(fs, buffer.bytes(lp)) {
+            lock.Lock::Held(file) => {
+                lock.let_go(file);
+            }
+            lock.Lock::Refused(rule) => {
+                alive = rule == task.rule_code(task.Rule::WorkspaceLocked);
+            }
+            lock.Lock::Failed(e2) => {
+            }
+        }
+    }
+    buffer.drop(heap, lock_path);
+    if !alive {
+        return option.Option::Some(verbs.cancel_reply(heap, request_id, target, "not_running"));
+    }
+    let cancel_path = under(heap, exec_dir, run_files.cancel_name());
+    var rc = 0;
+    borrow cancel_path as &cp in {
+        rc = write_file(fs, buffer.bytes(cp), target);
+    }
+    buffer.drop(heap, cancel_path);
+    if rc != 0 {
+        return option.Option::None;
+    }
+    var waited = 0;
+    var answered = 0;
+    while answered == 0 && waited < 200 {
+        let (got, st) = result_of(heap, fs, exec_dir, target);
+        buffer.drop(heap, got);
+        if st > 0 {
+            answered = st;
+        } else {
+            nap(heap, 50);
+            waited = waited + 1;
+        }
+    }
+    if answered == 4 {
+        return option.Option::Some(verbs.cancel_reply(heap, request_id, target, "cancelled"));
+    }
+    if answered > 0 {
+        return option.Option::Some(verbs.cancel_reply(heap, request_id, target, "too_late"));
+    }
+    return option.Option::None;
 }
 
 // The brief, decoded: the bytes of `input.brief` when it is a string of 1 to 16 KiB, else empty (then
@@ -481,14 +1095,39 @@ fn decode_brief[&h, &s, &t](heap: &!h Heap, src: &s [byte], tape: &t [int], node
     return out;
 }
 
-fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("")) -> [heap, io_read, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+// Open the tools directory and run the build as the supervisor (docs/async-level.md section 2). The exit code of `supervised`,
+// or 6 when the tools directory cannot be opened (the starter checked it already).
+fn supervise_task[&h, &f, &c, &x, &r, &k, &b, &e, &t, &a](heap: &!h Heap, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], tools_dir: &t [byte], args: &a [byte], timeout_ms: int, token: int) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+    match open_dir(fs, tools_dir) {
+        DirOpened::Failed(e2) => {
+            return 6;
+        }
+        DirOpened::Ok(opened) => {
+            var tools = opened;
+            var code = 6;
+            borrow tools as &td in {
+                code = supervised(heap, fs, clock, exec, td, request_id, task_id, brief, exec_dir, args, timeout_ms, token);
+            }
+            dir_close(tools);
+            return code;
+        }
+    }
+}
+
+// One call. A request that begins with the line `supervise <token>` is the one `start_supervisor` hands to its supervisor (the
+// token is the start token of that run, the rest of the input is the request of `execute`): this call is the supervisor, it
+// prints nothing, and its exit code is `supervised`'s. Anything else is a call of a verb, and its reply goes to standard
+// output. (The header is on standard input and not in the arguments so that the adapter reads no command line.)
+fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("")) -> [heap, io_read, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, child_signal, pipe_write, clock, poll] int {
     let (request, whole) = read_request(heap, io);
     var code = 0;
     if !whole {
         code = 4;
     }
     borrow request as &rb in {
-        let src = buffer.bytes(rb);
+        let all = buffer.bytes(rb);
+        let (token, offset) = header_of(all);
+        let src = all[offset..len(all)];
         let tape = box_slice(heap, json.tape_len(src), 0);
         borrow mut tape as &!t in {
             let tp = contents(t);
@@ -505,21 +1144,40 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                 if timeout >= 0 && json.is_int(tp, timeout) && json.fits_int(src, tp, timeout) {
                     timeout_ms = json.to_int(src, tp, timeout);
                 }
-                // A request that is not an `execute` of this contract, or that names no request and no task, is not
-                // answered: the worker has nothing to say that Forge could match to a call.
-                if is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") && is(src, tp, json.get(src, tp, 0, "verb"), "capabilities") && len(text_of(src, tp, rid)) > 0 {
-                    let reply = verbs.capabilities_reply(heap, text_of(src, tp, rid), "cancho-code-adapter", "0.1.0", "sync", "project.build", build_task.max_timeout_ms(), 1048576);
-                    borrow reply as &yb in {
-                        io.write_all(io, buffer.bytes(yb));
+                let verb = json.get(src, tp, 0, "verb");
+                let contract_ok = is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1");
+                let control = is(src, tp, verb, "status") || is(src, tp, verb, "result") || is(src, tp, verb, "cancel");
+                // A request that is not a verb of this contract, or that names no request (and, for `execute`, no task), is
+                // not answered: the worker has nothing to say that Forge could match to a call.
+                if token < 0 && contract_ok && is(src, tp, verb, "capabilities") && len(text_of(src, tp, rid)) > 0 {
+                    let reply = verbs.capabilities_reply(heap, text_of(src, tp, rid), "cancho-code-adapter", "0.2.0", "async", "project.build", build_task.max_timeout_ms(), 1048576);
+                    emit(heap, io, reply);
+                } else if token < 0 && contract_ok && control {
+                    let target = text_of(src, tp, json.get(src, tp, 0, "target"));
+                    let exec_dir = text_of(src, tp, json.get(src, tp, grants, "execution_dir"));
+                    if len(text_of(src, tp, rid)) == 0 || len(target) == 0 || !gate_task.path_ok(exec_dir) {
+                        code = 4;
+                    } else if is(src, tp, verb, "status") {
+                        emit(heap, io, control_status(heap, fs, text_of(src, tp, rid), target, exec_dir));
+                    } else if is(src, tp, verb, "result") {
+                        emit(heap, io, control_result(heap, fs, text_of(src, tp, rid), target, exec_dir));
+                    } else {
+                        match control_cancel(heap, fs, text_of(src, tp, rid), target, exec_dir) {
+                            option.Option::Some(reply) => {
+                                emit(heap, io, reply);
+                            }
+                            option.Option::None => {
+                                code = 4;
+                            }
+                        }
                     }
-                    io.newline(io);
-                    buffer.drop(heap, reply);
-                } else if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
+                } else if !contract_ok || !is(src, tp, verb, "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
                     code = 4;
                 } else {
                     let brief = decode_brief(heap, src, tp, json.get(src, tp, input, "brief"));
                     let exec_dir = text_of(src, tp, json.get(src, tp, grants, "execution_dir"));
                     let tools_dir = text_of(src, tp, json.get(src, tp, grants, "tools_dir"));
+                    let workers_dir = text_of(src, tp, json.get(src, tp, grants, "workers_dir"));
                     let kind = text_of(src, tp, json.get(src, tp, task, "type"));
                     let checker = text_of(src, tp, json.get(src, tp, build, "checker"));
                     let guide = text_of(src, tp, json.get(src, tp, build, "guide"));
@@ -532,26 +1190,39 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                     let plan_seconds = int_or(src, tp, json.get(src, tp, build, "plan_seconds"), default_plan_seconds());
                     let jobs = int_or(src, tp, json.get(src, tp, build, "jobs"), default_jobs());
                     borrow brief as &bb in {
-                        match build_task.check(kind, buffer.bytes(bb), exec_dir, tools_dir, timeout_ms) {
+                        var refusal = build_task.check(kind, buffer.bytes(bb), exec_dir, tools_dir, timeout_ms);
+                        match refusal {
+                            build_task.Checked::Held => {
+                                refusal = build_task.operator_checked(checker, guide, provider, model, agent, attempts, agent_seconds, rounds, plan_seconds, jobs);
+                            }
                             build_task.Checked::Refused(why) => {
-                                refuse(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), build_task.rule_name(why), "the task was refused before anything ran");
+                            }
+                        }
+                        match refusal {
+                            build_task.Checked::Refused(why) => {
+                                if token < 0 {
+                                    emit(heap, io, refuse(heap, text_of(src, tp, rid), text_of(src, tp, tid), build_task.rule_name(why), "the task was refused before anything ran"));
+                                } else {
+                                    code = 4;
+                                }
                             }
                             build_task.Checked::Held => {
-                                match build_task.operator_checked(checker, guide, provider, model, agent, attempts, agent_seconds, rounds, plan_seconds, jobs) {
-                                    build_task.Checked::Refused(why) => {
-                                        refuse(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), build_task.rule_name(why), "the task was refused before anything ran");
+                                if token < 0 {
+                                    if !build_task.workers_dir_ok(workers_dir) {
+                                        emit(heap, io, refuse(heap, text_of(src, tp, rid), text_of(src, tp, tid), build_task.rule_name(build_task.Refusal::PathInvalid), "the workers directory is not a path the adapter will use"));
+                                    } else {
+                                        emit(heap, io, start_supervisor(heap, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), src, exec_dir, workers_dir, tools_dir));
                                     }
-                                    build_task.Checked::Held => {
-                                        let brief_path = under(heap, exec_dir, "brief.txt");
-                                        borrow brief_path as &bp in {
-                                            let args = build_task.build_args(heap, checker, buffer.bytes(bp), exec_dir, agent, provider, model, guide, attempts, agent_seconds, rounds, plan_seconds, jobs);
-                                            borrow args as &ab in {
-                                                execute_task(heap, io, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), buffer.bytes(bb), exec_dir, tools_dir, buffer.bytes(ab), timeout_ms);
-                                            }
-                                            buffer.drop(heap, args);
+                                } else {
+                                    let brief_path = under(heap, exec_dir, "brief.txt");
+                                    borrow brief_path as &bp in {
+                                        let args = build_task.build_args(heap, checker, buffer.bytes(bp), exec_dir, agent, provider, model, guide, attempts, agent_seconds, rounds, plan_seconds, jobs);
+                                        borrow args as &ab in {
+                                            code = supervise_task(heap, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), buffer.bytes(bb), exec_dir, tools_dir, buffer.bytes(ab), timeout_ms, token);
                                         }
-                                        buffer.drop(heap, brief_path);
+                                        buffer.drop(heap, args);
                                     }
+                                    buffer.drop(heap, brief_path);
                                 }
                             }
                         }
@@ -566,6 +1237,30 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
     }
     buffer.drop(heap, request);
     return code;
+}
+
+// The header of a supervisor's input: `supervise <digits>\n`. The token and the offset of the request that follows, or (-1, 0)
+// when the input has no well-formed header: a call of a verb. (An input that begins `supervise` and is not well formed is no
+// JSON either, so it ends as every input that is not a request does: exit 4, nothing written.)
+fn header_of[&a](all: &a [byte]) -> [] (int, int) {
+    let mark = "supervise ";
+    if len(all) < len(mark) || !bytes.starts_with(all, mark) {
+        return (0 - 1, 0);
+    }
+    var n = 0;
+    var i = len(mark);
+    while i < len(all) && i < len(mark) + 19 && int_of(all[i]) != 10 {
+        let d = int_of(all[i]) - 48;
+        if d < 0 || d > 9 {
+            return (0 - 1, 0);
+        }
+        n = n * 10 + d;
+        i = i + 1;
+    }
+    if i == len(mark) || i >= len(all) || int_of(all[i]) != 10 {
+        return (0 - 1, 0);
+    }
+    return (n, i + 1);
 }
 
 fn main(world: World) -> [] int {

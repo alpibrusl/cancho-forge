@@ -49,6 +49,9 @@ fn reason_of(e: dispatch.Ending) -> [] int {
         dispatch.Ending::Setup(errno) => {
             return errno;
         }
+        dispatch.Ending::Lost => {
+            return 0 - 1;
+        }
     }
 }
 

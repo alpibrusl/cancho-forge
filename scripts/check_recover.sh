@@ -128,6 +128,7 @@ if $C build src/*.cho --std -o "$rc_dir/forge" && $C build workers/gate_runner.c
   "$F" recover "$rc_dir/../rc/lost" > /dev/null 2>&1; check "a .. directory: exit 2" test $? -eq 2
   "$F" recover > /dev/null 2>&1; check "no directory: exit 2" test $? -eq 2
   "$F" recover "$rc_dir/lost" extra > /dev/null 2>&1; check "an extra argument: exit 2" test $? -eq 2
+  "$F" recover "$rc_dir/lost" "$rc_dir" extra > /dev/null 2>&1; check "a workers directory and an extra argument: exit 2" test $? -eq 2
   # the verbs that only look still only look
   check "forge status still looks only (a running task is still running before recover)" eval "mkdir '$rc_dir/look' && cp '$rc_dir/nothing.before' '$rc_dir/look/journal.jsonl' && '$F' status '$rc_dir/look' > /dev/null && cmp -s '$rc_dir/look/journal.jsonl' '$rc_dir/nothing.before'"
 else

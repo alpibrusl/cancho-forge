@@ -287,9 +287,12 @@ policy layer's (milestone M4).
 request id or the `target` (the table is at the top of `tests/contract/mock_worker.cho`, so a test reaches each verdict
 with a real child process); the stub LLM and the gate runner answer `capabilities` (task types `repo.change` and
 `repo.gate`) and, being `sync`, are sent nothing else; a `cancel`, `status` or `result` forced onto them is not answered
-(exit 4, `worker-error`), which is the conformance a `sync` worker owes. **Not built:** a worker at the `async` level
-that does the work (the mock only answers the verdicts), so the `accepted` / poll / `result` flow is **not measured end
-to end**; Forge does not yet call `capabilities` at registration, cache the answer, or act on `status`; that is M4.
+(exit 4, `worker-error`), which is the conformance a `sync` worker owes. **Built since (issue #33, [`async-level.md`](async-level.md)):** a worker at the `async` level that does the work, the
+Cancho Code adapter, and Forge's side of the flow (`forge.await_run`: `status`, `result`, `cancel`; `forge await`, `forge cancel`),
+measured end to end against the stand-in tool. For that worker the three verbs take a `grants.execution_dir` beside the `target`
+(`verbs.build_targeted_in`): a stateless worker whose runs live in directories needs to be told which one. **Not built:** Forge does
+not yet call `capabilities` at registration, cache the answer, or read the level from it (`forge build` states in code that the adapter is
+`async`); that is M4.
 
 ## 4. Evidence references
 
@@ -431,10 +434,10 @@ command-line tool with a work directory, not how the tool must change.
 | Message | Carried as |
 |---|---|
 | `execute` request | Forge creates `executions/<id>/` (name derived from `request_id`; characters `A-Za-z0-9._-` only, no `..`; the worker's path rules are narrower than Forge's, audit 2.1), writes the brief into `brief.txt` there, and starts, **detached, in its own process group**, `cancho-build <checker> <abs>/brief.txt <abs>/executions/<id> "<agent-command>" --provider P --model M --guide G [--attempts N] [--rounds N] [--agent-seconds N] [--plan-seconds N] [--jobs N]`. The argument vector, including the agent command (which names the key file), is built by Forge from configuration, **never from a task**. |
-| `execute` response | `{"state":"accepted"}` at once; the pid and its start token are journalled (`execution.started`) before the call returns. |
-| `status` | read `executions/<id>/build.json`: `stage` `plan`/`build`/`done`, `units_verified`/`units_total`, `verdict`. Liveness is Forge's own (pid and start token), not `build.json`'s: it has no update timestamp. |
+| `execute` response | `{"state":"accepted"}` at once. *(Corrected, issue #33:)* the pid and start token of this row are **not** used: the intent is `execution.started`, and `execution.accepted` records the request and the execution directory, which is all a later call needs; the adapter's supervisor, not Forge, holds the build's process handle ([`async-level.md`](async-level.md) section 3). |
+| `status` | *(Corrected, issue #33:)* liveness is whether anybody holds the lock of the execution directory (the kernel drops it with the supervisor), not a pid; `progress.step` is `build.json`'s `stage` when it is a plain word. `build.json` has no update timestamp and is never the liveness. |
 | `result` | when the process has ended: the exit code **and** `build.json.verdict` (they must agree under the table in 9.4, else `worker-protocol`), plus the evidence of 9.3. |
-| `cancel` | kill the process group (TERM, grace, KILL); the task event is `execution.cancelled`; the directory is kept. A later `execute` with the same `request_id` resumes the same work. |
+| `cancel` | *(Corrected, issue #33:)* a cancel request is a file the supervisor looks for every 100 ms; it kills the build's whole group with KILL (no TERM and grace: the build's own shutdown is not relied on) and writes a `cancelled` result; the task event is `execution.cancelled`; the directory is kept. A later `execute` on the directory resumes the same work. |
 | `request_id` | the directory name; Forge takes a lock on it. Two builds in one directory are unguarded by the tool. |
 
 ### 9.2 Limits
@@ -576,15 +579,18 @@ dies in the middle of a gate (its detached gate is orphaned: spike S11, G4); the
 
 ---
 
-## 11. The Cancho Code adapter: task type `project.build` *(built, `sync` slice: `workers/cancho_code.cho`)*
+## 11. The Cancho Code adapter: task type `project.build` *(built, `async` level: `workers/cancho_code.cho`)*
 
 The process-and-directory binding of section 9, implemented as the first worker that starts its tool **beneath a run-time
 `Dir` as a process-group leader** (`exec_spawn_detached_under`, cancho #588; spike S12). It is described in full, with what it
 checks, what it measured and what it does not do, in [`cancho-code-adapter.md`](cancho-code-adapter.md). In short:
 
-* **Level `sync`, not `async` as 9.1 and 1.2 say it should be.** The `async` flow is not built end to end (3.6), so the adapter
-  runs the build to completion inside its own deadline (four fifths of Forge's), kills the build's whole group when it
-  passes, and keeps the directory so that the same request resumes the build.
+* **Level `async`** (since issue #33; it was `sync` before): `execute` answers `accepted` and the build goes on under a supervisor
+  process that holds the build's `Child`, the lock of the execution directory and a loop that looks for a cancel request; `status`,
+  `result` and `cancel` are answered by new processes from the files the supervisor keeps (`run.json`, `result.json`,
+  `cancel.req`). The adapter's own deadline is still four fifths of Forge's, it still kills the build's whole group when it
+  passes, and the directory is kept so that the same request resumes the build. [`async-level.md`](async-level.md) is the decision;
+  the pid-reuse question of 9.1 is answered there by not using a pid at all.
 * **The task** carries only the brief (`task.input.brief`, written to `brief.txt`, never to an argument). The tools directory
   and the build configuration are `grants.tools_dir` and `grants.build`, the operator's, built by Forge from configuration
   and never from `task.input` (9.1). `forge build` builds that request from the operator's command line

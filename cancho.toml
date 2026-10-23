@@ -86,3 +86,8 @@ std = true
 name = "recover"
 sources = ["tests/recover_test.cho", "src/recover.cho", "src/retry.cho", "src/flow.cho", "src/dispatch.cho", "src/response.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
 std = true
+
+[[test]]
+name = "run_files"
+sources = ["tests/run_files_test.cho", "src/run_files.cho"]
+std = true

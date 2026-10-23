@@ -290,6 +290,7 @@ fn test_every_refusal_has_its_own_rule_tag() -> [] int {
     test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::ToolUnusable), "tool-unusable"));
     test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "workdir-unwritable"));
     test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::ExecutionLocked), "execution-locked"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::SupervisorUnavailable), "supervisor-unavailable"));
     return 0;
 }
 
@@ -350,18 +351,18 @@ fn test_the_claimed_verdict_of_a_build_is_the_tools_own_word_or_nothing() -> [] 
 }
 
 fn test_the_request_has_the_brief_as_input_and_the_operators_configuration_in_grants[&h](heap: &!h Heap) -> [heap] int {
-    let r = build_task.request(heap, "r-b-1", 1, "b-1", "make \"x\"\nthen y", 20000, 1048576, "/w/e", "/opt/tools", "/opt/c", "", "prov", "mod", "agent --k /x", 4, 30, 3, 900, 4);
+    let r = build_task.request(heap, "r-b-1", 1, "b-1", "make \"x\"\nthen y", 20000, 1048576, "/w/e", "/opt/tools", "/opt/workers", "/opt/c", "", "prov", "mod", "agent --k /x", 4, 30, 3, 900, 4);
     borrow r as &rb in {
-        test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r-b-1\",\"attempt\":1,\"task\":{\"id\":\"b-1\",\"type\":\"project.build\",\"input\":{\"brief\":\"make \\\"x\\\"\\nthen y\"}},\"limits\":{\"timeout_ms\":20000,\"max_output_bytes\":1048576},\"grants\":{\"execution_dir\":\"/w/e\",\"tools_dir\":\"/opt/tools\",\"build\":{\"checker\":\"/opt/c\",\"agent\":\"agent --k /x\",\"provider\":\"prov\",\"model\":\"mod\",\"attempts\":4,\"agent_seconds\":30,\"rounds\":3,\"plan_seconds\":900,\"jobs\":4}}}"));
+        test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r-b-1\",\"attempt\":1,\"task\":{\"id\":\"b-1\",\"type\":\"project.build\",\"input\":{\"brief\":\"make \\\"x\\\"\\nthen y\"}},\"limits\":{\"timeout_ms\":20000,\"max_output_bytes\":1048576},\"grants\":{\"execution_dir\":\"/w/e\",\"tools_dir\":\"/opt/tools\",\"workers_dir\":\"/opt/workers\",\"build\":{\"checker\":\"/opt/c\",\"agent\":\"agent --k /x\",\"provider\":\"prov\",\"model\":\"mod\",\"attempts\":4,\"agent_seconds\":30,\"rounds\":3,\"plan_seconds\":900,\"jobs\":4}}}"));
     }
     buffer.drop(heap, r);
     return 0;
 }
 
 fn test_a_guide_is_in_the_request_only_when_there_is_one[&h](heap: &!h Heap) -> [heap] int {
-    let r = build_task.request(heap, "r", 2, "t", "b", 10000, 1, "/e", "/t", "/c", "/g/guide.md", "p", "m", "a", 7, 31, 2, 901, 5);
+    let r = build_task.request(heap, "r", 2, "t", "b", 10000, 1, "/e", "/t", "/wk", "/c", "/g/guide.md", "p", "m", "a", 7, 31, 2, 901, 5);
     borrow r as &rb in {
-        test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r\",\"attempt\":2,\"task\":{\"id\":\"t\",\"type\":\"project.build\",\"input\":{\"brief\":\"b\"}},\"limits\":{\"timeout_ms\":10000,\"max_output_bytes\":1},\"grants\":{\"execution_dir\":\"/e\",\"tools_dir\":\"/t\",\"build\":{\"checker\":\"/c\",\"guide\":\"/g/guide.md\",\"agent\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"attempts\":7,\"agent_seconds\":31,\"rounds\":2,\"plan_seconds\":901,\"jobs\":5}}}"));
+        test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r\",\"attempt\":2,\"task\":{\"id\":\"t\",\"type\":\"project.build\",\"input\":{\"brief\":\"b\"}},\"limits\":{\"timeout_ms\":10000,\"max_output_bytes\":1},\"grants\":{\"execution_dir\":\"/e\",\"tools_dir\":\"/t\",\"workers_dir\":\"/wk\",\"build\":{\"checker\":\"/c\",\"guide\":\"/g/guide.md\",\"agent\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"attempts\":7,\"agent_seconds\":31,\"rounds\":2,\"plan_seconds\":901,\"jobs\":5}}}"));
     }
     buffer.drop(heap, r);
     return 0;
@@ -369,5 +370,14 @@ fn test_a_guide_is_in_the_request_only_when_there_is_one[&h](heap: &!h Heap) -> 
 
 fn test_an_unreadable_brief_file_has_its_own_rule_tag() -> [] int {
     test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::BriefUnreadable), "brief-unreadable"));
+    return 0;
+}
+
+fn test_a_workers_directory_is_a_path_like_the_others_and_not_empty() -> [] int {
+    test.assert(build_task.workers_dir_ok("/opt/workers"));
+    test.assert(!build_task.workers_dir_ok(""));
+    test.assert(!build_task.workers_dir_ok("workers"));
+    test.assert(!build_task.workers_dir_ok("/opt/../workers"));
+    test.assert(!build_task.workers_dir_ok("/opt/work;ers"));
     return 0;
 }

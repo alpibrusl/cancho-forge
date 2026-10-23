@@ -120,40 +120,49 @@ fn recheck[&h, &f, &b, &e](heap: &!h Heap, fs: &f Fs(""), ending: dispatch.Endin
     }
 }
 
-// `run`, classified, and the evidence of a reply that is valid recomputed against the files beneath `execution_dir`:
-// a mismatch makes the reply `evidence-ref-invalid`, whatever state the worker claimed. An execution directory Forge
-// cannot open is `Setup`, not a verdict on the worker.
+// How a call that was run ended (`ran`) and what it wrote (`out`), classified, and the evidence of a reply that is valid
+// recomputed against the files beneath `execution_dir`: a mismatch makes the reply `evidence-ref-invalid`, whatever state the
+// worker claimed. An execution directory Forge cannot open is `Setup`, not a verdict on the worker. `request_id` is the id of
+// the call that was made (the one the reply must carry): for `execute` the request, for a `result` its own id.
+pub fn settle_run[&h, &f, &b, &r, &k, &e](heap: &!h Heap, fs: &f Fs(""), ran: process.Ran, out: &b [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte], is_async: bool) -> [heap, fs_read(""), dir_read, file_read] dispatch.Ending {
+    var ending = dispatch.classify(heap, ran, out, request_id, task_id, is_async);
+    match ending {
+        dispatch.Ending::Reply(verdict) => {
+            match verdict {
+                response.Verdict::Valid(state) => {
+                    ending = recheck(heap, fs, ending, out, execution_dir);
+                }
+                response.Verdict::Refused(rule, reason) => {
+                }
+            }
+        }
+        dispatch.Ending::Said(state, retry) => {
+            ending = recheck(heap, fs, ending, out, execution_dir);
+        }
+        dispatch.Ending::Unavailable(errno) => {
+        }
+        dispatch.Ending::Timeout => {
+        }
+        dispatch.Ending::Overflow => {
+        }
+        dispatch.Ending::Crashed(signal) => {
+        }
+        dispatch.Ending::Error(code) => {
+        }
+        dispatch.Ending::Setup(errno) => {
+        }
+        dispatch.Ending::Lost => {
+        }
+    }
+    return ending;
+}
+
+// `run`, classified (`settle_run`).
 pub fn execute[&h, &x, &w, &f, &c, &n, &q, &r, &k, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, name: &n [byte], request: &q [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte], most: int, timeout_ms: int, is_async: bool) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read] dispatch.Ending {
     let (out, ran) = run(heap, exec, workers, clock, name, request, most, timeout_ms);
     var ending = dispatch.Ending::Timeout;
     borrow out as &ob in {
-        ending = dispatch.classify(heap, ran, buffer.bytes(ob), request_id, task_id, is_async);
-        match ending {
-            dispatch.Ending::Reply(verdict) => {
-                match verdict {
-                    response.Verdict::Valid(state) => {
-                        ending = recheck(heap, fs, ending, buffer.bytes(ob), execution_dir);
-                    }
-                    response.Verdict::Refused(rule, reason) => {
-                    }
-                }
-            }
-            dispatch.Ending::Said(state, retry) => {
-                ending = recheck(heap, fs, ending, buffer.bytes(ob), execution_dir);
-            }
-            dispatch.Ending::Unavailable(errno) => {
-            }
-            dispatch.Ending::Timeout => {
-            }
-            dispatch.Ending::Overflow => {
-            }
-            dispatch.Ending::Crashed(signal) => {
-            }
-            dispatch.Ending::Error(code) => {
-            }
-            dispatch.Ending::Setup(errno) => {
-            }
-        }
+        ending = settle_run(heap, fs, ran, buffer.bytes(ob), request_id, task_id, execution_dir, is_async);
     }
     buffer.drop(heap, out);
     return ending;

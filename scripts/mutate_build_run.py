@@ -27,6 +27,12 @@ CANCHO = os.environ.get("CANCHO", "cancho")
 B = "src/build_run.cho"
 T = "src/build_task.cho"
 M = "src/main.cho"
+A = "src/await_run.cho"
+K = "src/await_task.cho"
+E = "src/event.cho"
+X = "src/recover.cho"
+D = "src/dispatch.cho"
+W = "src/worker.cho"
 # (name, file, old, new, what it breaks); `old` must occur exactly once in the file.
 MUT = [
     # ---- the orchestration (src/build_run.cho)
@@ -39,10 +45,36 @@ MUT = [
     ("claim-empty", B, "build_task.verdict_name(claimed_verdict(heap, fs, execution_dir))", '""', "the claim is written with no verdict"),
     ("worker-name", B, '"cancho_code", buffer.bytes(qb)', '"gate_runner", buffer.bytes(qb)', "the build is sent to another worker"),
     ("brief-dropped", B, "buffer.bytes(rb), attempts, tid, brief, timeout_ms,", 'buffer.bytes(rb), attempts, tid, "", timeout_ms,', "the request carries no brief"),
-    ("tools-as-workdir", B, "timeout_ms, 1048576, execution_dir, tools_dir, checker,", "timeout_ms, 1048576, tools_dir, tools_dir, checker,", "the build's work directory is the tools directory"),
+    ("tools-as-workdir", B, "timeout_ms, 1048576, execution_dir, tools_dir, workers_dir, checker,", "timeout_ms, 1048576, tools_dir, tools_dir, workers_dir, checker,", "the build's work directory is the tools directory"),
     ("ceilings-swapped", B, "agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);\n                        borrow req as &qb in {", "agent, attempts_ceiling, rounds, agent_seconds, plan_seconds, jobs);\n                        borrow req as &qb in {", "two of the ceilings are swapped on their way to the tool"),
     ("read-brief-limit", B, "journal_io.drain(heap, x, data, build_task.max_brief_bytes())", "journal_io.drain(heap, x, data, build_task.max_brief_bytes() + 1)", "a brief file one byte over the limit is read whole"),
     ("claimed-from-wrong-file", B, '"/build.json"', '"/run.log"', "the claim is read from another file"),
+    # ---- the async level (issue #33): what Forge does with `accepted` (src/build_run.cho, src/await_run.cho, src/await_task.cho)
+    ("accepted-not-polled", B, "if dispatch.accepted(ending) {", "if false {", "an accepted job is not waited for: the task stays running"),
+    ("accepted-not-journalled", B, "seq = gate_run.note_accepted(heap, fs, journal_path, seq, tid, buffer.bytes(rb), execution_dir);", "seq = seq;", "the run a later Forge must ask about is not written down"),
+    ("accepted-record-request", E, "    w = json.put_key(heap, w, \"request\");\n    w = json.put_string(heap, w, request);", "    w = json.put_key(heap, w, \"request\");\n    w = json.put_string(heap, w, task);", "the record names the task where it names the request"),
+    ("accepted-record-dir", E, "    w = json.put_key(heap, w, \"dir\");\n    w = json.put_string(heap, w, dir);", "    w = json.put_key(heap, w, \"dir\");\n    w = json.put_string(heap, w, task);", "the record names the task where it names the directory"),
+    ("cancelled-not-written", B, '            if bytes.equal(dispatch.consequence_name(consequence), "cancelled") {', '            if false {', "a cancelled run leaves no execution.cancelled (forge build)"),
+    ("cancelled-not-written-by-await", K, "    if bytes_equal_cancelled(consequence) {", "    if false {", "a cancelled run leaves no execution.cancelled (forge await)"),
+    ("tag-not-written-by-await", K, "    if len(tag) > 0 {\n        s = gate_run.note(", "    if len(tag) > 99 {\n        s = gate_run.note(", "forge await leaves no refusal record for the ending"),
+    ("claim-not-written-by-await", K, "    s = build_run.finish_attempt(heap, fs, journal_path, s, tid, ending, execution_dir);", "    s = s;", "forge await leaves no claim"),
+    ("await-any-task", K, "    if phase == 5 {\n        borrow request", "    if phase >= 0 {\n        borrow request", "forge await goes on with a task that has no accepted run"),
+    ("deadline-ignored", A, "if clock_ms(clock) >= deadline {", "if false {", "Forge waits for ever for a build that outruns its deadline"),
+    ("deadline-no-cancel", A, "                    cancel(heap, exec, workers, clock, name, request_id, task_id, execution_dir);\n", "", "a build that outruns Forge's deadline is not asked to stop"),
+    ("deadline-not-timeout", A, "                    ending = dispatch.Ending::Timeout;\n                    waiting = false;\n                } else {", "                    ending = dispatch.Ending::Lost;\n                    waiting = false;\n                } else {", "Forge's deadline is reported as a lost run"),
+    ("unknown-not-lost", A, "out = Probe::Ended(dispatch.Ending::Lost);", "out = Probe::Running;", "a worker that does not know its run is waited for for ever"),
+    ("result-to-wrong-request", A, "                ending = result_of(heap, exec, workers, fs, clock, name, request_id, task_id, execution_dir);", "                ending = result_of(heap, exec, workers, fs, clock, name, task_id, task_id, execution_dir);", "the result is asked for under the task id and not the request id"),
+    ("status-to-wrong-request", A, 'let q = verbs.build_targeted_in(heap, "status", buffer.bytes(ib), request_id, execution_dir);', 'let q = verbs.build_targeted_in(heap, "status", buffer.bytes(ib), task_id, execution_dir);', "status asks about the task id and not the request"),
+    ("lost-as-retry", D, "        Ending::Lost => {\n            return Consequence::Blocked;", "        Ending::Lost => {\n            return Consequence::RetryOrFail;", "a lost run is sent back to ready"),
+    ("lost-tag", D, '        Ending::Lost => {\n            return "execution-lost";', '        Ending::Lost => {\n            return "worker-error";', "a lost run is tagged as a worker error"),
+    ("workers-dir-not-sent", T, "    w = json.put_key(heap, w, \"workers_dir\");\n    w = json.put_string(heap, w, workers_dir);\n", "", "the request does not tell the adapter where to find its supervisor"),
+    # ---- the commands (src/main.cho) and recovery (src/recover.cho)
+    ("recover-awaiting-lost", X, "                    ph = map.put(heap, ph, id, 5);", "                    ph = map.put(heap, ph, id, 2);", "an accepted run is taken for a lost one"),
+    ("recover-awaiting-ignored", M, "                                if len(workers) > 0 {\n                                    code = ask_awaiting(", "                                if false {\n                                    code = ask_awaiting(", "forge recover with the workers directory does not ask the worker"),
+    ("recover-running-is-failure", M, '            line(io, "awaiting: ", "the worker says the run is going on; nothing was written");\n            code = 0;', '            line(io, "awaiting: ", "the worker says the run is going on; nothing was written");', "a run that is still going makes forge recover fail"),
+    ("cancel-exit", M, "                        verbs.CancelState::Cancelled => {\n                            return 0;", "                        verbs.CancelState::Cancelled => {\n                            return 4;", "a cancel that worked is reported as one that did not"),
+    ("cancel-any-task", M, "                    if phase != 5 {\n                        io.error_all(io, \"forge: \");", "                    if phase < 0 {\n                        io.error_all(io, \"forge: \");", "forge cancel asks the worker about a task that has no accepted run"),
+    ("await-timeout-floor", M, "        if timeout < 1000 {\n            return usage(io);", "        if timeout < 0 {\n            return usage(io);", "forge await takes a budget under a second"),
     # ---- the request and the pure half (src/build_task.cho)
     ("id-prefix", T, 'buffer.append(heap, buffer.empty(heap, 16), "build-")', 'buffer.append(heap, buffer.empty(heap, 16), "bld-")', "the task id has another prefix"),
     ("guide-dropped-in-request", T, '    if len(guide) > 0 {\n        w = json.put_key(heap, w, "guide");', '    if false {\n        w = json.put_key(heap, w, "guide");', "the operator's guide never reaches the adapter"),
@@ -78,12 +110,13 @@ def one(m):
             return name, what, "OK"
         path.write_text(text.replace(old, new))
         scratch = pathlib.Path(tempfile.mkdtemp(prefix="forge-cc-mut."))
-        env = dict(os.environ, CANCHO=CANCHO)
+        env = dict(os.environ, CANCHO=CANCHO, FORGE_FAILFAST="1")
         try:
             run = subprocess.run(["sh", str(work / "scripts" / "check_build_run.sh"), str(scratch)], capture_output=True, text=True, timeout=400, env=env, cwd=work)
         except subprocess.TimeoutExpired:
             subprocess.run(["pkill", "-x", "cancho_code"])
             subprocess.run(["pkill", "-f", "^sleep 79$"])
+            subprocess.run(["pkill", "-f", "^sleep 78$"])
             subprocess.run(["pkill", "-f", "[c]ancho-build"])
             shutil.rmtree(scratch, ignore_errors=True)
             return name, what, "KILLED"
@@ -92,13 +125,14 @@ def one(m):
         if run.returncode == 0 and "FAIL " not in out:
             # the pure half has its own oracle: the unit tests of src/build_task.cho (a rule the conformance cannot reach because
             # the process half refuses first, such as the size of a brief, is held there)
-            units = subprocess.run([CANCHO, "test", "tests/build_task_test.cho", "src/build_task.cho", "src/gate_task.cho", "src/gate_env.cho", "--std"], capture_output=True, text=True, timeout=300, cwd=work)
+            units = subprocess.run([CANCHO, "test"], capture_output=True, text=True, timeout=600, cwd=work)
             if units.returncode != 0:
                 return name, what, "KILLED"
         if "did not build" in out or re.search(r"^\S+:\d+:\d+: error", out, re.M) and "FAIL" not in out:
             return name, what, "INVALID (does not build)"
         subprocess.run(["pkill", "-x", "cancho_code"])
         subprocess.run(["pkill", "-f", "^sleep 79$"])
+        subprocess.run(["pkill", "-f", "^sleep 78$"])
         subprocess.run(["pkill", "-f", "[c]ancho-build"])
         return name, what, "KILLED" if run.returncode != 0 or "FAIL " in out else "SURVIVED"
 

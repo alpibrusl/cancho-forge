@@ -5,8 +5,10 @@ import std.bytes;
 import std.io;
 import std.json;
 import std.process;
+import forge.await_run;
 import forge.dispatch;
 import forge.support;
+import forge.verbs;
 import forge.worker;
 
 // The Cancho Code adapter against a real child process and a stand-in for the build tool (docs/cancho-code-adapter.md,
@@ -22,6 +24,42 @@ import forge.worker;
 
 fn default_build() -> [] &static [byte] {
     return "{\"checker\":\"/opt/cancho/bin/cancho\",\"agent\":\"stand-in-agent --x\",\"provider\":\"stand\",\"model\":\"m1\"}";
+}
+
+// The workers directory of the request: `workers` beside the tools directory (the check script makes both beneath the
+// scratch directory). A tools path with no `/` gets `workers` alone, which the adapter refuses as `path-invalid`.
+fn workers_beside[&h, &t](heap: &!h Heap, tools: &t [byte]) -> [heap] buffer.Buffer {
+    var cut = 0;
+    var i = 0;
+    while i < len(tools) {
+        if int_of(tools[i]) == 47 {
+            cut = i;
+        }
+        i = i + 1;
+    }
+    return buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), tools[0..cut]), "/workers");
+}
+
+// Wait `ms` milliseconds on a poller with nothing registered.
+fn nap[&h](heap: &!h Heap, ms: int) -> [heap, poll] int {
+    match poller_new() {
+        Polling::Failed(e) => {
+            return 0 - e;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            var events = box_slice(heap, 4, 0);
+            var n = 0;
+            borrow mut poller as &!ph in {
+                borrow mut events as &!eb in {
+                    n = poller_wait(ph, contents(eb), ms);
+                }
+            }
+            unbox_slice(heap, events);
+            poller_close(poller);
+            return n;
+        }
+    }
 }
 
 // The `execute` request. `brief_json` is JSON text (so that a brief that is not a string can be sent), `tools` and
@@ -62,6 +100,12 @@ fn request[&h, &b, &t, &e, &y, &u](heap: &!h Heap, brief_json: &b [byte], tools:
     w = json.put_string(heap, w, exec_dir);
     w = json.put_key(heap, w, "tools_dir");
     w = json.put_string(heap, w, tools);
+    w = json.put_key(heap, w, "workers_dir");
+    let beside = workers_beside(heap, tools);
+    borrow beside as &bs in {
+        w = json.put_string(heap, w, buffer.bytes(bs));
+    }
+    buffer.drop(heap, beside);
     if len(build) > 0 {
         w = json.put_key(heap, w, "build");
         w = json.put_fragment(heap, w, build);
@@ -100,13 +144,78 @@ fn ran_with[&h, &x, &w, &c, &q](heap: &!h Heap, exec: &x Exec(""), workers: &w D
     return worker.run(heap, exec, workers, clock, "cancho_code", req, 1048576, timeout_ms);
 }
 
+// Does the reply say `state`?
+fn state_is[&h, &b](heap: &!h Heap, out: &b [byte], state: &static [byte]) -> [heap] bool {
+    var held = false;
+    let tape = box_slice(heap, json.tape_len(out), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(out, tp) > 0 && json.is_object(tp, 0) {
+            let s = json.get(out, tp, 0, "state");
+            held = json.is_string(tp, s) && json.string_equals(out, tp, s, state);
+        }
+    }
+    unbox_slice(heap, tape);
+    return held;
+}
+
+// A call of `verb` about request `r-1` in `exec_dir` (a stateless worker is told where to look).
+fn call_about[&h, &x, &w, &c, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, verb: &static [byte], call_id: &static [byte], exec_dir: &e [byte]) -> [heap, exec_under, clock, poll] (buffer.Buffer, process.Ran) {
+    let q = verbs.build_targeted_in(heap, verb, call_id, "r-1", exec_dir);
+    var got = buffer.empty(heap, 1);
+    var ran = process.Ran::Failed(0 - 1);
+    borrow q as &qb in {
+        buffer.drop(heap, got);
+        let (out, r) = ran_with(heap, exec, workers, clock, buffer.bytes(qb), 15000);
+        got = out;
+        ran = r;
+    }
+    buffer.drop(heap, q);
+    return (got, ran);
+}
+
+// `execute`, and, when it answers `accepted`, the polling an `async` worker is owed (docs/async-level.md section 4): `status`
+// until it is `finished`, then `result`. What comes back is the final reply of the run, as a `sync` worker's `execute`
+// would have given it, so that a case reads it the same way; a reply that is not `accepted` (a refusal) comes back as it is.
+fn ran_async[&h, &x, &w, &c, &q, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, req: &q [byte], exec_dir: &e [byte], timeout_ms: int) -> [heap, exec_under, clock, poll] (buffer.Buffer, process.Ran) {
+    let (first, ran) = ran_with(heap, exec, workers, clock, req, timeout_ms);
+    var accepted = false;
+    match ran {
+        process.Ran::Code(n) => {
+            borrow first as &fb in {
+                accepted = n == 0 && state_is(heap, buffer.bytes(fb), "accepted");
+            }
+        }
+        _ => {
+        }
+    }
+    if !accepted {
+        return (first, ran);
+    }
+    buffer.drop(heap, first);
+    var finished = false;
+    var polls = 0;
+    while !finished && polls < 1200 {
+        let (st, sran) = call_about(heap, exec, workers, clock, "status", "s-1", exec_dir);
+        borrow st as &sb in {
+            finished = state_is(heap, buffer.bytes(sb), "finished") || !state_is(heap, buffer.bytes(sb), "running");
+        }
+        buffer.drop(heap, st);
+        if !finished {
+            nap(heap, 50);
+        }
+        polls = polls + 1;
+    }
+    return call_about(heap, exec, workers, clock, "result", "s-2", exec_dir);
+}
+
 // One case through `worker.run`: the reply must be `state`/`code`/`retryable` with `evidence` entries, within `within_ms`.
 fn case[&h, &x, &w, &c, &i, &b, &t, &e, &u](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], task_type: &static [byte], brief_json: &b [byte], tools: &t [byte], exec_dir: &e [byte], build: &u [byte], timeout_ms: int, state: &static [byte], code: &static [byte], retryable: bool, evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
     let req = request(heap, brief_json, tools, exec_dir, task_type, timeout_ms, build);
     let began = clock_ms(clock);
     var held = false;
     borrow req as &qb in {
-        let (out, ran) = ran_with(heap, exec, workers, clock, buffer.bytes(qb), timeout_ms);
+        let (out, ran) = ran_async(heap, exec, workers, clock, buffer.bytes(qb), exec_dir, timeout_ms);
         borrow out as &ob in {
             match ran {
                 process.Ran::Code(n) => {
@@ -174,7 +283,7 @@ fn raw[&h, &x, &w, &c, &i, &q](heap: &!h Heap, exec: &x Exec(""), workers: &w Di
     return support.verdict(io, held, label);
 }
 
-// `capabilities`: the adapter says what it is: a `sync` worker of the task type `project.build`, with the longest timeout
+// `capabilities`: the adapter says what it is: an `async` worker of the task type `project.build`, with the longest timeout
 // of a day.
 fn capabilities[&h, &x, &w, &c, &i](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io) -> [heap, exec_under, clock, poll, io_write] int {
     let (out, ran) = ran_with(heap, exec, workers, clock, "{\"contract\":\"forge-worker/1\",\"verb\":\"capabilities\",\"request_id\":\"r-0\"}", 5000);
@@ -190,7 +299,7 @@ fn capabilities[&h, &x, &w, &c, &i](heap: &!h Heap, exec: &x Exec(""), workers: 
                         if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
                             let level = json.get(src, tp, 0, "level");
                             let types = json.get(src, tp, 0, "task_types");
-                            held = json.is_string(tp, level) && json.string_equals(src, tp, level, "sync") && json.is_array(tp, types) && json.count(tp, types) == 1;
+                            held = json.is_string(tp, level) && json.string_equals(src, tp, level, "async") && json.is_array(tp, types) && json.count(tp, types) == 1;
                             if held {
                                 let first = json.at(tp, types, 0);
                                 let ty = json.get(src, tp, first, "type");
@@ -218,7 +327,7 @@ fn capabilities[&h, &x, &w, &c, &i](heap: &!h Heap, exec: &x Exec(""), workers: 
         }
     }
     buffer.drop(heap, out);
-    return support.verdict(io, held, "capabilities: a sync worker of project.build, a day at most");
+    return support.verdict(io, held, "capabilities: an async worker of project.build, a day at most");
 }
 
 // Forge's own path: `worker.execute` starts the adapter, classifies the ending and recomputes the evidence of a good run
@@ -227,11 +336,16 @@ fn forge_path[&h, &x, &w, &f, &c, &i, &t, &d](heap: &!h Heap, exec: &x Exec(""),
     let req = request(heap, "\"done\"", tools, exec_dir, "project.build", 20000, default_build());
     var held = false;
     borrow req as &qb in {
-        let e = worker.execute(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(qb), "r-1", "t-1", exec_dir, 1048576, 20000, false);
-        held = bytes.equal(dispatch.rule_tag(e), "") && bytes.equal(dispatch.consequence_name(dispatch.consequence(e)), "verification");
+        let e = worker.execute(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(qb), "r-1", "t-1", exec_dir, 1048576, 20000, true);
+        // `accepted` is a valid reply of an async worker to `execute`, and the consequence is to poll
+        held = dispatch.accepted(e) && bytes.equal(dispatch.consequence_name(dispatch.consequence(e)), "poll");
+        if held {
+            let e2 = await_run.finish(heap, exec, workers, fs, clock, "cancho_code", "r-1", "t-1", exec_dir, 20000, 100);
+            held = bytes.equal(dispatch.rule_tag(e2), "") && bytes.equal(dispatch.consequence_name(dispatch.consequence(e2)), "verification");
+        }
     }
     buffer.drop(heap, req);
-    return support.verdict(io, held, "forge's path: the evidence of a good run is recomputed and held, and the task goes to verification");
+    return support.verdict(io, held, "forge's path: accepted is polled to its end, the evidence of a good run is recomputed and held, and the task goes to verification");
 }
 
 // A brief of `n` letters, as a JSON string.
@@ -302,8 +416,9 @@ fn run[&h, &x, &w, &f, &c, &i, &s](heap: &!h Heap, exec: &x Exec(""), workers: &
     // ---- what is not a task
     bad = bad + capabilities(heap, exec, workers, clock, io);
     bad = bad + raw(heap, exec, workers, clock, io, "garbage on stdin: no answer, exit 4", "this is not json", 4);
-    bad = bad + raw(heap, exec, workers, clock, io, "a verb that is not execute or capabilities: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-0\"}", 4);
-    bad = bad + raw(heap, exec, workers, clock, io, "a complete task under another verb: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-0\",\"task\":{\"id\":\"t\",\"type\":\"project.build\",\"input\":{\"brief\":\"done\"}}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "a verb the contract has not: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"frobnicate\",\"request_id\":\"r-0\"}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "a status that names no target: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"status\",\"request_id\":\"r-0\",\"grants\":{\"execution_dir\":\"/tmp\"}}", 4);
+    bad = bad + raw(heap, exec, workers, clock, io, "a complete task under another verb: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"frobnicate\",\"request_id\":\"r-0\",\"task\":{\"id\":\"t\",\"type\":\"project.build\",\"input\":{\"brief\":\"done\"}}}", 4);
     bad = bad + raw(heap, exec, workers, clock, io, "another contract version: no answer, exit 4", "{\"contract\":\"forge-worker/2\",\"verb\":\"execute\",\"request_id\":\"r-0\",\"task\":{\"id\":\"t\"}}", 4);
     bad = bad + raw(heap, exec, workers, clock, io, "no request id: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"task\":{\"id\":\"t\"}}", 4);
     bad = bad + raw(heap, exec, workers, clock, io, "no task id: no answer, exit 4", "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r\",\"task\":{}}", 4);

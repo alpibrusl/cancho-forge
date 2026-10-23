@@ -1,11 +1,12 @@
 # The `async` level: an adapter that answers `accepted` and is polled (issue #33)
 
-> **Status: designed; the primitives are measured (spike S14), the code is not written.** Everything marked *measured* was
-> run on compiler `972099e`, Linux x86-64, against the stand-in tool. Nothing here ran the real `cancho-build`. A claim that
-> the building shows false is corrected here, in place, with the commit that corrected it.
+> **Status: built, against the stand-in tool only** (the design was merged first, #38; this is the build, #33). Everything
+> marked *measured* was run on compiler `972099e`, Linux x86-64, against the stand-in tool. Nothing here ran the real
+> `cancho-build`, a real model or macOS. Section 10 says what the building measured and what it corrected; a claim that the
+> building showed false is corrected where it was made.
 
-The Cancho Code adapter ([`cancho-code-adapter.md`](cancho-code-adapter.md)) is `sync` today: one Forge process waits, up to
-a day, on one build. [`worker-contract.md`](worker-contract.md) sections 1.2, 3.3 to 3.6 and 9 describe the `async` flow and
+The Cancho Code adapter ([`cancho-code-adapter.md`](cancho-code-adapter.md)) was `sync` (one Forge process waits, up to
+a day, on one build) and is `async` since this issue. [`worker-contract.md`](worker-contract.md) sections 1.2, 3.3 to 3.6 and 9 describe the `async` flow and
 say it is designed and not built. This document decides what `accepted`, `status`, `result` and `cancel` mean for this worker,
 for the journal and for recovery, and answers the two questions the issue asks: **how a later process stops a build an earlier
 one started**, and **what stops a reused pid from being killed**.
@@ -24,12 +25,14 @@ one started**, and **what stops a reused pid from being killed**.
 
 `execute` does not run the build. It starts a second copy of the adapter, in a mode of its own, **detached** (its own session
 and group, so that a kill of the adapter's or Forge's group does not reach it) and **released** (nobody owes it a wait), hands
-it the request on its standard input, waits until it says it holds the directory, and answers `accepted`. The supervisor is
+it the request on its standard input (after a first line `supervise <token>`, which is how the same program knows it is the
+supervisor without reading its command line: see section 10), waits until it says it holds the directory, and answers
+`accepted`. The supervisor is
 the process that today runs `run_locked`: it takes the lock, starts the build as a group leader, holds the `Child`, and ends
 when the build does. A later `cancel` reaches it **through a file**, not a signal:
 
 ```
-execute   --> checks the task (as today) --> starts SUPERVISOR (detached, released, request on stdin)
+execute   --> checks the task (as before) --> starts SUPERVISOR (detached, released; stdin: `supervise <token>` and the request)
                                           --> waits for run.json with its own token, or for the supervisor to end
                                           --> answers accepted         (or the supervisor's refusal)
 SUPERVISOR --> takes forge-build.lock (a held lock: exit, no write) --> removes the previous run's files
@@ -37,7 +40,7 @@ SUPERVISOR --> takes forge-build.lock (a held lock: exit, no write) --> removes 
            --> every slice: cancel.req names this request?  yes: kills the build's group (child_kill_group)
            --> writes result.json (the final reply of `execute`, atomically) --> lets the lock go --> ends
 status    --> reads run.json and result.json, and tries the lock: held = running, free and no result = lost
-result    --> returns result.json byte for byte; if the supervisor is gone, settles it as lost (below)
+result    --> returns result.json (the call's own request id in it); if the supervisor is gone, settles it as lost (below)
 cancel    --> writes cancel.req, waits for result.json, answers cancelled
 ```
 
@@ -97,7 +100,7 @@ The contract's request for `status`, `result` and `cancel` names a `target` and 
 | `status` | `unknown` | no `run.json`, or its `request_id` is not the `target` |
 | | `finished` | `result.json` exists for the target, or the lock is free (the supervisor is gone) |
 | | `running`, `progress.step` = the build's `stage` | the lock is held; `stage` is read from `build.json` when it is a plain word of at most 32 bytes, else absent (advisory, never a verdict) |
-| `result` | the final reply of `execute` | `result.json` exists for the target: **byte for byte, every time** |
+| `result` | the final reply of `execute` | `result.json` exists for the target: **the same bytes every time, with the request id of the call that asks** (a reply is valid for the request it answers: section 10) |
 | | `{"state":"not_ready"}` | the lock is held, or there is no run for the target |
 | | `failed`, `build-supervisor-lost` | the lock is free and there is no `result.json`: written to `result.json` (under the lock, atomically) and then returned, so it is the same answer next time |
 | `cancel` | `cancelled` | `cancel.req` written for a live run and `result.json` appeared saying `cancelled` |
@@ -150,7 +153,7 @@ for a lost supervisor, `execution-lost` for an `unknown` the worker cannot accou
 * **`forge.await_run`** (new, pure of the journal): given the worker, the request id, the execution directory and a
   deadline, loops `status` every second (a nap on a poller, measured above); on `running`, nap; on `finished`, `result`,
   classified as an `execute` reply and its evidence recomputed; on `unknown`, the ending `Unavailable`-class (the worker lost
-  the run); when Forge's deadline passes, a `cancel`, a `result`, and the ending `Timeout` (`worker-timeout`). A `status` or
+  the run); when Forge's deadline passes, a `cancel` and the ending `Timeout` (`worker-timeout`; as for any worker a deadline leaves the task `ready`, the policy of `forge.flow`, not `blocked`: section 10). A `status` or
   `result` call that does not answer (the process ended unclean, over the cap, past its deadline) ends the wait with that
   ending's tag, as any call does: the run is not assumed to have ended, and `forge await` can resume the wait.
 * **`forge build`** calls it after `execute` answers `accepted`, writes `execution.accepted` first, and from the ending on is
@@ -213,3 +216,103 @@ Each gets its row in `architecture.md` section 7 and a case in the conformance p
    rename and remove rows to be read from the report, not assumed), and of the forge binary.
 6. Every new refusal with its tag and a test that reaches it; a deliberate-break harness in the style of
    `scripts/mutate_cancho_code.py` kills every break.
+
+## 10. Measured, and what the building changed
+
+Compiler `972099e`, Linux x86-64, one run each, against the **stand-in** tool (`scripts/standin_cancho_build.sh`, modes `slow` and
+`holdgrand`, the second with a grandchild `sleep 78` that only a kill of the build's group reaches).
+
+**What was run.**
+
+* **Every ending of the table of `result`, polled.** The cases of `tests/conformance/cancho_code.cho` assert what they
+  asserted when the adapter was `sync` (state, `error.code`, `retryable`, number of evidence entries, time), but the program now
+  drives each through `execute` -> `status` until `finished` -> `result` (`ran_async`), and `forge.worker.execute` +
+  `forge.await_run.finish` for Forge's own path. `scripts/check_cancho_code.sh`: **103 checks, all `ok`** (it was 84).
+* **Cancel of a running build**: answered `cancelled` in under 3 s; the build and its grandchild are gone, so is the
+  supervisor; `status` is `finished` and `result` is `cancelled` with no error and the evidence there is, the same twice; the
+  directory is kept (brief, report, log, lock file) and has no product; a second cancel is `cancelled`; **the same request on the
+  same directory is accepted and ends `done`** (the old `cancel.req` did not stop it: the supervisor removes it at the start).
+* **`status` and `result` of a build whose supervisor was killed with SIGKILL**: the build and its grandchild are still running
+  (the orphan, gap G4); `status` is `finished`, `cancel` is `not_running`, `result` is `failed` / `build-supervisor-lost` /
+  not retryable with the evidence there is, **kept** (a file removed from the directory afterwards does not change it), and a
+  cancel after that is `too_late`. The next request on the directory takes the lock at once and ends `done`.
+* **The races of the lock and the file protocol**: a second adapter on a busy directory is answered `execution-locked` in under
+  three seconds and writes nothing (every file's size, mtime to the nanosecond and checksum is what it was); a cancel request
+  naming another request does not stop the build; `status`, `result` and `cancel` about a directory with no run answer
+  `unknown`, `not_ready`, `not_running` and write not a byte (not even the lock file); a relative directory or no target is not
+  answered (exit 4); a workers directory that is missing, or has no `cancho_code`, is `supervisor-unavailable`, and none at all
+  is `path-invalid`, with nothing written.
+* **Forge, end to end** (`scripts/check_build_run.sh`: **70 checks**, it was 52). `forge build` waits for an accepted build and
+  writes its ending as it always did (the journal has one more record, `execution.accepted`). `forge cancel` is answered while
+  `forge build` holds the workspace lock and writes nothing; the polling `forge build` then ends `cancelled` (`execution.cancelled`,
+  `task.cancelled`, exit 4, no claim) and the directory resumes under a new task. **A Forge killed with SIGKILL in the middle of a
+  build**: the build outlives it; `forge recover <dir>` reports the task awaiting and writes nothing; `forge recover <dir>
+  <workers>` asks the worker, finds the build running, and writes nothing; after the build ended while Forge was down, the same
+  command reads the result and moves the task to `verification` with the claim; recovering again finds nothing. `forge await`
+  waits for a build that was still running when Forge came back and settles it. A budget the build outruns makes Forge cancel it
+  (`worker-timeout`, the group gone, the directory kept). A worker that does not know the run it accepted is `execution-lost`
+  (`blocked`). A cancel with no Forge polling is written by the next `forge await`.
+* **Unit tests** (`cancho test`: **262** in all): `run_files` 6, `verbs` +2 (the replies a worker writes are the ones Forge
+  judges valid), `dispatch` +2, `recover` +6 (an accepted task is awaiting, not lost, however many times the worker was started;
+  an `accepted_of` that reads the request and directory), `build_task` +1.
+* **Authority**: `docs/authority-cancho-code.txt` and `docs/authority.txt` are byte for byte what they were (the gate compares
+  both). `child_kill_group` needed no new label; the rename and the remove are `fs_write("")`.
+* **Deliberate breaks**:
+  * `scripts/mutate_cancho_code.py`: **86 breaks, 85 killed, 1 equivalent**, 31 of them new for this level (the state words of
+    `accepted` and `cancelled`; an accepted answer before the supervisor holds the directory; a start token that is not compared;
+    the supervisor's exit codes misread; a workers directory not checked; a stale cancel request, result or header kept; each
+    answer of `status`, `result` and `cancel` for a run that is live, finished, lost, unknown or cancelled; a result that is not
+    re-bound to the caller's request id or is made again at every call; a cancel not written, for another request, never looked for,
+    looked for every hundred seconds, or killing the pid and not the group; a cancelled build reported as a signal; the unit
+    tests of `run_files` and `verbs`). The one equivalent: removing a stale `run.json` before `open_write` truncates it (a write
+    that fails after the removal cannot be arranged as root). One break the first run did not kill (a stale `result.json` kept)
+    needed a better test: the new run was too quick to be told from the old result, so the check now holds the build and asks
+    `status` and `result` of it before it ends.
+  * `scripts/mutate_build_run.py`: **51 breaks, all killed**, 25 of them new (the accepted run not polled or not written down,
+    the request or the directory of the record, `execution.cancelled` missing in `forge build` and in `forge await`, the refusal
+    tag or the claim missing in `forge await`, a deadline ignored, not cancelled or reported as a loss, a status that is not
+    `unknown`-is-lost, the result asked under the wrong id, `recover` taking an accepted run for a lost one or not asking, the exit
+    status of a running run and of a cancel, a budget under a second). Two were not killed at first: a `forge await` budget under a
+    second (the check now tries 999 ms) and one that was INVALID (replaced).
+  * `dispatch` 41 of 41 (five new: the lost run's tag and consequence, and the three states `accepted` is not), `verbs` 72 of 72
+    (the request in a directory), `recover` 40 of 40, `contract` 15 of 15, `gate_run` 58 (57 killed, 1 equivalent as before),
+    `stub_llm` 33 of 36 with 3 equivalent as before. **Thirteen breaks of the older harnesses were INVALID** (the three of `mutate_contract.py` already were
+    on `main`, since `recheck` was extracted; ten became so with this change, by a field added to `Counts`, a command added to
+    `main.cho` that repeats a line, or a second request builder in `verbs.cho`); their texts are repaired and they are killed.
+
+**What the building corrected in the design (each is fixed above in place):**
+
+1. **The supervisor is told it is one on standard input, not in its arguments.** The first build read `supervise <token>` from
+   the command line and the adapter's report gained `args` (it had listed "the command line" under *never touches*). A review
+   artefact that widens for a convenience is the wrong trade: the first line of the input is now `supervise <token>`, and the
+   report is unchanged.
+2. **A `result` must carry the request id of the call that asks.** The design said `result.json` is returned "byte for byte";
+   Forge's validator (rightly) refuses a reply whose `request_id` is not the call's, and the stored reply carries the `execute`'s.
+   `forge.run_files.rebind` replaces the id in the stored bytes (the file is in a fixed layout the adapter wrote, and an id that is
+   not plain text is refused), so the answer is the same bytes with the id of the caller.
+3. **Forge's own deadline leaves the task `ready`, not `blocked`.** The design said the ending is `worker-timeout`, which is true;
+   the consequence of that ending in `forge.flow` (`retry-or-fail`) is `ready` for every worker, a deadline having no verdict, and
+   `forge.retry` refuses the retry of a task that writes only for `worker-retryable` endings. The build check says so.
+4. **The request id Forge gives the worker is `r-<task>`** (`r-build-1`), not `<task>-a<n>` as the examples of section 5 had it;
+   `execution.accepted` records whatever it was.
+5. **The ending of a lost run is `Ending::Lost`** (a new variant of `forge.dispatch`: tag `execution-lost`, consequence
+   `blocked`), not an `Unavailable`; and `status` creates no file for a run it does not know (the lock file is only opened for a
+   run that has a `run.json`).
+6. **`forge build` takes at least as long as one poll** when the first `status` finds the build running: it asks, naps a second,
+   and asks again. Not tuned.
+
+**Not measured, and not claimed:**
+
+* **The real `cancho-build`**, a real model and a key. In particular whether the tool, killed with `KILL` at its group's
+  level, leaves `plan.json` and `state.txt` in a state from which it resumes (the audit's claim, audit 4; the stand-in resumes
+  because it is a shell script). `progress.step` is the stand-in's `stage` word; the real tool's stages are the audit's.
+* **macOS** (`EWOULDBLOCK` is 35 there; `child_kill_group` and the poller are measured on Linux only), a network filesystem.
+* **An orphan build** after a SIGKILL of the supervisor: gap G4. The check shows it alive and shows that `result` names the loss;
+  nothing stops it, and a new request on the directory would be accepted beside it.
+* **The three tries of the supervisor's lock** against a `status` probe that holds the lock at that instant (the break that
+  makes it one try is equivalent: no test can arrange the instant). **A supervisor silent for ten seconds** (its kill and
+  `supervisor-unavailable`) and **a supervisor that does not write its result in ten seconds after a cancel** (the adapter's only
+  unanswered call, exit 4, `worker-error`): the code is there, no test reaches either.
+* **Latency and cost of polling** (one process start per `status`), many builds at once, a journal with many awaiting tasks.
+* **`forge recover <dir> <workers>` for a task whose directory was moved or deleted**: `status` answers `unknown` and the task is
+  `execution-lost` (the `lo` case removes `run.json`); a workers directory that cannot be opened is exit 3.

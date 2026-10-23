@@ -57,6 +57,11 @@ M = [
     ("signal-value", "return Ending::Crashed(s);", "return Ending::Crashed(0);", "the signal number is lost"),
     ("errno-value", "return Ending::Unavailable(e);", "return Ending::Unavailable(0);", "the errno is lost"),
     ("exit-value", "return Ending::Error(n);", "return Ending::Error(1);", "the exit status is lost"),
+    ("lost-consequence", "        Ending::Lost => {\n            return Consequence::Blocked;", "        Ending::Lost => {\n            return Consequence::RetryOrFail;", "a run the worker lost is sent back to ready"),
+    ("lost-tag", "        Ending::Lost => {\n            return \"execution-lost\";", "        Ending::Lost => {\n            return \"worker-error\";", "a lost run is tagged as a worker error"),
+    ("accepted-is-not-accepted", "                        response.State::Accepted => {\n                            return true;", "                        response.State::Accepted => {\n                            return false;", "an accepted reply is not polled"),
+    ("succeeded-is-accepted", "                        response.State::Succeeded => {\n                            return false;", "                        response.State::Succeeded => {\n                            return true;", "a finished reply is polled"),
+    ("cancelled-is-accepted", "                        response.State::Cancelled => {\n                            return false;", "                        response.State::Cancelled => {\n                            return true;", "a cancelled reply is polled"),
 ]
 
 

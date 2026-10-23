@@ -1,0 +1,158 @@
+edition 9;
+module forge.run_files;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+
+// The files of a run in an execution directory (docs/async-level.md sections 2 to 4): what the Cancho Code adapter's
+// supervisor writes so that a later call, a new process, can find the run. Pure: the process and file half is the adapter's.
+//
+//   run.json      {"request_id":..,"task_id":..,"token":N}   written by the supervisor once it holds the lock; `token` is the
+//                 clock in milliseconds at `execute`, chosen by `execute` and passed on, so that a file left by an earlier
+//                 run is never taken for this start
+//   result.json   the final reply of `execute`, as `answer` wrote it, with the request id of the `execute`; a `result` call
+//                 answers it with its own request id (`rebind`), because a reply is valid for the request it answers
+//   cancel.req    the request id a cancel is meant for, nothing else (`forge.supervise.asks_for_cancel`)
+//
+// None of these is evidence; none is hashed or offered.
+
+pub fn run_name() -> [] &static [byte] {
+    return "run.json";
+}
+
+pub fn result_name() -> [] &static [byte] {
+    return "result.json";
+}
+
+pub fn cancel_name() -> [] &static [byte] {
+    return "cancel.req";
+}
+
+// The temporary name `result.json` is written under before it is renamed into place.
+pub fn result_tmp_name() -> [] &static [byte] {
+    return "result.json.tmp";
+}
+
+// The longest `run.json`, `result.json` and `cancel.req` read: a result is the reply of `execute` (the evidence of four files)
+// and fits a few KiB; this is the bound on what is read from a file the build could have written.
+pub fn max_file_bytes() -> [] int {
+    return 1048576;
+}
+
+pub fn run_record[&h, &r, &k](heap: &!h Heap, request_id: &r [byte], task_id: &k [byte], token: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "task_id");
+    w = json.put_string(heap, w, task_id);
+    w = json.put_key(heap, w, "token");
+    w = json.put_int(heap, w, token);
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}
+
+// Does `data` (a `run.json`) name `request_id`, and, when `token` is not negative, that start token? Anything that is not the
+// record of `run_record` is no.
+pub fn run_is[&h, &d, &r](heap: &!h Heap, data: &d [byte], request_id: &r [byte], token: int) -> [heap] bool {
+    var held = false;
+    let tape = box_slice(heap, json.tape_len(data), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(data, tp) > 0 && json.is_object(tp, 0) {
+            let rid = json.get(data, tp, 0, "request_id");
+            let tk = json.get(data, tp, 0, "token");
+            held = rid >= 0 && json.is_string(tp, rid) && json.string_equals(data, tp, rid, request_id) && tk >= 0 && json.is_int(tp, tk) && json.fits_int(data, tp, tk);
+            if held && token >= 0 {
+                held = json.to_int(data, tp, tk) == token;
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return held;
+}
+
+// The state word of a stored result: 1 `succeeded`, 2 `partial`, 3 `failed`, 4 `cancelled`, 0 for anything else (not a
+// result of this adapter: the file is untrusted, a build can write into its own directory).
+pub fn result_state[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] int {
+    var state = 0;
+    let tape = box_slice(heap, json.tape_len(data), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(data, tp) > 0 && json.is_object(tp, 0) {
+            let c = json.get(data, tp, 0, "contract");
+            let s = json.get(data, tp, 0, "state");
+            if c >= 0 && json.is_string(tp, c) && json.string_equals(data, tp, c, "forge-worker/1") && s >= 0 && json.is_string(tp, s) {
+                if json.string_equals(data, tp, s, "succeeded") {
+                    state = 1;
+                } else if json.string_equals(data, tp, s, "partial") {
+                    state = 2;
+                } else if json.string_equals(data, tp, s, "failed") {
+                    state = 3;
+                } else if json.string_equals(data, tp, s, "cancelled") {
+                    state = 4;
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return state;
+}
+
+fn prefix() -> [] &static [byte] {
+    return "{\"contract\":\"forge-worker/1\",\"request_id\":\"";
+}
+
+// The id a stored result answers: the text between the quotes after `"request_id":` in the layout `adapter.answer` writes,
+// or nothing (an empty slice) when the file does not begin so or the id is not plain text of 1 to 128 bytes.
+pub fn stored_id[&d](data: &d [byte]) -> [] &d [byte] {
+    let p = prefix();
+    if len(data) <= len(p) || !bytes.starts_with(data, p) {
+        return data[0..0];
+    }
+    var i = len(p);
+    while i < len(data) && i <= len(p) + 128 {
+        let c = int_of(data[i]);
+        if c == 34 {
+            if i == len(p) {
+                return data[0..0];
+            }
+            return data[len(p)..i];
+        }
+        if c == 92 || c < 32 {
+            return data[0..0];
+        }
+        i = i + 1;
+    }
+    return data[0..0];
+}
+
+// The stored result as the answer to the call whose request id is `new_id` (plain text, 1 to 128 bytes, checked by the
+// caller): the same bytes with the id replaced. Empty when `stored` is not in the layout.
+pub fn rebind[&h, &d, &n](heap: &!h Heap, stored: &d [byte], new_id: &n [byte]) -> [heap] buffer.Buffer {
+    let id = stored_id(stored);
+    if len(id) == 0 {
+        return buffer.empty(heap, 1);
+    }
+    var out = buffer.append(heap, buffer.empty(heap, len(stored) + 64), prefix());
+    out = buffer.append(heap, out, new_id);
+    return buffer.append(heap, out, stored[len(prefix()) + len(id)..len(stored)]);
+}
+
+// The task id a `run.json` records, or an empty buffer when the file is not a run record.
+pub fn run_task_id[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 16);
+    let tape = box_slice(heap, json.tape_len(data), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(data, tp) > 0 && json.is_object(tp, 0) {
+            let k = json.get(data, tp, 0, "task_id");
+            if k >= 0 && json.is_string(tp, k) && json.string_plain(tp, k) {
+                out = buffer.append(heap, out, json.string_view(data, tp, k));
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
