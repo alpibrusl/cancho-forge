@@ -13,7 +13,7 @@ say() { printf '\n=== %s\n' "$*"; }
 
 say "gate: fmt, check"
 $C fmt --check .. && echo "fmt: ok"
-for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under s10_symlink s11_runner s11_forge s12_detached_under s13_lock_inherit mock_worker; do
+for f in s1_capture s2_timeout_kill s3_narrow s4_json_event s5_journal s6_dispatch s7_grandchild s8_covers s9_under s10_symlink s11_runner s11_forge s12_detached_under s13_lock_inherit s14_supervise mock_worker; do
   $C check $f.cho --std && echo "check $f: ok"
 done
 
@@ -123,3 +123,6 @@ s13=$(mktemp -d /tmp/forge-s13.XXXXXX) || exit 1
 sh s13_two_builds.sh "$D/cancho_code" "$s13" "$D/forge"
 rm -rf "$s13"
 CANCHO="$C" sh s13_lock_inherit.sh
+
+say "S14 a supervisor that stays: start, probe, cancel, SIGKILL, and a nap (issue #33)"
+CANCHO="$C" sh s14_supervise.sh

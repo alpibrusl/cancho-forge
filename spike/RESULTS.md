@@ -610,6 +610,54 @@ replaces the lock file in its own directory (argued in `docs/cancho-code-adapter
 
 ---
 
+## S14 -- a supervisor that stays: what an `async` adapter stands on (issue #33)
+
+`docs/async-level.md` decides that the process that starts a build stays as a supervisor, because cancho has no kill-by-pid
+and a worker is stateless per call. `spike/s14_supervise.cho` is that supervisor in its smallest form (the lock, `run`, a
+build that is a group leader, a loop in slices of 100 ms that looks for a `cancel` file, `result`) with the starter, a probe
+and a nap; `spike/s14_supervise.sh` drives it and looks at the process table from outside. Compiler `972099e`, Linux x86-64,
+LLVM, one run each (the cancel took 29, 45, 88, 40 and 60 ms in five runs; the start answered in 26 or 27 ms in all five).
+Verbatim, the last run:
+
+```
+accepted
+1. start answered after 26 ms
+   the starter has exited; supervisors alive: 1; builds alive: 1; run file: started
+live, errno 11
+   (probe from a new process)
+refused, supervisor exit 3
+2. a second start on the same directory: answered after 6 ms; supervisors alive: 1; builds alive: 1
+3. cancel: result 'cancelled' after 60 ms; builds alive: 0 (the sleep 76 grandchild was in the group)
+   supervisors alive: 0
+free
+4. the supervisor killed with SIGKILL: supervisors alive: 0; builds alive (orphan): 1
+free
+   (the lock went with the supervisor; the orphan is not stopped by anything)
+5. a build that ends by itself: result 'exited'; supervisors alive: 0
+nap returned 0
+6. a nap of 250 ms on an empty poller took 255 ms (process start included)
+```
+
+**What failed on the way, and what it taught** (kept because the measurements above would have been wrong):
+
+* The first driver counted processes with `pgrep -f` patterns and a bare `pgrep -x`; it reported 2 builds where there was 1
+  (the pattern matched the driver's own command line, and `pkill` then killed the shell that ran the driver: exit 144).
+  The patterns are anchored now (`^sleep 76$`), as the gate's other checks do.
+* `pgrep -x s14` counted a **zombie**: a released child is reaped by a runtime thread later than the parent exits, so for a
+  moment the supervisor "was alive" after it had ended, and the step that killed "the supervisor" killed the zombie of the
+  previous one (a probe then still found the lock held). The driver uses `scripts/procs.sh`'s `leftover`, which skips
+  zombies; this is the reason that function exists.
+* The first draft passed `&child` to a function; the compiler refuses (`expected an expression, found &`): a borrow is a
+  `borrow child as &c in { ... }` block, and `poller_add_child` takes the borrowed `Child` directly.
+
+**What it says.** The supervisor outlives its starter; a new process can tell it is alive (the lock) and can stop the build
+(a file the supervisor looks for), with the build's whole group gone; a second start is refused by the supervisor's exit code
+with no write; a SIGKILL of the supervisor frees the lock and **leaves the build as an orphan**; Forge can nap on an empty
+poller. **Not measured:** the real tool, macOS, a loaded machine, a supervisor that is slow to start (the starter waits up to
+10 s in the design; the spike's wait was 10 s of 20 ms slices and was not stressed).
+
+---
+
 ## M1 findings -- what building the core measured
 
 Not spikes: these were found writing `src/task.cho`, `src/journal.cho`,
