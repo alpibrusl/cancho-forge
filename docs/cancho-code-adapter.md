@@ -19,6 +19,9 @@ worker to use it.
 
 ## 1. Scope: why `sync`
 
+> **The `async` level is designed in [`async-level.md`](async-level.md) (issue #33).** What follows is the reason for the first
+> slice; the decision that replaces it, and its measurements (spike S14), are there.
+
 Section 9 says the Cancho Code adapter is `async`: `execute` answers `accepted`, `status` and `result` are polled, `cancel` kills
 the group. The `async` flow is **designed and not built end to end** (worker-contract 3.6: the mock only answers the verdicts;
 Forge does not act on `status`). An adapter that answers `accepted` would have nothing on the other side to poll it. So the

@@ -1,0 +1,347 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.process;
+
+// Spike 14 (issue #33): the primitives an `async` Cancho Code adapter would stand on, measured from outside by
+// s14_supervise.sh. A call of a worker is a process that ends; the build must outlive it, and a LATER call (a new process)
+// must find it, ask whether it lives, and stop it. cancho has no kill-by-pid (docs/processes.md 4.11), so the process that
+// started the build stays: a SUPERVISOR that holds the `Child`, the lock, and a loop that looks for a request to cancel.
+//
+//   supervise <dir> <tools>    takes `<dir>/lock` (exit 3 when another holds it), writes `<dir>/run`, starts `sleeper`
+//                              found beneath <tools> as a group leader, and loops in slices of 100 ms: the build ended ->
+//                              writes `<dir>/result` and exits; `<dir>/cancel` exists -> kills the build's group, writes
+//                              `result`.
+//   start <dir> <tools> <self> starts `s14` (this program) beneath <self> as `supervise`, detached, and answers `accepted`
+//                              when `<dir>/run` is there, `refused <code>` when the supervisor ended first; then exits.
+//   probe <dir>                is the lock held? (`live` / `free`); takes and lets go of it.
+//   cancel <dir>               writes `<dir>/cancel`.
+//   nap                        waits 250 ms on a poller with nothing registered (Forge has no sleep).
+
+fn say[&i, &t](io: &!i Io, text: &t [byte], n: int) -> [io_write] int {
+    io.write_all(io, text);
+    io.print_int(io, n);
+    io.newline(io);
+    return 0;
+}
+
+fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of(47));
+    return buffer.append(heap, b, name);
+}
+
+fn exists[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] bool {
+    match open_read(fs, path) {
+        Opened::Ok(file) => {
+            file_close(file);
+            return true;
+        }
+        Opened::Failed(e) => {
+            return false;
+        }
+    }
+}
+
+fn put[&f, &p, &t](fs: &f Fs(""), path: &p [byte], text: &t [byte]) -> [fs_write(""), file_write] int {
+    match open_write(fs, path) {
+        Opened::Ok(opened) => {
+            var file = opened;
+            borrow mut file as &!x in {
+                file_write(x, text);
+            }
+            file_close(file);
+            return 0;
+        }
+        Opened::Failed(e) => {
+            return e;
+        }
+    }
+}
+
+fn exists_in[&h, &f, &d, &n](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte]) -> [heap, fs_read("")] bool {
+    let p = under(heap, dir, name);
+    var found = false;
+    borrow p as &pb in {
+        found = exists(fs, buffer.bytes(pb));
+    }
+    buffer.drop(heap, p);
+    return found;
+}
+
+fn put_in[&h, &f, &d, &n, &t](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte], text: &t [byte]) -> [heap, fs_write(""), file_write] int {
+    let p = under(heap, dir, name);
+    var rc = 0;
+    borrow p as &pb in {
+        rc = put(fs, buffer.bytes(pb), text);
+    }
+    buffer.drop(heap, p);
+    return rc;
+}
+
+enum Taken {
+    Held(File),
+    No(int),
+}
+
+fn take[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_write(""), file_write] Taken {
+    match open_append(fs, path) {
+        Opened::Failed(e) => {
+            return Taken::No(e);
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var errno = 0;
+            borrow mut file as &!x in {
+                match file_lock(x) {
+                    Done::Ok(n) => {
+                        errno = 0;
+                    }
+                    Done::Failed(e) => {
+                        errno = e;
+                    }
+                }
+            }
+            if errno != 0 {
+                file_close(file);
+                return Taken::No(errno);
+            }
+            return Taken::Held(file);
+        }
+    }
+}
+
+// Wait for `child` in slices of `slice_ms`; after each slice that found it still running, `watch` says whether to go on.
+// 0: it ended by itself; 1: stopped because `<dir>/cancel` exists (its group was killed); 2: `limit` slices passed.
+fn wait_slices[&h, &f, &k, &d](heap: &!h Heap, fs: &f Fs(""), child: &k Child, dir: &d [byte], watch_name: &static [byte], slice_ms: int, limit: int) -> [heap, fs_read(""), poll] int {
+    var state = 2;
+    match poller_new() {
+        Polling::Failed(e) => {
+            state = 2;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            var events = box_slice(heap, 16, 0);
+            borrow mut poller as &!ph in {
+                poller_add_child(ph, child, 3);
+                var i = 0;
+                var running = true;
+                while running && i < limit {
+                    var n = 0;
+                    borrow mut events as &!eb in {
+                        n = poller_wait(ph, contents(eb), slice_ms);
+                    }
+                    if n > 0 {
+                        state = 0;
+                        running = false;
+                    } else if len(watch_name) > 0 && exists_in(heap, fs, dir, watch_name) {
+                        state = 1;
+                        running = false;
+                    }
+                    i = i + 1;
+                }
+            }
+            unbox_slice(heap, events);
+            poller_close(poller);
+        }
+    }
+    return state;
+}
+
+fn supervise[&h, &f, &x, &d, &t](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), dir: &d [byte], tools: &t [byte]) -> [heap, fs_read(""), fs_write(""), file_write, exec_under, exec_detached, poll, child_signal] int {
+    let lp = under(heap, dir, "lock");
+    var code = 0;
+    borrow lp as &lb in {
+        match take(fs, buffer.bytes(lb)) {
+            Taken::No(e) => {
+                code = 5;
+                if e == 11 {
+                    code = 3;
+                }
+            }
+            Taken::Held(lock) => {
+                put_in(heap, fs, dir, "run", "started\n");
+                match open_dir(fs, tools) {
+                    DirOpened::Failed(e) => {
+                        code = 6;
+                    }
+                    DirOpened::Ok(td) => {
+                        var tools_dir = td;
+                        borrow tools_dir as &tq in {
+                            match exec_spawn_detached_under(exec, tq, "sleeper", "", "", Stdio::Null, Stdio::Null, Stdio::Null) {
+                                Spawned::Failed(e) => {
+                                    code = 7;
+                                }
+                                Spawned::Ok(child) => {
+                                    var how = 2;
+                                    borrow child as &cw in {
+                                        how = wait_slices(heap, fs, cw, dir, "cancel", 100, 100000);
+                                    }
+                                    if how == 1 {
+                                        borrow child as &ch in {
+                                            child_kill_group(ch, 256);
+                                            child_kill(ch, 256);
+                                        }
+                                    }
+                                    var ended = "exited";
+                                    if how == 1 {
+                                        ended = "cancelled";
+                                    }
+                                    match child_wait(child) {
+                                        Exited::Code(n) => {
+                                            code = 0;
+                                        }
+                                        Exited::Signaled(s) => {
+                                            code = 0;
+                                        }
+                                        Exited::Failed(e) => {
+                                            code = 8;
+                                        }
+                                    }
+                                    put_in(heap, fs, dir, "result", ended);
+                                }
+                            }
+                        }
+                        dir_close(tools_dir);
+                    }
+                }
+                file_close(lock);
+            }
+        }
+    }
+    buffer.drop(heap, lp);
+    return code;
+}
+
+// `start`: the caller of the adapter. Starts the supervisor (this program, beneath `selfdir`) and answers when it is
+// known to have the lock (`run` exists) or to have refused (it ended first).
+fn start[&h, &f, &x, &d, &t, &s, &i](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), io: &!i Io, dir: &d [byte], tools: &t [byte], selfdir: &s [byte]) -> [heap, fs_read(""), exec_under, exec_detached, poll, io_write] int {
+    var args = buffer.append(heap, buffer.empty(heap, 64), "supervise");
+    args = buffer.push(heap, args, byte_of(0));
+    args = buffer.append(heap, args, dir);
+    args = buffer.push(heap, args, byte_of(0));
+    args = buffer.append(heap, args, tools);
+    args = buffer.push(heap, args, byte_of(0));
+    match open_dir(fs, selfdir) {
+        DirOpened::Failed(e) => {
+            say(io, "cannot open the directory of this program, errno ", e);
+        }
+        DirOpened::Ok(sd) => {
+            var self_dir = sd;
+            borrow self_dir as &sq in {
+                borrow args as &ab in {
+                    match exec_spawn_detached_under(exec, sq, "s14", buffer.bytes(ab), "", Stdio::Null, Stdio::Null, Stdio::Null) {
+                        Spawned::Failed(e) => {
+                            say(io, "spawn failed errno ", e);
+                        }
+                        Spawned::Ok(child) => {
+                            var how = 2;
+                            borrow child as &cw in {
+                                how = wait_slices(heap, fs, cw, dir, "run", 20, 500);
+                            }
+                            if how == 0 {
+                                match child_wait(child) {
+                                    Exited::Code(n) => {
+                                        say(io, "refused, supervisor exit ", n);
+                                    }
+                                    Exited::Signaled(sg) => {
+                                        say(io, "supervisor signaled ", sg);
+                                    }
+                                    Exited::Failed(e) => {
+                                        say(io, "wait failed ", e);
+                                    }
+                                }
+                            } else {
+                                child_release(child);
+                                io.write_all(io, "accepted\n");
+                            }
+                        }
+                    }
+                }
+            }
+            dir_close(self_dir);
+        }
+    }
+    buffer.drop(heap, args);
+    return 0;
+}
+
+fn probe[&h, &f, &d, &i](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte]) -> [heap, fs_write(""), file_write, io_write] int {
+    let lp = under(heap, dir, "lock");
+    borrow lp as &lb in {
+        match take(fs, buffer.bytes(lb)) {
+            Taken::No(e) => {
+                say(io, "live, errno ", e);
+            }
+            Taken::Held(file) => {
+                file_close(file);
+                io.write_all(io, "free\n");
+            }
+        }
+    }
+    buffer.drop(heap, lp);
+    return 0;
+}
+
+// `nap`: wait `ms` milliseconds on a poller with nothing registered (Forge has no sleep; its poll interval needs one).
+fn nap[&h](heap: &!h Heap, ms: int) -> [heap, poll] int {
+    var slept = 0 - 1;
+    match poller_new() {
+        Polling::Failed(e) => {
+            slept = 0 - e;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            var events = box_slice(heap, 4, 0);
+            borrow mut poller as &!ph in {
+                borrow mut events as &!eb in {
+                    slept = poller_wait(ph, contents(eb), ms);
+                }
+            }
+            unbox_slice(heap, events);
+            poller_close(poller);
+        }
+    }
+    return slept;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    release(clock);
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow fs as &f in {
+        borrow exec as &x in {
+            borrow mut console as &!i in {
+                borrow mut memory as &!h in {
+                    borrow args as &g in {
+                        let mode = int_of(arg(g, 1)[0]);
+                        if mode == 's' && int_of(arg(g, 1)[1]) == 'u' {
+                            code = supervise(h, f, x, arg(g, 2), arg(g, 3));
+                        } else if mode == 's' {
+                            code = start(h, f, x, i, arg(g, 2), arg(g, 3), arg(g, 4));
+                        } else if mode == 'n' {
+                            say(i, "nap returned ", nap(h, 250));
+                        } else if mode == 'p' {
+                            code = probe(h, f, i, arg(g, 2));
+                        } else {
+                            put_in(h, f, arg(g, 2), "cancel", "now\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(console);
+    release(memory);
+    release(args);
+    return code;
+}
