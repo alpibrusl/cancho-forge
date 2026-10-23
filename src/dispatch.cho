@@ -29,6 +29,9 @@ pub enum Ending {
     // Exit 0: the verdict on what it wrote (rows 6 and 7, and the states of section 3.2), for a reply that is not a
     // `failed` or `partial` one.
     Reply(response.Verdict),
+    // An `async` worker took the job (`accepted`) and later does not know the run: the worker lost it (docs/async-level.md
+    // section 6). Reached by the poll (`forge.await_run`), never by `classify`.
+    Lost,
     // Exit 0 and a valid reply whose state is `failed` or `partial`: the state, and whether `error.retryable` says that
     // retrying can help (row 7).
     Said(response.State, bool),
@@ -125,6 +128,9 @@ pub fn rule_tag(e: Ending) -> [] &static [byte] {
         Ending::Setup(errno) => {
             return "path-invalid";
         }
+        Ending::Lost => {
+            return "execution-lost";
+        }
         Ending::Said(state, retry) => {
             return "";
         }
@@ -137,6 +143,62 @@ pub fn rule_tag(e: Ending) -> [] &static [byte] {
                     return "";
                 }
             }
+        }
+    }
+}
+
+// Did an `async` worker take the job: a valid `accepted` reply to `execute`? Then the run goes on elsewhere and is polled.
+pub fn accepted(e: Ending) -> [] bool {
+    match e {
+        Ending::Reply(verdict) => {
+            match verdict {
+                response.Verdict::Valid(state) => {
+                    match state {
+                        response.State::Accepted => {
+                            return true;
+                        }
+                        response.State::Succeeded => {
+                            return false;
+                        }
+                        response.State::Failed => {
+                            return false;
+                        }
+                        response.State::Partial => {
+                            return false;
+                        }
+                        response.State::Cancelled => {
+                            return false;
+                        }
+                    }
+                }
+                response.Verdict::Refused(rule, reason) => {
+                    return false;
+                }
+            }
+        }
+        Ending::Unavailable(errno) => {
+            return false;
+        }
+        Ending::Timeout => {
+            return false;
+        }
+        Ending::Overflow => {
+            return false;
+        }
+        Ending::Crashed(signal) => {
+            return false;
+        }
+        Ending::Error(code) => {
+            return false;
+        }
+        Ending::Setup(errno) => {
+            return false;
+        }
+        Ending::Lost => {
+            return false;
+        }
+        Ending::Said(state, retry) => {
+            return false;
         }
     }
 }
@@ -160,6 +222,10 @@ pub fn consequence(e: Ending) -> [] Consequence {
             return Consequence::RetryOrFail;
         }
         Ending::Setup(errno) => {
+            return Consequence::Blocked;
+        }
+        // The run is gone and nothing says how far it got: an operator decides (a build writes; nothing re-dispatches it).
+        Ending::Lost => {
             return Consequence::Blocked;
         }
         Ending::Said(state, retry) => {

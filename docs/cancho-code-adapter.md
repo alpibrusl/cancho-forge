@@ -1,6 +1,6 @@
 # The Cancho Code adapter: task type `project.build`
 
-> **Status: built, as a `sync` slice (issue #16).** `workers/cancho_code.cho` (the process half) and `src/build_task.cho`
+> **Status: built (issue #16), `sync` at first and `async` since issue #33 ([`async-level.md`](async-level.md)).** `workers/cancho_code.cho` (the process half) and `src/build_task.cho`
 > (the pure half) are checked in with a conformance program, a stand-in build tool, outside oracles and a deliberate-break
 > harness. It has **never started the real `cancho-build`**: no model, no key and no real Cancho Code binary were used. What
 > was measured is the adapter against a stand-in that ends the way [`cancho-code-audit.md`](cancho-code-audit.md) says the
@@ -19,8 +19,9 @@ worker to use it.
 
 ## 1. Scope: why `sync`
 
-> **The `async` level is designed in [`async-level.md`](async-level.md) (issue #33).** What follows is the reason for the first
-> slice; the decision that replaces it, and its measurements (spike S14), are there.
+> **The `async` level is built ([`async-level.md`](async-level.md), issue #33).** What follows is the reason for the first
+> slice, kept because the deadline and the resume it describes are unchanged; the decision that replaces the waiting, and its
+> measurements (spike S14, the conformance), are in that document.
 
 Section 9 says the Cancho Code adapter is `async`: `execute` answers `accepted`, `status` and `result` are polled, `cancel` kills
 the group. The `async` flow is **designed and not built end to end** (worker-contract 3.6: the mock only answers the verdicts;
@@ -98,6 +99,8 @@ is a function of the verdict), and the verdict is **never** taken from standard 
 | not finished inside the adapter's deadline (its group is killed) | `failed` | `build-timeout` | no (the same request resumes it) | what exists |
 | more than 1 MiB of standard output (its group is killed) | `failed` | `build-output-overflow` | no | what exists |
 | the tool could not be started | `failed` | `build-unavailable` | no | none |
+| asked to stop by `cancel` (its group is killed) | `cancelled` | none | | what exists |
+| the supervisor is gone and left no result (`result`, issue #33) | `failed` | `build-supervisor-lost` | no | what exists |
 
 `stuck`, `gate_failed` and `plan_failed` are **outcomes**, not worker errors; they are never retried blindly. Only a provider
 error is `retryable: true`.
@@ -105,7 +108,7 @@ error is `retryable: true`.
 Refused before anything runs (`failed`, no evidence): `task-type-invalid`, `input-invalid`, `path-invalid`, `limits-invalid`,
 `operator-invalid`; `tool-unusable` (the tools directory cannot be opened); `workdir-unwritable` (the brief or the
 output cannot be written, the directory cannot be opened to list the evidence, or its lock file cannot be opened); and
-`execution-locked` (another adapter holds the directory: section 11, not retryable, nothing written). A request that is not an `execute` or a
+`execution-locked` (another adapter holds the directory: section 11, not retryable, nothing written); and, since issue #33, `supervisor-unavailable` (the supervisor of the build cannot be started or does not take the directory) and `path-invalid` for a `workers_dir` that is not a path. With the `async` level every ending of this table is the answer to `result`; `execute` answers `accepted` once the build is running, or one of the refusals of this paragraph. A request that is not an `execute` or a
 `capabilities` of this contract, or names no request id or no task id, is **not answered** (exit 4, which Forge classifies
 `worker-error`). Every code has a row in [`architecture.md`](architecture.md) section 7 and a case in the conformance program.
 
@@ -119,6 +122,12 @@ a poll for the capture, the heap, stdio; no network, no signals, no foreign code
 and `dir_read`/`file_read` are new, because the adapter reads `build.json` and hashes the evidence. What the build does once
 started is the build's authority, not the adapter's: **`cancho-build` itself holds `exec("")`** (audit 6, architecture G2), and
 the `Exec` bound Forge puts on starting the adapter does not bound it.
+
+The `async` level (issue #33) **did not widen it either**: the supervisor is the adapter itself started by name beneath a `Dir`
+(`exec_under` and `exec_detached`, already in the report), the files it keeps are written under `fs_write("")`, and the
+rename and the remove of `result.json` are covered by the same label. The one thing that could have added `args` (the
+supervisor needs its start token) is passed on standard input as a first line instead (`supervise <token>`), so that the
+adapter still reads no command line. `docs/authority-cancho-code.txt` is byte for byte what it was; the gate compares it.
 
 The lock of section 11 (issue #35) **did not widen this report**: it is `file_lock` on a file the adapter opens with `open_append`, under
 the `fs_write("")` and `file_write` it already held for `brief.txt`. The gate compares the report with the checked-in file
@@ -170,8 +179,8 @@ The harness itself had a defect found at the same time: it called a break INVALI
 
 ## 8. Not done
 
-* **The `async` level** (an adapter that answers `accepted` and is polled) and with it `status`, `result` and `cancel` for this
-  worker. Section 1 says why the `sync` slice is what can be tested today.
+* ~~**The `async` level** (an adapter that answers `accepted` and is polled) and with it `status`, `result` and `cancel` for this
+  worker.~~ Built (issue #33): [`async-level.md`](async-level.md).
 * **A real `cancho-build`.** Nothing here ran the real tool, a model or a key; the stand-in ends the way the audit measured the
   real one ends. Latency, token use, cost and the share of runs that end `done` are still unmeasured (worker-contract 9.5).
 * **Forge's side** is built since issue #34 (section 10): `forge build` builds the `project.build` request from the operator's
@@ -329,7 +338,7 @@ list makes that unreachable (no input may reach a trap, even an unreachable one)
 * **A refusal tag from `forge.dispatch`** (a reply that is not valid for the contract) is journalled by the same code as the
   gate's, but the stand-in adapter never produces one: this check does not reach that line. The gate's checks cover the same
   shape.
-* **The `async` level** (#33). (The lock for two builds in one directory, #35, is built: section 11.)
+* ~~**The `async` level** (#33).~~ Built: [`async-level.md`](async-level.md). (The lock for two builds in one directory, #35, is built: section 11.)
 * **The tag of a refused second build is not in `forge build`'s output.** The second `forge build` on a busy directory ends
   `blocked` with `ending: worker-said`, exit 4, and journals no `execution.finished`; the code `execution-locked` is in the
   adapter's reply, which Forge does not keep (the item above about a failed build's code). The first build is undisturbed.

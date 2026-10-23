@@ -147,3 +147,27 @@ pub fn retry[&h, &t](heap: &!h Heap, seq: int, task: &t [byte], attempt: int) ->
     w = json.end_object(heap, w);
     return buffer.push(heap, json.finish(w), byte_of(10));
 }
+
+// The record that an `async` worker took the job (kind "execution.accepted"; docs/async-level.md section 5): the request the
+// worker was given and the execution directory, which is all a later Forge needs to ask the worker about the run. Written by
+// Forge after a valid `accepted` and before the first poll. No state is replayed from it.
+pub fn accepted[&h, &t, &r, &d](heap: &!h Heap, seq: int, task: &t [byte], request: &r [byte], dir: &d [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 192);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "v");
+    w = json.put_int(heap, w, schema_version());
+    w = json.put_key(heap, w, "seq");
+    w = json.put_int(heap, w, seq);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, "execution.accepted");
+    w = json.put_key(heap, w, "task");
+    w = json.put_string(heap, w, task);
+    w = json.put_key(heap, w, "actor");
+    w = json.put_string(heap, w, "forge");
+    w = json.put_key(heap, w, "request");
+    w = json.put_string(heap, w, request);
+    w = json.put_key(heap, w, "dir");
+    w = json.put_string(heap, w, dir);
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}

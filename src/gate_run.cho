@@ -171,6 +171,23 @@ pub fn note_execution[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [b
     return seq + 1;
 }
 
+// The `execution.accepted` of task `id`: the request the worker took and the directory it works in, written.
+pub fn note_accepted[&h, &f, &p, &i, &r, &d](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], request: &r [byte], dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_write] int {
+    if seq < 0 {
+        return seq;
+    }
+    let record = event.accepted(heap, seq, id, request, dir);
+    var status = 0 - 1;
+    borrow record as &rb in {
+        status = write_record(fs, path, buffer.bytes(rb), false);
+    }
+    buffer.drop(heap, record);
+    if status != 0 {
+        return 0 - 1;
+    }
+    return seq + 1;
+}
+
 // The `execution.retry` of task `id` after attempt `attempt`, written.
 pub fn note_retry[&h, &f, &p, &i](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], attempt: int) -> [heap, fs_read(""), fs_write(""), file_write] int {
     if seq < 0 {

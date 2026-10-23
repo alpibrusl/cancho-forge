@@ -1,0 +1,95 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.run_files;
+
+// Unit tests for src/run_files.cho (docs/async-level.md sections 2 to 4). Run with `cancho test`.
+
+fn stored(id: &static [byte]) -> [] &static [byte] {
+    return "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-1\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"summary\":\"s\",\"evidence\":[],\"error\":null}";
+}
+
+fn test_the_names_are_fixed_and_none_is_the_lock_or_evidence() -> [] int {
+    test.assert(bytes.equal(run_files.run_name(), "run.json"));
+    test.assert(bytes.equal(run_files.result_name(), "result.json"));
+    test.assert(bytes.equal(run_files.cancel_name(), "cancel.req"));
+    test.assert(bytes.equal(run_files.result_tmp_name(), "result.json.tmp"));
+    return 0;
+}
+
+fn test_a_run_record_names_its_request_and_its_token[&h](heap: &!h Heap) -> [heap] int {
+    let rec = run_files.run_record(heap, "r-1", "t-1", 1700000000123);
+    borrow rec as &rb in {
+        let data = buffer.bytes(rb);
+        test.assert(bytes.equal(data, "{\"request_id\":\"r-1\",\"task_id\":\"t-1\",\"token\":1700000000123}\n"));
+        test.assert(run_files.run_is(heap, data, "r-1", 1700000000123));
+        // a token that is not this start's is not this run
+        test.assert(!run_files.run_is(heap, data, "r-1", 1700000000124));
+        // a negative token asks only about the request
+        test.assert(run_files.run_is(heap, data, "r-1", 0 - 1));
+        test.assert(!run_files.run_is(heap, data, "r-2", 0 - 1));
+        test.assert(!run_files.run_is(heap, data, "r-", 0 - 1));
+        test.assert(!run_files.run_is(heap, data, "r-11", 0 - 1));
+    }
+    buffer.drop(heap, rec);
+    return 0;
+}
+
+fn test_a_file_that_is_not_a_run_record_is_no_run[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(!run_files.run_is(heap, "", "r-1", 0 - 1));
+    test.assert(!run_files.run_is(heap, "not json", "r-1", 0 - 1));
+    test.assert(!run_files.run_is(heap, "[]", "r-1", 0 - 1));
+    test.assert(!run_files.run_is(heap, "{\"request_id\":\"r-1\"}", "r-1", 0 - 1));
+    test.assert(!run_files.run_is(heap, "{\"request_id\":1,\"token\":5}", "r-1", 0 - 1));
+    test.assert(!run_files.run_is(heap, "{\"request_id\":\"r-1\",\"token\":\"5\"}", "r-1", 0 - 1));
+    test.assert(run_files.run_is(heap, "{\"request_id\":\"r-1\",\"token\":5}", "r-1", 0 - 1));
+    return 0;
+}
+
+fn test_the_state_of_a_stored_result_is_one_of_four_words_or_nothing[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(run_files.result_state(heap, "{\"contract\":\"forge-worker/1\",\"state\":\"succeeded\"}"), 1);
+    test.assert_eq(run_files.result_state(heap, "{\"contract\":\"forge-worker/1\",\"state\":\"partial\"}"), 2);
+    test.assert_eq(run_files.result_state(heap, "{\"contract\":\"forge-worker/1\",\"state\":\"failed\"}"), 3);
+    test.assert_eq(run_files.result_state(heap, "{\"contract\":\"forge-worker/1\",\"state\":\"cancelled\"}"), 4);
+    test.assert_eq(run_files.result_state(heap, "{\"contract\":\"forge-worker/1\",\"state\":\"accepted\"}"), 0);
+    test.assert_eq(run_files.result_state(heap, "{\"contract\":\"forge-worker/2\",\"state\":\"failed\"}"), 0);
+    test.assert_eq(run_files.result_state(heap, "{\"state\":\"failed\"}"), 0);
+    test.assert_eq(run_files.result_state(heap, "garbage"), 0);
+    test.assert_eq(run_files.result_state(heap, ""), 0);
+    return 0;
+}
+
+fn test_the_id_a_stored_result_answers_is_read_from_its_layout() -> [] int {
+    let r = stored("x");
+    test.assert(bytes.equal(run_files.stored_id(r), "r-1"));
+    test.assert_eq(len(run_files.stored_id("")), 0);
+    test.assert_eq(len(run_files.stored_id("{\"contract\":\"forge-worker/1\",\"request_id\":\"\",\"state\":\"x\"}")), 0);
+    test.assert_eq(len(run_files.stored_id("{\"contract\":\"forge-worker/1\",\"request_id\":\"a\\\"b\"}")), 0);
+    test.assert_eq(len(run_files.stored_id("{\"request_id\":\"r-1\"}")), 0);
+    // no closing quote within 128 bytes
+    test.assert_eq(len(run_files.stored_id("{\"contract\":\"forge-worker/1\",\"request_id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), 0);
+    return 0;
+}
+
+fn test_a_stored_result_answers_the_call_that_asks_with_its_own_id_and_nothing_else_changes[&h](heap: &!h Heap) -> [heap] int {
+    let out = run_files.rebind(heap, stored("x"), "r-20");
+    borrow out as &ob in {
+        test.assert(bytes.equal(buffer.bytes(ob), "{\"contract\":\"forge-worker/1\",\"request_id\":\"r-20\",\"state\":\"succeeded\",\"task_id\":\"t-1\",\"summary\":\"s\",\"evidence\":[],\"error\":null}"));
+    }
+    buffer.drop(heap, out);
+    // the same bytes when the id is the same
+    let same = run_files.rebind(heap, stored("x"), "r-1");
+    borrow same as &sb in {
+        test.assert(bytes.equal(buffer.bytes(sb), stored("x")));
+    }
+    buffer.drop(heap, same);
+    // a file that is not in the layout gives nothing
+    let none = run_files.rebind(heap, "{\"request_id\":\"r-1\"}", "r-2");
+    borrow none as &nb in {
+        test.assert_eq(len(buffer.bytes(nb)), 0);
+    }
+    buffer.drop(heap, none);
+    return 0;
+}

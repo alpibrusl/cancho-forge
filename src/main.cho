@@ -4,6 +4,8 @@ import std.buffer;
 import std.bytes;
 import std.io;
 import std.json;
+import forge.await_run;
+import forge.await_task;
 import forge.build_run;
 import forge.build_task;
 import forge.dispatch;
@@ -11,11 +13,13 @@ import forge.gate_env;
 import forge.gate_run;
 import forge.gate_task;
 import forge.journal_io;
+import forge.recover;
 import forge.recover_io;
 import forge.retry;
 import forge.lock;
 import forge.report;
 import forge.task;
+import forge.verbs;
 
 // The operator's view of a workspace, read-only (docs/architecture.md section
 // 4.9):
@@ -63,7 +67,7 @@ import forge.task;
 // usage or a path that is not ok; 3 the workspace is locked, a directory cannot be opened, or an I/O error; 4 the run ended
 // without a claim (the ending and the state are printed).
 //
-//   forge recover <dir>
+//   forge recover <dir> [<workers>]
 //
 // settles the tasks a crash left `running` (docs/architecture.md section 4.4): it takes the lock of the workspace <dir>,
 // replays the journal (a torn tail is cut), and for each task that is `running` with no ending writes what happened to it
@@ -93,7 +97,7 @@ fn show[&i, &h](io: &!i Io, heap: &!h Heap, text: buffer.Buffer) -> [heap, io_wr
 }
 
 fn usage[&i](io: &!i Io) -> [err_write] int {
-    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
+    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
     return 2;
 }
 
@@ -511,7 +515,7 @@ fn build[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""
                                     var wdir = opened;
                                     borrow wdir as &w in {
                                         borrow brief as &bb in {
-                                            let done = build_run.run(heap, fs, exec, w, clock, buffer.bytes(jb), buffer.bytes(bb), execution_dir, tools, checker, guide, provider, model, agent, attempts, agent_seconds, rounds, plan_seconds, jobs, timeout);
+                                            let done = build_run.run(heap, fs, exec, w, clock, buffer.bytes(jb), buffer.bytes(bb), execution_dir, tools, workers, checker, guide, provider, model, agent, attempts, agent_seconds, rounds, plan_seconds, jobs, timeout);
                                             code = show_build(heap, io, done);
                                         }
                                     }
@@ -531,17 +535,298 @@ fn build[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""
     return code;
 }
 
-fn recover[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), fs_write(""), file_read, file_write, io_write, err_write] int {
-    if arg_count(args) != 3 {
+// The ending of an awaited run, printed, and the exit status: 0 a claim was recorded, 4 the run ended without one, 1 the task
+// was refused or the journal is, 3 the journal cannot be read or written.
+fn show_awaited[&i, &d](io: &!i Io, tid: &d [byte], done: await_task.Awaited) -> [io_write, err_write] int {
+    var code = 4;
+    match done.outcome {
+        await_task.Outcome::Journal(rule) => {
+            if rule > 0 {
+                io.error_all(io, "forge: the journal is refused: ");
+                io.error_all(io, task.rule_code_name(rule));
+                io.error_all(io, "\n");
+                code = 1;
+            } else {
+                io.error_all(io, "forge: the journal cannot be read or written\n");
+                code = 3;
+            }
+        }
+        await_task.Outcome::NotAwaiting => {
+            io.error_all(io, "forge: ");
+            io.error_all(io, await_task.not_awaiting_tag());
+            io.error_all(io, ": the task is not running with an accepted run and no ending after it\n");
+            code = 1;
+        }
+        await_task.Outcome::Running => {
+            line(io, "task: ", tid);
+            line(io, "state: ", "running");
+            line(io, "awaiting: ", "the worker says the run is going on; nothing was written");
+            code = 0;
+        }
+        await_task.Outcome::Ended(ending, claim) => {
+            line(io, "task: ", tid);
+            line(io, "state: ", task.code_name(done.state));
+            let tag = dispatch.rule_tag(ending);
+            if len(tag) > 0 {
+                line(io, "refusal: ", tag);
+            }
+            line(io, "ending: ", dispatch.consequence_name(dispatch.consequence(ending)));
+            let again = retry.rule_tag(retry.decide(dispatch.consequence(ending), 1, false));
+            if len(again) > 0 {
+                line(io, "refusal: ", again);
+            }
+            if claim > 0 {
+                line(io, "claimed verdict: ", build_task.verdict_name(claim));
+                io.write_all(io, "(a worker's claim: the task is in verification, not accepted)\n");
+                code = 0;
+            }
+        }
+    }
+    return code;
+}
+
+// forge await <dir> <workers> <task-id> [timeout-ms]: go on with a task whose async worker accepted the job (the journal has
+// its `execution.accepted` and no ending): wait for the run, then write its ending as `forge build` would have.
+fn await_cmd[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let count = arg_count(args);
+    if count < 5 || count > 6 {
         return usage(io);
+    }
+    let dir = arg(args, 2);
+    let workers = arg(args, 3);
+    let tid = arg(args, 4);
+    var timeout = 3600000;
+    if count == 6 {
+        timeout = nat_of(arg(args, 5));
+        if timeout < 1000 {
+            return usage(io);
+        }
+    }
+    let jpath = concat(heap, dir, "/journal.jsonl");
+    let lpath = concat(heap, dir, "/lock");
+    var code = 0;
+    borrow jpath as &jb in {
+        borrow lpath as &lb in {
+            if journal_io.path_ok(fs, buffer.bytes(jb)) == false || journal_io.path_ok(fs, workers) == false || !task.id_ok(tid) {
+                io.error_all(io, "forge: path-invalid: <dir> and <workers> must be absolute, with no .. component, and <task-id> a task id\n");
+                code = 2;
+            } else if journal_io.exists(fs, buffer.bytes(jb)) == false {
+                io.error_all(io, "forge: no journal.jsonl in that directory\n");
+                code = 3;
+            } else {
+                match lock.acquire(fs, buffer.bytes(lb)) {
+                    lock.Lock::Refused(rule) => {
+                        io.error_all(io, "forge: ");
+                        io.error_all(io, task.rule_code_name(rule));
+                        io.error_all(io, ": the workspace cannot be written\n");
+                        code = 3;
+                    }
+                    lock.Lock::Failed(errno2) => {
+                        io.error_all(io, "forge: the lock of the workspace could not be taken\n");
+                        code = 3;
+                    }
+                    lock.Lock::Held(held) => {
+                        match open_dir(fs, workers) {
+                            DirOpened::Failed(errno3) => {
+                                io.error_all(io, "forge: cannot open the workers directory\n");
+                                code = 3;
+                            }
+                            DirOpened::Ok(opened) => {
+                                var wdir = opened;
+                                borrow wdir as &w in {
+                                    let done = await_task.run(heap, fs, exec, w, clock, buffer.bytes(jb), tid, timeout, true);
+                                    code = show_awaited(io, tid, done);
+                                }
+                                dir_close(wdir);
+                            }
+                        }
+                        lock.let_go(held);
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, lpath);
+    return code;
+}
+
+// forge cancel <dir> <workers> <task-id>: ask the worker to stop the run of a task that is awaiting. READS the journal
+// (as `status` does, without the lock: the Forge that is polling holds it) and writes nothing: the Forge that waits, or the
+// next `forge await`, sees the run end `cancelled` and writes it. Exit status: 0 the worker stopped the run; 4 it did not
+// (not running, too late, or the call failed: what it said is printed); 1 the task is not awaiting; 2 bad usage; 3 I/O.
+fn cancel_cmd[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, clock, poll, fs_read(""), file_read, io_write, err_write] int {
+    if arg_count(args) != 5 {
+        return usage(io);
+    }
+    let dir = arg(args, 2);
+    let workers = arg(args, 3);
+    let tid = arg(args, 4);
+    let jpath = concat(heap, dir, "/journal.jsonl");
+    var code = 0;
+    borrow jpath as &jb in {
+        if journal_io.path_ok(fs, buffer.bytes(jb)) == false || journal_io.path_ok(fs, workers) == false || !task.id_ok(tid) {
+            io.error_all(io, "forge: path-invalid: <dir> and <workers> must be absolute, with no .. component, and <task-id> a task id\n");
+            code = 2;
+        } else if journal_io.exists(fs, buffer.bytes(jb)) == false {
+            io.error_all(io, "forge: no journal.jsonl in that directory\n");
+            code = 3;
+        } else {
+            let (data, errno) = journal_io.read_all(heap, fs, buffer.bytes(jb));
+            if errno != 0 {
+                io.error_all(io, "forge: the journal cannot be read\n");
+                code = 3;
+            } else {
+                borrow data as &db in {
+                    let (phase, request, execution_dir) = recover.accepted_of(heap, buffer.bytes(db), tid);
+                    if phase != 5 {
+                        io.error_all(io, "forge: ");
+                        io.error_all(io, await_task.not_awaiting_tag());
+                        io.error_all(io, ": the task is not running with an accepted run and no ending after it\n");
+                        code = 1;
+                    } else {
+                        match open_dir(fs, workers) {
+                            DirOpened::Failed(errno3) => {
+                                io.error_all(io, "forge: cannot open the workers directory\n");
+                                code = 3;
+                            }
+                            DirOpened::Ok(opened) => {
+                                var wdir = opened;
+                                borrow wdir as &w in {
+                                    borrow request as &rb in {
+                                        borrow execution_dir as &eb in {
+                                            code = show_cancel(io, await_run.cancel(heap, exec, w, clock, "cancho_code", buffer.bytes(rb), tid, buffer.bytes(eb)));
+                                        }
+                                    }
+                                }
+                                dir_close(wdir);
+                            }
+                        }
+                    }
+                    buffer.drop(heap, request);
+                    buffer.drop(heap, execution_dir);
+                }
+            }
+            buffer.drop(heap, data);
+        }
+    }
+    buffer.drop(heap, jpath);
+    return code;
+}
+
+// What the worker answered to a `cancel`, printed, and the exit status (0 only for `cancelled`).
+fn show_cancel[&i](io: &!i Io, settled: verbs.Settled) -> [io_write] int {
+    match settled {
+        verbs.Settled::Ended(ending) => {
+            line(io, "refusal: ", dispatch.rule_tag(ending));
+            return 4;
+        }
+        verbs.Settled::Reply(judged) => {
+            match judged {
+                verbs.Judged::Cancel(c) => {
+                    line(io, "cancel: ", verbs.cancel_name(c));
+                    match c {
+                        verbs.CancelState::Cancelled => {
+                            return 0;
+                        }
+                        verbs.CancelState::NotRunning => {
+                            return 4;
+                        }
+                        verbs.CancelState::TooLate => {
+                            return 4;
+                        }
+                    }
+                }
+                verbs.Judged::Refused(rule, reason) => {
+                    line(io, "refusal: ", verbs.rule_name(rule));
+                    return 4;
+                }
+                verbs.Judged::Capabilities(level) => {
+                    line(io, "refusal: ", "worker-protocol");
+                    return 4;
+                }
+                verbs.Judged::Status(st) => {
+                    line(io, "refusal: ", "worker-protocol");
+                    return 4;
+                }
+                verbs.Judged::Result(r) => {
+                    line(io, "refusal: ", "worker-protocol");
+                    return 4;
+                }
+            }
+        }
+    }
+}
+
+// `forge recover <dir> <workers>`, the second half: for each task that is awaiting (an async worker took the job and nothing
+// ended it), ask the worker ONCE. A run that is going on is left running; one that ended is written as `forge await` writes
+// it. The exit status is that of the worst: 0 when every one is settled with a claim or is still running, else the first
+// other status.
+fn ask_awaiting[&h, &f, &x, &c, &i, &j, &w](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, journal_path: &j [byte], workers: &w [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    var code = 0;
+    let (data, errno) = journal_io.read_all(heap, fs, journal_path);
+    if errno != 0 {
+        buffer.drop(heap, data);
+        io.error_all(io, "forge: the journal cannot be read\n");
+        return 3;
+    }
+    var ids = buffer.empty(heap, 1);
+    borrow data as &db in {
+        buffer.drop(heap, ids);
+        ids = recover.awaiting(heap, buffer.bytes(db));
+    }
+    buffer.drop(heap, data);
+    match open_dir(fs, workers) {
+        DirOpened::Failed(errno3) => {
+            io.error_all(io, "forge: cannot open the workers directory\n");
+            code = 3;
+        }
+        DirOpened::Ok(opened) => {
+            var wdir = opened;
+            borrow wdir as &wq in {
+                borrow ids as &ib in {
+                    let all = buffer.bytes(ib);
+                    var start = 0;
+                    var k = 0;
+                    while k < len(all) {
+                        if int_of(all[k]) == 10 {
+                            let one = show_awaited_quiet(heap, fs, exec, wq, clock, journal_path, all[start..k], io);
+                            if one != 0 && code == 0 {
+                                code = one;
+                            }
+                            start = k + 1;
+                        }
+                        k = k + 1;
+                    }
+                }
+            }
+            dir_close(wdir);
+        }
+    }
+    buffer.drop(heap, ids);
+    return code;
+}
+
+fn show_awaited_quiet[&h, &f, &x, &w, &c, &j, &d, &i](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], tid: &d [byte], io: &!i Io) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let done = await_task.run(heap, fs, exec, workers, clock, journal_path, tid, 1000, false);
+    return show_awaited(io, tid, done);
+}
+
+fn recover[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    if arg_count(args) != 3 && arg_count(args) != 4 {
+        return usage(io);
+    }
+    var workers = "";
+    if arg_count(args) == 4 {
+        workers = arg(args, 3);
     }
     let jpath = concat(heap, arg(args, 2), "/journal.jsonl");
     let lpath = concat(heap, arg(args, 2), "/lock");
     var code = 0;
     borrow jpath as &jb in {
         borrow lpath as &lb in {
-            if journal_io.path_ok(fs, buffer.bytes(jb)) == false {
-                io.error_all(io, "forge: path-invalid: <dir> must be absolute, with no .. component\n");
+            if journal_io.path_ok(fs, buffer.bytes(jb)) == false || len(workers) > 0 && journal_io.path_ok(fs, workers) == false {
+                io.error_all(io, "forge: path-invalid: <dir> and <workers> must be absolute, with no .. component\n");
                 code = 2;
             } else if journal_io.exists(fs, buffer.bytes(jb)) == false {
                 io.error_all(io, "forge: no journal.jsonl in that directory\n");
@@ -580,6 +865,18 @@ fn recover[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g A
                             }
                             buffer.drop(heap, n);
                             io.newline(io);
+                            if counts.awaiting > 0 {
+                                io.write_all(io, "awaiting: ");
+                                var m = buffer.push_nat(heap, buffer.empty(heap, 4), counts.awaiting);
+                                borrow m as &mb in {
+                                    io.write_all(io, buffer.bytes(mb));
+                                }
+                                buffer.drop(heap, m);
+                                io.newline(io);
+                                if len(workers) > 0 {
+                                    code = ask_awaiting(heap, fs, exec, clock, io, buffer.bytes(jb), workers);
+                                }
+                            }
                         }
                         buffer.drop(heap, text);
                         lock.let_go(held);
@@ -601,7 +898,13 @@ fn run[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""),
         return build(heap, fs, exec, clock, io, args);
     }
     if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "recover") {
-        return recover(heap, fs, io, args);
+        return recover(heap, fs, exec, clock, io, args);
+    }
+    if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "await") {
+        return await_cmd(heap, fs, exec, clock, io, args);
+    }
+    if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "cancel") {
+        return cancel_cmd(heap, fs, exec, clock, io, args);
     }
     return read_only(heap, fs, io, args);
 }

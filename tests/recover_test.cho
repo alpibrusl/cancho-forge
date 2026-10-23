@@ -103,7 +103,7 @@ fn run[&h, &i](heap: &!h Heap, j: buffer.Buffer, id: &i [byte]) -> [heap] Run {
     var v_seq5 = false;
     var v_seq6 = false;
     var v_text_names_task = false;
-    var v_counts = recover.Counts { unstarted: 0, lost: 0, finished: 0, exhausted: 0 };
+    var v_counts = recover.Counts { unstarted: 0, lost: 0, finished: 0, exhausted: 0, awaiting: 0 };
     var v_state = 0 - 1;
     var v_settled = false;
     borrow j as &jb in {
@@ -360,5 +360,152 @@ fn test_a_torn_tail_is_not_a_record[&h](heap: &!h Heap) -> [heap] int {
     let r = run(heap, j, "t-1");
     test.assert_eq(r.counts.unstarted, 1);
     test.assert_eq(r.counts.lost, 0);
+    return 0;
+}
+
+// ---- an async worker took the job (docs/async-level.md section 5) ---------
+
+fn with_accepted[&h, &i, &r, &d](heap: &!h Heap, j: buffer.Buffer, id: &i [byte], request: &r [byte], dir: &d [byte]) -> [heap] buffer.Buffer {
+    var seq = 0;
+    borrow j as &jb in {
+        seq = seq_next(jb);
+    }
+    let rec = event.accepted(heap, seq, id, request, dir);
+    var out = j;
+    borrow rec as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, rec);
+    return out;
+}
+
+fn test_a_task_whose_worker_accepted_the_job_is_awaiting_not_lost[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = with_accepted(heap, j, "t-1", "r-1", "/w/e");
+    let r = run(heap, j, "t-1");
+    // nothing is written: not lost, not ready, no record at all, and the task is still running
+    test.assert(r.empty);
+    test.assert(!r.lost_record);
+    test.assert(!r.tag_lost);
+    test.assert(!r.ready);
+    test.assert_eq(r.counts.awaiting, 1);
+    test.assert_eq(r.counts.lost + r.counts.unstarted + r.counts.finished + r.counts.exhausted, 0);
+    test.assert(r.text_names_task);
+    test.assert_eq(r.state, task.state_code(task.State::Running));
+    test.assert(r.settled);
+    return 0;
+}
+
+fn test_the_accepted_task_is_awaiting_however_many_times_the_worker_was_started[&h](heap: &!h Heap) -> [heap] int {
+    // started three times (the budget of starts is used up), the third accepted: still awaiting, never `retry-exhausted`
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = with_accepted(heap, j, "t-1", "r-3", "/w/e");
+    let r = run(heap, j, "t-1");
+    test.assert(r.empty);
+    test.assert(!r.tag_exhausted);
+    test.assert_eq(r.counts.awaiting, 1);
+    return 0;
+}
+
+fn test_a_run_that_ended_after_it_was_accepted_is_settled_as_any_other[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = with_accepted(heap, j, "t-1", "r-1", "/w/e");
+    j = push(heap, j, "execution.finished", "t-1");
+    let r = run(heap, j, "t-1");
+    test.assert(r.verification);
+    test.assert_eq(r.counts.finished, 1);
+    test.assert_eq(r.counts.awaiting, 0);
+    test.assert_eq(r.state, task.state_code(task.State::Verification));
+    return 0;
+}
+
+fn test_a_cancelled_run_whose_move_was_not_recorded_is_moved_to_cancelled[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = with_accepted(heap, j, "t-1", "r-1", "/w/e");
+    j = push(heap, j, "execution.cancelled", "t-1");
+    let r = run(heap, j, "t-1");
+    test.assert(!r.empty);
+    test.assert(r.by_forge);
+    test.assert(!r.lost_record);
+    test.assert_eq(r.state, task.state_code(task.State::Cancelled));
+    test.assert(r.settled);
+    return 0;
+}
+
+fn test_the_request_and_directory_of_an_accepted_run_are_read_from_its_record[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 256), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = with_accepted(heap, j, "t-1", "build-1-a1", "/work/ev one");
+    borrow j as &jb in {
+        let (phase, request, dir) = recover.accepted_of(heap, buffer.bytes(jb), "t-1");
+        test.assert_eq(phase, 5);
+        borrow request as &rb in {
+            test.assert(bytes.equal(buffer.bytes(rb), "build-1-a1"));
+        }
+        borrow dir as &db in {
+            test.assert(bytes.equal(buffer.bytes(db), "/work/ev one"));
+        }
+        buffer.drop(heap, request);
+        buffer.drop(heap, dir);
+        // another task of the journal has no such run
+        let (other, r2, d2) = recover.accepted_of(heap, buffer.bytes(jb), "t-2");
+        test.assert_eq(other, 0);
+        borrow r2 as &r2b in {
+            test.assert_eq(len(buffer.bytes(r2b)), 0);
+        }
+        buffer.drop(heap, r2);
+        buffer.drop(heap, d2);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_task_is_awaiting_only_while_it_is_running_with_no_ending_after_the_accepted_record[&h](heap: &!h Heap) -> [heap] int {
+    // finished
+    var a = running(heap, buffer.empty(heap, 256), "t-1");
+    a = push(heap, a, "execution.started", "t-1");
+    a = with_accepted(heap, a, "t-1", "r-1", "/w/e");
+    a = push(heap, a, "execution.finished", "t-1");
+    borrow a as &ab in {
+        let (p, r, d) = recover.accepted_of(heap, buffer.bytes(ab), "t-1");
+        test.assert_eq(p, 3);
+        buffer.drop(heap, r);
+        buffer.drop(heap, d);
+    }
+    // moved on
+    a = push(heap, a, "task.verification", "t-1");
+    borrow a as &ab2 in {
+        let (p2, r2, d2) = recover.accepted_of(heap, buffer.bytes(ab2), "t-1");
+        test.assert_eq(p2, 0);
+        buffer.drop(heap, r2);
+        buffer.drop(heap, d2);
+    }
+    buffer.drop(heap, a);
+    // an accepted record of a task that is not running is ignored
+    var b = push(heap, buffer.empty(heap, 256), "task.proposed", "t-2");
+    b = with_accepted(heap, b, "t-2", "r-2", "/w/e");
+    borrow b as &bb in {
+        let (p3, r3, d3) = recover.accepted_of(heap, buffer.bytes(bb), "t-2");
+        test.assert_eq(p3, 0);
+        buffer.drop(heap, r3);
+        buffer.drop(heap, d3);
+    }
+    buffer.drop(heap, b);
+    // a record with no plain request or directory is no accepted run
+    var c = running(heap, buffer.empty(heap, 256), "t-3");
+    c = push(heap, c, "execution.accepted", "t-3");
+    borrow c as &cb in {
+        let (p4, r4, d4) = recover.accepted_of(heap, buffer.bytes(cb), "t-3");
+        test.assert_eq(p4, 1);
+        buffer.drop(heap, r4);
+        buffer.drop(heap, d4);
+    }
+    buffer.drop(heap, c);
     return 0;
 }

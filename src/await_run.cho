@@ -1,0 +1,196 @@
+edition 9;
+module forge.await_run;
+
+import std.buffer;
+import std.process;
+import forge.dispatch;
+import forge.response;
+import forge.verbs;
+import forge.worker;
+
+// Waiting for a run that an `async` worker accepted (docs/async-level.md sections 4 and 6): ask `status`, and when the worker
+// says `finished` ask `result`, and judge it as an `execute` reply (`forge.worker.settle_run`: the same classification, the
+// evidence recomputed against the files). The journal is the caller's: this starts the worker for each call, writes nothing,
+// and is the same code for `forge build` after `accepted`, for `forge await`, for `forge recover` and for `forge cancel`.
+//
+// Each call is a worker started once beneath the workers directory (worker-contract 1.1), with its own request id, made of the
+// run's request id and a word, so that a reply to one call is never taken for the reply to another.
+//
+// What the worker's replies mean for the wait:
+//   status running, queued   go on
+//   status finished          ask `result`
+//   status unknown           the worker does not know the run it accepted: `Ending::Lost`
+//   a call that ends badly   the ending of that call, with its tag (a deadline, a signal, an exit code, too much output): the
+//                            wait stops; the run is NOT assumed to have ended, and a later `forge await` can resume the wait
+//   a reply not valid        `worker-protocol`, as for `execute`
+
+// The ceiling of the output of a call about a run, and its deadline: a reply is a few KiB; a worker that does not answer in
+// 30 seconds is not answering.
+pub fn call_most() -> [] int {
+    return 1048576;
+}
+
+pub fn call_timeout_ms() -> [] int {
+    return 30000;
+}
+
+// One look at a run.
+pub enum Probe {
+    // The worker says it is going on.
+    Running,
+    // The worker says it is done: `result` has the ending.
+    Finished,
+    // The look itself ended: the worker lost the run, or the call failed, or the reply was not valid.
+    Ended(dispatch.Ending),
+}
+
+fn call_id[&h, &r, &w](heap: &!h Heap, request_id: &r [byte], word: &w [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 32), request_id);
+    b = buffer.push(heap, b, byte_of(45));
+    return buffer.append(heap, b, word);
+}
+
+fn protocol(reason: int) -> [] dispatch.Ending {
+    return dispatch.Ending::Reply(response.Verdict::Refused(response.Rule::WorkerProtocol, reason));
+}
+
+// Wait `ms` milliseconds on a poller with nothing registered (spike S14 measured 256 ms for 250).
+pub fn nap[&h](heap: &!h Heap, ms: int) -> [heap, poll] int {
+    var slept = 0 - 1;
+    match poller_new() {
+        Polling::Failed(e) => {
+            slept = 0 - e;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            var events = box_slice(heap, 4, 0);
+            borrow mut poller as &!ph in {
+                borrow mut events as &!eb in {
+                    slept = poller_wait(ph, contents(eb), ms);
+                }
+            }
+            unbox_slice(heap, events);
+            poller_close(poller);
+        }
+    }
+    return slept;
+}
+
+// `status` of the run `request_id` of task `task_id` in `execution_dir`.
+pub fn probe[&h, &x, &w, &c, &n, &r, &k, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, name: &n [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte]) -> [heap, exec_under, clock, poll] Probe {
+    let id = call_id(heap, request_id, "status");
+    var out = Probe::Ended(dispatch.Ending::Timeout);
+    borrow id as &ib in {
+        let q = verbs.build_targeted_in(heap, "status", buffer.bytes(ib), request_id, execution_dir);
+        borrow q as &qb in {
+            let settled = worker.call(heap, exec, workers, clock, name, verbs.Level::Async, "status", buffer.bytes(qb), buffer.bytes(ib), request_id, task_id, call_most(), call_timeout_ms());
+            match settled {
+                verbs.Settled::Ended(e) => {
+                    out = Probe::Ended(e);
+                }
+                verbs.Settled::Reply(judged) => {
+                    match judged {
+                        verbs.Judged::Status(st) => {
+                            match st {
+                                verbs.StatusState::Running => {
+                                    out = Probe::Running;
+                                }
+                                verbs.StatusState::Queued => {
+                                    out = Probe::Running;
+                                }
+                                verbs.StatusState::Finished => {
+                                    out = Probe::Finished;
+                                }
+                                verbs.StatusState::Unknown => {
+                                    out = Probe::Ended(dispatch.Ending::Lost);
+                                }
+                            }
+                        }
+                        verbs.Judged::Refused(rule, reason) => {
+                            out = Probe::Ended(protocol(reason));
+                        }
+                        verbs.Judged::Capabilities(level) => {
+                            out = Probe::Ended(protocol(verbs.r_status_state()));
+                        }
+                        verbs.Judged::Cancel(c2) => {
+                            out = Probe::Ended(protocol(verbs.r_status_state()));
+                        }
+                        verbs.Judged::Result(r2) => {
+                            out = Probe::Ended(protocol(verbs.r_status_state()));
+                        }
+                    }
+                }
+            }
+        }
+        buffer.drop(heap, q);
+    }
+    buffer.drop(heap, id);
+    return out;
+}
+
+// `result` of a run the worker says is finished, judged as the reply of `execute`. A `not_ready` after `finished` is the
+// worker contradicting itself: `worker-protocol`.
+pub fn result_of[&h, &x, &w, &f, &c, &n, &r, &k, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, name: &n [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read] dispatch.Ending {
+    let id = call_id(heap, request_id, "result");
+    var ending = dispatch.Ending::Timeout;
+    borrow id as &ib in {
+        let q = verbs.build_targeted_in(heap, "result", buffer.bytes(ib), request_id, execution_dir);
+        borrow q as &qb in {
+            let (out, ran) = worker.run(heap, exec, workers, clock, name, buffer.bytes(qb), call_most(), call_timeout_ms());
+            borrow out as &ob in {
+                ending = worker.settle_run(heap, fs, ran, buffer.bytes(ob), buffer.bytes(ib), task_id, execution_dir, false);
+            }
+            buffer.drop(heap, out);
+        }
+        buffer.drop(heap, q);
+    }
+    buffer.drop(heap, id);
+    return ending;
+}
+
+// `cancel` of the run: what the worker answered, judged (`Settled`). A worker that does not answer, answers badly or ends
+// uncleanly is the ending of that call.
+pub fn cancel[&h, &x, &w, &c, &n, &r, &k, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, name: &n [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte]) -> [heap, exec_under, clock, poll] verbs.Settled {
+    let id = call_id(heap, request_id, "cancel");
+    var settled = verbs.Settled::Ended(dispatch.Ending::Timeout);
+    borrow id as &ib in {
+        let q = verbs.build_targeted_in(heap, "cancel", buffer.bytes(ib), request_id, execution_dir);
+        borrow q as &qb in {
+            settled = worker.call(heap, exec, workers, clock, name, verbs.Level::Async, "cancel", buffer.bytes(qb), buffer.bytes(ib), request_id, task_id, call_most(), call_timeout_ms());
+        }
+        buffer.drop(heap, q);
+    }
+    buffer.drop(heap, id);
+    return settled;
+}
+
+// Wait for the run to end, at most `budget_ms`, asking `status` every `interval_ms`, and give its ending. When the budget is
+// used up the run is asked to stop (`cancel`) and the ending is `Timeout`: Forge's deadline is the total of a run (worker-
+// contract 9.2), and a build that is still running at it is stopped, its directory kept.
+pub fn finish[&h, &x, &w, &f, &c, &n, &r, &k, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, name: &n [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte], budget_ms: int, interval_ms: int) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read] dispatch.Ending {
+    let deadline = clock_ms(clock) + budget_ms;
+    var ending = dispatch.Ending::Timeout;
+    var waiting = true;
+    while waiting {
+        match probe(heap, exec, workers, clock, name, request_id, task_id, execution_dir) {
+            Probe::Ended(e2) => {
+                ending = e2;
+                waiting = false;
+            }
+            Probe::Finished => {
+                ending = result_of(heap, exec, workers, fs, clock, name, request_id, task_id, execution_dir);
+                waiting = false;
+            }
+            Probe::Running => {
+                if clock_ms(clock) >= deadline {
+                    cancel(heap, exec, workers, clock, name, request_id, task_id, execution_dir);
+                    ending = dispatch.Ending::Timeout;
+                    waiting = false;
+                } else {
+                    nap(heap, interval_ms);
+                }
+            }
+        }
+    }
+    return ending;
+}

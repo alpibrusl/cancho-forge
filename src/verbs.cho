@@ -305,6 +305,85 @@ pub fn build_targeted[&h, &v, &a, &t](heap: &!h Heap, verb: &v [byte], request_i
     return json.finish(w);
 }
 
+// The same request with `grants.execution_dir`: a stateless worker whose runs live in directories (docs/async-level.md section
+// 4) needs to be told which one the `target` is in. The path is Forge's, from the journal; the worker checks it again.
+pub fn build_targeted_in[&h, &v, &a, &t, &e](heap: &!h Heap, verb: &v [byte], request_id: &a [byte], target: &t [byte], execution_dir: &e [byte]) -> [heap] buffer.Buffer {
+    if !(bytes.equal(verb, "cancel") || bytes.equal(verb, "status") || bytes.equal(verb, "result")) {
+        return buffer.empty(heap, 1);
+    }
+    var w = json.writer(heap, 200);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "verb");
+    w = json.put_string(heap, w, verb);
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "target");
+    w = json.put_string(heap, w, target);
+    w = json.put_key(heap, w, "grants");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "execution_dir");
+    w = json.put_string(heap, w, execution_dir);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The reply of a worker to `status` (section 3.4): `state` is one of the four words, `step` is the progress step when it is
+// not empty. `judge` is its inverse.
+pub fn status_reply[&h, &a, &t, &s, &p](heap: &!h Heap, request_id: &a [byte], target: &t [byte], state: &s [byte], step: &p [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 192);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "target");
+    w = json.put_string(heap, w, target);
+    w = json.put_key(heap, w, "state");
+    w = json.put_string(heap, w, state);
+    if len(step) > 0 {
+        w = json.put_key(heap, w, "progress");
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "step");
+        w = json.put_string(heap, w, step);
+        w = json.end_object(heap, w);
+    }
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The reply to `cancel` (section 3.3): `state` is `cancelled`, `not_running` or `too_late`.
+pub fn cancel_reply[&h, &a, &t, &s](heap: &!h Heap, request_id: &a [byte], target: &t [byte], state: &s [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 160);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "target");
+    w = json.put_string(heap, w, target);
+    w = json.put_key(heap, w, "state");
+    w = json.put_string(heap, w, state);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The reply to a `result` when there is nothing to give yet (section 3.5).
+pub fn not_ready_reply[&h, &a](heap: &!h Heap, request_id: &a [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 96);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "state");
+    w = json.put_string(heap, w, "not_ready");
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
 // The `capabilities` reply of a worker (section 3.1): its name and version, the one contract version it speaks, its level,
 // and the one task type it serves with the largest limits it will take (no task type when `task_type` is empty). The three
 // workers of this repository answer with this; `judge` is its inverse.

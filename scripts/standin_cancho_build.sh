@@ -36,5 +36,11 @@ case "$mode" in
              log; report build 0 ""; tag=$(sed -n 2p "$brief"); cp "$brief" "$work/seen_brief.txt"; printf '%s\n' "$$" >> "$work/pids.txt"
              while [ ! -e "$work/release" ]; do sleep 0.1; done
              report done 2 done; printf 'product of %s\n' "$tag" > "$work/project.cho"; printf '[BUILD_VERDICT]\tdone %s\n' "$tag"; exit 0 ;;
+  holdgrand) # issue #33: like `slow`, and it starts a grandchild (`sleep 78`) that a kill of the build's group must reach
+             log; report build 0 ""; tag=$(sed -n 2p "$brief"); cp "$brief" "$work/seen_brief.txt"; printf '%s\n' "$$" >> "$work/pids.txt"
+             sleep 78 &
+             while [ ! -e "$work/release" ]; do sleep 0.1; done
+             kill $! 2> /dev/null
+             report done 2 done; printf 'product of %s\n' "$tag" > "$work/project.cho"; printf '[BUILD_VERDICT]\tdone %s\n' "$tag"; exit 0 ;;
   *)         log; report done 1 wat; exit 1 ;;
 esac

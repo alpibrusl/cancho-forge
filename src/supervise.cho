@@ -1,0 +1,297 @@
+edition 9;
+module forge.supervise;
+
+import std.buffer;
+import std.bytes;
+import std.option;
+import std.process;
+import forge.journal_io;
+
+// The wait of a supervisor (docs/async-level.md section 2): `std.process.capture` for a child that was started as a group
+// leader, with one more way to end. `capture` runs the child to its end or to its deadline and cannot be asked to stop
+// sooner; a supervisor must also look, in slices, for a request to cancel the build, written by another process into a file
+// of the execution directory (cancho has no kill by pid, docs/processes.md 4.11, so a request is a file, not a signal). The
+// loop is `std.process.gather` with the input and the error channel taken out and the cancel check put in; the reads, the
+// bound, the reaping and the group kill are the same.
+//
+// The child's standard input is closed at once (the build is given none). The output is kept up to `most` bytes; one byte
+// more kills the build's group (`Ran::TooMuch`). The deadline is `timeout` milliseconds by `clock`. Every `slice_ms` the file
+// `cancel_path` is read: when its text is exactly `request_id` the build's group is killed with KILL and the answer's third
+// part is true. A cancel file for another request is ignored. The child is reaped on every path.
+
+fn output_token() -> [] int {
+    return 1;
+}
+
+fn child_token() -> [] int {
+    return 3;
+}
+
+fn read_again() -> [] int {
+    return 0;
+}
+
+fn read_end() -> [] int {
+    return 1;
+}
+
+fn read_too_much() -> [] int {
+    return 2;
+}
+
+// The longest cancel request read: a request id is at most 128 bytes (build_task checks it before the supervisor starts).
+pub fn cancel_cap() -> [] int {
+    return 128;
+}
+
+// How often the cancel file is looked at.
+pub fn slice_ms() -> [] int {
+    return 100;
+}
+
+fn drain[&h, &p, &s](heap: &!h Heap, from: &!p Pipe, scratch: &!s [byte], out: buffer.Buffer, most: int) -> [heap, pipe_read] (buffer.Buffer, int) {
+    var kept = out;
+    while true {
+        match pipe_read(from, scratch) {
+            Received::Data(n) => {
+                var room = 0;
+                borrow kept as &k in {
+                    room = most - buffer.size(k);
+                }
+                if n > room {
+                    kept = buffer.append(heap, kept, scratch[0..room]);
+                    return (kept, read_too_much());
+                }
+                kept = buffer.append(heap, kept, scratch[0..n]);
+            }
+            Received::End => {
+                return (kept, read_end());
+            }
+            Received::Again => {
+                return (kept, read_again());
+            }
+            Received::Failed(e) => {
+                return (kept, read_end());
+            }
+        }
+    }
+    return (kept, read_again());
+}
+
+fn shut(held: option.Option[Pipe]) -> [] int {
+    match held {
+        option.Option::Some(p) => {
+            pipe_close(p);
+        }
+        option.Option::None => {
+        }
+    }
+    return 0;
+}
+
+fn running() -> [] int {
+    return 0;
+}
+
+fn exited() -> [] int {
+    return 1;
+}
+
+fn timed_out() -> [] int {
+    return 2;
+}
+
+fn too_much() -> [] int {
+    return 3;
+}
+
+fn failed() -> [] int {
+    return 4;
+}
+
+fn cancelled() -> [] int {
+    return 5;
+}
+
+// Is the file `path` there and exactly `request_id`? An absent file, an unreadable one, a longer one or another text is no.
+pub fn asks_for_cancel[&h, &f, &p, &r](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], request_id: &r [byte]) -> [heap, fs_read(""), file_read] bool {
+    var asked = false;
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var data = buffer.empty(heap, 64);
+            var errno = 0;
+            borrow mut file as &!x in {
+                let (got, e) = journal_io.drain(heap, x, data, cancel_cap() + 1);
+                data = got;
+                errno = e;
+            }
+            file_close(file);
+            borrow data as &db in {
+                asked = bytes.equal(buffer.bytes(db), request_id);
+            }
+            buffer.drop(heap, data);
+        }
+    }
+    return asked;
+}
+
+pub fn wait[&h, &c, &f, &p, &r](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, cancel_path: &p [byte], request_id: &r [byte]) -> [heap, clock, poll, fs_read(""), file_read] (buffer.Buffer, process.Ran, bool) {
+    let deadline = clock_ms(clock) + timeout;
+    var out = buffer.empty(heap, 4096);
+    var reader = option.Option::Some(from_child);
+    var state = running();
+    var why = 0;
+    pipe_close(to_child);
+
+    match poller_new() {
+        Polling::Failed(e) => {
+            state = failed();
+            why = e;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            var scratch_box = box_slice(heap, 4096, byte_of(0));
+            var events = box_slice(heap, 16, 0);
+            borrow mut poller as &!ph in {
+                borrow child as &ch in {
+                    let added = poller_add_child(ph, ch, child_token());
+                    if added != 0 {
+                        state = failed();
+                        why = added;
+                    }
+                }
+                borrow mut reader as &!r2 in {
+                    match r2 {
+                        option.Option::Some(rp) => {
+                            pipe_nonblocking(rp);
+                            let added = poller_add_pipe(ph, rp, output_token(), 1);
+                            if added != 0 && state == running() {
+                                state = failed();
+                                why = added;
+                            }
+                        }
+                        option.Option::None => {
+                        }
+                    }
+                }
+
+                while state == running() {
+                    let left = deadline - clock_ms(clock);
+                    if left <= 0 {
+                        state = timed_out();
+                    } else {
+                        var wait_ms = left;
+                        if wait_ms > slice_ms() {
+                            wait_ms = slice_ms();
+                        }
+                        var n = 0;
+                        borrow mut events as &!eb in {
+                            n = poller_wait(ph, contents(eb), wait_ms);
+                        }
+                        if n < 0 {
+                            state = failed();
+                            why = 0 - n;
+                        }
+                        var k = 0;
+                        var gone = false;
+                        var output_done = false;
+                        while k < n && state == running() {
+                            var token = 0;
+                            borrow events as &e in {
+                                token = contents(e)[2 * k];
+                            }
+                            if token == child_token() {
+                                gone = true;
+                            }
+                            if token == output_token() {
+                                borrow mut reader as &!r2 in {
+                                    match r2 {
+                                        option.Option::Some(rp) => {
+                                            borrow mut scratch_box as &!sb in {
+                                                let (kept, found) = drain(heap, rp, contents(sb), out, most);
+                                                out = kept;
+                                                if found == read_too_much() {
+                                                    state = too_much();
+                                                }
+                                                if found == read_end() {
+                                                    output_done = true;
+                                                }
+                                            }
+                                        }
+                                        option.Option::None => {
+                                        }
+                                    }
+                                }
+                            }
+                            k = k + 1;
+                        }
+                        if output_done {
+                            shut(reader);
+                            reader = option.Option::None;
+                        }
+                        if gone && state == running() {
+                            // Everything the child wrote is in the channel now.
+                            borrow mut reader as &!r2 in {
+                                match r2 {
+                                    option.Option::Some(rp) => {
+                                        borrow mut scratch_box as &!sb in {
+                                            let (kept, found) = drain(heap, rp, contents(sb), out, most);
+                                            out = kept;
+                                            if found == read_too_much() {
+                                                state = too_much();
+                                            }
+                                        }
+                                    }
+                                    option.Option::None => {
+                                    }
+                                }
+                            }
+                            if state == running() {
+                                state = exited();
+                            }
+                        }
+                        if state == running() && asks_for_cancel(heap, fs, cancel_path, request_id) {
+                            state = cancelled();
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, scratch_box);
+            unbox_slice(heap, events);
+            poller_close(poller);
+        }
+    }
+
+    shut(reader);
+    if state != exited() {
+        borrow child as &ch in {
+            child_kill_group(ch, 256);
+            child_kill(ch, 256);
+        }
+    }
+    var ran = process.Ran::Failed(why);
+    match child_wait(child) {
+        Exited::Code(n) => {
+            ran = process.Ran::Code(n);
+        }
+        Exited::Signaled(s) => {
+            ran = process.Ran::Signaled(s);
+        }
+        Exited::Failed(e) => {
+            ran = process.Ran::Failed(e);
+        }
+    }
+    if state == timed_out() {
+        ran = process.Ran::TimedOut;
+    }
+    if state == too_much() {
+        ran = process.Ran::TooMuch;
+    }
+    if state == failed() {
+        ran = process.Ran::Failed(why);
+    }
+    return (out, ran, state == cancelled());
+}

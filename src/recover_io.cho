@@ -25,7 +25,7 @@ pub struct Settled {
 pub fn run[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] Settled {
     let (table, report, recovered) = journal_io.recover(heap, fs, path);
     map.drop(heap, table);
-    let none = recover.Counts { unstarted: 0, lost: 0, finished: 0, exhausted: 0 };
+    let none = recover.Counts { unstarted: 0, lost: 0, finished: 0, exhausted: 0, awaiting: 0 };
     if report.rule != 0 {
         return Settled { rule: report.rule, errno: 0, text: buffer.empty(heap, 1), counts: none };
     }

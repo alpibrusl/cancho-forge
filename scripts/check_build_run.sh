@@ -19,7 +19,7 @@ $C check src/*.cho --std || fail=1
 $C check workers/cancho_code.cho $libs --std || fail=1
 if $C build src/*.cho --std -o "$br/forge" && $C build workers/cancho_code.cho $libs --std -o "$br/workers/cancho_code"; then
   ok() { echo "ok   forge build: $1"; }
-  bad() { echo "FAIL forge build: $1"; fail=1; }
+  bad() { echo "FAIL forge build: $1"; fail=1; [ "${FORGE_FAILFAST:-}" = 1 ] && exit 1; }
   check() { # name, command...
     name=$1; shift
     if "$@"; then ok "$name"; else bad "$name"; fi
@@ -38,12 +38,12 @@ if $C build src/*.cho --std -o "$br/forge" && $C build workers/cancho_code.cho $
   mkws done; printf 'done\nline with "quotes", a \\ backslash and a\ttab\n' > "$br/done.brief"; build done "$br/done.brief" 20000
   check "done: exit 0" test "$(rc done)" = 0
   check "done: the output names the task, the state and the claimed verdict" sh -c "grep -q '^task: build-1\$' '$br/done.out' && grep -q '^state: verification\$' '$br/done.out' && grep -q '^claimed verdict: done\$' '$br/done.out'"
-  check "done: the journal replays to one task in verification, seven records" sh -c "'$br/forge' status '$br/done' > '$br/done.status' && grep -q '^records: 7\$' '$br/done.status' && grep -q '^  verification: 1\$' '$br/done.status'"
+  check "done: the journal replays to one task in verification, eight records (the worker took the job: execution.accepted)" sh -c "'$br/forge' status '$br/done' > '$br/done.status' && grep -q '^records: 8\$' '$br/done.status' && grep -q '^  verification: 1\$' '$br/done.status'"
   check "done: the verdict is in the journal, claimed, written by the worker" grep -q '"kind":"execution.finished".*"actor":"worker","basis":"claimed","verdict":"done"' "$br/done/journal.jsonl"
   check "done: the intent was written before the outcome" sh -c "[ \$(grep -n 'execution.started' '$br/done/journal.jsonl' | cut -d: -f1) -lt \$(grep -n 'execution.finished' '$br/done/journal.jsonl' | cut -d: -f1) ]"
   check "done: the operator proposed and approved, Forge made it ready and running" sh -c "grep -q '\"kind\":\"task.proposed\".*\"actor\":\"human\"' '$br/done/journal.jsonl' && grep -q '\"kind\":\"task.approved\".*\"actor\":\"human\"' '$br/done/journal.jsonl' && grep -q '\"kind\":\"task.ready\".*\"actor\":\"forge\"' '$br/done/journal.jsonl' && grep -q '\"kind\":\"task.running\".*\"actor\":\"forge\"' '$br/done/journal.jsonl'"
   check "done: no record accepts the task" sh -c "! grep -q 'task.accepted' '$br/done/journal.jsonl'"
-  check "done: history shows the whole life of the task, in order" sh -c "'$br/forge' history '$br/done' | cut -d' ' -f2 | tr '\\n' ' ' | grep -q '^kind=task.proposed kind=task.approved kind=task.ready kind=task.running kind=execution.started kind=execution.finished kind=task.verification \$'"
+  check "done: history shows the whole life of the task, in order" sh -c "'$br/forge' history '$br/done' | cut -d' ' -f2 | tr '\\n' ' ' | grep -q '^kind=task.proposed kind=task.approved kind=task.ready kind=task.running kind=execution.started kind=execution.accepted kind=execution.finished kind=task.verification \$'"
   check "done: the brief reached the tool as a file, byte for byte, with quotes, a backslash and a tab" cmp -s "$br/done.brief" "$br/done/ev/brief.txt"
   check "done: the evidence is in the execution directory" sh -c "grep -q '\"verdict\":\"done\"' '$br/done/ev/build.json' && [ -f '$br/done/ev/project.cho' ] && [ -f '$br/done/ev/build.out' ]"
   check "done: nothing of the operator's configuration is in the journal (checker, agent command, provider, model)" sh -c "! grep -q 'stand-in-agent\|/opt/cancho\|stand\|m1' '$br/done/journal.jsonl'"
@@ -145,6 +145,89 @@ if $C build src/*.cho --std -o "$br/forge" && $C build workers/cancho_code.cho $
   check "two workspaces, one execution directory: the first build is undisturbed, ends in verification with its own claim, and brief.txt is its brief" sh -c "[ '$(rc lk1)' = 0 ] && grep -q '^state: verification\$' '$br/lk1.out' && [ \"\$(sed -n 2p '$br/lkev/brief.txt')\" = first ] && [ \"\$(cat '$br/lkev/project.cho')\" = 'product of first' ]"
   check "two workspaces, one execution directory: the refused one wrote no claim, and its task is not accepted" sh -c "! grep -q 'execution.finished\|task.accepted' '$br/lk2/journal.jsonl'"
   check "two forge build on ONE workspace: the second is refused workspace-locked at the workspace, exit 3" sh -c "mkdir '$br/lk3' '$br/lk3ev'; printf 'slow\nfirst' > '$br/lk3.brief'; '$br/forge' build '$br/lk3' '$br/workers' '$br/tools' '$br/lk3.brief' '$br/lk3ev' /opt/cancho/bin/cancho stand m1 a 60000 > /dev/null 2>&1 & p=\$!; n=0; while [ ! -s '$br/lk3ev/pids.txt' ] && [ \$n -lt 100 ]; do sleep 0.1; n=\$((n + 1)); done; '$br/forge' build '$br/lk3' '$br/workers' '$br/tools' '$br/lk3.brief' '$br/lk3ev' /opt/cancho/bin/cancho stand m1 a 60000 > '$br/lk3.out2' 2> '$br/lk3.err2'; rc=\$?; touch '$br/lk3ev/release'; wait \$p; [ \$rc -eq 3 ] && grep -q 'workspace-locked' '$br/lk3.err2' '$br/lk3.out2'"
+
+  # ---- the async level (issue #33; docs/async-level.md): the adapter answers accepted and Forge asks. The stand-in's `holdgrand`
+  # mode keeps the build (and a grandchild, `sleep 78`) running until a file `release` is in the execution directory.
+  waitfor() { # path, tenths of a second at most
+    n=0; while [ ! -s "$1" ] && [ "$n" -lt "$2" ]; do sleep 0.1; n=$((n + 1)); done
+  }
+  fb_bg() { # ws, brief text, timeout: forge build in the background on $br/$ws, output in $br/$ws.out, pid in $br/$ws.pid
+    mkdir "$br/$1" "$br/$1/ev" || exit 1
+    printf '%s' "$2" > "$br/$1.brief"
+    "$br/forge" build "$br/$1" "$br/workers" "$br/tools" "$br/$1.brief" "$br/$1/ev" /opt/cancho/bin/cancho stand m1 a "$3" > "$br/$1.out" 2> "$br/$1.err" &
+    echo $! > "$br/$1.pid"
+  }
+  jsum() { cksum < "$br/$1/journal.jsonl"; }
+  # -- cancel while forge build holds the workspace lock: the group is gone, the directory kept, the same work resumes
+  fb_bg cx 'holdgrand
+first' 60000
+  waitfor "$br/cx/ev/pids.txt" 100; sleep 0.3
+  check "async: the build is running and the journal says the worker took the job (execution.accepted with the request and the directory)" sh -c "grep -q '\"kind\":\"execution.accepted\".*\"request\":\"r-build-1\".*\"dir\":\"$br/cx/ev\"' '$br/cx/journal.jsonl' && ! grep -q 'execution.finished' '$br/cx/journal.jsonl'"
+  "$br/forge" cancel "$br/cx" "$br/workers" build-1 > "$br/cx.cancel" 2> "$br/cx.cancel.err"; echo $? > "$br/cx.cancel.rc"
+  wait "$(cat "$br/cx.pid")"; echo $? > "$br/cx.rc"
+  check "async: forge cancel is answered while the build holds the workspace lock (it reads the journal and writes nothing): the worker stopped the run" sh -c "[ '$(rc cx.cancel)' = 0 ] && grep -q '^cancel: cancelled\$' '$br/cx.cancel'"
+  check "async: the polling forge build sees it end cancelled: exit 4, state cancelled, execution.cancelled in the journal, no claim" sh -c "[ '$(rc cx)' = 4 ] && grep -q '^state: cancelled\$' '$br/cx.out' && grep -q '^ending: cancelled\$' '$br/cx.out' && grep -q '\"kind\":\"execution.cancelled\"' '$br/cx/journal.jsonl' && grep -q '\"kind\":\"task.cancelled\"' '$br/cx/journal.jsonl' && ! grep -q 'claimed verdict' '$br/cx.out'"
+  check "async: the build's whole group is gone, the execution directory is kept, and the lock is let go" sh -c ". scripts/procs.sh; ! leftover -f '^sleep 78\$' > /dev/null && ! leftover -f '[c]ancho-build' > /dev/null && ! leftover -x cancho_code > /dev/null && [ -s '$br/cx/ev/brief.txt' ] && [ -s '$br/cx/ev/build.json' ]"
+  printf 'done' > "$br/cx2.brief"
+  "$br/forge" build "$br/cx" "$br/workers" "$br/tools" "$br/cx2.brief" "$br/cx/ev" /opt/cancho/bin/cancho stand m1 a 30000 > "$br/cx2.out" 2> "$br/cx2.err"; echo $? > "$br/cx2.rc"
+  check "async: the same directory resumes with a new task (build-2): it ends done, in verification" sh -c "[ '$(rc cx2)' = 0 ] && grep -q '^task: build-2\$' '$br/cx2.out' && grep -q '^state: verification\$' '$br/cx2.out'"
+  "$br/forge" cancel "$br/cx" "$br/workers" build-1 > /dev/null 2> "$br/cx3.err"; echo $? > "$br/cx3.rc"
+  check "async: forge cancel about a task that has ended is refused task-not-awaiting (exit 1), and so is forge await" sh -c "[ '$(rc cx3)' = 1 ] && grep -q 'task-not-awaiting' '$br/cx3.err' && '$br/forge' await '$br/cx' '$br/workers' build-2 > /dev/null 2> '$br/cx4.err'; [ \$? -eq 1 ] && grep -q 'task-not-awaiting' '$br/cx4.err'"
+
+  # -- a Forge killed in the middle of a running build: recover leaves the task running, await settles it
+  fb_bg rs 'holdgrand
+second' 60000
+  waitfor "$br/rs/ev/pids.txt" 100; sleep 0.3
+  kill -9 "$(cat "$br/rs.pid")"; wait "$(cat "$br/rs.pid")" 2> /dev/null; sleep 0.3
+  check "restart: the build outlived the Forge that started it, and the journal says running with the worker's run accepted" sh -c ". scripts/procs.sh; leftover -f '[c]ancho-build' > /dev/null && leftover -x cancho_code > /dev/null && '$br/forge' status '$br/rs' | grep -q '^  running: 1\$'"
+  before=$(jsum rs)
+  "$br/forge" recover "$br/rs" > "$br/rs.rec1" 2> "$br/rs.rec1.err"; echo $? > "$br/rs.rec1.rc"
+  check "restart: forge recover with no workers directory writes nothing for it: not lost, still running, reported awaiting" sh -c "[ '$(rc rs.rec1)' = 0 ] && grep -q '^awaiting: 1\$' '$br/rs.rec1' && [ \"\$(cksum < '$br/rs/journal.jsonl')\" = \"$before\" ]"
+  "$br/forge" recover "$br/rs" "$br/workers" > "$br/rs.rec2" 2> "$br/rs.rec2.err"; echo $? > "$br/rs.rec2.rc"
+  check "restart: forge recover with the workers directory asks the worker: it is running, so the task stays running and nothing is written" sh -c "[ '$(rc rs.rec2)' = 0 ] && grep -q '^state: running\$' '$br/rs.rec2' && [ \"\$(cksum < '$br/rs/journal.jsonl')\" = \"$before\" ] && ! grep -q 'execution.lost' '$br/rs/journal.jsonl'"
+  touch "$br/rs/ev/release"; sleep 1.5
+  "$br/forge" recover "$br/rs" "$br/workers" > "$br/rs.rec3" 2> "$br/rs.rec3.err"; echo $? > "$br/rs.rec3.rc"
+  check "restart: after the build ended while Forge was down, forge recover reads the result and moves the task to verification with the claim" sh -c "[ '$(rc rs.rec3)' = 0 ] && grep -q '^state: verification\$' '$br/rs.rec3' && grep -q '^claimed verdict: done\$' '$br/rs.rec3' && grep -q '\"kind\":\"execution.finished\".*\"verdict\":\"done\"' '$br/rs/journal.jsonl' && '$br/forge' status '$br/rs' | grep -q '^  verification: 1\$'"
+  "$br/forge" recover "$br/rs" "$br/workers" > "$br/rs.rec4" 2>&1
+  check "restart: recovering again finds nothing to do" sh -c "! grep -q 'awaiting' '$br/rs.rec4' && grep -q '^recovered: 0\$' '$br/rs.rec4'"
+  # -- the same with forge await, a build still running when Forge comes back
+  fb_bg aw 'holdgrand
+third' 60000
+  waitfor "$br/aw/ev/pids.txt" 100; sleep 0.3
+  kill -9 "$(cat "$br/aw.pid")"; wait "$(cat "$br/aw.pid")" 2> /dev/null
+  ( sleep 2; touch "$br/aw/ev/release" ) &
+  "$br/forge" await "$br/aw" "$br/workers" build-1 30000 > "$br/aw.out" 2> "$br/aw.err"; echo $? > "$br/aw.rc"
+  check "restart: forge await waits for the build that was still running, and settles the task: verification, the claim, exit 0" sh -c "[ '$(rc aw)' = 0 ] && grep -q '^state: verification\$' '$br/aw.out' && grep -q '^claimed verdict: done\$' '$br/aw.out'"
+  # -- Forge's own deadline: the build is still running at it, so Forge asks the worker to stop it (the group is gone, the directory kept)
+  fb_bg dl 'holdgrand
+fourth' 60000
+  waitfor "$br/dl/ev/pids.txt" 100; sleep 0.3
+  kill -9 "$(cat "$br/dl.pid")"; wait "$(cat "$br/dl.pid")" 2> /dev/null
+  "$br/forge" await "$br/dl" "$br/workers" build-1 1000 > "$br/dl.out" 2> "$br/dl.err"; echo $? > "$br/dl.rc"
+  check "deadline: forge await with a budget the build outruns cancels it: exit 4, worker-timeout (a deadline sends the task back to ready, as for any worker), no claim" sh -c "[ '$(rc dl)' = 4 ] && grep -q '^state: ready\$' '$br/dl.out' && grep -q '^refusal: worker-timeout\$' '$br/dl.out' && grep -q '^ending: retry-or-fail\$' '$br/dl.out' && grep -q '\"rule\":\"worker-timeout\"' '$br/dl/journal.jsonl' && ! grep -q 'claimed verdict' '$br/dl.out'"
+  check "deadline: the build's group is gone and the directory is kept" sh -c "sleep 0.3; . scripts/procs.sh; ! leftover -f '^sleep 78\$' > /dev/null && ! leftover -f '[c]ancho-build' > /dev/null && [ -s '$br/dl/ev/build.json' ]"
+  # -- a worker that does not know the run it accepted: status unknown is a lost run, never retried, an operator decides
+  fb_bg lo 'holdgrand
+fifth' 60000
+  waitfor "$br/lo/ev/pids.txt" 100; sleep 0.3
+  kill -9 "$(cat "$br/lo.pid")"; wait "$(cat "$br/lo.pid")" 2> /dev/null
+  rm -f "$br/lo/ev/run.json"
+  "$br/forge" await "$br/lo" "$br/workers" build-1 5000 > "$br/lo.out" 2> "$br/lo.err"; echo $? > "$br/lo.rc"
+  check "lost: a status of unknown for an accepted run is execution-lost: exit 4, blocked, the tag in the journal, no claim" sh -c "[ '$(rc lo)' = 4 ] && grep -q '^state: blocked\$' '$br/lo.out' && grep -q '^refusal: execution-lost\$' '$br/lo.out' && grep -q '\"rule\":\"execution-lost\"' '$br/lo/journal.jsonl' && ! grep -q 'claimed verdict' '$br/lo.out'"
+  touch "$br/lo/ev/release"; sleep 1; pkill -f '^sleep 78$'
+  # -- cancelled while no Forge was polling: forge await writes the cancellation
+  fb_bg cw 'holdgrand
+sixth' 60000
+  waitfor "$br/cw/ev/pids.txt" 100; sleep 0.3
+  kill -9 "$(cat "$br/cw.pid")"; wait "$(cat "$br/cw.pid")" 2> /dev/null
+  "$br/forge" cancel "$br/cw" "$br/workers" build-1 > "$br/cw.cancel" 2> /dev/null; echo $? > "$br/cw.cancel.rc"
+  "$br/forge" await "$br/cw" "$br/workers" build-1 10000 > "$br/cw.out" 2> "$br/cw.err"; echo $? > "$br/cw.rc"
+  check "cancel with no Forge polling: the worker stops the run; forge await then writes execution.cancelled and the move to cancelled (exit 4, no claim)" sh -c "[ '$(rc cw.cancel)' = 0 ] && [ '$(rc cw)' = 4 ] && grep -q '^state: cancelled\$' '$br/cw.out' && grep -q '\"kind\":\"execution.cancelled\"' '$br/cw/journal.jsonl' && grep -q '\"kind\":\"task.cancelled\"' '$br/cw/journal.jsonl' && ! grep -q 'claimed verdict' '$br/cw.out'"
+  # -- a task that is not awaiting
+  "$br/forge" await "$br/dl" "$br/workers" build-9 > /dev/null 2> "$br/na.err"; echo $? > "$br/na.rc"
+  check "await: a task that does not exist is refused task-not-awaiting, exit 1, nothing written" sh -c "[ '$(rc na)' = 1 ] && grep -q 'task-not-awaiting' '$br/na.err'"
+  "$br/forge" await "$br/dl" relative build-1 > /dev/null 2>&1; r1=$?; "$br/forge" await "$br/dl" "$br/workers" > /dev/null 2>&1; r2=$?; "$br/forge" await "$br/dl" "$br/workers" build-1 999 > /dev/null 2>&1; r4=$?; "$br/forge" cancel "$br/nowhere-ws" "$br/workers" build-1 > /dev/null 2>&1; r3=$?
+  check "await, cancel: a path that is not absolute, a missing argument, a budget under a second: exit 2; no journal there: exit 3" sh -c "[ $r1 -eq 2 ] && [ $r2 -eq 2 ] && [ $r4 -eq 2 ] && [ $r3 -eq 3 ]"
 
   check "no adapter and no build outlived the run" sh -c ". scripts/procs.sh; ! leftover -x cancho_code > /dev/null && ! leftover -f '[c]ancho-build' > /dev/null"
 else

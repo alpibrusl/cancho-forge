@@ -20,6 +20,8 @@ import forge.task;
 //   phase 2  `execution.started` and nothing after it: the worker may have run, and what it did is not known
 //   phase 3  `execution.finished`, and no move after it: the worker's claim is recorded, the move was not
 //   phase 4  `execution.lost` and no move after it: a recovery that was itself cut short
+//   phase 5  `execution.accepted` and nothing after it: an `async` worker took the job and may still be running
+//   phase 6  `execution.cancelled` and no move after it: the worker stopped it because it was asked to
 //
 // and answers the records that put each of them where the run would have:
 //
@@ -28,6 +30,10 @@ import forge.task;
 //   phase 4  the task has started the worker `retry.max_attempts()` times or more: refusal `retry-exhausted`, then
 //            `task.blocked`; else refusal `execution-lost`, then `task.ready`
 //   phase 3  `task.verification` (a finished record is written only for a `succeeded` reply, and it is a claim)
+//   phase 5  NOTHING: the worker is not known to be gone. It is not lost, and re-dispatching it would start a second build in
+//            a directory the first may still be writing. The caller asks the worker (`forge.await_task`); with no worker to
+//            ask the task stays `running` and is counted as awaiting (docs/async-level.md section 5)
+//   phase 6  `task.cancelled`
 //
 // Forge never re-dispatches by itself: `ready` is where the budget and the policy are consulted again (section 6). Every
 // record is written by Forge (actor forge). Running it twice on a journal it has already recovered finds nothing.
@@ -38,6 +44,7 @@ pub struct Counts {
     lost: int,
     finished: int,
     exhausted: int,
+    awaiting: int,
 }
 
 fn phase_of[&m, &i](phase: &m map.Map[int], id: &i [byte]) -> [] int {
@@ -74,6 +81,10 @@ fn scan_line[&h, &l](heap: &!h Heap, phase: map.Map[int], starts: map.Map[int], 
                         seen = map.get(sb, id, 0);
                     }
                     st = map.put(heap, st, id, seen + 1);
+                } else if current > 0 && bytes.equal(kind, "execution.accepted") {
+                    ph = map.put(heap, ph, id, 5);
+                } else if current > 0 && bytes.equal(kind, "execution.cancelled") {
+                    ph = map.put(heap, ph, id, 6);
                 } else if current > 0 && bytes.equal(kind, "execution.finished") {
                     ph = map.put(heap, ph, id, 3);
                 } else if current > 0 && bytes.equal(kind, "execution.lost") {
@@ -113,12 +124,21 @@ fn settle[&h, &i](heap: &!h Heap, out: buffer.Buffer, text: buffer.Buffer, seq: 
         o = add(heap, o, event.refusal(heap, s, id, "execution-unstarted"));
         o = add(heap, o, event.transition(heap, s + 1, task.kind_of_state(task.State::Ready), id, "forge", ""));
         t = say(heap, t, id, "execution-unstarted, no worker was started: running -> ready");
-        return (o, t, s + 2, Counts { unstarted: c.unstarted + 1, lost: c.lost, finished: c.finished, exhausted: c.exhausted });
+        return (o, t, s + 2, Counts { unstarted: c.unstarted + 1, lost: c.lost, finished: c.finished, exhausted: c.exhausted, awaiting: c.awaiting });
+    }
+    if p == 5 {
+        t = say(heap, t, id, "awaiting: an async worker took the job and is not known to be gone; nothing is written (forge await, or forge recover with the workers directory, asks it)");
+        return (o, t, s, Counts { unstarted: c.unstarted, lost: c.lost, finished: c.finished, exhausted: c.exhausted, awaiting: c.awaiting + 1 });
+    }
+    if p == 6 {
+        o = add(heap, o, event.transition(heap, s, task.kind_of_state(task.State::Cancelled), id, "forge", ""));
+        t = say(heap, t, id, "the worker stopped the run because it was asked to and the move was not recorded: running -> cancelled");
+        return (o, t, s + 1, Counts { unstarted: c.unstarted, lost: c.lost, finished: c.finished, exhausted: c.exhausted, awaiting: c.awaiting });
     }
     if p == 3 {
         o = add(heap, o, event.transition(heap, s, task.kind_of_state(task.State::Verification), id, "forge", ""));
         t = say(heap, t, id, "the worker's claim was recorded and the move was not: running -> verification");
-        return (o, t, s + 1, Counts { unstarted: c.unstarted, lost: c.lost, finished: c.finished + 1, exhausted: c.exhausted });
+        return (o, t, s + 1, Counts { unstarted: c.unstarted, lost: c.lost, finished: c.finished + 1, exhausted: c.exhausted, awaiting: c.awaiting });
     }
     if p == 2 {
         o = add(heap, o, event.execution(heap, s, "execution.lost", id, ""));
@@ -128,12 +148,12 @@ fn settle[&h, &i](heap: &!h Heap, out: buffer.Buffer, text: buffer.Buffer, seq: 
         o = add(heap, o, event.refusal(heap, s, id, "retry-exhausted"));
         o = add(heap, o, event.transition(heap, s + 1, task.kind_of_state(task.State::Blocked), id, "forge", ""));
         t = say(heap, t, id, "retry-exhausted, the worker was started the whole budget and no run ended: running -> blocked");
-        return (o, t, s + 2, Counts { unstarted: c.unstarted, lost: c.lost + 1, finished: c.finished, exhausted: c.exhausted + 1 });
+        return (o, t, s + 2, Counts { unstarted: c.unstarted, lost: c.lost + 1, finished: c.finished, exhausted: c.exhausted + 1, awaiting: c.awaiting });
     }
     o = add(heap, o, event.refusal(heap, s, id, "execution-lost"));
     o = add(heap, o, event.transition(heap, s + 1, task.kind_of_state(task.State::Ready), id, "forge", ""));
     t = say(heap, t, id, "execution-lost, the worker's run has no ending and is not re-dispatched: running -> ready");
-    return (o, t, s + 2, Counts { unstarted: c.unstarted, lost: c.lost + 1, finished: c.finished, exhausted: c.exhausted });
+    return (o, t, s + 2, Counts { unstarted: c.unstarted, lost: c.lost + 1, finished: c.finished, exhausted: c.exhausted, awaiting: c.awaiting });
 }
 
 // The plan for a journal `data` that replayed cleanly and holds `records` records (the caller checked both): the bytes
@@ -156,7 +176,7 @@ pub fn plan[&h, &d](heap: &!h Heap, data: &d [byte], records: int) -> [heap] (bu
     var out = buffer.empty(heap, 256);
     var text = buffer.empty(heap, 128);
     var seq = records + 1;
-    var counts = Counts { unstarted: 0, lost: 0, finished: 0, exhausted: 0 };
+    var counts = Counts { unstarted: 0, lost: 0, finished: 0, exhausted: 0, awaiting: 0 };
     borrow phase as &pb in {
         borrow starts as &sb in {
             var e = 0;
@@ -176,4 +196,94 @@ pub fn plan[&h, &d](heap: &!h Heap, data: &d [byte], records: int) -> [heap] (bu
     map.drop(heap, phase);
     map.drop(heap, starts);
     return (out, text, counts);
+}
+
+// Where a task that is `running` stopped, read from the journal `data` (complete lines): the phase of the table above (0 when
+// the task is not running), and, when it is 5, the request the worker was given and the directory it works in, from the
+// `execution.accepted` record. Empty buffers otherwise. This is what `forge await`, `forge cancel` and `forge recover` need
+// to ask the worker about a run.
+pub fn accepted_of[&h, &d, &i](heap: &!h Heap, data: &d [byte], id: &i [byte]) -> [heap] (int, buffer.Buffer, buffer.Buffer) {
+    var phase = 0;
+    var request = buffer.empty(heap, 1);
+    var dir = buffer.empty(heap, 1);
+    var start = 0;
+    var k = 0;
+    while k < len(data) {
+        if int_of(data[k]) == 10 {
+            let line = data[start..k];
+            let tape = box_slice(heap, json.tape_len(line), 0);
+            borrow mut tape as &!tw in {
+                let tp = contents(tw);
+                if json.parse(line, tp) > 0 && json.is_object(tp, 0) {
+                    let kindn = json.get(line, tp, 0, "kind");
+                    let taskn = json.get(line, tp, 0, "task");
+                    if kindn >= 0 && taskn >= 0 && json.is_string(tp, kindn) && json.is_string(tp, taskn) && json.string_equals(line, tp, taskn, id) {
+                        let kind = json.string_view(line, tp, kindn);
+                        if bytes.equal(kind, "task.running") {
+                            phase = 1;
+                            buffer.drop(heap, request);
+                            buffer.drop(heap, dir);
+                            request = buffer.empty(heap, 1);
+                            dir = buffer.empty(heap, 1);
+                        } else if bytes.starts_with(kind, "task.") {
+                            phase = 0;
+                        } else if phase > 0 && bytes.equal(kind, "execution.started") {
+                            phase = 2;
+                        } else if phase > 0 && bytes.equal(kind, "execution.accepted") {
+                            let rq = json.get(line, tp, 0, "request");
+                            let dr = json.get(line, tp, 0, "dir");
+                            if rq >= 0 && dr >= 0 && json.is_string(tp, rq) && json.is_string(tp, dr) && json.string_plain(tp, rq) && json.string_plain(tp, dr) {
+                                phase = 5;
+                                buffer.drop(heap, request);
+                                buffer.drop(heap, dir);
+                                request = buffer.append(heap, buffer.empty(heap, 16), json.string_view(line, tp, rq));
+                                dir = buffer.append(heap, buffer.empty(heap, 16), json.string_view(line, tp, dr));
+                            }
+                        } else if phase > 0 && bytes.equal(kind, "execution.finished") {
+                            phase = 3;
+                        } else if phase > 0 && bytes.equal(kind, "execution.lost") {
+                            phase = 4;
+                        } else if phase > 0 && bytes.equal(kind, "execution.cancelled") {
+                            phase = 6;
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return (phase, request, dir);
+}
+
+// The ids of the tasks in phase 5 (an `async` worker took the job and nothing ended it), one per line, in the order of the
+// table the scan builds. What `forge recover <dir> <workers>` goes on to ask the worker about.
+pub fn awaiting[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer {
+    var phase = map.empty(heap, 16, 0, 0);
+    var starts = map.empty(heap, 16, 0, 0);
+    var start = 0;
+    var k = 0;
+    while k < len(data) {
+        if int_of(data[k]) == 10 {
+            let (p, s) = scan_line(heap, phase, starts, data[start..k]);
+            phase = p;
+            starts = s;
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    var out = buffer.empty(heap, 32);
+    borrow phase as &pb in {
+        var e = 0;
+        while e < map.entries(pb) {
+            if map.is_live(pb, e) && map.value_at(pb, e) == 5 {
+                out = buffer.push(heap, buffer.append(heap, out, map.key_at(pb, e)), byte_of(10));
+            }
+            e = e + 1;
+        }
+    }
+    map.drop(heap, phase);
+    map.drop(heap, starts);
+    return out;
 }

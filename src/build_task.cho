@@ -42,6 +42,9 @@ pub enum Refusal {
     // Another adapter holds the lock of the execution directory (issue #35; decided by the process half, which takes the
     // lock): a build is running there. Nothing in the directory is written.
     ExecutionLocked,
+    // The Cancho Code adapter could not start its supervisor (docs/async-level.md section 4): the workers directory cannot be
+    // opened, the supervisor cannot be started, or it ended or stayed silent without taking the directory.
+    SupervisorUnavailable,
 }
 
 pub enum Checked {
@@ -78,6 +81,9 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         Refusal::ExecutionLocked => {
             return "execution-locked";
         }
+        Refusal::SupervisorUnavailable => {
+            return "supervisor-unavailable";
+        }
     }
 }
 
@@ -89,6 +95,12 @@ pub fn task_type() -> [] &static [byte] {
 // what runs.
 pub fn tool_name() -> [] &static [byte] {
     return "cancho-build";
+}
+
+// Is `path` a workers directory the adapter will open to start its supervisor beneath it? The same rule as the other paths
+// of the request (`gate_task.path_ok`); a request without one is not valid for `execute`.
+pub fn workers_dir_ok[&p](path: &p [byte]) -> [] bool {
+    return gate_task.path_ok(path);
 }
 
 // The lock file of an execution directory (docs/cancho-code-adapter.md section 11): a file of its own beneath it, locked
@@ -539,8 +551,9 @@ pub fn verdict_name(id: int) -> [] &static [byte] {
 
 // The `execute` request of a `project.build` task, as the adapter reads it: the brief is the task's input (the JSON writer
 // escapes it); the tools directory and the build configuration are the operator's, in `grants`, and no field of `task.input`
-// carries any of them. Every value has passed `check` and `operator_checked`; `guide` is empty for none.
-pub fn request[&h, &r, &t, &b, &e, &u, &c, &g, &p, &m, &a](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &t [byte], brief: &b [byte], timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], tools_dir: &u [byte], checker: &c [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [heap] buffer.Buffer {
+// carries any of them. `workers_dir` is the directory holding the adapter itself, where it finds its supervisor
+// (docs/async-level.md section 4). Every value has passed `check` and `operator_checked`; `guide` is empty for none.
+pub fn request[&h, &r, &t, &b, &e, &u, &z, &c, &g, &p, &m, &a](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &t [byte], brief: &b [byte], timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], tools_dir: &u [byte], workers_dir: &z [byte], checker: &c [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 512);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "contract");
@@ -576,6 +589,8 @@ pub fn request[&h, &r, &t, &b, &e, &u, &c, &g, &p, &m, &a](heap: &!h Heap, reque
     w = json.put_string(heap, w, execution_dir);
     w = json.put_key(heap, w, "tools_dir");
     w = json.put_string(heap, w, tools_dir);
+    w = json.put_key(heap, w, "workers_dir");
+    w = json.put_string(heap, w, workers_dir);
     w = json.put_key(heap, w, "build");
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "checker");

@@ -5,6 +5,7 @@ import std.buffer;
 import std.bytes;
 import std.json;
 import std.map;
+import forge.await_run;
 import forge.build_task;
 import forge.dispatch;
 import forge.event;
@@ -120,7 +121,7 @@ fn claimed_verdict[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), execution_dir: &d 
 }
 
 // The claimed verdict of the run that ended with `e`: 0 unless it was a `succeeded` reply.
-fn claimed_of[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), file_read] int {
+pub fn claimed_of[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), file_read] int {
     if gate_run.succeeded(e) {
         return claimed_verdict(heap, fs, execution_dir);
     }
@@ -128,18 +129,23 @@ fn claimed_of[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), e: dispatch.Ending, exe
 }
 
 // The `execution.finished` of a `succeeded` run, written with the verdict it claimed; nothing for any other ending.
-fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] int {
+pub fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] int {
     if gate_run.succeeded(e) {
         return gate_run.note_execution(heap, fs, path, seq, "execution.finished", id, build_task.verdict_name(claimed_verdict(heap, fs, execution_dir)));
     }
     return seq;
 }
 
+// How often a run that was accepted is asked whether it is done: once a second (each ask is a process start).
+pub fn poll_interval_ms() -> [] int {
+    return 1000;
+}
+
 // Run the task. `journal_path` is the journal of the workspace (the caller holds the lock); `workers` is the directory
 // holding `cancho_code`; `tools` is the operator's directory holding `cancho-build`; `brief` is the brief's text;
 // `execution_dir` an existing directory for the build (the work directory of the tool, and where the evidence is); the rest
 // is the operator's configuration. `timeout_ms` is Forge's deadline for the run.
-pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &k, &g, &p, &m, &a](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], brief: &b [byte], execution_dir: &e [byte], tools_dir: &t [byte], checker: &k [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts_ceiling: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int, timeout_ms: int) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, clock, poll] Finished {
+pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], brief: &b [byte], execution_dir: &e [byte], tools_dir: &t [byte], workers_dir: &y [byte], checker: &k [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts_ceiling: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int, timeout_ms: int) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, clock, poll] Finished {
     let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
     if report.rule != 0 || recovered.errno != 0 {
         map.drop(heap, existing);
@@ -190,9 +196,22 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &k, &g, &p, &m, &a](heap: &!h Hea
                     attempts = attempts + 1;
                     let request_id = gate_run.request_id_of(heap, tid, attempts);
                     borrow request_id as &rb in {
-                        let req = build_task.request(heap, buffer.bytes(rb), attempts, tid, brief, timeout_ms, 1048576, execution_dir, tools_dir, checker, guide, provider, model, agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);
+                        let req = build_task.request(heap, buffer.bytes(rb), attempts, tid, brief, timeout_ms, 1048576, execution_dir, tools_dir, workers_dir, checker, guide, provider, model, agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);
                         borrow req as &qb in {
-                            let ending = worker.execute(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, false);
+                            let began = clock_ms(clock);
+                            var ending = worker.execute(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, true);
+                            if dispatch.accepted(ending) {
+                                // The worker took the job and the build goes on elsewhere (docs/async-level.md): write down what a
+                                // later Forge needs to ask about it, then wait for it. Forge's deadline is the total of the run.
+                                seq = gate_run.note_accepted(heap, fs, journal_path, seq, tid, buffer.bytes(rb), execution_dir);
+                                if seq >= 0 {
+                                    var left = timeout_ms - (clock_ms(clock) - began);
+                                    if left < 1000 {
+                                        left = 1000;
+                                    }
+                                    ending = await_run.finish(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(rb), tid, execution_dir, left, poll_interval_ms());
+                                }
+                            }
                             let consequence = dispatch.consequence(ending);
                             let decision = retry.decide(consequence, attempts, false);
                             let tag = dispatch.rule_tag(ending);
@@ -204,6 +223,9 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &k, &g, &p, &m, &a](heap: &!h Hea
                                 seq = gate_run.note(heap, fs, journal_path, seq, tid, again, false);
                             }
                             seq = finish_attempt(heap, fs, journal_path, seq, tid, ending, execution_dir);
+                            if bytes.equal(dispatch.consequence_name(consequence), "cancelled") {
+                                seq = gate_run.note_execution(heap, fs, journal_path, seq, "execution.cancelled", tid, "");
+                            }
                             let (t5, s5) = gate_run.move_to(heap, fs, journal_path, tasks, seq, tid, retry.target_after(consequence, decision), task.Actor::Forge, false);
                             tasks = t5;
                             seq = s5;
