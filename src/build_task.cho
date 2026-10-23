@@ -39,6 +39,9 @@ pub enum Refusal {
     // `forge build` could not read the brief file the operator named, or it is over 16 KiB (decided by `forge build`, before
     // a task exists: nothing is journalled).
     BriefUnreadable,
+    // Another adapter holds the lock of the execution directory (issue #35; decided by the process half, which takes the
+    // lock): a build is running there. Nothing in the directory is written.
+    ExecutionLocked,
 }
 
 pub enum Checked {
@@ -72,6 +75,9 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         Refusal::BriefUnreadable => {
             return "brief-unreadable";
         }
+        Refusal::ExecutionLocked => {
+            return "execution-locked";
+        }
     }
 }
 
@@ -83,6 +89,12 @@ pub fn task_type() -> [] &static [byte] {
 // what runs.
 pub fn tool_name() -> [] &static [byte] {
     return "cancho-build";
+}
+
+// The lock file of an execution directory (docs/cancho-code-adapter.md section 11): a file of its own beneath it, locked
+// with `flock` by the adapter for the life of a request. Not in the evidence list; never written.
+pub fn lock_name() -> [] &static [byte] {
+    return "forge-build.lock";
 }
 
 // The shortest and longest `timeout_ms` of a build: 10 seconds (below it the margin of `runner_deadline_ms` and the

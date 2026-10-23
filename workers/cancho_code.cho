@@ -9,7 +9,9 @@ import std.process;
 import forge.build_task;
 import forge.gate_task;
 import forge.journal_io;
+import forge.lock;
 import forge.snapshot;
+import forge.task;
 import forge.verbs;
 
 // The Cancho Code adapter (docs/cancho-code-adapter.md; issue #16): a `sync` worker of the contract (worker-contract
@@ -288,10 +290,10 @@ fn tool_ok[&x](exec: &x Exec("")) -> [] bool {
     return exec_covers(exec, build_task.tool_name());
 }
 
-// The tool has been found: write the brief, start the build detached beneath `tools`, wait for it under the deadline,
+// The lock of the execution directory is held and the tool has been found: write the brief, start the build detached beneath `tools`, wait for it under the deadline,
 // write its standard output, and answer with how it ended and the files it left. `args` is the argument vector
 // (`build_task.build_args`), whose brief path and work directory are beneath `exec_dir`.
-fn run_with[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+fn run_locked[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
     if !tool_ok(exec) {
         return refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::ToolUnusable), "the build tool is not a name the Exec bound covers");
     }
@@ -406,6 +408,37 @@ fn settle[&h, &i, &d, &r, &k](heap: &!h Heap, io: &!i Io, wd: &d Dir, request_id
     }
     buffer.drop(heap, evidence);
     return 0;
+}
+
+// Take the lock of the execution directory, run, and let the lock go after the answer is written (docs/cancho-code-adapter.md
+// section 11). `flock` on a file of its own beneath the directory: the kernel drops it when this process ends however it ends,
+// so a killed adapter leaves nothing to remove. It is taken after the task was checked and before the first write, so a
+// start that is refused has written nothing to the directory in use (the lock file exists already: the holder made it, and
+// opening it for append writes no byte). A second adapter on the same directory is `execution-locked`; a directory that
+// cannot be opened for the lock is `workdir-unwritable`, as it is for the brief.
+fn run_with[&h, &i, &f, &c, &x, &d, &r, &k, &b, &e, &a](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], brief: &b [byte], exec_dir: &e [byte], args: &a [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll] int {
+    let lock_path = under(heap, exec_dir, build_task.lock_name());
+    var done = 0;
+    borrow lock_path as &lp in {
+        match lock.acquire(fs, buffer.bytes(lp)) {
+            lock.Lock::Refused(rule) => {
+                if rule == task.rule_code(task.Rule::WorkspaceLocked) {
+                    done = refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::ExecutionLocked), "another build holds this execution directory; nothing was written");
+                } else {
+                    done = refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::PathInvalid), "the execution directory is not a path the adapter will lock");
+                }
+            }
+            lock.Lock::Failed(e) => {
+                done = refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the execution directory could not be opened for its lock");
+            }
+            lock.Lock::Held(file) => {
+                done = run_locked(heap, io, fs, clock, exec, tools, request_id, task_id, brief, exec_dir, args, timeout_ms);
+                lock.let_go(file);
+            }
+        }
+    }
+    buffer.drop(heap, lock_path);
+    return done;
 }
 
 // A task that has passed `build_task.check` and `build_task.operator_checked`: open the tools directory, then run.

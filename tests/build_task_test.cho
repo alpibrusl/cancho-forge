@@ -289,6 +289,17 @@ fn test_every_refusal_has_its_own_rule_tag() -> [] int {
     test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::OperatorInvalid), "operator-invalid"));
     test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::ToolUnusable), "tool-unusable"));
     test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "workdir-unwritable"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::ExecutionLocked), "execution-locked"));
+    return 0;
+}
+
+fn test_the_lock_is_a_file_of_its_own_that_is_not_evidence() -> [] int {
+    test.assert(bytes.equal(build_task.lock_name(), "forge-build.lock"));
+    var i = 0;
+    while i < build_task.evidence_count() {
+        test.assert(!bytes.equal(build_task.evidence_name(i), build_task.lock_name()));
+        i = i + 1;
+    }
     return 0;
 }
 

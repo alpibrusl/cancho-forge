@@ -599,6 +599,11 @@ held
 | does the lock go with the holder when it is killed with SIGKILL? | yes: the next try took it at once; nothing to remove |
 | does the build the holder started inherit the descriptor? | **No**: the build has no descriptor naming the lock file (`exec_spawn_detached_under` starts it with the descriptors closed, as cancho's `docs/processes.md` says). So the lock does **not** outlive a killed adapter whose build is still running: that build is an orphan (G4) and the lock is free while it writes |
 
+**The same script after the lock was built (same compiler, one run):** one build live, `brief.txt` still `first`, B answered
+`failed` with `error.code` `execution-locked`, `project.cho` and `build.out` the first build's; through `forge build` with two
+workspaces the exit codes are 0 and 4 and the states `verification` and `blocked`. The `pids.txt` and checksums did not change
+when B started.
+
 **Not measured, not claimed.** macOS (`EWOULDBLOCK` is 35 there); a lock file on a network filesystem; a build that deletes or
 replaces the lock file in its own directory (argued in `docs/cancho-code-adapter.md` section 11, not run); the real
 `cancho-build`.

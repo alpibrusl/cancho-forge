@@ -76,6 +76,14 @@ M = [
     ("arg-guide-dropped", T, "    if len(guide) > 0 {\n        b2 = put_option", "    if false {\n        b2 = put_option", "the operator's guide never reaches the tool"),
     ("default-attempts", W, "fn default_attempts() -> [] int {\n    return 4;", "fn default_attempts() -> [] int {\n    return 5;", "the default is not the tool's"),
     ("arg-agent-split", T, "b2 = put_arg(heap, b2, agent);", "b2 = put_arg(heap, put_arg(heap, b2, agent), agent);", "the agent command is given twice"),
+    # ---- the lock of the execution directory (issue #35; docs/cancho-code-adapter.md section 11)
+    ("lock-let-go-early", W, "                done = run_locked(heap, io, fs, clock, exec, tools, request_id, task_id, brief, exec_dir, args, timeout_ms);\n                lock.let_go(file);", "                lock.let_go(file);\n                done = run_locked(heap, io, fs, clock, exec, tools, request_id, task_id, brief, exec_dir, args, timeout_ms);", "the lock is let go before the build runs, so a second adapter is not refused"),
+    ("lock-refusal-unrecognised", W, "if rule == task.rule_code(task.Rule::WorkspaceLocked) {", "if false {", "a held lock is reported as a path that is not lockable"),
+    ("lock-refusal-tag", W, "build_task.rule_name(build_task.Refusal::ExecutionLocked), \"another build", "build_task.rule_name(build_task.Refusal::WorkdirUnwritable), \"another build", "a held lock is reported as an unwritable directory"),
+    ("lock-tag-name", T, 'return "execution-locked";', 'return "execution-lock";', "the refusal's tag is not the documented one"),
+    ("lock-refusal-retryable", W, 'done = refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::ExecutionLocked), "another build holds this execution directory; nothing was written");', 'done = answer(heap, io, request_id, task_id, 2, build_task.rule_name(build_task.Refusal::ExecutionLocked), "another build holds this execution directory; nothing was written", true, "[]");', "a held lock is retryable"),
+    ("lock-failure-runs", W, 'done = refuse(heap, io, request_id, task_id, build_task.rule_name(build_task.Refusal::WorkdirUnwritable), "the execution directory could not be opened for its lock");', 'done = run_locked(heap, io, fs, clock, exec, tools, request_id, task_id, brief, exec_dir, args, timeout_ms);', "a lock file that cannot be opened is run without a lock"),
+    ("lock-name", T, 'return "forge-build.lock";', 'return "build.out";', "the lock is the build's output file, which the build and the adapter write"),
     # ---- what is not a task
     ("unknown-verb-served", W, 'is(src, tp, json.get(src, tp, 0, "verb"), "execute") ||', 'is(src, tp, json.get(src, tp, 0, "verb"), "execute") && false ||', "a verb that is not execute is served"),
     ("request-id-not-needed", W, "|| len(text_of(src, tp, rid)) == 0 ||", "||", "a request with no id is answered"),

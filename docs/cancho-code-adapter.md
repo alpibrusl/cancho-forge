@@ -100,8 +100,9 @@ is a function of the verdict), and the verdict is **never** taken from standard 
 error is `retryable: true`.
 
 Refused before anything runs (`failed`, no evidence): `task-type-invalid`, `input-invalid`, `path-invalid`, `limits-invalid`,
-`operator-invalid`; and `tool-unusable` (the tools directory cannot be opened) and `workdir-unwritable` (the brief or the
-output cannot be written, or the directory cannot be opened to list the evidence). A request that is not an `execute` or a
+`operator-invalid`; `tool-unusable` (the tools directory cannot be opened); `workdir-unwritable` (the brief or the
+output cannot be written, the directory cannot be opened to list the evidence, or its lock file cannot be opened); and
+`execution-locked` (another adapter holds the directory: section 11, not retryable, nothing written). A request that is not an `execute` or a
 `capabilities` of this contract, or names no request id or no task id, is **not answered** (exit 4, which Forge classifies
 `worker-error`). Every code has a row in [`architecture.md`](architecture.md) section 7 and a case in the conformance program.
 
@@ -115,6 +116,10 @@ a poll for the capture, the heap, stdio; no network, no signals, no foreign code
 and `dir_read`/`file_read` are new, because the adapter reads `build.json` and hashes the evidence. What the build does once
 started is the build's authority, not the adapter's: **`cancho-build` itself holds `exec("")`** (audit 6, architecture G2), and
 the `Exec` bound Forge puts on starting the adapter does not bound it.
+
+The lock of section 11 (issue #35) **did not widen this report**: it is `file_lock` on a file the adapter opens with `open_append`, under
+the `fs_write("")` and `file_write` it already held for `brief.txt`. The gate compares the report with the checked-in file
+and it is unchanged.
 
 ## 6. How it is checked
 
@@ -168,8 +173,9 @@ The harness itself had a defect found at the same time: it called a break INVALI
   real one ends. Latency, token use, cost and the share of runs that end `done` are still unmeasured (worker-contract 9.5).
 * **Forge's side** is built since issue #34 (section 10): `forge build` builds the `project.build` request from the operator's
   configuration and starts this adapter. The adapter still checks its request again, because a request may not come from Forge.
-* **Two builds in one directory.** The tool has no lock (audit 4). The adapter holds none either: exclusion is Forge's lock on
-  the execution directory (`forge.lock`), as for the gate runner.
+* ~~**Two builds in one directory.** The adapter holds none either: exclusion is Forge's lock on the execution directory.~~
+  **Corrected (issue #35, section 11): that assumption was false** (Forge's lock is the workspace's, and two workspaces can point at
+  one directory; measured) and is replaced by the adapter's own lock. The tool itself still has none (audit 4).
 * **Cost.** The tool records tokens in `usage.jsonl`; the adapter does not offer that file or derive a cost (worker-contract 9.2,
   milestone M4).
 * **`--retry`, `--patch`, `--review`, `--contract`, `--memory`**: not passed. A `stuck` outcome continues only through a new
@@ -320,14 +326,16 @@ list makes that unreachable (no input may reach a trap, even an unreachable one)
 * **A refusal tag from `forge.dispatch`** (a reply that is not valid for the contract) is journalled by the same code as the
   gate's, but the stand-in adapter never produces one: this check does not reach that line. The gate's checks cover the same
   shape.
-* **The `async` level** (#33) and **the lock for two builds in one directory** (#35). `forge build` holds the workspace lock, not
-  a lock on the execution directory: two workspaces can point at one directory.
+* **The `async` level** (#33). (The lock for two builds in one directory, #35, is built: section 11.)
+* **The tag of a refused second build is not in `forge build`'s output.** The second `forge build` on a busy directory ends
+  `blocked` with `ending: worker-said`, exit 4, and journals no `execution.finished`; the code `execution-locked` is in the
+  adapter's reply, which Forge does not keep (the item above about a failed build's code). The first build is undisturbed.
 * **Cost**, **a configuration file**, **`--retry`/`--patch`** (section 8).
 
 ## 11. Two builds in one directory (issue #35)
 
-> **Status: designed (this section is the first commit of the issue; the build follows in the next, and corrects what it
-> finds, in place).** The measurements are `spike/RESULTS.md`, S13.
+> **Status: built, checked against the stand-in tool only.** Written before the code (sections 11.1 to 11.6 are the design as
+> committed first; 11.7 says what the building measured and changed). The spike measurements are `spike/RESULTS.md`, S13.
 
 ### 11.1 The race, measured (before any lock)
 
@@ -424,3 +432,32 @@ them, with `cmp`, to a run of the same brief in another directory).
   exclusion; the lock stops two *adapters*, not a build that works against it. Argued, not measured.
 * **Network filesystems, macOS** (`EWOULDBLOCK` is 35 there; `forge.lock` already carries both numbers). Linux ext4/tmpfs only.
 * **The real `cancho-build`** may care about an extra file in its work directory; the stand-in does not.
+
+### 11.7 Measured, and what the building changed
+
+Compiler `972099e`, Linux x86-64, one run each, against the **stand-in** tool (`scripts/standin_cancho_build.sh`, mode `slow`).
+
+* **The race is a test.** `scripts/check_cancho_code.sh` runs the scenario of 11.1 with two real adapters: the first build running,
+  the second adapter started on the same directory. Run on the adapter **as it was**, with the check in place, it failed 7 of its
+  new checks and the updated `notool` one (the second ran, `brief.txt` changed, the two answered `succeeded`, the files differed from a
+  run alone, the lock file did not exist); on the
+  adapter with the lock all pass. The second answers `failed` / `execution-locked` / `retryable: false` / no evidence at once, every
+  file of the directory (size, mtime to the nanosecond, checksum, the lock file included) is what it was before it started, and
+  the first build's files and its answer are byte for byte those of the same brief run alone in another directory.
+* **Stale lock, settled.** The first adapter killed with SIGKILL with its build running: the build is still alive (an orphan),
+  holds no descriptor naming the lock file, and the next adapter takes the lock at once and finishes `succeeded`. **The orphan
+  and the second build overlap while the orphan lives**: that is the residual of 11.4, shown by the check, not removed by it.
+* **A deadline kill and a resume**: after the `build-timeout` case, the same directory takes the same request and the build
+  finishes `done`. A lock file that is a directory is `workdir-unwritable` and the tool never runs.
+* **Through Forge**: two `forge build` on two workspaces and one execution directory (`scripts/check_build_run.sh`): the second
+  ends `blocked`, exit 4, and started no build; the first ends in `verification` with its own claim and its own `brief.txt`.
+  Two on one workspace are refused at the workspace (`workspace-locked`, exit 3), as before.
+* **Unit tests**: `build_task` has the new tag and the lock name (31 tests, one new; the tag is also asserted in the existing tag test).
+* **Counts**: `check_cancho_code.sh` 84 checks, all `ok` (69 before); `check_build_run.sh` 52 (48 before).
+* **Deliberate breaks**, `scripts/mutate_cancho_code.py`: 7 new (the lock let go before the build, the held lock not recognised,
+  the refusal under another tag or tag name, retryable, a lock file that cannot be opened run anyway, the lock file named as the
+  build's output), all killed.
+* **Authority**: the adapter's report and the forge binary's are unchanged (the gate compares both).
+
+What the building changed: the first oracle for the `notool` case listed only `brief.txt`, and now lists the lock file too (the
+adapter takes the lock before the tool is looked up by the spawn). The decision of 11.2 did not change.

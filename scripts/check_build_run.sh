@@ -131,6 +131,21 @@ if $C build src/*.cho --std -o "$br/forge" && $C build workers/cancho_code.cho $
   mkws nowd
   check "a workers directory that is not there: exit 3" sh -c "'$br/forge' build '$br/nowd' '$br/nowhere-workers' '$br/tools' '$br/done.brief' '$br/nowd/ev' /opt/cancho/bin/cancho stand m1 a 20000 > /dev/null 2>&1; [ \$? -eq 3 ]"
 
+  # ---- two workspaces, one execution directory (issue #35): Forge's lock is the workspace's, the adapter's is the directory's.
+  # The stand-in's `slow` mode keeps the first build running until a file `release` is there.
+  mkdir "$br/lk1" "$br/lk2" "$br/lkev" || exit 1
+  printf 'slow\nfirst' > "$br/lk1.brief"; printf 'slow\nsecond' > "$br/lk2.brief"
+  "$br/forge" build "$br/lk1" "$br/workers" "$br/tools" "$br/lk1.brief" "$br/lkev" /opt/cancho/bin/cancho stand m1 a 60000 > "$br/lk1.out" 2> "$br/lk1.err" &
+  lkpid=$!
+  n=0; while [ ! -s "$br/lkev/pids.txt" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+  "$br/forge" build "$br/lk2" "$br/workers" "$br/tools" "$br/lk2.brief" "$br/lkev" /opt/cancho/bin/cancho stand m1 a 60000 > "$br/lk2.out" 2> "$br/lk2.err"; echo $? > "$br/lk2.rc"
+  touch "$br/lkev/release"
+  wait "$lkpid"; echo $? > "$br/lk1.rc"
+  check "two workspaces, one execution directory: the second forge build ends blocked (exit 4), its adapter refused it, and it started no build" sh -c "[ '$(rc lk2)' = 4 ] && grep -q '^state: blocked\$' '$br/lk2.out' && [ \$(wc -l < '$br/lkev/pids.txt') -eq 1 ]"
+  check "two workspaces, one execution directory: the first build is undisturbed, ends in verification with its own claim, and brief.txt is its brief" sh -c "[ '$(rc lk1)' = 0 ] && grep -q '^state: verification\$' '$br/lk1.out' && [ \"\$(sed -n 2p '$br/lkev/brief.txt')\" = first ] && [ \"\$(cat '$br/lkev/project.cho')\" = 'product of first' ]"
+  check "two workspaces, one execution directory: the refused one wrote no claim, and its task is not accepted" sh -c "! grep -q 'execution.finished\|task.accepted' '$br/lk2/journal.jsonl'"
+  check "two forge build on ONE workspace: the second is refused workspace-locked at the workspace, exit 3" sh -c "mkdir '$br/lk3' '$br/lk3ev'; printf 'slow\nfirst' > '$br/lk3.brief'; '$br/forge' build '$br/lk3' '$br/workers' '$br/tools' '$br/lk3.brief' '$br/lk3ev' /opt/cancho/bin/cancho stand m1 a 60000 > /dev/null 2>&1 & p=\$!; n=0; while [ ! -s '$br/lk3ev/pids.txt' ] && [ \$n -lt 100 ]; do sleep 0.1; n=\$((n + 1)); done; '$br/forge' build '$br/lk3' '$br/workers' '$br/tools' '$br/lk3.brief' '$br/lk3ev' /opt/cancho/bin/cancho stand m1 a 60000 > '$br/lk3.out2' 2> '$br/lk3.err2'; rc=\$?; touch '$br/lk3ev/release'; wait \$p; [ \$rc -eq 3 ] && grep -q 'workspace-locked' '$br/lk3.err2' '$br/lk3.out2'"
+
   check "no adapter and no build outlived the run" sh -c ". scripts/procs.sh; ! leftover -x cancho_code > /dev/null && ! leftover -f '[c]ancho-build' > /dev/null"
 else
   echo "forge build: did not build"
