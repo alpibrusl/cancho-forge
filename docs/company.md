@@ -3,7 +3,7 @@
 **Status, stated first.** The company layer is built and tested with stand-in workers. **No company has been run with a real
 model**: every number in this document comes from the gate's conformance programs, in which the builder is the real Cancho Code
 adapter over a *stand-in* build tool (`scripts/standin_cancho_build.sh`), the qa step runs the real gate runner on a throw-away git
-checkout, and the analyst runs a stand-in tool (and, once, the real `tally` and `jsonq`). The layer has not built StatusLite, has not
+checkout, and the analyst runs a stand-in tool (the real `tally` and `jsonq` were run once during development; the gate skips that run unless `FORGE_CANCHO_TOOLS` is set and does not re-run it otherwise). The layer has not built StatusLite, has not
 spent a dollar, and says nothing about what a model-driven company costs or achieves. See "What is not measured" at the end.
 
 ## 1. What it is
@@ -91,7 +91,7 @@ the operator's (section 4), so whoever edits `company.json` cannot widen what Fo
   no NUL. Nothing is driven by `mission`.
 * `model`: `provider` and `name`. A builder step is built with this provider and model, and the price table is looked up with them.
 * `budget`: **all six keys are required** (`budget-missing` / `price-table-missing`). `input`, `output`, `cache_write`, `cache_read` are
-  token ceilings (non-negative integers; a ceiling may be reached and not passed, and 0 allows nothing: it does not mean unlimited).
+  token ceilings (non-negative integers; a ceiling may be reached and not passed; a ceiling of 0 does not mean unlimited, but it does **not** stop the first model step either: the budget is checked only between model steps, so with every ceiling 0 and nothing spent the first builder or writer step still starts, and everything after it is refused).
   `max_cost` is **whole US dollars**. `price_table` is a plain file name (1 to 128 bytes of letters, digits, `-`, `_`, `.`, not starting
   with `.`) of a file in the company directory. See section 9.
 * `human_gates`: the names a step's `gate` may use. (Besides these, every step id makes a *retry gate* `retry:<id>`, section 5.)
@@ -324,7 +324,7 @@ The budget is **derived from recorded tokens, never worker-reported**.
 * **When it is checked**: only **between model steps**. The scheduler (`company_run.next_action`) will not start a builder or writer
   step when any token class is over its ceiling (`spent > limit`) or the cost is over `max_cost`; the run then ends `budget-exhausted`,
   exit 12 (a gated model step behind a spent budget counts as held by it). **Steps that use no model (qa, analyst, reviewer, product)
-  are never stopped by it.** A running step is **not** killed when the ceiling is crossed, so spending can pass a ceiling by one step.
+  are never stopped by it.** A running step is **not** killed when the ceiling is crossed, so spending can pass a ceiling by one step. **A zero-budget company still runs its first model step**: `spent > limit` is false at 0 spent, there is no pre-check, and no test covers it.
 * **Two ways the recorded spend lags what was spent** (read from the code, not covered by a test): (1) a run killed after a build ended
   and before its `spend.recorded` was appended has spent tokens the journal does not hold; the next run's budget check does not see them
   and may admit one more model step, and the delta recorded after that step includes them (the **kill-before-spend window**). (2) The
@@ -361,7 +361,7 @@ workers directory has no check_guard`. A race left open: if a next run takes `ch
 |---|---|---|---|---|
 | builder | `project.build` | the Cancho Code adapter, `forge build`'s run; a model step (budget applies) | `project.cho` | **implemented and measured** with a stand-in build tool: lying worker, good path, budget, rejected gate, kill and resume, needs, contract |
 | qa | `repo.gate` | the gate runner, `forge gate`'s run, over the operator's `gates.<id>` (repo on the allow-list, revision, checkout) | `report.json` | **implemented and measured** on a throw-away git checkout |
-| analyst | `tool.run` | the tool runner `workers/tool_run.cho`; no model | `tool.out` | **implemented and measured** with a stand-in tool and, once, the real `tally` and `jsonq`; its re-run comparison (forge#41) is not built (below) |
+| analyst | `tool.run` | the tool runner `workers/tool_run.cho`; no model | `tool.out` | **implemented and measured** with a stand-in tool (the real `tally` and `jsonq` ran once in development; the gate skips that unless `FORGE_CANCHO_TOOLS` is set); its re-run comparison (forge#41) is not built (below) |
 | product | none | a person: the step's `gate` (accepted on the approved decision alone when it has no `check`; with a `check` that runs on `company.json`); a product step with neither is `check-missing` | `company.json` | **implemented and measured** |
 | reviewer | `repo.gate` | **the same path as qa**: the gate runner over `gates.<id>`. Nothing compares `cancho authority` to a checked-in ceiling, which was the reviewer's whole point in the design (4.2, 10) | `report.json` | **accepted by the manifest and mapped to the gate runner, but not run by any test and not distinct from qa.** The design's goal 5 asked for a reviewer; it is not met |
 | writer | `project.build` | the builder path (a model step) | `project.cho` | **accepted by the manifest (a `check` is required) and mapped to the builder path, but no writer step has been run by any test.** The design's checks (length, required sections and links) are whatever the step's own `check` program does; Forge adds none, and "a person reads it before the gate opens" is only a `gate` the manifest author puts on the step |
@@ -371,7 +371,7 @@ default check, and each step names its own.
 
 ## 12. Refusal tags
 
-Every refusal has a stable `rule` tag, printed as `refusal: <tag>`, and a test that reaches it. The table is the company layer's,
+Every refusal has a stable `rule` tag, printed as `refusal: <tag>`, and a test that reaches it (one arm, the `step-failed` stale-build refusal, is not reached by a test; see the row). The table is the company layer's,
 with the exit code of the verb that prints it and one test or oracle case that reaches it. The full prose of each, and every test, is
 [`architecture.md`](architecture.md) section 7 (the same tags; `scripts/gate.sh` checks that every tag the company code can print is in
 both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `tests/conformance/company_run.sh`; `kill.sh` is
@@ -535,13 +535,21 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
   A file `needs-*` of the worker's own in `ev` is deleted at the next start (those names are Forge's).
 * **`forge build` has no `--contract` option**: a contract can only be given by a manifest step (or a direct task).
 
+* **A zero-budget company still runs its first model step**: no pre-check exists and no test covers it (section 9).
+* **Smaller gaps from the review ledger**: an environment over 64 KiB makes `decide` record the user as `unknown`; `decide` creates the
+  lock file before it checks the manifest and the gate. The score parser's blank skipping ignores `\r`, and its last-`TOTAL`-line rule is
+  strict: a later prose line starting with `TOTAL` makes the score unavailable. The qa and reviewer need cases are only partly tested; the
+  cycle check's glue (`has_cycle`) is untested on cyclic input; there is no oversize-manifest oracle case; the early oracle skipped output
+  checks on an empty expectation (fixed in task 5). A held `artifact-invalid` step prints `check-unavailable` again on the next run.
+  The `event-malformed` tests for the fields of `check_failed`, `admitted` and `gate.decided` records are missing.
+
 **Kill and process gaps** (details in section 10 and [`architecture.md`](architecture.md) 4.4.2)
 
 * A SIGKILL mid-build leaves the supervisor and the build running until the next `run`; mid-qa leaves the gate and mid-analyst the tool until
   they end by themselves (gap G4: cancho has no kill by pid or parent-death signal); a SIGKILL of the check guard leaves the check.
   The qa and analyst cases and the kill between `execution.started` and `execution.accepted` are **not tested**.
 * The `step-failed` arm for a stale build that will not stop needs an adapter that ignores `cancel` and **is not reached by a test**; the
-  worst case of cancelling a hung adapter is about five minutes.
+  worst case of cancelling a hung adapter is derived from the code (at most ten asks, each call bounded by a 30 s timeout), not measured.
 * The window between the step's `execution.started` and its `accepted` record, and a signal that arrives between the last look and the
   close of the claim, are not placed by any test.
 * **FIFOs**: a FIFO swapped into place *between* Forge's `dir_stat` and its open still blocks the open; a FIFO named as an analyst's

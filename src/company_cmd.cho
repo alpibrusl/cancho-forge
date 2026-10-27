@@ -35,7 +35,7 @@ import forge.task;
 // the bad line); 2 bad usage or a path that is not ok (`refusal: path-invalid`); 3 the journal cannot be read (I/O error).
 //
 // The state of a step (a closed set; docs/company.md):
-//   accepted  the journal holds `company.accepted` for it
+//   accepted  the journal holds `company.step.accepted` for it
 //   rejected  its human gate was decided `rejected`
 //   gated     its needs are accepted, its human gate has no decision yet
 //   ready     its needs are accepted and it has no gate or its gate is approved

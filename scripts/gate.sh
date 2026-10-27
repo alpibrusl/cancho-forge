@@ -253,8 +253,8 @@ else
 fi
 
 echo "== docs: every rule tag the company code can print is in docs/company.md and docs/architecture.md"
-# An oracle from outside the program: the tags are the kebab-case string literals of the files that print them.
-company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_manifest.cho src/company_step.cho src/company_runner.cho src/company_run.cho src/company_check.cho src/tool_task.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
+# An oracle from outside the program: the tags are the kebab-case string literals of the company files and the tool task (listed; workers/*.cho are left out: their literals include non-tag names).
+company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_check.cho src/company_cmd.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_run.cho src/company_runner.cho src/company_state.cho src/company_step.cho src/step_run.cho src/tool_call.cho src/tool_task.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
 for t in $company_tags; do
   for d in docs/company.md docs/architecture.md; do
     if grep -qF "\`$t\`" "$d"; then :; else echo "FAIL docs: tag $t is not in $d"; fail=1; fi
