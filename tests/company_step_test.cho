@@ -233,6 +233,11 @@ fn test_every_way_an_artifact_is_refused_has_its_reason() -> [] int {
     test.assert(bytes.equal(company_step.artifact_reason(3), "over 16 MiB"));
     test.assert(bytes.equal(company_step.artifact_reason(4), "cannot be read"));
     test.assert(bytes.equal(company_step.artifact_reason(5), "changed while the check ran"));
+    test.assert(bytes.equal(company_step.artifact_reason(6), "contract-changed"));
+    test.assert(bytes.equal(company_step.contract_reason(1), "contract-missing"));
+    test.assert(bytes.equal(company_step.contract_reason(2), "contract-unreadable"));
+    test.assert(bytes.equal(company_step.contract_reason(4), "contract-unreadable"));
+    test.assert(bytes.equal(company_step.contract_reason(0 - 9), "contract-unreadable"));
     test.assert(bytes.equal(company_step.artifact_reason(0 - 9), "cannot be read"));
     test.assert(bytes.equal(company_step.retry_hint(), "retry: forge company decide "));
     return 0;

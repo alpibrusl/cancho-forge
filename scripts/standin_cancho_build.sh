@@ -38,6 +38,15 @@ case "$mode" in
              # directory, needs.json and then each copy, so the oracle can see that it arrived.
              log; report done 2 done; { cat "$work/needs.json"; for f in "$work"/needs-*; do cat "$f"; done; } > "$work/project.cho" 2> /dev/null
              printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
+  contract|contractmut)
+             # task 10 (company_run.sh): a build that is given a contract. It records its argument vector (args.txt) and its product
+             # is the contract file as it read it from the path after `--contract` (or `nocontract` when it was not given one).
+             # `contractmut` then appends to that file: a build that changes its contract.
+             log; report done 2 done; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"
+             c=; prev=; for a in "$@"; do if [ "$prev" = --contract ]; then c=$a; fi; prev=$a; done
+             if [ -n "$c" ]; then cat "$c" > "$work/project.cho"; else printf 'nocontract\n' > "$work/project.cho"; fi
+             if [ "$mode" = contractmut ] && [ -n "$c" ]; then printf 'tampered\n' >> "$c"; fi
+             printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   bare)      log; report done 2 done; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # done, and no project.cho (company_run.sh)
   args)      log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   args2)     log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;

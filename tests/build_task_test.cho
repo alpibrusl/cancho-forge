@@ -168,7 +168,7 @@ fn test_the_adapters_deadline_is_four_fifths_of_forges() -> [] int {
 }
 
 fn test_the_argument_vector_is_the_tools_command_line_nul_ended[&h](heap: &!h Heap) -> [heap] int {
-    let v = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "agent --k /x", "prov", "mod", "", 4, 30, 3, 900, 4);
+    let v = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "agent --k /x", "prov", "mod", "", "", 4, 30, 3, 900, 4);
     borrow v as &vb in {
         test.assert(bytes.equal(buffer.bytes(vb), "/opt/c\0/w/e/brief.txt\0/w/e\0agent --k /x\0--provider\0prov\0--model\0mod\0--attempts\04\0--agent-seconds\030\0--rounds\03\0--plan-seconds\0900\0--jobs\04\0"));
     }
@@ -177,11 +177,117 @@ fn test_the_argument_vector_is_the_tools_command_line_nul_ended[&h](heap: &!h He
 }
 
 fn test_a_guide_adds_its_option_only_when_there_is_one[&h](heap: &!h Heap) -> [heap] int {
-    let v = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "a", "p", "m", "/g/guide.md", 7, 31, 2, 901, 5);
+    let v = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "a", "p", "m", "/g/guide.md", "", 7, 31, 2, 901, 5);
     borrow v as &vb in {
         test.assert(bytes.equal(buffer.bytes(vb), "/opt/c\0/w/e/brief.txt\0/w/e\0a\0--provider\0p\0--model\0m\0--guide\0/g/guide.md\0--attempts\07\0--agent-seconds\031\0--rounds\02\0--plan-seconds\0901\0--jobs\05\0"));
     }
     buffer.drop(heap, v);
+    return 0;
+}
+
+fn contract_refusal[&c](present: bool, contract: &c [byte]) -> [] &static [byte] {
+    return refusal(build_task.contract_checked(present, contract, "/w/e"));
+}
+
+fn test_a_contract_adds_its_option_only_when_there_is_one[&h](heap: &!h Heap) -> [heap] int {
+    let v = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "a", "p", "m", "/g/guide.md", "/w/e/contract.txt", 7, 31, 2, 901, 5);
+    borrow v as &vb in {
+        test.assert(bytes.equal(buffer.bytes(vb), "/opt/c\0/w/e/brief.txt\0/w/e\0a\0--provider\0p\0--model\0m\0--guide\0/g/guide.md\0--contract\0/w/e/contract.txt\0--attempts\07\0--agent-seconds\031\0--rounds\02\0--plan-seconds\0901\0--jobs\05\0"));
+    }
+    buffer.drop(heap, v);
+    let w = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "a", "p", "m", "", "/w/e/c.txt", 4, 30, 3, 900, 4);
+    borrow w as &wb in {
+        test.assert(bytes.equal(buffer.bytes(wb), "/opt/c\0/w/e/brief.txt\0/w/e\0a\0--provider\0p\0--model\0m\0--contract\0/w/e/c.txt\0--attempts\04\0--agent-seconds\030\0--rounds\03\0--plan-seconds\0900\0--jobs\04\0"));
+    }
+    buffer.drop(heap, w);
+    let none = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "a", "p", "m", "", "", 4, 30, 3, 900, 4);
+    borrow none as &nb in {
+        test.assert(bytes.equal(buffer.bytes(nb), "/opt/c\0/w/e/brief.txt\0/w/e\0a\0--provider\0p\0--model\0m\0--attempts\04\0--agent-seconds\030\0--rounds\03\0--plan-seconds\0900\0--jobs\04\0"));
+    }
+    buffer.drop(heap, none);
+    return 0;
+}
+
+fn test_a_contract_beneath_the_execution_directory_is_held() -> [] int {
+    test.assert(bytes.equal(contract_refusal(false, ""), ""));
+    test.assert(bytes.equal(contract_refusal(true, "contract.txt"), ""));
+    test.assert(bytes.equal(contract_refusal(true, "sub/api-2.txt"), ""));
+    test.assert(bytes.equal(contract_refusal(true, "/w/e/contract.txt"), ""));
+    test.assert(bytes.equal(contract_refusal(true, "/w/e/sub/c.txt"), ""));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::ContractPathInvalid), "contract-path-invalid"));
+    return 0;
+}
+
+fn test_a_contract_that_is_not_beneath_the_execution_directory_is_contract_path_invalid() -> [] int {
+    test.assert(bytes.equal(contract_refusal(true, ""), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "../x"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "a/../x"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "..x"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "/w/e/../x"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "/etc/passwd"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "/w/e"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "/w/e/"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "/w/e2/c.txt"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "/w/c.txt"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "/"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, ".hidden"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "-opt"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "a/.hidden"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "a//b"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "a/"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "c;x"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "c x"), "contract-path-invalid"));
+    test.assert(bytes.equal(contract_refusal(true, "c\0x"), "contract-path-invalid"));
+    return 0;
+}
+
+fn test_a_contract_path_has_a_length_bound[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 600);
+    var i = 0;
+    while i < 510 {
+        b = buffer.push(heap, b, byte_of(97));
+        i = i + 1;
+    }
+    borrow b as &bb in {
+        test.assert(bytes.equal(contract_refusal(true, buffer.bytes(bb)), "contract-path-invalid"));
+        test.assert(bytes.equal(contract_refusal(true, buffer.bytes(bb)[0..100]), ""));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_a_relative_contract_is_resolved_against_the_execution_directory[&h](heap: &!h Heap) -> [heap] int {
+    let a = build_task.contract_resolved(heap, "contract.txt", "/w/e");
+    let b = build_task.contract_resolved(heap, "/w/e/contract.txt", "/w/e");
+    let c = build_task.contract_resolved(heap, "c.txt", "/w/e/");
+    borrow a as &ab in {
+        test.assert(bytes.equal(buffer.bytes(ab), "/w/e/contract.txt"));
+    }
+    borrow b as &bb in {
+        test.assert(bytes.equal(buffer.bytes(bb), "/w/e/contract.txt"));
+    }
+    borrow c as &cb in {
+        test.assert(bytes.equal(buffer.bytes(cb), "/w/e/c.txt"));
+    }
+    buffer.drop(heap, a);
+    buffer.drop(heap, b);
+    buffer.drop(heap, c);
+    test.assert(bytes.equal(contract_refusal(true, "/w/e/c.txt"), ""));
+    return 0;
+}
+
+fn test_the_request_carries_a_contract_only_when_there_is_one[&h](heap: &!h Heap) -> [heap] int {
+    let with = build_task.request(heap, "r", 1, "build-1", "brief", "contract.txt", 600000, 1048576, "/w/e", "/opt/tools", "/opt/workers", "/opt/c", "", "p", "m", "a", 4, 30, 3, 900, 4);
+    let without = build_task.request(heap, "r", 1, "build-1", "brief", "", 600000, 1048576, "/w/e", "/opt/tools", "/opt/workers", "/opt/c", "", "p", "m", "a", 4, 30, 3, 900, 4);
+    borrow with as &wb in {
+        test.assert(bytes.find(buffer.bytes(wb), "\"input\":{\"brief\":\"brief\",\"contract\":\"contract.txt\"}") >= 0);
+    }
+    borrow without as &nb in {
+        test.assert(bytes.find(buffer.bytes(nb), "\"input\":{\"brief\":\"brief\"}") >= 0);
+        test.assert(bytes.find(buffer.bytes(nb), "contract.txt") < 0);
+    }
+    buffer.drop(heap, with);
+    buffer.drop(heap, without);
     return 0;
 }
 
@@ -351,7 +457,7 @@ fn test_the_claimed_verdict_of_a_build_is_the_tools_own_word_or_nothing() -> [] 
 }
 
 fn test_the_request_has_the_brief_as_input_and_the_operators_configuration_in_grants[&h](heap: &!h Heap) -> [heap] int {
-    let r = build_task.request(heap, "r-b-1", 1, "b-1", "make \"x\"\nthen y", 20000, 1048576, "/w/e", "/opt/tools", "/opt/workers", "/opt/c", "", "prov", "mod", "agent --k /x", 4, 30, 3, 900, 4);
+    let r = build_task.request(heap, "r-b-1", 1, "b-1", "make \"x\"\nthen y", "", 20000, 1048576, "/w/e", "/opt/tools", "/opt/workers", "/opt/c", "", "prov", "mod", "agent --k /x", 4, 30, 3, 900, 4);
     borrow r as &rb in {
         test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r-b-1\",\"attempt\":1,\"task\":{\"id\":\"b-1\",\"type\":\"project.build\",\"input\":{\"brief\":\"make \\\"x\\\"\\nthen y\"}},\"limits\":{\"timeout_ms\":20000,\"max_output_bytes\":1048576},\"grants\":{\"execution_dir\":\"/w/e\",\"tools_dir\":\"/opt/tools\",\"workers_dir\":\"/opt/workers\",\"build\":{\"checker\":\"/opt/c\",\"agent\":\"agent --k /x\",\"provider\":\"prov\",\"model\":\"mod\",\"attempts\":4,\"agent_seconds\":30,\"rounds\":3,\"plan_seconds\":900,\"jobs\":4}}}"));
     }
@@ -360,7 +466,7 @@ fn test_the_request_has_the_brief_as_input_and_the_operators_configuration_in_gr
 }
 
 fn test_a_guide_is_in_the_request_only_when_there_is_one[&h](heap: &!h Heap) -> [heap] int {
-    let r = build_task.request(heap, "r", 2, "t", "b", 10000, 1, "/e", "/t", "/wk", "/c", "/g/guide.md", "p", "m", "a", 7, 31, 2, 901, 5);
+    let r = build_task.request(heap, "r", 2, "t", "b", "", 10000, 1, "/e", "/t", "/wk", "/c", "/g/guide.md", "p", "m", "a", 7, 31, 2, 901, 5);
     borrow r as &rb in {
         test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r\",\"attempt\":2,\"task\":{\"id\":\"t\",\"type\":\"project.build\",\"input\":{\"brief\":\"b\"}},\"limits\":{\"timeout_ms\":10000,\"max_output_bytes\":1},\"grants\":{\"execution_dir\":\"/e\",\"tools_dir\":\"/t\",\"workers_dir\":\"/wk\",\"build\":{\"checker\":\"/c\",\"guide\":\"/g/guide.md\",\"agent\":\"a\",\"provider\":\"p\",\"model\":\"m\",\"attempts\":7,\"agent_seconds\":31,\"rounds\":2,\"plan_seconds\":901,\"jobs\":5}}}"));
     }

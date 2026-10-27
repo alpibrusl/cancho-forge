@@ -44,7 +44,7 @@ What makes this honest rather than a shortcut:
 ## 2. The task, and who says what
 
 ```json
-"task":   {"id": "t-1", "type": "project.build", "input": {"brief": "<1 to 16384 bytes of text>"}},
+"task":   {"id": "t-1", "type": "project.build", "input": {"brief": "<1 to 16384 bytes of text>", "contract": "<optional: a file beneath the execution directory>"}},
 "limits": {"timeout_ms": 600000, "max_output_bytes": 1048576},
 "grants": {
   "execution_dir": "/abs/executions/e-1",
@@ -61,6 +61,7 @@ from a task):
 |---|---|---|
 | the **brief** | the task (`task.input.brief`): untrusted text a model will read | 1 to 16 KiB, no NUL; written to `brief.txt` in the execution directory, **never to an argument** |
 | **where and with what** the build runs: the tools directory, the checker, the agent command, the provider, the model, the guide, the five ceilings | the operator, through Forge (`grants.tools_dir`, `grants.build`) | paths as `gate_task.path_ok`; provider and model only what the tool allows in a shell line; the agent command one printable-ASCII argument; ceilings in ranges. Defaults are the tool's own |
+| the **contract** (optional) | the task (`task.input.contract`): the exact public signatures the build must use (spec arm B), a file Forge put in the execution directory | a path beneath the execution directory, relative or absolute (`build_task.contract_ok`: the `path_ok` rule on the resolved path); else `contract-path-invalid`. Passed to the tool as `--contract <absolute path>`; absent means no `--contract` at all |
 | the **execution directory** | Forge (`grants.execution_dir`) | `gate_task.path_ok` |
 
 The tool is **a fixed name**, `cancho-build`, found beneath `tools_dir` (`exec_spawn_detached_under`, under `Exec("")` with the
@@ -69,10 +70,10 @@ name checked first by `exec_covers`): a task cannot name what runs. `limits.time
 ## 3. What it does
 
 1. Validate (`build_task.check`, then `build_task.operator_checked`). The first fault, in the order type, brief, paths, limits,
-   operator, is the one named. A refusal runs nothing and writes nothing.
+   contract (`build_task.contract_checked`), operator, is the one named. A refusal runs nothing and writes nothing.
 2. Open `tools_dir` as a `Dir`; ask `exec_covers` about `cancho-build`.
 3. Write `brief.txt` in the execution directory.
-4. Start `cancho-build <checker> <execution_dir>/brief.txt <execution_dir> <agent> --provider P --model M [--guide G]
+4. Start `cancho-build <checker> <execution_dir>/brief.txt <execution_dir> <agent> --provider P --model M [--guide G] [--contract C]
    --attempts N --agent-seconds N --rounds N --plan-seconds N --jobs N` **detached beneath the tools directory, with an empty
    environment** (the audit ran it under `env -i`), and capture its standard output up to 1 MiB under the deadline.
 5. Write that output as `build.out`.

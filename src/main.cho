@@ -344,7 +344,7 @@ fn build[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""
     var none: option.Option[SignalWatch] = option.Option::None;
     var code = 0;
     borrow mut none as &!s in {
-        let (c, stopped) = step_run.run_build(heap, fs, exec, clock, io, spec, dir, workers, tools, brief_file, execution_dir, checker, provider, model, agent, guide, s);
+        let (c, stopped) = step_run.run_build(heap, fs, exec, clock, io, spec, dir, workers, tools, brief_file, execution_dir, checker, provider, model, agent, guide, "", s);
         code = c;
     }
     match none {

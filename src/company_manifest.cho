@@ -14,7 +14,7 @@ import std.json;
 //     "model":  { "provider", "name" },
 //     "budget": { "input", "output", "cache_write", "cache_read", "max_cost", "price_table" },
 //     "human_gates": [name...], "roles": [role...],
-//     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "gate"? } ... ] }
+//     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "contract"?, "gate"? } ... ] }
 //
 // The order the checks run in, so that a manifest with two faults is always refused for the same one:
 //   1. size (over 1 MiB), JSON, the root an object                                       manifest-malformed
@@ -27,6 +27,7 @@ import std.json;
 //   7. per step, in order: role (not one of the six, or not in `roles`)                  role-unknown
 //      task type (not the one the role offers)                                           task-type-unsupported
 //      check (a builder or writer without one)                                           check-missing
+//      contract (a step that is neither a builder nor a writer names one)                contract-role-invalid
 //      gate (not in `human_gates`)                                                       gate-unknown
 //   8. a `needs` entry that is no step id                                                step-needs-unknown
 //   9. a step that needs itself, or any cycle                                            step-cycle
@@ -54,6 +55,8 @@ pub enum Refusal {
     TaskTypeUnsupported,
     // A builder or writer step with no `check` (absent or empty).
     CheckMissing,
+    // A `contract` on a step that is neither a builder nor a writer: only a build is given a contract file.
+    ContractRoleInvalid,
     // A step's `gate` that is not in `human_gates`.
     GateUnknown,
     // No `budget` object, or one of its five numbers is absent.
@@ -88,6 +91,9 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         Refusal::CheckMissing => {
             return "check-missing";
         }
+        Refusal::ContractRoleInvalid => {
+            return "contract-role-invalid";
+        }
         Refusal::GateUnknown => {
             return "gate-unknown";
         }
@@ -118,8 +124,8 @@ pub enum TaskType {
     None,
 }
 
-// A step, as the nodes of the manifest's tape: read the text of a field with `step_id`, `step_input`, `step_check`, `step_gate`
-// and `step_need`. `check` and `gate` are -1 when the step has none.
+// A step, as the nodes of the manifest's tape: read the text of a field with `step_id`, `step_input`, `step_check`, `step_contract`,
+// `step_gate` and `step_need`. `check`, `contract` and `gate` are -1 when the step has none.
 pub struct Step {
     id: int,
     role: Role,
@@ -127,6 +133,7 @@ pub struct Step {
     needs: int,
     input: int,
     check: int,
+    contract: int,
     gate: int,
 }
 
@@ -181,7 +188,7 @@ pub fn max_text() -> [] int {
 
 // ---- the checks -----------------------------------------------------------------------------------------------------------
 // Each answers 0 for held, else a code: 1 malformed, 2 unknown field, 3 duplicate, 4 needs unknown, 5 cycle, 6 role unknown, 7 task
-// type, 8 check missing, 9 gate unknown, 10 budget missing, 11 price table missing.
+// type, 8 check missing, 9 gate unknown, 10 budget missing, 11 price table missing, 12 contract on a role that builds nothing.
 
 fn refusal_of(code: int) -> [] Refusal {
     if code == 2 {
@@ -213,6 +220,9 @@ fn refusal_of(code: int) -> [] Refusal {
     }
     if code == 11 {
         return Refusal::PriceTableMissing;
+    }
+    if code == 12 {
+        return Refusal::ContractRoleInvalid;
     }
     return Refusal::ManifestMalformed;
 }
@@ -500,12 +510,12 @@ fn in_names[&s, &t](src: &s [byte], tp: &t [int], arr: int, i: int) -> [] bool {
     return false;
 }
 
-// The shape of one step: keys, and the type of every field. Presence of `check` and `gate` is judged later.
+// The shape of one step: keys, and the type of every field. Presence of `check` and `gate` is judged later; a `contract`, unlike a `check`, is a file name or malformed (an empty one is not none).
 fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
     if !json.is_object(tp, step) {
         return 1;
     }
-    let keys = keys_code(src, tp, step, "id role task_type needs input check gate");
+    let keys = keys_code(src, tp, step, "id role task_type needs input check contract gate");
     if keys != 0 {
         return keys;
     }
@@ -513,6 +523,7 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
     let task_type = json.get(src, tp, step, "task_type");
     let input = json.get(src, tp, step, "input");
     let check = json.get(src, tp, step, "check");
+    let contract = json.get(src, tp, step, "contract");
     let gate = json.get(src, tp, step, "gate");
     if !is_name(src, tp, json.get(src, tp, step, "id")) || !json.string_plain(tp, role) || !json.string_plain(tp, task_type) {
         return 1;
@@ -524,6 +535,9 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
         return 1;
     }
     if check >= 0 && (!json.string_plain(tp, check) || len(json.string_view(src, tp, check)) > 0 && !file_ok(json.string_view(src, tp, check))) {
+        return 1;
+    }
+    if contract >= 0 && (!json.string_plain(tp, contract) || !file_ok(json.string_view(src, tp, contract))) {
         return 1;
     }
     if gate >= 0 && !is_name(src, tp, gate) {
@@ -546,6 +560,9 @@ fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, 
     let check = json.get(src, tp, step, "check");
     if (role == 0 || role == 4) && (check < 0 || len(json.string_view(src, tp, check)) == 0) {
         return 8;
+    }
+    if json.get(src, tp, step, "contract") >= 0 && role != 0 && role != 4 {
+        return 12;
     }
     let gate = json.get(src, tp, step, "gate");
     if gate >= 0 && !in_names(src, tp, gates, gate) {
@@ -858,7 +875,7 @@ pub fn step_at[&m](m: &m Manifest, i: int) -> [] Step {
     let node = json.at(tp, m.steps, at);
     let role = role_code(json.string_view(src, tp, json.get(src, tp, node, "role")));
     let tcode = type_code(json.string_view(src, tp, json.get(src, tp, node, "task_type")));
-    return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), gate: json.get(src, tp, node, "gate") };
+    return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), contract: json.get(src, tp, node, "contract"), gate: json.get(src, tp, node, "gate") };
 }
 
 pub fn step_id[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
@@ -873,6 +890,11 @@ pub fn step_input[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
 // The step's check file name, empty when it has none.
 pub fn step_check[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
     return text_at(m, s.check);
+}
+
+// The step's contract file name (a builder's or writer's), empty when it has none.
+pub fn step_contract[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
+    return text_at(m, s.contract);
 }
 
 // The step's gate, empty when it has none.

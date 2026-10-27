@@ -1,0 +1,180 @@
+edition 9;
+module forge.company_files;
+
+import std.buffer;
+import std.bytes;
+import forge.company_step;
+import forge.journal_io;
+
+// The company runner's two file operations on a directory it does not trust (task 8c, task 10), and the contract file of a builder
+// step (task 10; spec section on the contract arms). Split from `forge.company_runner` so that module stays under its size mark.
+//
+// `read_artifact` reads a file beneath a directory by the rules an artifact is accepted by (a regular file, at most 16 MiB, no
+// link followed). `put_beneath` replaces a name beneath a directory without ever writing through a link.
+//
+// THE CONTRACT. A builder or writer step may name a `contract` (company_manifest: a plain file name in the company directory, the
+// manifest author's). Forge does not hand the build tool that file's path. It reads the file with `read_artifact` and WRITES its own
+// copy, `contract.txt`, in the step's execution directory with `put_beneath`; the build tool is then given the path of the copy
+// (`build_task.contract_ok`: a path beneath the execution directory, so `contract-path-invalid` stays meaningful). The build tool
+// reads a copy that Forge wrote and verified, never a path the manifest author or a step chose; and because the build can write in
+// its execution directory, Forge reads the copy again when the build ends and compares it with the company directory's file
+// (`contract_intact`): a build that changed its contract is refused (`artifact-invalid`, `reason: contract-changed`), not accepted.
+
+// The bytes of the artifact `name` beneath the directory `dir`, and 0, or why it is refused (`company_step.artifact_reason`: 1 not
+// there, 2 not a regular file, 3 too large, 4 unreadable). `dir_stat` never follows a link and never opens, so a link, a directory
+// or a FIFO is refused before any open (a FIFO would block it); the open is `dir_open_read`, beneath the directory with O_NOFOLLOW,
+// so a link put there between the two is refused too. The same rules at acceptance and when a dependent step is given it.
+pub fn read_artifact[&h, &f, &d, &n](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte]) -> [heap, fs_read(""), dir_read, file_read] (buffer.Buffer, int) {
+    var data = buffer.empty(heap, 256);
+    var why = 4;
+    if journal_io.path_ok(fs, dir) == false {
+        return (data, why);
+    }
+    match open_dir(fs, dir) {
+        DirOpened::Failed(e) => {
+            why = 4;
+        }
+        DirOpened::Ok(opened) => {
+            var d = opened;
+            borrow d as &dr in {
+                match dir_stat(dr, name) {
+                    DirStat::Failed(e) => {
+                        why = 4;
+                        if e == 2 {
+                            why = 1;
+                        }
+                    }
+                    DirStat::Ok(kind, size, mtime) => {
+                        if kind != 1 {
+                            why = 2;
+                        } else if size > company_step.artifact_cap() {
+                            why = 3;
+                        } else {
+                            match dir_open_read(dr, name) {
+                                Opened::Failed(e) => {
+                                    why = 2;
+                                    if e == 2 {
+                                        why = 1;
+                                    }
+                                }
+                                Opened::Ok(file_opened) => {
+                                    var file = file_opened;
+                                    var errno = 0;
+                                    borrow mut file as &!x in {
+                                        let (got, e2) = journal_io.drain(heap, x, data, company_step.artifact_cap());
+                                        data = got;
+                                        errno = e2;
+                                    }
+                                    file_close(file);
+                                    if errno == 0 - 3 {
+                                        why = 3;
+                                    } else if errno != 0 {
+                                        why = 4;
+                                    } else {
+                                        why = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            dir_close(d);
+        }
+    }
+    return (data, why);
+}
+
+// Replace `name` beneath the directory `d` with `data`: written to `needs.tmp` (a stale one removed first), created with O_EXCL and
+// O_NOFOLLOW, then renamed over `name`. A link at either name is never written through: `unlinkat` removes the link, `O_EXCL`
+// refuses one, `renameat` replaces one. 0 or an errno (a directory at `name` cannot be replaced).
+pub fn put_beneath[&d, &n, &b](d: &d Dir, name: &n [byte], data: &b [byte]) -> [dir_write, file_write] int {
+    // A stale temporary (a run killed between the open and the rename, or anything left there) is removed; none is fine.
+    var removed = 0;
+    match dir_remove(d, "needs.tmp") {
+        Done::Ok(n) => {
+            removed = 0;
+        }
+        Done::Failed(e) => {
+            removed = e;
+        }
+    }
+    match dir_open_new(d, "needs.tmp") {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, data);
+            }
+            file_close(file);
+            if rc != 0 {
+                return rc;
+            }
+            match dir_rename(d, "needs.tmp", name) {
+                Done::Ok(n) => {
+                    return 0;
+                }
+                Done::Failed(e) => {
+                    return e;
+                }
+            }
+        }
+    }
+}
+
+// The name the contract is given in the execution directory.
+pub fn contract_name() -> [] &static [byte] {
+    return "contract.txt";
+}
+
+// Give the step its contract: the file `name` of the company directory `dir` is read (`read_artifact`; the reason it is refused is
+// returned: 1 not there, 2 not a regular file, 3 too large, 4 unreadable) and written as `contract.txt` beneath `evdir`, replacing
+// anything there (a link included). 0, or the reason, or 6 when the execution directory cannot be opened or written.
+pub fn deliver_contract[&h, &f, &d, &n, &e](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte], evdir: &e [byte]) -> [heap, fs_read(""), dir_read, dir_write, file_read, file_write] int {
+    let (data, why) = read_artifact(heap, fs, dir, name);
+    var code = why;
+    if why == 0 {
+        code = 6;
+        if journal_io.path_ok(fs, evdir) {
+            match open_dir(fs, evdir) {
+                DirOpened::Failed(e2) => {
+                    code = 6;
+                }
+                DirOpened::Ok(opened) => {
+                    var ed = opened;
+                    borrow ed as &edr in {
+                        borrow data as &db in {
+                            if put_beneath(edr, contract_name(), buffer.bytes(db)) == 0 {
+                                code = 0;
+                            }
+                        }
+                    }
+                    dir_close(ed);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, data);
+    return code;
+}
+
+// After the build: is `contract.txt` in `evdir` still, byte for byte, the file `name` of the company directory? True when both can
+// be read and are equal.
+pub fn contract_intact[&h, &f, &d, &n, &e](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte], evdir: &e [byte]) -> [heap, fs_read(""), dir_read, file_read] bool {
+    let (want, w) = read_artifact(heap, fs, dir, name);
+    let (have, h2) = read_artifact(heap, fs, evdir, contract_name());
+    var same = false;
+    if w == 0 && h2 == 0 {
+        borrow want as &wb in {
+            borrow have as &hb in {
+                same = bytes.equal(buffer.bytes(wb), buffer.bytes(hb));
+            }
+        }
+    }
+    buffer.drop(heap, want);
+    buffer.drop(heap, have);
+    return same;
+}

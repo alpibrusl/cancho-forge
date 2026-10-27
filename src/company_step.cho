@@ -307,7 +307,17 @@ pub fn rule_artifact_invalid() -> [] &static [byte] {
     return "artifact-invalid";
 }
 
-// The `reason:` of an artifact refusal: 1 not there, 2 not a regular file, 3 too large, 4 unreadable, 5 changed; anything else is
+// The `reason:` of a step's contract file that cannot be given (task 10): 1 (`artifact_reason`'s "not there") is `contract-missing`;
+// anything else (not a regular file, too large, unreadable) is `contract-unreadable`.
+pub fn contract_reason(why: int) -> [] &static [byte] {
+    if why == 1 {
+        return "contract-missing";
+    }
+    return "contract-unreadable";
+}
+
+// The `reason:` of an artifact refusal: 1 not there, 2 not a regular file, 3 too large, 4 unreadable, 5 changed, 6 the build changed
+// its contract (the one reason that is a tag-like word: `contract-changed`); anything else is
 // "cannot be read".
 pub fn artifact_reason(code: int) -> [] &static [byte] {
     if code == 1 {
@@ -321,6 +331,9 @@ pub fn artifact_reason(code: int) -> [] &static [byte] {
     }
     if code == 5 {
         return "changed while the check ran";
+    }
+    if code == 6 {
+        return "contract-changed";
     }
     return "cannot be read";
 }

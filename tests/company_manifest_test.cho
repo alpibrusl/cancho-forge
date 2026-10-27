@@ -144,6 +144,7 @@ fn test_the_refusal_tags_are_the_documented_ones() -> [] int {
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RoleUnknown), "role-unknown"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::TaskTypeUnsupported), "task-type-unsupported"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::CheckMissing), "check-missing"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::ContractRoleInvalid), "contract-role-invalid"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::GateUnknown), "gate-unknown"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::BudgetMissing), "budget-missing"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::PriceTableMissing), "price-table-missing"));
@@ -320,6 +321,60 @@ fn test_a_builder_step_without_a_check_is_refused[&h](heap: &!h Heap) -> [heap] 
     test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"\"}"), "check-missing"));
     test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"writer\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\"}"), "check-missing"));
     test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"audit.cho\"}"), ""));
+    return 0;
+}
+
+fn test_a_builder_or_writer_step_may_name_a_contract[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"writer\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api-2_v.txt\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}"), ""));
+    return 0;
+}
+
+fn test_a_contract_is_a_plain_file_name_or_the_manifest_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"../api.txt\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"/etc/passwd\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"d/api.txt\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\".hidden\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":5}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"a b\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"a\\u0062.txt\"}"), "manifest-malformed"));
+    return 0;
+}
+
+fn test_a_contract_on_a_role_that_builds_nothing_is_contract_role_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"contract\":\"api.txt\"}"), "contract-role-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"analyst\",\"task_type\":\"tool.run\",\"needs\":[],\"input\":\"x\",\"contract\":\"api.txt\"}"), "contract-role-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"reviewer\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"contract\":\"api.txt\"}"), "contract-role-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"contract\":\"api.txt\"}"), "contract-role-invalid"));
+    return 0;
+}
+
+fn test_the_contract_of_a_step_reads_back_and_a_step_without_one_has_none[&h](heap: &!h Heap) -> [heap] int {
+    let d = doc(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\"},{\"id\":\"b\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}", budget(), "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert(bytes.equal(company_manifest.step_contract(mr, company_manifest.step_at(mr, 0)), "api.txt"));
+                    test.assert(bytes.equal(company_manifest.step_contract(mr, company_manifest.step_at(mr, 1)), ""));
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_step_key_outside_the_shape_is_still_unknown_beside_a_contract[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"contracts\":\"api.txt\"}"), "manifest-unknown-field"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"Contract\":\"api.txt\"}"), "manifest-unknown-field"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"contract\":\"b.txt\"}"), "manifest-malformed"));
     return 0;
 }
 

@@ -15,6 +15,9 @@
 # directory missing, a bad operator file, a corrupt journal, a held lock, bad usage; and resume: a step admitted and never accepted
 # (a run killed mid-step) is admitted again, once. And needs (task 8c): a step that needs another is given a copy of its accepted
 # artifact and needs.json with the recorded sha256; one whose need changed or is gone is refused artifact-invalid and never admitted.
+# And the contract (task 10): a builder step that names a `contract` file is given a Forge-written copy (contract.txt) in its
+# execution directory and the build tool is started with `--contract <that path>`; a step that names none is started without the
+# option; a missing contract is refused before the step is admitted; a build that changes its contract is not accepted.
 # Prints `ok ...` / `FAIL ...` lines; exit 1 if any FAIL or a build failed.
 # Usage: CANCHO=path/to/cancho tests/conformance/company_run.sh <scratch directory, empty>
 set -u
@@ -239,6 +242,57 @@ printf 'tampered\n' >> "$w/qtamper/steps/lib/ev/project.cho"
 "$F" company decide "$w/qtamper" g approved "go" > /dev/null
 run qtamper 2
 check "a qa step whose need changed: artifact-invalid (needs-changed), exit 14, not admitted" sh -c "[ '$(rc qtamper 1)' = 10 ] && [ '$(rc qtamper 2)' = 14 ] && grep -qx 'step: qa' '$w/qtamper.2.out' && grep -qx 'reason: needs-changed' '$w/qtamper.2.out' && [ $(kinds qtamper company.step.admitted qa) -eq 0 ]"
+
+# ---- the contract (task 10): a builder step may name a file of the company directory; Forge copies it to contract.txt in the step's
+# execution directory and starts the build tool with `--contract <that path>`. The stand-in's mode `contract` records its argument
+# vector and its product is the contract file as it read it; `contractmut` appends to it.
+cbuilder() { printf '{"id":"%s","role":"builder","task_type":"project.build","needs":[],"input":"%s","check":"audit_pass.sh","contract":"%s"}' "$1" "$2" "$3"; }
+mkco ctr "[$(cbuilder withc contract api.txt),$(builder plain '' contract audit_pass.sh)]" 100000 withc plain
+printf 'fn add(a: int, b: int) -> [] int\nfn sub(a: int, b: int) -> [] int\n' > "$w/ctr/api.txt"
+run ctr 1
+check "contract: the run completes, exit 0, each step admitted once" sh -c "[ '$(rc ctr 1)' = 0 ] && [ $(kinds ctr company.step.admitted withc) -eq 1 ] && [ $(kinds ctr company.step.admitted plain) -eq 1 ]"
+check "contract: the build tool got --contract and the path of Forge's copy in the execution directory, once" sh -c "[ \$(grep -c -x 'A:--contract' '$w/ctr/steps/withc/ev/args.txt') -eq 1 ] && grep -x -A1 'A:--contract' '$w/ctr/steps/withc/ev/args.txt' | tail -1 | grep -qx 'A:$w/ctr/steps/withc/ev/contract.txt'"
+check "contract: the copy is a regular file, byte for byte the company directory's file, and the build read it (its product is the contract)" sh -c "[ -f '$w/ctr/steps/withc/ev/contract.txt' ] && [ ! -L '$w/ctr/steps/withc/ev/contract.txt' ] && cmp -s '$w/ctr/api.txt' '$w/ctr/steps/withc/ev/contract.txt' && cmp -s '$w/ctr/api.txt' '$w/ctr/steps/withc/ev/project.cho'"
+check "contract: a step that names none is started without the option and given no copy (arm A unchanged)" sh -c "! grep -q -e '--contract' '$w/ctr/steps/plain/ev/args.txt' && [ ! -e '$w/ctr/steps/plain/ev/contract.txt' ] && grep -qx 'nocontract' '$w/ctr/steps/plain/ev/project.cho'"
+printf 'A:/opt/cancho/bin/cancho\nA:%s/ctr/steps/plain/ev/brief.txt\nA:%s/ctr/steps/plain/ev\nA:stand-in-agent\nA:--provider\nA:stand\nA:--model\nA:m1\nA:--attempts\nA:4\nA:--agent-seconds\nA:30\nA:--rounds\nA:3\nA:--plan-seconds\nA:900\nA:--jobs\nA:4\n' "$w" "$w" > "$w/ctr.plain.want"
+check "contract: and the whole argument vector of the step without one is the one it always was" sh -c "cmp -s '$w/ctr.plain.want' '$w/ctr/steps/plain/ev/args.txt'"
+
+# the file is not there: refused before the step is admitted, nothing written; once it is there the step runs
+mkco ctrmiss "[$(cbuilder withc contract api.txt)]" 100000 withc
+run ctrmiss 1
+check "contract missing: artifact-invalid with reason contract-missing, exit 14, naming the step and the file, not admitted, nothing built" sh -c "[ '$(rc ctrmiss 1)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/ctrmiss.1.out' && grep -qx 'step: withc' '$w/ctrmiss.1.out' && grep -qx 'contract: api.txt' '$w/ctrmiss.1.out' && grep -qx 'reason: contract-missing' '$w/ctrmiss.1.out' && [ $(kinds ctrmiss company.step.admitted withc) -eq 0 ] && [ ! -e '$w/ctrmiss/steps/withc/journal.jsonl' ] && [ ! -e '$w/ctrmiss/steps/withc/ev/contract.txt' ] && [ ! -e '$w/ctrmiss/company.journal' ]"
+printf 'fn one() -> [] int\n' > "$w/ctrmiss/api.txt"
+run ctrmiss 2
+check "contract missing: with the file in place the next run builds and accepts the step, given the contract" sh -c "[ '$(rc ctrmiss 2)' = 0 ] && [ $(kinds ctrmiss company.step.accepted withc) -eq 1 ] && cmp -s '$w/ctrmiss/api.txt' '$w/ctrmiss/steps/withc/ev/project.cho'"
+
+# a link where the contract should be, and a directory: never read through
+mkco ctrlink "[$(cbuilder withc contract api.txt)]" 100000 withc
+printf 'secret\n' > "$w/ctrlink.outside"; ln -s "$w/ctrlink.outside" "$w/ctrlink/api.txt"
+run ctrlink 1
+check "contract as a link: artifact-invalid with reason contract-unreadable, exit 14, not admitted" sh -c "[ '$(rc ctrlink 1)' = 14 ] && grep -qx 'reason: contract-unreadable' '$w/ctrlink.1.out' && [ $(kinds ctrlink company.step.admitted withc) -eq 0 ] && [ ! -e '$w/ctrlink/steps/withc/ev/contract.txt' ]"
+
+# the execution directory was left with a link at contract.txt: replaced by Forge's copy, never written through
+mkco ctrhost "[$(cbuilder withc contract api.txt)]" 100000 withc
+printf 'fn only() -> [] int\n' > "$w/ctrhost/api.txt"
+printf 'untouched\n' > "$w/ctrhost.outside"; ln -s "$w/ctrhost.outside" "$w/ctrhost/steps/withc/ev/contract.txt"
+run ctrhost 1
+check "contract: a link planted at contract.txt is replaced by a regular copy, its target untouched" sh -c "[ '$(rc ctrhost 1)' = 0 ] && [ ! -L '$w/ctrhost/steps/withc/ev/contract.txt' ] && cmp -s '$w/ctrhost/api.txt' '$w/ctrhost/steps/withc/ev/contract.txt' && [ \"\$(cat '$w/ctrhost.outside')\" = untouched ]"
+
+# the builder cannot change the contract it was given: the copy is compared with the company directory's file when the build ends
+mkco ctrmut "[$(cbuilder withc contractmut api.txt)]" 100000 withc
+printf 'fn keep() -> [] int\n' > "$w/ctrmut/api.txt"; cp "$w/ctrmut/api.txt" "$w/ctrmut.orig"
+run ctrmut 1
+check "contract changed by the build: artifact-invalid with reason contract-changed, exit 14, held, never accepted, the check never run" sh -c "[ '$(rc ctrmut 1)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/ctrmut.1.out' && grep -qx 'artifact: steps/withc/ev/contract.txt' '$w/ctrmut.1.out' && grep -qx 'reason: contract-changed' '$w/ctrmut.1.out' && ! grep -q 'company.step.accepted' '$w/ctrmut/company.journal' && grep -q '\"kind\":\"company.step.check_unavailable\",\"task\":\"withc\"' '$w/ctrmut/company.journal'"
+run ctrmut 2
+check "contract changed by the build: the company directory's contract is untouched, and a second run is held (nothing built again)" sh -c "cmp -s '$w/ctrmut.orig' '$w/ctrmut/api.txt' && [ '$(rc ctrmut 2)' = 14 ] && [ $(kinds ctrmut company.step.admitted withc) -eq 1 ]"
+
+# the manifest: a contract on a step that builds nothing, and a bad contract name, are refused by `forge company check`
+printf '{"id":"c","mission":"m","model":{"provider":"p","name":"n"},"budget":{"input":1,"output":1,"cache_write":1,"cache_read":1,"max_cost":1,"price_table":"prices.json"},"human_gates":[],"roles":["qa"],"steps":[{"id":"a","role":"qa","task_type":"repo.gate","needs":[],"input":"x","contract":"api.txt"}]}' > "$w/ctr-qa.json"
+"$F" company check "$w/ctr-qa.json" > "$w/ctr-qa.out" 2>&1; echo $? > "$w/ctr-qa.rc"
+check "manifest: a contract on a qa step is contract-role-invalid, exit 1" sh -c "[ \$(cat '$w/ctr-qa.rc') = 1 ] && grep -qx 'refusal: contract-role-invalid' '$w/ctr-qa.out'"
+sed 's|"role":"qa","task_type":"repo.gate"|"role":"builder","task_type":"project.build","check":"c.sh"|; s|"contract":"api.txt"|"contract":"../api.txt"|; s|"roles":\["qa"\]|"roles":["builder"]|' "$w/ctr-qa.json" > "$w/ctr-bad.json"
+"$F" company check "$w/ctr-bad.json" > "$w/ctr-bad.out" 2>&1; echo $? > "$w/ctr-bad.rc"
+check "manifest: a contract that is a path, not a file name, is manifest-malformed, exit 1" sh -c "[ \$(cat '$w/ctr-bad.rc') = 1 ] && grep -qx 'refusal: manifest-malformed' '$w/ctr-bad.out'"
 
 # ---- a worker that ends without a claim: no accepted, exit 15
 mkco stuck "[$(builder lib '' stuck audit_pass.sh)]" 100000 lib

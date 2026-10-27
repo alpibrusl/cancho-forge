@@ -147,8 +147,9 @@ pub fn poll_interval_ms() -> [] int {
 // Run the task. `journal_path` is the journal of the workspace (the caller holds the lock); `workers` is the directory
 // holding `cancho_code`; `tools` is the operator's directory holding `cancho-build`; `brief` is the brief's text;
 // `execution_dir` an existing directory for the build (the work directory of the tool, and where the evidence is); the rest
-// is the operator's configuration. `timeout_ms` is Forge's deadline for the run.
-pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a, &s](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], brief: &b [byte], execution_dir: &e [byte], tools_dir: &t [byte], workers_dir: &y [byte], checker: &k [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts_ceiling: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int, timeout_ms: int, stop: &!s option.Option[SignalWatch]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, clock, poll, signals_read] Finished {
+// is the operator's configuration. `contract` is the task's optional contract file (a path beneath `execution_dir`, `build_task.contract_ok`;
+// empty: none). `timeout_ms` is Forge's deadline for the run.
+pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &q, &p, &m, &a, &s](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], brief: &b [byte], execution_dir: &e [byte], tools_dir: &t [byte], workers_dir: &y [byte], checker: &k [byte], guide: &g [byte], contract: &q [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts_ceiling: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int, timeout_ms: int, stop: &!s option.Option[SignalWatch]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, clock, poll, signals_read] Finished {
     let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
     if report.rule != 0 || recovered.errno != 0 {
         map.drop(heap, existing);
@@ -176,6 +177,13 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a, &s](heap:
         var checked = build_task.check(build_task.task_type(), brief, execution_dir, tools_dir, timeout_ms);
         match checked {
             build_task.Checked::Held => {
+                checked = build_task.contract_checked(len(contract) > 0, contract, execution_dir);
+            }
+            build_task.Checked::Refused(why) => {
+            }
+        }
+        match checked {
+            build_task.Checked::Held => {
                 checked = build_task.operator_checked(checker, guide, provider, model, agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);
             }
             build_task.Checked::Refused(why) => {
@@ -200,7 +208,7 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a, &s](heap:
                     attempts = attempts + 1;
                     let request_id = gate_run.request_id_of(heap, tid, attempts);
                     borrow request_id as &rb in {
-                        let req = build_task.request(heap, buffer.bytes(rb), attempts, tid, brief, timeout_ms, 1048576, execution_dir, tools_dir, workers_dir, checker, guide, provider, model, agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);
+                        let req = build_task.request(heap, buffer.bytes(rb), attempts, tid, brief, contract, timeout_ms, 1048576, execution_dir, tools_dir, workers_dir, checker, guide, provider, model, agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);
                         borrow req as &qb in {
                             let began = clock_ms(clock);
                             var ending = worker.execute(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, true);
