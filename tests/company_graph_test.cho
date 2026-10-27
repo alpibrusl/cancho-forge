@@ -125,6 +125,64 @@ fn test_a_short_flag_slice_counts_the_rest_as_not_accepted[&h](heap: &!h Heap) -
     return 0;
 }
 
+// `needs_met` for step `i` of the diamond with flags a0..a3, as 1 (met) or 0.
+fn met_in_diamond[&h](heap: &!h Heap, i: int, a0: bool, a1: bool, a2: bool, a3: bool) -> [heap] int {
+    let d = manifest_text(heap, diamond());
+    var out = 0 - 2;
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                let flags = box_slice(heap, 4, false);
+                borrow mut flags as &!f in {
+                    let fs = contents(f);
+                    fs[0] = a0;
+                    fs[1] = a1;
+                    fs[2] = a2;
+                    fs[3] = a3;
+                }
+                borrow m as &mr in {
+                    borrow flags as &fr in {
+                        out = 0;
+                        if company_graph.needs_met(mr, contents(fr), i) {
+                            out = 1;
+                        }
+                    }
+                }
+                unbox_slice(heap, flags);
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return out;
+}
+
+fn test_needs_met_is_true_for_a_step_with_no_needs_whatever_the_flags[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(met_in_diamond(heap, 0, false, false, false, false), 1);
+    test.assert_eq(met_in_diamond(heap, 0, true, true, true, true), 1);
+    return 0;
+}
+
+fn test_needs_met_wants_every_need_accepted[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(met_in_diamond(heap, 1, false, false, false, false), 0);
+    test.assert_eq(met_in_diamond(heap, 1, true, false, false, false), 1);
+    test.assert_eq(met_in_diamond(heap, 3, true, true, false, false), 0);
+    test.assert_eq(met_in_diamond(heap, 3, true, false, true, false), 0);
+    test.assert_eq(met_in_diamond(heap, 3, false, true, true, false), 1);
+    return 0;
+}
+
+// A step outside the manifest has no needs (met), and is never a trap.
+fn test_needs_met_outside_the_manifest_is_met[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(met_in_diamond(heap, 0 - 1, false, false, false, false), 1);
+    test.assert_eq(met_in_diamond(heap, 4, false, false, false, false), 1);
+    test.assert_eq(met_in_diamond(heap, 9000000, false, false, false, false), 1);
+    return 0;
+}
+
 fn test_index_of_finds_a_step_or_says_minus_one[&h](heap: &!h Heap) -> [heap] int {
     let d = manifest_text(heap, diamond());
     borrow d as &db in {

@@ -104,12 +104,12 @@ std = true
 
 [[test]]
 name = "company_state"
-sources = ["tests/company_state_test.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+sources = ["tests/company_state_test.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
 std = true
 
 [[test]]
 name = "company_cmd"
-sources = ["tests/company_cmd_test.cho", "src/company_cmd.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/lock.cho", "src/journal_io.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+sources = ["tests/company_cmd_test.cho", "src/company_cmd.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/lock.cho", "src/journal_io.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
 std = true
 
 [[test]]

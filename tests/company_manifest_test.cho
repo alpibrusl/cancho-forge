@@ -91,6 +91,7 @@ fn test_the_good_manifest_parses_and_reads_back[&h](heap: &!h Heap) -> [heap] in
                 test.assert(company_manifest.step_count(mr) == 3);
                 test.assert(bytes.equal(company_manifest.id_of(mr), "statuslite"));
                 test.assert(bytes.equal(company_manifest.provider_of(mr), "anthropic"));
+                test.assert(bytes.equal(company_manifest.model_of(mr), "claude-haiku-4-5"));
                 test.assert(bytes.equal(company_manifest.price_table_of(mr), "prices.json"));
                 test.assert(company_manifest.budget_input(mr) == 2000000);
                 test.assert(company_manifest.budget_output(mr) == 400000);

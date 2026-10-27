@@ -4,6 +4,7 @@ import std.buffer;
 import std.bytes;
 import std.option;
 import std.test;
+import forge.company_budget;
 import forge.company_manifest;
 import forge.company_graph;
 import forge.company_state;
@@ -415,6 +416,166 @@ fn test_spend_saturates_instead_of_overflowing[&h](heap: &!h Heap) -> [heap] int
         let p = probe_of(heap, buffer.bytes(jb));
         test.assert(bytes.equal(task.rule_code_name(p.rule), "event-malformed"));
         test.assert_eq(p.input, 1000000000000000);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- recorded cost (cost_micro) ---------------------------------------------------------------------------------------------
+
+// One micro-dollar per token of every class, no over tier.
+fn flat_prices() -> [] company_budget.Prices {
+    return company_budget.Prices { input: 1000000, output: 1000000, cache_write: 1000000, cache_read: 1000000, prompt_limit: 0, has_over: false, over_input: 0, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
+}
+
+struct CostProbe {
+    rule: int,
+    input: int,
+    recorded: int,
+    spent: int,
+    a_input: int,
+    a_output: int,
+    a_cost: int,
+    b_input: int,
+    b_cost: int,
+    out_of_range: int,
+}
+
+fn cost_probe[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] CostProbe {
+    var p = CostProbe { rule: 0 - 1, input: 0, recorded: 0, spent: 0, a_input: 0, a_output: 0, a_cost: 0, b_input: 0, b_cost: 0, out_of_range: 0 - 1 };
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    let a = company_state.step_recorded(sr, 0);
+                    let b = company_state.step_recorded(sr, 1);
+                    let far = company_state.step_recorded(sr, 9223372036854775807);
+                    p = CostProbe { rule: company_state.report_of(sr).rule, input: company_state.spend_input(sr), recorded: company_state.spend_cost_micro(sr), spent: company_state.spent_cost_micro(sr, flat_prices()), a_input: a.input, a_output: a.output, a_cost: company_state.step_cost_micro(sr, 0), b_input: b.input, b_cost: company_state.step_cost_micro(sr, 1), out_of_range: far.input + company_state.step_cost_micro(sr, 0 - 1) + company_state.step_cost_micro(sr, 3) + company_state.step_cost_micro(sr, 9223372036854775807) + company_state.step_recorded(sr, 3).input };
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return p;
+}
+
+// A priced record carries the cost Forge derived when it recorded it; replay sums it, per company and per step.
+fn test_the_recorded_cost_is_summed_per_company_and_per_step[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.spend_priced(heap, 1, "a", 100, 20, 0, 0, 7));
+    j = add(heap, j, company_state.spend_priced(heap, 2, "b", 10, 0, 0, 0, 5));
+    j = add(heap, j, company_state.spend_priced(heap, 3, "a", 1, 2, 0, 0, 1));
+    borrow j as &jb in {
+        let p = cost_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.input, 111);
+        test.assert_eq(p.recorded, 13);
+        test.assert_eq(p.spent, 13);
+        test.assert_eq(p.a_input, 101);
+        test.assert_eq(p.a_output, 22);
+        test.assert_eq(p.a_cost, 8);
+        test.assert_eq(p.b_input, 10);
+        test.assert_eq(p.b_cost, 5);
+        test.assert_eq(p.out_of_range, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// The recorded cost is authoritative: a million tokens recorded at a cost of 3 are 3, not re-priced from the totals (the replay
+// does not know the per-call tier; pricing the totals would put Haiku at its higher tier).
+fn test_a_recorded_cost_is_not_repriced_from_the_tokens[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.spend_priced(heap, 1, "a", 1000000, 0, 0, 0, 3));
+    borrow j as &jb in {
+        let p = cost_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.input, 1000000);
+        test.assert_eq(p.spent, 3);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// A record without `cost_micro` (written before the field existed) is unpriced: its recorded cost is 0, and `spent_cost_micro`
+// prices its tokens with the prices it is given (the caller's, conservative tier), beside the recorded cost of the others.
+fn test_a_record_without_cost_is_priced_by_the_caller_and_added[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.spend_recorded(heap, 1, "a", 100, 0, 0, 0));
+    j = add(heap, j, company_state.spend_priced(heap, 2, "b", 50, 0, 0, 0, 7));
+    borrow j as &jb in {
+        let p = cost_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.input, 150);
+        test.assert_eq(p.recorded, 7);
+        test.assert_eq(p.spent, 107);
+        test.assert_eq(p.a_input, 100);
+        test.assert_eq(p.a_cost, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_cost_that_is_not_a_count_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":1,\"kind\":\"company.spend.recorded\",\"task\":\"a\",\"input\":1,\"output\":0,\"cache_write\":0,\"cache_read\":0,\"cost_micro\":-1}\n");
+    var k = buffer.empty(heap, 256);
+    k = buffer.append(heap, k, "{\"v\":1,\"seq\":1,\"kind\":\"company.spend.recorded\",\"task\":\"a\",\"input\":1,\"output\":0,\"cache_write\":0,\"cache_read\":0,\"cost_micro\":\"7\"}\n");
+    var m = buffer.empty(heap, 256);
+    m = buffer.append(heap, m, "{\"v\":1,\"seq\":1,\"kind\":\"company.spend.recorded\",\"task\":\"a\",\"input\":1,\"output\":0,\"cache_write\":0,\"cache_read\":0,\"cost_micro\":1000000000000001}\n");
+    var n = buffer.empty(heap, 256);
+    n = add(heap, n, company_state.spend_priced(heap, 1, "a", 1, 0, 0, 0, 0 - 4));
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(jb)), "event-malformed"));
+    }
+    borrow k as &kb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(kb)), "event-malformed"));
+    }
+    borrow m as &mb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(mb)), "event-malformed"));
+        test.assert_eq(cost_probe(heap, buffer.bytes(mb)).input, 0);
+    }
+    borrow n as &nb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(nb)), "event-malformed"));
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, k);
+    buffer.drop(heap, m);
+    buffer.drop(heap, n);
+    return 0;
+}
+
+// A spend record for a step id the manifest does not have counts for the company, and for no step.
+fn test_a_spend_of_an_unknown_step_counts_for_the_company_only[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.spend_priced(heap, 1, "zzz", 9, 0, 0, 0, 4));
+    borrow j as &jb in {
+        let p = cost_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.input, 9);
+        test.assert_eq(p.recorded, 4);
+        test.assert_eq(p.a_input + p.b_input + p.a_cost + p.b_cost, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_the_recorded_cost_saturates[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.spend_priced(heap, 1, "a", 0, 0, 0, 0, 1000000000000000));
+    j = add(heap, j, company_state.spend_priced(heap, 2, "a", 0, 0, 0, 0, 1000000000000000));
+    j = add(heap, j, company_state.spend_recorded(heap, 3, "a", 1000000000000000, 0, 0, 0));
+    borrow j as &jb in {
+        let p = cost_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.recorded, 1000000000000000);
+        test.assert_eq(p.a_cost, 1000000000000000);
+        test.assert_eq(p.spent, 1000000000000000);
     }
     buffer.drop(heap, j);
     return 0;

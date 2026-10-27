@@ -6,6 +6,7 @@ import std.bytes;
 import std.json;
 import std.map;
 import std.option;
+import forge.company_budget;
 import forge.company_graph;
 import forge.company_manifest;
 import forge.event;
@@ -26,12 +27,22 @@ import forge.task;
 //   company.step.accepted       artifact, sha256   Forge's own check passed against the artifact it hashed
 //   company.step.check_failed   score, total       the check ran and did not pass
 //   company.gate.decided        gate, verdict (approved | rejected), user, reason
-//   company.spend.recorded      input, output, cache_write, cache_read   tokens one call used
+//   company.spend.recorded      input, output, cache_write, cache_read   tokens a step used, and (since the run, task 8b)
+//                               cost_micro   what Forge derived they cost, in micro-dollars, when it recorded them
 //
 // Replay keeps: which steps are accepted (by step number in the manifest, the shape `company_graph.ready` reads), the last
 // decision of each gate (0 open, 1 approved, 2 rejected; the last record wins), how many times each step id was admitted, and the
-// total tokens spent per class. A kind this build does not know is passed over, as the task journal does for the kinds it only
+// total tokens spent per class, and the same per step (by step number). A kind this build does not know is passed over, as the task journal does for the kinds it only
 // records, so a later build can add some. A known kind whose fields are not the ones above is `event-malformed`.
+//
+// Cost. `cost_micro` is additive: a spend record that has it is PRICED, and the recorded cost is authoritative (the run prices each
+// step's `usage.jsonl` call by call, with the over-limit tier where a call crossed it, before it records; the totals replayed here
+// have lost the per-call prompt sizes, so re-pricing them would put every call of a tiered model such as Haiku at its higher tier,
+// up to five times over). A record without the field (written before it existed) is UNPRICED: it adds 0 to the recorded cost, and
+// its tokens are kept apart so that `spent_cost_micro` prices them with the caller's prices, conservatively (`company_budget.usage_of`
+// is priced wholly at the over tier when there is one): never under-counted. `cost_micro` present but not a count (not an integer,
+// negative, over the cap of 10^15) is `event-malformed`. Per step only the priced cost is kept: an unpriced record adds 0 to its
+// step's cost, which makes the run's delta for that step larger, never smaller.
 
 pub res struct CompanyState {
     accepted: Box[[bool]],
@@ -138,7 +149,45 @@ pub fn spend_recorded[&h, &s](heap: &!h Heap, seq: int, step: &s [byte], input: 
     return closed(heap, w);
 }
 
+// The same, priced: the tokens cost `cost_micro` micro-dollars, as Forge derived it from the step's usage when it recorded it.
+pub fn spend_priced[&h, &s](heap: &!h Heap, seq: int, step: &s [byte], input: int, output: int, cache_write: int, cache_read: int, cost_micro: int) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_spend_recorded(), step);
+    w = json.put_key(heap, w, "input");
+    w = json.put_int(heap, w, input);
+    w = json.put_key(heap, w, "output");
+    w = json.put_int(heap, w, output);
+    w = json.put_key(heap, w, "cache_write");
+    w = json.put_int(heap, w, cache_write);
+    w = json.put_key(heap, w, "cache_read");
+    w = json.put_int(heap, w, cache_read);
+    w = json.put_key(heap, w, "cost_micro");
+    w = json.put_int(heap, w, cost_micro);
+    return closed(heap, w);
+}
+
 // ---- replay ---------------------------------------------------------------------------------------------------------------
+
+// The layout of the spend slice: the four token totals, the recorded cost, the four unpriced token totals, then per step number
+// `i` five slots from `step_base(i)`: its four token totals and its recorded cost.
+fn slot_cost() -> [] int {
+    return 4;
+}
+
+fn slot_unpriced() -> [] int {
+    return 5;
+}
+
+fn step_base(i: int) -> [] int {
+    return 9 + 5 * i;
+}
+
+// Has the spend slice the five slots of step number `i`? Answered without computing `step_base(i)` for an `i` that could overflow.
+fn in_steps[&s](sp: &s [int], i: int) -> [] bool {
+    if i < 0 {
+        return false;
+    }
+    return i < (len(sp) - 9) / 5;
+}
 
 // One count never passes this, and a total saturates at it, so no sum of journal numbers can overflow.
 fn cap() -> [] int {
@@ -170,6 +219,15 @@ fn field[&s, &t, &n](src: &s [byte], tp: &t [int], obj: int, name: &n [byte]) ->
         return 0 - 1;
     }
     return n;
+}
+
+// Add four token counts to the four slots of `spend` from `base` (the caller keeps `base + 3` in range).
+fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -> [] int {
+    spend[base] = clamp_add(spend[base], a);
+    spend[base + 1] = clamp_add(spend[base + 1], b);
+    spend[base + 2] = clamp_add(spend[base + 2], c);
+    spend[base + 3] = clamp_add(spend[base + 3], d);
+    return 0;
 }
 
 // Apply one complete line (no newline) that must carry `expect` as its `seq`. Answers the two maps and 0, or a rule code.
@@ -239,13 +297,28 @@ fn apply[&h, &l, &m, &a, &s](heap: &!h Heap, line: &l [byte], expect: int, man: 
                     let b = field(line, tp, 0, "output");
                     let c = field(line, tp, 0, "cache_write");
                     let d = field(line, tp, 0, "cache_read");
-                    if named == false || a < 0 || b < 0 || c < 0 || d < 0 {
+                    let priced = json.get(line, tp, 0, "cost_micro") >= 0;
+                    var cost = 0;
+                    if priced {
+                        cost = field(line, tp, 0, "cost_micro");
+                    }
+                    if named == false || a < 0 || b < 0 || c < 0 || d < 0 || cost < 0 {
                         rule = bad;
                     } else {
-                        spend[0] = clamp_add(spend[0], a);
-                        spend[1] = clamp_add(spend[1], b);
-                        spend[2] = clamp_add(spend[2], c);
-                        spend[3] = clamp_add(spend[3], d);
+                        add_tokens(spend, 0, a, b, c, d);
+                        if priced {
+                            spend[slot_cost()] = clamp_add(spend[slot_cost()], cost);
+                        } else {
+                            add_tokens(spend, slot_unpriced(), a, b, c, d);
+                        }
+                        let at = company_graph.index_of(man, id);
+                        if at >= 0 {
+                            let base = step_base(at);
+                            if base + 4 < len(spend) {
+                                add_tokens(spend, base, a, b, c, d);
+                                spend[base + 4] = clamp_add(spend[base + 4], cost);
+                            }
+                        }
                     }
                 }
             }
@@ -266,7 +339,7 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
         steps = 1;
     }
     let accepted = box_slice(heap, steps, false);
-    let spend = box_slice(heap, 4, 0);
+    let spend = box_slice(heap, step_base(steps), 0);
     var gates = map.empty(heap, 16, 0, 0);
     var admitted = map.empty(heap, 16, 0, 0);
     var records = 0;
@@ -356,6 +429,44 @@ pub fn spend_cache_write[&s](s: &s CompanyState) -> [] int {
 
 pub fn spend_cache_read[&s](s: &s CompanyState) -> [] int {
     return contents(s.spend)[3];
+}
+
+// The cost recorded by priced spend records, in micro-dollars (saturating at 10^15): authoritative, never re-priced.
+pub fn spend_cost_micro[&s](s: &s CompanyState) -> [] int {
+    return contents(s.spend)[slot_cost()];
+}
+
+// The tokens of the unpriced spend records (written without `cost_micro`).
+pub fn unpriced[&s](s: &s CompanyState) -> [] company_budget.Usage {
+    let sp = contents(s.spend);
+    let u = slot_unpriced();
+    return company_budget.usage_of(sp[u], sp[u + 1], sp[u + 2], sp[u + 3]);
+}
+
+// What the company has spent, in micro-dollars: the recorded cost, plus the unpriced records' tokens priced with `prices`
+// (`company_budget.cost_micro` of `unpriced`, the conservative tier), saturating at 10^15. What `next_action` is given.
+pub fn spent_cost_micro[&s](s: &s CompanyState, prices: company_budget.Prices) -> [] int {
+    return clamp_add(spend_cost_micro(s), company_budget.cost_micro(unpriced(s), prices));
+}
+
+// The tokens recorded for step number `i` (zero for a step outside the manifest): what the run subtracts from the step's
+// `usage.jsonl` to find what is new.
+pub fn step_recorded[&s](s: &s CompanyState, i: int) -> [] company_budget.Usage {
+    let sp = contents(s.spend);
+    if in_steps(sp, i) == false {
+        return company_budget.usage_of(0, 0, 0, 0);
+    }
+    let base = step_base(i);
+    return company_budget.usage_of(sp[base], sp[base + 1], sp[base + 2], sp[base + 3]);
+}
+
+// The cost recorded for step number `i` by its priced records (zero outside the manifest).
+pub fn step_cost_micro[&s](s: &s CompanyState, i: int) -> [] int {
+    let sp = contents(s.spend);
+    if in_steps(sp, i) == false {
+        return 0;
+    }
+    return sp[step_base(i) + 4];
 }
 
 // ---- human gates ----------------------------------------------------------------------------------------------------------

@@ -796,6 +796,13 @@ pub fn provider_of[&m](m: &m Manifest) -> [] &m [byte] {
     return text_at(m, m.provider);
 }
 
+// The model's `name` (a name, 1 to 64 bytes, as `parse` checked it).
+pub fn model_of[&m](m: &m Manifest) -> [] &m [byte] {
+    let src = buffer.bytes(m.text);
+    let tp = contents(m.tape);
+    return text_at(m, json.get(src, tp, json.get(src, tp, 0, "model"), "name"));
+}
+
 pub fn price_table_of[&m](m: &m Manifest) -> [] &m [byte] {
     return text_at(m, m.price_table);
 }

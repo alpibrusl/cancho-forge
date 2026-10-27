@@ -341,8 +341,13 @@ fn entry_prices[&s, &t](src: &s [byte], tp: &t [int], entry: int) -> [] option.O
     return option.Option::Some(Prices { input: price_field(src, tp, entry, "in"), output: price_field(src, tp, entry, "out"), cache_write: price_field(src, tp, entry, "cache_write"), cache_read: price_field(src, tp, entry, "cache_read"), prompt_limit: limit, has_over: has_over, over_input: oi, over_output: oo, over_cache_write: ow, over_cache_read: orr });
 }
 
+// A note key (`_source`, `_note`, `_any`) or an empty name. Nested, not `||`: the operators do not short-circuit, and `name[0]` of
+// an empty name would trap.
 fn is_note[&m](name: &m [byte]) -> [] bool {
-    return len(name) == 0 || int_of(name[0]) == 95;
+    if len(name) == 0 {
+        return true;
+    }
+    return int_of(name[0]) == 95;
 }
 
 fn max_table() -> [] int {
@@ -352,7 +357,7 @@ fn max_table() -> [] int {
 // The prices of `model` in the table `text`, looking in every provider in the file's order (the first provider that has the model
 // by name). `_any` entries are not consulted: a model nobody priced is unavailable (None), not free. Use `parse_prices_for` when the
 // provider is known. None for a table that does not parse, a model that is not there, or a price that is not exact.
-pub fn parse_prices[&h, &t](heap: &!h Heap, text: &t [byte], model: &static [byte]) -> [heap] option.Option[Prices] {
+pub fn parse_prices[&h, &t, &n](heap: &!h Heap, text: &t [byte], model: &n [byte]) -> [heap] option.Option[Prices] {
     if len(text) < 2 || len(text) > max_table() || is_note(model) {
         return option.Option::None;
     }
@@ -391,7 +396,7 @@ pub fn parse_prices[&h, &t](heap: &!h Heap, text: &t [byte], model: &static [byt
 }
 
 // The prices of `model` under `provider`: the model's own entry, else that provider's `_any` entry (ollama), else None.
-pub fn parse_prices_for[&h, &t](heap: &!h Heap, text: &t [byte], provider: &static [byte], model: &static [byte]) -> [heap] option.Option[Prices] {
+pub fn parse_prices_for[&h, &t, &p, &n](heap: &!h Heap, text: &t [byte], provider: &p [byte], model: &n [byte]) -> [heap] option.Option[Prices] {
     if len(text) < 2 || len(text) > max_table() || is_note(model) || is_note(provider) {
         return option.Option::None;
     }

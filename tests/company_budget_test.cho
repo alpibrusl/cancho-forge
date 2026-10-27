@@ -458,3 +458,26 @@ fn test_a_limit_at_or_above_one_quadrillion_is_reachable_by_a_saturated_total() 
     test.assert(company_budget.exhausted(company_budget.usage_of(0 - 4, 0, 0, 0), limits(0 - 1, 0, 0, 0), 0 - 9, 0 - 1) == false);
     return 0;
 }
+
+// An empty model or provider name is no model (None), never a trap: `is_note` now reads `name[0]` only behind a nested `if` (the
+// old `||` form was measured not to trap on this input, so this test pins the behaviour). A name chosen at run time, not a
+// literal, is taken: the run passes the manifest's model name (task 8b).
+fn test_an_empty_model_or_provider_name_is_none_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(load(heap, table(), "").input, 0 - 1);
+    test.assert_eq(load_for(heap, table(), "", "claude-haiku-5-5").input, 0 - 1);
+    test.assert_eq(load_for(heap, table(), "anthropic", "").input, 0 - 1);
+    var name = buffer.append(heap, buffer.empty(heap, 32), "claude-haiku-");
+    name = buffer.append(heap, name, "5-5");
+    borrow name as &nb in {
+        match company_budget.parse_prices_for(heap, table(), "anthropic", buffer.bytes(nb)) {
+            option.Option::Some(p) => {
+                test.assert(p.input > 0);
+            }
+            option.Option::None => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, name);
+    return 0;
+}

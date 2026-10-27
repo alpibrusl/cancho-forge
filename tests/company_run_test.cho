@@ -223,14 +223,101 @@ fn test_a_qa_step_still_starts_when_the_budget_is_exhausted[&h](heap: &!h Heap) 
     return 0;
 }
 
-// Stop wins over an open gate when a model step is held back only by the budget.
-fn test_stop_comes_before_waiting_on_a_gate[&h](heap: &!h Heap) -> [heap] int {
+// A model step held back by the budget does NOT hide a product step waiting on its gate (the product step uses no model, so a
+// person deciding the gate lets it go on): WaitGate(brief). Before the 8b review this answered Stop.
+fn test_a_gated_product_step_waits_although_a_model_step_is_held_by_the_budget[&h](heap: &!h Heap) -> [heap] int {
     let j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    test.assert_eq(act_and_drop(heap, free_model_manifest(), j), 10);
+    return 0;
+}
+
+// With the product step accepted, only the held model step is left: Stop.
+fn test_stop_when_only_a_model_step_held_by_the_budget_is_left[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    j = accepted_step(heap, j, 2, "brief");
     test.assert_eq(act_and_drop(heap, free_model_manifest(), j), 30 + company_run.stop_budget());
     return 0;
 }
 
 fn test_the_stop_tag_is_named() -> [] int {
     test.assert(bytes.equal(company_run.stop_name(company_run.stop_budget()), "budget-exhausted"));
+    return 0;
+}
+
+// ---- roles -----------------------------------------------------------------------------------------------------------------
+
+fn test_builder_and_writer_steps_use_the_model_the_others_do_not() -> [] int {
+    test.assert(company_run.uses_model(company_manifest.Role::Builder));
+    test.assert(company_run.uses_model(company_manifest.Role::Writer));
+    test.assert(company_run.uses_model(company_manifest.Role::Qa) == false);
+    test.assert(company_run.uses_model(company_manifest.Role::Analyst) == false);
+    test.assert(company_run.uses_model(company_manifest.Role::Reviewer) == false);
+    test.assert(company_run.uses_model(company_manifest.Role::Product) == false);
+    return 0;
+}
+
+// ---- a spent budget and a gate -----------------------------------------------------------------------------------------------
+
+// lib (builder, no needs) and check (qa, gate g, no needs): a step that uses no model waits on a human while the budget is spent.
+fn gated_qa_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\"],\"steps\":[{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"check\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"}]}";
+}
+
+// write (writer, gate g, no needs) and lib (builder, no needs): only model steps, one of them gated.
+fn gated_writer_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"writer\"],\"steps\":[{\"id\":\"write\",\"role\":\"writer\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"gate\":\"g\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}]}";
+}
+
+// The budget is spent and the model step `lib` is held, but `check` (qa) waits on gate g: a person approving g lets it run, so
+// the answer is WaitGate(check), not Stop (the spec: the budget covers model steps only).
+fn test_a_gated_step_that_uses_no_model_waits_even_when_the_budget_is_spent[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    test.assert_eq(act_and_drop(heap, gated_qa_manifest(), j), 11);
+    return 0;
+}
+
+// And once g is approved, check starts although the budget is spent.
+fn test_the_approved_qa_step_starts_with_the_budget_spent[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "g", "approved", "ana", "go"));
+    test.assert_eq(act_and_drop(heap, gated_qa_manifest(), j), 1);
+    return 0;
+}
+
+// Within budget the free model step starts first and the gate waits after it.
+fn test_within_budget_the_free_builder_starts_before_the_gate_is_asked[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(act_and_drop(heap, gated_qa_manifest(), buffer.empty(heap, 8)), 0);
+    let j = accepted_step(heap, buffer.empty(heap, 256), 1, "lib");
+    test.assert_eq(act_and_drop(heap, gated_qa_manifest(), j), 11);
+    return 0;
+}
+
+// A gated MODEL step under a spent budget: approving it would not let it run, so Stop outranks the wait.
+fn test_a_gated_model_step_under_a_spent_budget_is_stop_not_wait[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    j = accepted_step(heap, j, 2, "lib");
+    test.assert_eq(act_and_drop(heap, gated_writer_manifest(), j), 30 + company_run.stop_budget());
+    return 0;
+}
+
+// ---- the answer when nothing can start (settle) -------------------------------------------------------------------------------
+
+fn test_settle_with_nothing_pending_is_done() -> [] int {
+    test.assert_eq(code_of(company_run.settle(0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)), 40);
+    return 0;
+}
+
+fn test_settle_orders_wait_then_stop_then_blocked() -> [] int {
+    test.assert_eq(code_of(company_run.settle(3, 2, 1, 0, 0)), 11);
+    test.assert_eq(code_of(company_run.settle(3, 2, 0 - 1, 0, 0)), 30 + company_run.stop_budget());
+    test.assert_eq(code_of(company_run.settle(3, 0 - 1, 0 - 1, 1, 0)), 21);
+    return 0;
+}
+
+// Steps are left and none can start, wait or is blocked by a gate (a need that can never be met, which `parse` refuses): the
+// first step left is Blocked, so the run never loops.
+fn test_settle_falls_back_to_blocking_the_first_step_left() -> [] int {
+    test.assert_eq(code_of(company_run.settle(2, 0 - 1, 0 - 1, 0 - 1, 1)), 21);
+    test.assert_eq(code_of(company_run.settle(1, 0 - 1, 0 - 1, 0 - 1, 0)), 20);
     return 0;
 }
