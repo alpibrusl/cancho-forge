@@ -444,3 +444,115 @@ fn test_every_builder_writes_one_complete_line[&h](heap: &!h Heap) -> [heap] int
     buffer.drop(heap, j);
     return 0;
 }
+
+// ---- human gates: which steps a gate blocks ------------------------------------------------------------------------------
+
+// Step a is behind gate g, b needs a (no gate), c needs nothing (no gate).
+fn gate_manifest_text() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"qa\"],\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"},{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}";
+}
+
+// blocked-by-gate of steps a, b, c as 3 digits (a*100 + b*10 + c), and the next runnable step number (-1 for none).
+struct GateProbe {
+    blocked: int,
+    next: int,
+    out_of_range: int,
+}
+
+fn gate_probe_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] GateProbe {
+    var p = GateProbe { blocked: 0 - 1, next: 0 - 2, out_of_range: 0 - 1 };
+    match company_manifest.parse(heap, gate_manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    let a = company_state.step_blocked_by_gate(mr, sr, 0);
+                    let b = company_state.step_blocked_by_gate(mr, sr, 1);
+                    let c = company_state.step_blocked_by_gate(mr, sr, 2);
+                    var next = 0 - 1;
+                    match company_state.next_runnable(mr, sr) {
+                        option.Option::Some(n) => {
+                            next = n;
+                        }
+                        option.Option::None => {
+                            next = 0 - 1;
+                        }
+                    }
+                    p = GateProbe { blocked: a * 100 + b * 10 + c, next: next, out_of_range: company_state.step_blocked_by_gate(mr, sr, 3) + company_state.step_blocked_by_gate(mr, sr, 0 - 1) };
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return p;
+}
+
+fn test_a_step_behind_an_open_gate_is_blocked_gate_open_and_a_free_step_is_not[&h](heap: &!h Heap) -> [heap] int {
+    let p = gate_probe_of(heap, "");
+    test.assert_eq(p.blocked, 100);
+    test.assert_eq(p.next, 2);
+    test.assert_eq(p.out_of_range, 0);
+    return 0;
+}
+
+fn test_an_approved_gate_frees_its_step[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "ana", "fine"));
+    borrow j as &jb in {
+        let p = gate_probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.blocked, 0);
+        test.assert_eq(p.next, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_rejected_gate_blocks_its_step_gate_rejected_and_its_dependents_are_never_ready[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "rejected", "ana", "no"));
+    borrow j as &jb in {
+        let p = gate_probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.blocked, 200);
+        test.assert_eq(p.next, 2);
+    }
+    // c done: nothing is runnable, b waits on a, a is rejected.
+    j = add(heap, j, company_state.accepted(heap, 2, "c", "out", "abc"));
+    borrow j as &kb in {
+        let p = gate_probe_of(heap, buffer.bytes(kb));
+        test.assert_eq(p.blocked, 200);
+        test.assert_eq(p.next, 0 - 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_approve_reject_approve_the_last_decision_decides_what_is_runnable[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "ana", "ok"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "g", "rejected", "ana", "no"));
+    borrow j as &ab in {
+        test.assert_eq(gate_probe_of(heap, buffer.bytes(ab)).blocked, 200);
+    }
+    j = add(heap, j, company_state.gate_decided(heap, 3, "g", "approved", "ana", "ok again"));
+    borrow j as &bb in {
+        test.assert_eq(gate_probe_of(heap, buffer.bytes(bb)).blocked, 0);
+        test.assert_eq(gate_probe_of(heap, buffer.bytes(bb)).next, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_an_accepted_gated_step_is_not_runnable_and_its_dependent_is[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "ana", "ok"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "out", "abc"));
+    borrow j as &jb in {
+        test.assert_eq(gate_probe_of(heap, buffer.bytes(jb)).next, 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}

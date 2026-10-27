@@ -5,6 +5,7 @@ import std.buffer;
 import std.bytes;
 import std.json;
 import std.map;
+import std.option;
 import forge.company_graph;
 import forge.company_manifest;
 import forge.event;
@@ -355,4 +356,55 @@ pub fn spend_cache_write[&s](s: &s CompanyState) -> [] int {
 
 pub fn spend_cache_read[&s](s: &s CompanyState) -> [] int {
     return contents(s.spend)[3];
+}
+
+// ---- human gates ----------------------------------------------------------------------------------------------------------
+
+// Does the human gate of step number `step` keep it from running? 0 free (no gate, an approved gate, or a step outside the
+// manifest), 1 the gate is open (`gate-open`, no decision yet), 2 the gate was rejected (`gate-rejected`; the last decision wins).
+// A step that needs a rejected-gated step is not blocked by it directly: it is not ready because that step is not accepted.
+pub fn step_blocked_by_gate[&m, &s](m: &m company_manifest.Manifest, s: &s CompanyState, step: int) -> [] int {
+    if step < 0 || step >= company_manifest.step_count(m) {
+        return 0;
+    }
+    let gate = company_manifest.step_gate(m, company_manifest.step_at(m, step));
+    if len(gate) == 0 {
+        return 0;
+    }
+    let g = gate_state(s, gate);
+    if g == 0 {
+        return 1;
+    }
+    if g == 2 {
+        return 2;
+    }
+    return 0;
+}
+
+// The number of the first step that may run now: not accepted, every need accepted, and not blocked by its gate. A step whose gate is
+// open or rejected is skipped, and so is everything behind it (its dependents are not ready, `company_graph.ready`). None when there
+// is no such step.
+pub fn next_runnable[&m, &s](m: &m company_manifest.Manifest, s: &s CompanyState) -> [] option.Option[int] {
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        if accepted_at(s, i) == false && step_blocked_by_gate(m, s, i) == 0 {
+            let step = company_manifest.step_at(m, i);
+            let k = company_manifest.step_needs_count(m, step);
+            var met = true;
+            var j = 0;
+            while j < k {
+                let at = company_graph.index_of(m, company_manifest.step_need(m, step, j));
+                if at < 0 || accepted_at(s, at) == false {
+                    met = false;
+                }
+                j = j + 1;
+            }
+            if met {
+                return option.Option::Some(i);
+            }
+        }
+        i = i + 1;
+    }
+    return option.Option::None;
 }

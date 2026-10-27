@@ -138,6 +138,7 @@ pub res struct Manifest {
     provider: int,
     price_table: int,
     steps: int,
+    gates: int,
     step_count: int,
     input: int,
     output: int,
@@ -746,6 +747,7 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
     var provider = 0 - 1;
     var price_table = 0 - 1;
     var steps = 0 - 1;
+    var gates = 0 - 1;
     var count = 0;
     var input = 0;
     var output = 0;
@@ -759,6 +761,7 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
         let budget = json.get(text, tp, 0, "budget");
         price_table = json.get(text, tp, budget, "price_table");
         steps = json.get(text, tp, 0, "steps");
+        gates = json.get(text, tp, 0, "human_gates");
         count = json.count(tp, steps);
         input = json.to_int(text, tp, json.get(text, tp, budget, "input"));
         output = json.to_int(text, tp, json.get(text, tp, budget, "output"));
@@ -766,11 +769,11 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
         cache_read = json.to_int(text, tp, json.get(text, tp, budget, "cache_read"));
         max_cost = json.to_int(text, tp, json.get(text, tp, budget, "max_cost"));
     }
-    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
+    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
 }
 
 pub fn drop[&h](heap: &!h Heap, m: Manifest) -> [heap] int {
-    let Manifest { text, tape, id, provider, price_table, steps, step_count, input, output, cache_write, cache_read, max_cost } = m;
+    let Manifest { text, tape, id, provider, price_table, steps, gates, step_count, input, output, cache_write, cache_read, max_cost } = m;
     buffer.drop(heap, text);
     unbox_slice(heap, tape);
     return 0;
@@ -815,6 +818,22 @@ pub fn budget_cache_read[&m](m: &m Manifest) -> [] int {
 
 pub fn budget_max_cost[&m](m: &m Manifest) -> [] int {
     return m.max_cost;
+}
+
+// Is `name` one of the manifest's `human_gates`? An empty name is not.
+pub fn has_gate[&m, &n](m: &m Manifest, name: &n [byte]) -> [] bool {
+    if len(name) == 0 {
+        return false;
+    }
+    let tp = contents(m.tape);
+    var k = 0;
+    while k < json.count(tp, m.gates) {
+        if bytes.equal(text_at(m, json.at(tp, m.gates, k)), name) {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
 }
 
 pub fn step_count[&m](m: &m Manifest) -> [] int {

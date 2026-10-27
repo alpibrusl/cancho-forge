@@ -781,7 +781,7 @@ ones by `tests/conformance/journal_files.cho`):
 | `role-unknown` | a role outside `builder, qa, analyst, reviewer, writer, product`, in `roles` or a step, or a step whose role `roles` does not list | `test_a_role_that_is_not_one_of_the_six_is_refused`, `..._a_role_pack_that_names_...`, `..._a_step_whose_role_is_not_in_the_roles_in_use_...` |
 | `task-type-unsupported` | a `task_type` that is not `project.build`, `repo.gate`, `tool.run` or `none`, or is not the one the step's role offers | `test_a_task_type_the_role_does_not_offer_is_refused` |
 | `check-missing` | a builder or writer step with no `check`, or an empty one | `test_a_builder_step_without_a_check_is_refused` |
-| `gate-unknown` | a step's `gate` that is not in `human_gates` | `test_a_gate_that_is_not_a_human_gate_is_refused` |
+| `gate-unknown` | a step's `gate` that is not in `human_gates`; and `forge company decide` about a gate the manifest does not list (exit 1, nothing written) | `test_a_gate_that_is_not_a_human_gate_is_refused`; `scripts/check_company.sh` (`decide: a gate the manifest does not list is gate-unknown`, `a refused decision wrote no journal`); `tests/company_manifest_test.cho` (`has_gate`) |
 | `budget-missing` | no `budget` object, or one of `input`, `output`, `cache_write`, `cache_read`, `max_cost` absent | `test_a_missing_budget_or_price_table_is_refused` |
 | `price-table-missing` | `budget.price_table` absent or empty | `test_a_missing_budget_or_price_table_is_refused`, `test_a_price_table_that_is_not_a_plain_file_name_is_malformed` |
 
@@ -789,6 +789,7 @@ Designed, not implemented (no test reaches them yet; they are not claims):
 
 | rule | meaning |
 |---|---|
+| `gate-open`, `gate-rejected` | `company_state.step_blocked_by_gate` answers 1 (the step's human gate has no decision) or 2 (its last decision is `rejected`); `next_runnable` skips such a step, and so every step behind it. Reached as values by `tests/company_state_test.cho` (`test_a_step_behind_an_open_gate_is_blocked_gate_open...`, `test_a_rejected_gate_blocks_its_step_gate_rejected_and_its_dependents_are_never_ready`); no verb prints them as a `refusal:` line until `company run` (a later task) | 
 | `policy-denied` | policy decision `Deny`, with the policy version |
 | `policy-missing` | no policy loaded or it did not parse (fail closed) |
 | `approval-missing` | a protected action without a granted approval |

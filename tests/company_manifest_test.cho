@@ -121,6 +121,9 @@ fn test_the_good_manifest_parses_and_reads_back[&h](heap: &!h Heap) -> [heap] in
                 test.assert(bytes.equal(company_manifest.step_gate(mr, s0), "product-brief"));
                 let s2 = company_manifest.step_at(mr, 2);
                 test.assert(bytes.equal(company_manifest.step_gate(mr, s2), ""));
+                test.assert(company_manifest.has_gate(mr, "product-brief"));
+                test.assert(company_manifest.has_gate(mr, "product-brie") == false);
+                test.assert(company_manifest.has_gate(mr, "") == false);
             }
             company_manifest.drop(heap, m);
         }

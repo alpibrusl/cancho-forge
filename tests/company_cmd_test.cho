@@ -119,3 +119,39 @@ fn test_a_refused_journal_shows_what_replayed_before_the_bad_line[&h](heap: &!h 
     buffer.drop(heap, j);
     return 0;
 }
+
+// ---- the OS user of a decision --------------------------------------------------------------------------------------------
+
+fn user_of[&t](environ: &t [byte]) -> [] &t [byte] {
+    return company_cmd.user_in_environ(environ);
+}
+
+fn test_the_user_is_the_value_of_user_in_a_nul_separated_environment() -> [] int {
+    test.assert(bytes.equal(user_of("HOME=/home/ana\0USER=ana\0PATH=/bin\0"), "ana"));
+    test.assert(bytes.equal(user_of("USER=ana\0"), "ana"));
+    test.assert(bytes.equal(user_of("USER=ana"), "ana"));
+    return 0;
+}
+
+fn test_a_missing_empty_or_look_alike_user_is_unknown() -> [] int {
+    test.assert(bytes.equal(user_of(""), "unknown"));
+    test.assert(bytes.equal(user_of("HOME=/h\0PATH=/bin\0"), "unknown"));
+    test.assert(bytes.equal(user_of("USER=\0"), "unknown"));
+    test.assert(bytes.equal(user_of("XUSER=bob\0USERNAME=bob\0"), "unknown"));
+    test.assert(bytes.equal(user_of("USER"), "unknown"));
+    return 0;
+}
+
+fn test_a_user_name_that_is_too_long_is_unknown() -> [] int {
+    test.assert(bytes.equal(user_of("USER=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0"), "unknown"));
+    return 0;
+}
+
+fn test_a_verdict_word_is_approved_or_rejected_and_nothing_else() -> [] int {
+    test.assert_eq(company_cmd.verdict_code("approved"), 1);
+    test.assert_eq(company_cmd.verdict_code("rejected"), 2);
+    test.assert_eq(company_cmd.verdict_code("Approved"), 0);
+    test.assert_eq(company_cmd.verdict_code("open"), 0);
+    test.assert_eq(company_cmd.verdict_code(""), 0);
+    return 0;
+}
