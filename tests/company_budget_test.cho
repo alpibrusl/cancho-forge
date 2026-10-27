@@ -1,0 +1,405 @@
+edition 9;
+
+import std.buffer;
+import std.option;
+import std.test;
+import forge.company_budget;
+
+// Unit tests for src/company_budget.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.1 and 10): the
+// price table, the usage log, the cost in micro-dollars and the ceiling. Every expected number is worked out by hand in the test.
+// Run with `cancho test`.
+
+// The shape of cancho-code's eval/prices.json (USD per million tokens as decimal numbers; `_` keys are notes), with the _source
+// and _note texts shortened. The values are the file's own.
+fn table() -> [] &static [byte] {
+    return "{\"_source\":\"s\",\"_note\":\"n\",\"anthropic\":{\"claude-haiku-5-5\":{\"prompt_limit\":100000,\"in\":0.10,\"cache_write\":0.125,\"cache_read\":0.01,\"out\":0.50,\"over_limit_prices\":{\"in\":0.50,\"cache_write\":0.625,\"cache_read\":0.05,\"out\":2.50}},\"claude-sonnet-5-5\":{\"in\":2.0,\"cache_write\":2.5,\"cache_read\":0.10,\"out\":10.0},\"claude-opus-5-5\":{\"in\":4.0,\"cache_write\":5.0,\"cache_read\":0.20,\"out\":20.0},\"claude-fable-5-1\":{\"in\":10.0,\"cache_write\":12.5,\"cache_read\":0.25,\"out\":50.0}},\"ollama\":{\"_any\":{\"in\":0.0,\"cache_write\":0.0,\"cache_read\":0.0,\"out\":0.0,\"_note\":\"local\"}}}";
+}
+
+// One line exactly as cancho-agent's log_call writes it (src/cancho_agent.cho in cancho-code; scripts/test-agent-native.sh checks
+// in=11 out=22 cache_write=33 cache_read=44 thinking=7 for the same call).
+fn real_line() -> [] &static [byte] {
+    return "{\"provider\":\"anthropic\",\"model\":\"stub-model\",\"task\":\"UNIT: refill\",\"sample\":1,\"in\":11,\"out\":22,\"thinking\":7,\"cache_write\":33,\"cache_read\":44,\"stop\":\"end_turn\",\"outcome\":\"written\",\"status\":200,\"reply_chars\":40,\"program_chars\":40,\"ms\":12}";
+}
+
+// A prices value, or `input = -1` for None.
+fn load[&h, &t](heap: &!h Heap, text: &t [byte], model: &static [byte]) -> [heap] company_budget.Prices {
+    match company_budget.parse_prices(heap, text, model) {
+        option.Option::Some(p) => {
+            return p;
+        }
+        option.Option::None => {
+            return company_budget.Prices { input: 0 - 1, output: 0, cache_write: 0, cache_read: 0, prompt_limit: 0, has_over: false, over_input: 0, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
+        }
+    }
+}
+
+fn load_for[&h, &t](heap: &!h Heap, text: &t [byte], provider: &static [byte], model: &static [byte]) -> [heap] company_budget.Prices {
+    match company_budget.parse_prices_for(heap, text, provider, model) {
+        option.Option::Some(p) => {
+            return p;
+        }
+        option.Option::None => {
+            return company_budget.Prices { input: 0 - 1, output: 0, cache_write: 0, cache_read: 0, prompt_limit: 0, has_over: false, over_input: 0, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
+        }
+    }
+}
+
+// A one-model table with the given in-price text and the three other prices fixed.
+fn one_price[&h](heap: &!h Heap, in_text: &static [byte]) -> [heap] int {
+    var b = buffer.empty(heap, 256);
+    b = buffer.append(heap, b, "{\"anthropic\":{\"m\":{\"in\":");
+    b = buffer.append(heap, b, in_text);
+    b = buffer.append(heap, b, ",\"cache_write\":1,\"cache_read\":1,\"out\":1}}}");
+    var got = 0 - 2;
+    borrow b as &br in {
+        got = load(heap, buffer.bytes(br), "m").input;
+    }
+    buffer.drop(heap, b);
+    return got;
+}
+
+fn plain(input: int, output: int, cache_write: int, cache_read: int) -> [] company_budget.Prices {
+    return company_budget.Prices { input: input, output: output, cache_write: cache_write, cache_read: cache_read, prompt_limit: 0, has_over: false, over_input: 0, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
+}
+
+// ---- parse_prices ---------------------------------------------------------------------------------------------------------------
+
+fn test_a_model_with_an_over_limit_tier_reads_both_tiers_as_micro_dollars[&h](heap: &!h Heap) -> [heap] int {
+    let p = load(heap, table(), "claude-haiku-5-5");
+    test.assert_eq(p.input, 100000);
+    test.assert_eq(p.output, 500000);
+    test.assert_eq(p.cache_write, 125000);
+    test.assert_eq(p.cache_read, 10000);
+    test.assert_eq(p.prompt_limit, 100000);
+    test.assert(p.has_over);
+    test.assert_eq(p.over_input, 500000);
+    test.assert_eq(p.over_output, 2500000);
+    test.assert_eq(p.over_cache_write, 625000);
+    test.assert_eq(p.over_cache_read, 50000);
+    return 0;
+}
+
+fn test_models_without_a_tier_have_none_and_whole_numbers_read_exactly[&h](heap: &!h Heap) -> [heap] int {
+    let s = load(heap, table(), "claude-sonnet-5-5");
+    test.assert_eq(s.input, 2000000);
+    test.assert_eq(s.output, 10000000);
+    test.assert_eq(s.cache_write, 2500000);
+    test.assert_eq(s.cache_read, 100000);
+    test.assert(s.has_over == false);
+    test.assert_eq(s.prompt_limit, 0);
+    let o = load(heap, table(), "claude-opus-5-5");
+    test.assert_eq(o.input, 4000000);
+    test.assert_eq(o.output, 20000000);
+    test.assert_eq(o.cache_write, 5000000);
+    test.assert_eq(o.cache_read, 200000);
+    let f = load(heap, table(), "claude-fable-5-1");
+    test.assert_eq(f.input, 10000000);
+    test.assert_eq(f.output, 50000000);
+    test.assert_eq(f.cache_write, 12500000);
+    test.assert_eq(f.cache_read, 250000);
+    return 0;
+}
+
+fn test_an_unknown_model_has_no_price_even_though_ollama_has_an_any_entry[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(load(heap, table(), "claude-nope").input, 0 - 1);
+    test.assert_eq(load(heap, table(), "_any").input, 0 - 1);
+    test.assert_eq(load(heap, table(), "_note").input, 0 - 1);
+    test.assert_eq(load(heap, table(), "").input, 0 - 1);
+    return 0;
+}
+
+fn test_the_provider_aware_lookup_uses_the_any_entry_of_that_provider_only[&h](heap: &!h Heap) -> [heap] int {
+    let l = load_for(heap, table(), "ollama", "llama3:8b");
+    test.assert_eq(l.input, 0);
+    test.assert_eq(l.output, 0);
+    test.assert_eq(l.cache_write, 0);
+    test.assert_eq(l.cache_read, 0);
+    test.assert_eq(load_for(heap, table(), "anthropic", "llama3:8b").input, 0 - 1);
+    test.assert_eq(load_for(heap, table(), "ollama", "claude-haiku-5-5").input, 0);
+    test.assert_eq(load_for(heap, table(), "anthropic", "claude-opus-5-5").input, 4000000);
+    test.assert_eq(load_for(heap, table(), "openai", "claude-opus-5-5").input, 0 - 1);
+    return 0;
+}
+
+fn test_decimals_are_exact_up_to_six_places_and_anything_else_is_no_price[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(one_price(heap, "0.000001"), 1);
+    test.assert_eq(one_price(heap, "0.125"), 125000);
+    test.assert_eq(one_price(heap, "12.345678"), 12345678);
+    test.assert_eq(one_price(heap, "7"), 7000000);
+    test.assert_eq(one_price(heap, "0"), 0);
+    test.assert_eq(one_price(heap, "1000"), 1000000000);
+    test.assert_eq(one_price(heap, "0.0000001"), 0 - 1);
+    test.assert_eq(one_price(heap, "0.1000000"), 0 - 1);
+    test.assert_eq(one_price(heap, "1e-1"), 0 - 1);
+    test.assert_eq(one_price(heap, "1E2"), 0 - 1);
+    test.assert_eq(one_price(heap, "-1"), 0 - 1);
+    test.assert_eq(one_price(heap, "1000.000001"), 0 - 1);
+    test.assert_eq(one_price(heap, "\"2.0\""), 0 - 1);
+    test.assert_eq(one_price(heap, "null"), 0 - 1);
+    test.assert_eq(one_price(heap, "true"), 0 - 1);
+    return 0;
+}
+
+fn test_a_missing_price_class_or_a_broken_table_is_no_price[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(load(heap, "{\"anthropic\":{\"m\":{\"in\":1,\"cache_write\":1,\"out\":1}}}", "m").input, 0 - 1);
+    test.assert_eq(load(heap, "{\"anthropic\":{\"m\":{\"in\":1,\"cache_write\":1,\"cache_read\":1,\"out\":1}}}", "m").input, 1000000);
+    test.assert_eq(load(heap, "{\"anthropic\":{\"m\":", "m").input, 0 - 1);
+    test.assert_eq(load(heap, "", "m").input, 0 - 1);
+    test.assert_eq(load(heap, "[1,2]", "m").input, 0 - 1);
+    test.assert_eq(load(heap, "{\"anthropic\":[]}", "m").input, 0 - 1);
+    test.assert_eq(load(heap, "{\"anthropic\":{\"m\":3}}", "m").input, 0 - 1);
+    return 0;
+}
+
+fn test_an_over_limit_block_that_is_incomplete_or_has_no_limit_is_handled_without_guessing[&h](heap: &!h Heap) -> [heap] int {
+    // over_limit_prices without prompt_limit: no tier can apply, the base price stands.
+    let a = load(heap, "{\"anthropic\":{\"m\":{\"in\":1,\"cache_write\":1,\"cache_read\":1,\"out\":1,\"over_limit_prices\":{\"in\":2,\"cache_write\":2,\"cache_read\":2,\"out\":2}}}}", "m");
+    test.assert_eq(a.input, 1000000);
+    test.assert(a.has_over == false);
+    // over_limit_prices that lacks a class: the whole price is unavailable (a tier we cannot price must not be priced as the base).
+    test.assert_eq(load(heap, "{\"anthropic\":{\"m\":{\"prompt_limit\":10,\"in\":1,\"cache_write\":1,\"cache_read\":1,\"out\":1,\"over_limit_prices\":{\"in\":2,\"cache_write\":2,\"cache_read\":2}}}}", "m").input, 0 - 1);
+    // prompt_limit that is not a positive integer.
+    test.assert_eq(load(heap, "{\"anthropic\":{\"m\":{\"prompt_limit\":\"x\",\"in\":1,\"cache_write\":1,\"cache_read\":1,\"out\":1}}}", "m").input, 0 - 1);
+    return 0;
+}
+
+// ---- parse_usage ----------------------------------------------------------------------------------------------------------------
+
+fn test_a_real_usage_line_is_summed_by_its_four_token_fields() -> [] int {
+    let u = company_budget.parse_usage(real_line());
+    test.assert_eq(u.input, 11);
+    test.assert_eq(u.output, 22);
+    test.assert_eq(u.cache_write, 33);
+    test.assert_eq(u.cache_read, 44);
+    test.assert_eq(u.calls, 1);
+    test.assert_eq(u.malformed, 0);
+    return 0;
+}
+
+fn test_lines_add_up_and_blank_lines_and_crlf_are_not_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 1024);
+    b = buffer.append(heap, b, real_line());
+    b = buffer.append(heap, b, "\r\n\n");
+    b = buffer.append(heap, b, "{\"in\":1,\"out\":2,\"cache_write\":3,\"cache_read\":4}\n");
+    b = buffer.append(heap, b, "{\"in\":0,\"out\":0,\"cache_write\":0,\"cache_read\":0,\"outcome\":\"rate_limited\"}");
+    borrow b as &br in {
+        let u = company_budget.parse_usage(buffer.bytes(br));
+        test.assert_eq(u.input, 12);
+        test.assert_eq(u.output, 24);
+        test.assert_eq(u.cache_write, 36);
+        test.assert_eq(u.cache_read, 48);
+        test.assert_eq(u.calls, 3);
+        test.assert_eq(u.malformed, 0);
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_malformed_lines_are_skipped_and_counted_and_the_rest_still_counts[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 2048);
+    b = buffer.append(heap, b, "garbage\n");
+    b = buffer.append(heap, b, real_line());
+    b = buffer.append(heap, b, "\n{\"in\":1,\"out\":2,\"cache_write\":3}\n");
+    b = buffer.append(heap, b, "{\"in\":\"1\",\"out\":2,\"cache_write\":3,\"cache_read\":4}\n");
+    b = buffer.append(heap, b, "{\"in\":1.5,\"out\":2,\"cache_write\":3,\"cache_read\":4}\n");
+    b = buffer.append(heap, b, "{\"in\":-1,\"out\":2,\"cache_write\":3,\"cache_read\":4}\n");
+    b = buffer.append(heap, b, "[1,2,3]\n");
+    b = buffer.append(heap, b, "{\"in\":1,\"out\":2,\"cache_write\":3,\"cache_read\":4\n");
+    b = buffer.append(heap, b, "{\"in\":1000000000000001,\"out\":2,\"cache_write\":3,\"cache_read\":4}\n");
+    b = buffer.append(heap, b, "{\"in\":99999999999999999999,\"out\":2,\"cache_write\":3,\"cache_read\":4}\n");
+    b = buffer.append(heap, b, "{\"in\":5,\"out\":6,\"cache_write\":7,\"cache_read\":8}\n");
+    borrow b as &br in {
+        let u = company_budget.parse_usage(buffer.bytes(br));
+        test.assert_eq(u.malformed, 9);
+        test.assert_eq(u.calls, 2);
+        test.assert_eq(u.input, 16);
+        test.assert_eq(u.output, 28);
+        test.assert_eq(u.cache_write, 40);
+        test.assert_eq(u.cache_read, 52);
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_a_line_longer_than_the_line_limit_is_malformed_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 8192);
+    b = buffer.append(heap, b, "{\"task\":\"");
+    var i = 0;
+    while i < 3000 {
+        b = buffer.append(heap, b, "x");
+        i = i + 1;
+    }
+    b = buffer.append(heap, b, "\",\"in\":1,\"out\":1,\"cache_write\":1,\"cache_read\":1}\n");
+    b = buffer.append(heap, b, "{\"in\":1,\"out\":1,\"cache_write\":1,\"cache_read\":1}\n");
+    borrow b as &br in {
+        let u = company_budget.parse_usage(buffer.bytes(br));
+        test.assert_eq(u.malformed, 1);
+        test.assert_eq(u.calls, 1);
+        test.assert_eq(u.input, 1);
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_totals_saturate_at_one_quadrillion[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 512);
+    b = buffer.append(heap, b, "{\"in\":1000000000000000,\"out\":1000000000000000,\"cache_write\":0,\"cache_read\":999999999999999}\n");
+    b = buffer.append(heap, b, "{\"in\":1000000000000000,\"out\":1,\"cache_write\":5,\"cache_read\":999999999999999}\n");
+    borrow b as &br in {
+        let u = company_budget.parse_usage(buffer.bytes(br));
+        test.assert_eq(u.malformed, 0);
+        test.assert_eq(u.input, 1000000000000000);
+        test.assert_eq(u.output, 1000000000000000);
+        test.assert_eq(u.cache_write, 5);
+        test.assert_eq(u.cache_read, 1000000000000000);
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_empty_usage_text_is_zero_everything() -> [] int {
+    let u = company_budget.parse_usage("");
+    test.assert_eq(u.input + u.output + u.cache_write + u.cache_read + u.calls + u.malformed, 0);
+    return 0;
+}
+
+// ---- cost_micro -----------------------------------------------------------------------------------------------------------------
+
+fn test_one_million_input_tokens_cost_the_input_price_in_micro_dollars[&h](heap: &!h Heap) -> [heap] int {
+    // Haiku bills input at $0.10 per million: 1,000,000 tokens = 100000 micro-dollars. A usage built from totals carries no per-call
+    // tier, and haiku has an over tier, so the figure for it is the conservative one (500000, below); the plain figure is the
+    // price itself, with no tier.
+    let u = company_budget.usage_of(1000000, 0, 0, 0);
+    test.assert_eq(company_budget.cost_micro(u, plain(100000, 500000, 125000, 10000)), 100000);
+    test.assert_eq(company_budget.cost_micro(u, load(heap, table(), "claude-sonnet-5-5")), 2000000);
+    test.assert_eq(company_budget.cost_micro(u, load(heap, table(), "claude-opus-5-5")), 4000000);
+    test.assert_eq(company_budget.cost_micro(u, load(heap, table(), "claude-fable-5-1")), 10000000);
+    return 0;
+}
+
+fn test_a_mixed_usage_on_a_model_without_a_tier_is_the_hand_computed_sum[&h](heap: &!h Heap) -> [heap] int {
+    // sonnet: in 2.0, out 10.0, cache_write 2.5, cache_read 0.10 dollars per million.
+    // in 1,000,000 -> 2,000,000; out 100,000 -> 1,000,000; cache_write 400,000 -> 1,000,000; cache_read 3,000,000 -> 300,000.
+    let u = company_budget.usage_of(1000000, 100000, 400000, 3000000);
+    let s = load(heap, table(), "claude-sonnet-5-5");
+    test.assert_eq(company_budget.cost_micro(u, s), 4300000);
+    // ollama's entry costs nothing.
+    test.assert_eq(company_budget.cost_micro(u, load_for(heap, table(), "ollama", "x")), 0);
+    return 0;
+}
+
+fn test_cost_rounds_up_once_over_the_whole_sum_never_down() -> [] int {
+    // 1 token at 100000 micro/M = 0.1 micro-dollar -> 1.
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(1, 0, 0, 0), plain(100000, 0, 0, 0)), 1);
+    // exactly 10 tokens = exactly 1 micro-dollar -> 1; 11 tokens = 1.1 -> 2.
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(10, 0, 0, 0), plain(100000, 0, 0, 0)), 1);
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(11, 0, 0, 0), plain(100000, 0, 0, 0)), 2);
+    // 3 tokens of every class at haiku base prices: 300000 + 1500000 + 375000 + 30000 = 2205000 / 1000000 = 2.205 -> 3
+    // (rounding each class up would say 5).
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(3, 3, 3, 3), plain(100000, 500000, 125000, 10000)), 3);
+    // no usage, no cost; a zero price, no cost.
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(0, 0, 0, 0), plain(1, 1, 1, 1)), 0);
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(999999, 999999, 999999, 999999), plain(0, 0, 0, 0)), 0);
+    return 0;
+}
+
+fn test_the_largest_tokens_and_prices_do_not_overflow_and_the_cost_saturates() -> [] int {
+    let big = company_budget.usage_of(1000000000000000, 1000000000000000, 1000000000000000, 1000000000000000);
+    test.assert_eq(company_budget.cost_micro(big, plain(1000000000, 1000000000, 1000000000, 1000000000)), 1000000000000000);
+    test.assert_eq(company_budget.cost_micro(big, plain(1, 0, 0, 0)), 1000000000);
+    return 0;
+}
+
+fn test_calls_are_priced_by_tier_when_the_log_is_read_with_the_limit[&h](heap: &!h Heap) -> [heap] int {
+    // call A: prompt 50,000 (in) <= 100,000 -> base. call B: prompt 60,000 + 50,000 = 110,000 > 100,000 -> over tier.
+    var b = buffer.empty(heap, 512);
+    b = buffer.append(heap, b, "{\"in\":50000,\"out\":1000,\"cache_write\":0,\"cache_read\":0}\n");
+    b = buffer.append(heap, b, "{\"in\":60000,\"out\":2000,\"cache_write\":50000,\"cache_read\":0}\n");
+    let p = load(heap, table(), "claude-haiku-5-5");
+    borrow b as &br in {
+        let u = company_budget.parse_usage_tiered(buffer.bytes(br), p.prompt_limit);
+        test.assert_eq(u.input, 110000);
+        test.assert_eq(u.output, 3000);
+        test.assert_eq(u.cache_write, 50000);
+        // base: in 50000 * 100000/M = 5000; out 1000 * 500000/M = 500 -> 5500.
+        // over: in 60000 * 500000/M = 30000; cache_write 50000 * 625000/M = 31250; out 2000 * 2500000/M = 5000 -> 66250.
+        test.assert_eq(company_budget.cost_micro(u, p), 71750);
+        // parse_usage_for takes the limit from the prices.
+        let v = company_budget.parse_usage_for(buffer.bytes(br), p);
+        test.assert_eq(company_budget.cost_micro(v, p), 71750);
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_a_call_exactly_at_the_prompt_limit_is_not_over[&h](heap: &!h Heap) -> [heap] int {
+    let p = load(heap, table(), "claude-haiku-5-5");
+    // prompt = 100,000 exactly: base. 100000 in * 100000/M = 10000.
+    let at = company_budget.parse_usage_for("{\"in\":100000,\"out\":0,\"cache_write\":0,\"cache_read\":0}", p);
+    test.assert_eq(company_budget.cost_micro(at, p), 10000);
+    // one more token of cache_read: prompt 100,001 > limit -> all of that call over. in 100000 * 500000/M = 50000; cache_read 1 * 50000/M = 0.05 -> total ceil(50000.05) = 50001.
+    let over = company_budget.parse_usage_for("{\"in\":100000,\"out\":0,\"cache_write\":0,\"cache_read\":1}", p);
+    test.assert_eq(company_budget.cost_micro(over, p), 50001);
+    return 0;
+}
+
+fn test_without_per_call_information_a_model_with_a_tier_is_priced_at_the_higher_tier[&h](heap: &!h Heap) -> [heap] int {
+    // Totals alone cannot say which calls were long (parse_usage, usage_of, a replayed spend): when the prices have an over tier the
+    // whole usage is priced at it, so a budget never under-counts. The same two calls as above:
+    // in 110000 * 500000/M = 55000; out 3000 * 2500000/M = 7500; cache_write 50000 * 625000/M = 31250 -> 93750 (tiered: 71750).
+    var b = buffer.empty(heap, 512);
+    b = buffer.append(heap, b, "{\"in\":50000,\"out\":1000,\"cache_write\":0,\"cache_read\":0}\n");
+    b = buffer.append(heap, b, "{\"in\":60000,\"out\":2000,\"cache_write\":50000,\"cache_read\":0}\n");
+    let p = load(heap, table(), "claude-haiku-5-5");
+    borrow b as &br in {
+        let u = company_budget.parse_usage(buffer.bytes(br));
+        test.assert_eq(company_budget.cost_micro(u, p), 93750);
+    }
+    buffer.drop(heap, b);
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(1000000, 0, 0, 0), p), 500000);
+    // And a model with no tier is priced at its one price whatever way the usage was read.
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(1000000, 0, 0, 0), load(heap, table(), "claude-sonnet-5-5")), 2000000);
+    return 0;
+}
+
+// ---- exhausted ------------------------------------------------------------------------------------------------------------------
+
+fn limits(input: int, output: int, cache_write: int, cache_read: int) -> [] company_budget.Limits {
+    return company_budget.Limits { input: input, output: output, cache_write: cache_write, cache_read: cache_read };
+}
+
+fn test_a_budget_is_exhausted_by_one_token_over_any_class_and_not_before() -> [] int {
+    let l = limits(100, 200, 300, 400);
+    test.assert(company_budget.exhausted(company_budget.usage_of(100, 200, 300, 400), l, 0, 10) == false);
+    test.assert(company_budget.exhausted(company_budget.usage_of(101, 0, 0, 0), l, 0, 10));
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 201, 0, 0), l, 0, 10));
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 0, 301, 0), l, 0, 10));
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 0, 0, 401), l, 0, 10));
+    test.assert(company_budget.exhausted(company_budget.usage_of(99, 199, 299, 399), l, 0, 10) == false);
+    return 0;
+}
+
+fn test_a_budget_is_exhausted_by_one_micro_dollar_over_the_cost_ceiling() -> [] int {
+    let l = limits(100, 100, 100, 100);
+    let u = company_budget.usage_of(1, 1, 1, 1);
+    test.assert(company_budget.exhausted(u, l, 5000000, 5000000) == false);
+    test.assert(company_budget.exhausted(u, l, 5000001, 5000000));
+    test.assert(company_budget.exhausted(u, l, 0, 5000000) == false);
+    return 0;
+}
+
+fn test_a_zero_limit_allows_nothing_it_does_not_mean_unlimited() -> [] int {
+    let z = limits(0, 0, 0, 0);
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 0, 0, 0), z, 0, 0) == false);
+    test.assert(company_budget.exhausted(company_budget.usage_of(1, 0, 0, 0), z, 0, 0));
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 0, 0, 0), z, 1, 0));
+    return 0;
+}
+
+fn test_max_cost_is_whole_dollars_and_converts_with_saturation() -> [] int {
+    test.assert_eq(company_budget.dollars_to_micro(0), 0);
+    test.assert_eq(company_budget.dollars_to_micro(10), 10000000);
+    test.assert_eq(company_budget.dollars_to_micro(0 - 5), 0);
+    test.assert_eq(company_budget.dollars_to_micro(9000000000000000000), 1000000000000000);
+    return 0;
+}

@@ -1,0 +1,462 @@
+edition 9;
+module forge.company_budget;
+
+import std.bytes;
+import std.json;
+import std.option;
+
+// Forge's company budget (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.1 and 10): what a company has
+// spent, read from the usage log a model step leaves, priced from the operator's price table, compared with the manifest's ceiling.
+// Pure: no effect row. Nothing here is floating point. Cost is derived from recorded tokens, never worker-reported.
+//
+// Units
+//   Prices are micro-dollars (USD * 1e-6) per million tokens, whole numbers. A micro-dollar price per million tokens is also the
+//   cost of one token in nano-dollars, so a price of 100000 (haiku input, $0.10 per million) means 1,000,000 tokens cost 100000
+//   micro-dollars. `cost_micro` answers micro-dollars.
+//   `max_cost` in the manifest is WHOLE US DOLLARS (the spec writes the ceiling as "$10"); `dollars_to_micro` converts it for
+//   `exhausted`. Token limits are token counts.
+//
+// The price table (cancho-code's eval/prices.json)
+//   {provider: {model: {"in", "cache_write", "cache_read", "out", optional "prompt_limit", optional "over_limit_prices": {the four}}}}
+//   with prices as USD per million tokens written as DECIMAL numbers (0.125). Keys that begin with `_` are notes and are ignored; a
+//   provider's `_any` entry prices every model of a provider that has no entry of its own (ollama), found only by
+//   `parse_prices_for`, which names the provider. A price is read from the number's own text: digits, optionally a point and 1 to 6
+//   more digits (so exact in micro-dollars), at most 1000 dollars. A sign, an exponent, more than six places, a string, or a missing
+//   class makes the model's price unavailable (None); nothing is rounded to make a price fit.
+//
+// The usage log (cancho-agent's `--usage-log`, written by log_call in cancho-code's src/cancho_agent.cho)
+//   One JSON object per line, per API call: {"provider","model","task","sample","in","out","thinking","cache_write","cache_read",
+//   "stop","outcome","status","reply_chars","program_chars","ms"}. `in` is the uncached prompt tokens, `cache_write` and
+//   `cache_read` the cached prompt tokens, `out` the reply (thinking is inside it). A line is VALID when it is an object of at most
+//   `line_limit()` bytes whose four token fields are integers from 0 to 1e15; everything else (and a line the log tore) is skipped and
+//   counted in `Usage.malformed`. Blank lines are not lines. Totals saturate at 1e15.
+//
+// Tiers
+//   A model may carry `prompt_limit` and `over_limit_prices`: a call whose prompt (in + cache_write + cache_read) is longer than
+//   the limit is priced at the over tier, as eval/metrics.py does. The log has the per-call prompt tokens, so `parse_usage_tiered`
+//   (and `parse_usage_for`, which takes the limit from the prices) puts each over-limit call's tokens in the `over_*` buckets.
+//   Totals carry no per-call information (`parse_usage`, `usage_of`, a spend replayed from the journal), so `Usage.tiered` is false
+//   and `cost_micro` prices the WHOLE usage at the over tier whenever the prices have one: conservative, never an under-count.
+//
+// Rounding and range
+//   The cost is sum(tokens * price) / 1,000,000 over every class, computed with integers and rounded UP once to the next
+//   micro-dollar, so a budget never under-counts. A cost above 1e15 micro-dollars (a billion dollars) saturates at 1e15.
+//
+// Ceilings
+//   A limit is a ceiling that may be reached and not passed: `exhausted` is true when a class SPENT is GREATER than its limit, or
+//   the cost is greater than the cost ceiling. A limit of 0 therefore allows no spending at all; it does NOT mean unlimited (the
+//   manifest requires every budget number, Task 1, so there is no "unset").
+//
+// Overshoot: the budget is checked between steps and a running step is not stopped, so spending can pass a ceiling by one step.
+
+// Tokens by class, as a total over a usage log (or a journal's spend). `calls` and `malformed` count valid and skipped lines.
+// The `over_*` fields are the part of the totals that belongs to calls over the prompt limit; they are meaningful when `tiered`.
+pub struct Usage {
+    input: int,
+    output: int,
+    cache_write: int,
+    cache_read: int,
+    calls: int,
+    malformed: int,
+    tiered: bool,
+    over_input: int,
+    over_output: int,
+    over_cache_write: int,
+    over_cache_read: int,
+}
+
+// Micro-dollars per million tokens. `has_over` says the over tier below applies to calls whose prompt is longer than `prompt_limit`.
+pub struct Prices {
+    input: int,
+    output: int,
+    cache_write: int,
+    cache_read: int,
+    prompt_limit: int,
+    has_over: bool,
+    over_input: int,
+    over_output: int,
+    over_cache_write: int,
+    over_cache_read: int,
+}
+
+// The manifest's token ceilings (`budget.input`, `output`, `cache_write`, `cache_read`).
+pub struct Limits {
+    input: int,
+    output: int,
+    cache_write: int,
+    cache_read: int,
+}
+
+// One count never passes this, and a total saturates at it, so no sum can overflow.
+fn cap() -> [] int {
+    return 1000000000000000;
+}
+
+// The longest usage line read. A line is parsed into a stack arena sized for it; a longer line is malformed.
+pub fn line_limit() -> [] int {
+    return 2048;
+}
+
+fn clamp_add(total: int, n: int) -> [] int {
+    if n > cap() - total {
+        return cap();
+    }
+    return total + n;
+}
+
+// ---- the usage log --------------------------------------------------------------------------------------------------------------
+
+// A usage made from four totals (a spend replayed from the journal). It carries no per-call information.
+pub fn usage_of(input: int, output: int, cache_write: int, cache_read: int) -> [] Usage {
+    return Usage { input: input, output: output, cache_write: cache_write, cache_read: cache_read, calls: 0, malformed: 0, tiered: false, over_input: 0, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
+}
+
+struct Row {
+    ok: bool,
+    input: int,
+    output: int,
+    cache_write: int,
+    cache_read: int,
+}
+
+fn bad_row() -> [] Row {
+    return Row { ok: false, input: 0, output: 0, cache_write: 0, cache_read: 0 };
+}
+
+// One token field: its value, or -1 when it is absent, not an integer, not exact, negative or over the cap.
+fn token_field[&s, &t](src: &s [byte], tp: &t [int], obj: int, name: &static [byte]) -> [] int {
+    let node = json.get(src, tp, obj, name);
+    if node < 0 || json.is_int(tp, node) == false || json.fits_int(src, tp, node) == false {
+        return 0 - 1;
+    }
+    let n = json.to_int(src, tp, node);
+    if n < 0 || n > cap() {
+        return 0 - 1;
+    }
+    return n;
+}
+
+// One line (no newline, at most `line_limit()` bytes) as a row.
+fn read_row[&l](line: &l [byte]) -> [] Row {
+    var row = bad_row();
+    region a {
+        let tape = alloc_slice[a](json.tape_len(line), 0);
+        if json.parse(line, tape) > 0 && json.is_object(tape, 0) {
+            let i = token_field(line, tape, 0, "in");
+            let o = token_field(line, tape, 0, "out");
+            let w = token_field(line, tape, 0, "cache_write");
+            let r = token_field(line, tape, 0, "cache_read");
+            if i >= 0 && o >= 0 && w >= 0 && r >= 0 {
+                row = Row { ok: true, input: i, output: o, cache_write: w, cache_read: r };
+            }
+        }
+    }
+    return row;
+}
+
+fn is_blank[&l](line: &l [byte]) -> [] bool {
+    var i = 0;
+    while i < len(line) {
+        let c = int_of(line[i]);
+        if c != 32 && c != 9 && c != 13 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Sum a usage log. Calls whose prompt (in + cache_write + cache_read) is longer than `prompt_limit` also go to the `over_*` buckets;
+// a `prompt_limit` of 0 or less means the tiers are not asked for and the result is not `tiered`.
+pub fn parse_usage_tiered[&t](text: &t [byte], prompt_limit: int) -> [] Usage {
+    var calls = 0;
+    var malformed = 0;
+    var ti = 0;
+    var to = 0;
+    var tw = 0;
+    var tr = 0;
+    var oi = 0;
+    var oo = 0;
+    var ow = 0;
+    var orr = 0;
+    var start = 0;
+    var i = 0;
+    while i <= len(text) {
+        if i == len(text) || int_of(text[i]) == 10 {
+            let line = text[start..i];
+            if is_blank(line) == false {
+                var row = bad_row();
+                if len(line) <= line_limit() {
+                    row = read_row(line);
+                }
+                if row.ok {
+                    calls = calls + 1;
+                    ti = clamp_add(ti, row.input);
+                    to = clamp_add(to, row.output);
+                    tw = clamp_add(tw, row.cache_write);
+                    tr = clamp_add(tr, row.cache_read);
+                    if prompt_limit > 0 && row.input + row.cache_write + row.cache_read > prompt_limit {
+                        oi = clamp_add(oi, row.input);
+                        oo = clamp_add(oo, row.output);
+                        ow = clamp_add(ow, row.cache_write);
+                        orr = clamp_add(orr, row.cache_read);
+                    }
+                } else {
+                    malformed = malformed + 1;
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return Usage { input: ti, output: to, cache_write: tw, cache_read: tr, calls: calls, malformed: malformed, tiered: prompt_limit > 0, over_input: oi, over_output: oo, over_cache_write: ow, over_cache_read: orr };
+}
+
+// Sum a usage log without per-call tiers (`tiered` is false; see "Tiers").
+pub fn parse_usage[&t](text: &t [byte]) -> [] Usage {
+    return parse_usage_tiered(text, 0);
+}
+
+// Sum a usage log for a model with these prices: tiered by the prices' own `prompt_limit` when the prices have an over tier.
+pub fn parse_usage_for[&t](text: &t [byte], p: Prices) -> [] Usage {
+    if p.has_over {
+        return parse_usage_tiered(text, p.prompt_limit);
+    }
+    return parse_usage_tiered(text, 0);
+}
+
+// ---- the price table ------------------------------------------------------------------------------------------------------------
+
+// A price written as a decimal number: its micro-dollars, or -1 when the text is not digits [. 1..6 digits], or is over 1000 dollars.
+fn decimal_micro[&r](raw: &r [byte]) -> [] int {
+    var i = 0;
+    var whole = 0;
+    var digits = 0;
+    while i < len(raw) && int_of(raw[i]) >= 48 && int_of(raw[i]) <= 57 {
+        whole = whole * 10 + (int_of(raw[i]) - 48);
+        if whole > 1000 {
+            return 0 - 1;
+        }
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return 0 - 1;
+    }
+    var frac = 0;
+    var places = 0;
+    if i < len(raw) {
+        if int_of(raw[i]) != 46 {
+            return 0 - 1;
+        }
+        i = i + 1;
+        while i < len(raw) && int_of(raw[i]) >= 48 && int_of(raw[i]) <= 57 {
+            frac = frac * 10 + (int_of(raw[i]) - 48);
+            places = places + 1;
+            i = i + 1;
+        }
+        if places < 1 || places > 6 || i != len(raw) {
+            return 0 - 1;
+        }
+    }
+    while places < 6 {
+        frac = frac * 10;
+        places = places + 1;
+    }
+    let micro = whole * 1000000 + frac;
+    if micro > 1000000000 {
+        return 0 - 1;
+    }
+    return micro;
+}
+
+// The price under `name` in the object `obj`, in micro-dollars, or -1.
+fn price_field[&s, &t](src: &s [byte], tp: &t [int], obj: int, name: &static [byte]) -> [] int {
+    let node = json.get(src, tp, obj, name);
+    if node < 0 || json.is_number(tp, node) == false {
+        return 0 - 1;
+    }
+    return decimal_micro(src[tp[3 * node + 1]..tp[3 * node + 2]]);
+}
+
+// The four prices of an object are all there and exact.
+fn four_prices[&s, &t](src: &s [byte], tp: &t [int], obj: int) -> [] bool {
+    return price_field(src, tp, obj, "in") >= 0 && price_field(src, tp, obj, "out") >= 0 && price_field(src, tp, obj, "cache_write") >= 0 && price_field(src, tp, obj, "cache_read") >= 0;
+}
+
+// The prices of one model's entry, or None when any part of it is missing or inexact.
+fn entry_prices[&s, &t](src: &s [byte], tp: &t [int], entry: int) -> [] option.Option[Prices] {
+    if json.is_object(tp, entry) == false || four_prices(src, tp, entry) == false {
+        return option.Option::None;
+    }
+    var limit = 0;
+    let lim = json.get(src, tp, entry, "prompt_limit");
+    if lim >= 0 {
+        if json.is_int(tp, lim) == false || json.fits_int(src, tp, lim) == false || json.to_int(src, tp, lim) < 1 || json.to_int(src, tp, lim) > cap() {
+            return option.Option::None;
+        }
+        limit = json.to_int(src, tp, lim);
+    }
+    var has_over = false;
+    var oi = 0;
+    var oo = 0;
+    var ow = 0;
+    var orr = 0;
+    let over = json.get(src, tp, entry, "over_limit_prices");
+    if over >= 0 {
+        if json.is_object(tp, over) == false || four_prices(src, tp, over) == false {
+            return option.Option::None;
+        }
+        if limit > 0 {
+            has_over = true;
+            oi = price_field(src, tp, over, "in");
+            oo = price_field(src, tp, over, "out");
+            ow = price_field(src, tp, over, "cache_write");
+            orr = price_field(src, tp, over, "cache_read");
+        }
+    }
+    return option.Option::Some(Prices { input: price_field(src, tp, entry, "in"), output: price_field(src, tp, entry, "out"), cache_write: price_field(src, tp, entry, "cache_write"), cache_read: price_field(src, tp, entry, "cache_read"), prompt_limit: limit, has_over: has_over, over_input: oi, over_output: oo, over_cache_write: ow, over_cache_read: orr });
+}
+
+fn is_note[&m](name: &m [byte]) -> [] bool {
+    return len(name) == 0 || int_of(name[0]) == 95;
+}
+
+fn max_table() -> [] int {
+    return 1048576;
+}
+
+// The prices of `model` in the table `text`, looking in every provider in the file's order (the first provider that has the model
+// by name). `_any` entries are not consulted: a model nobody priced is unavailable (None), not free. Use `parse_prices_for` when the
+// provider is known. None for a table that does not parse, a model that is not there, or a price that is not exact.
+pub fn parse_prices[&h, &t](heap: &!h Heap, text: &t [byte], model: &static [byte]) -> [heap] option.Option[Prices] {
+    if len(text) < 2 || len(text) > max_table() || is_note(model) {
+        return option.Option::None;
+    }
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    var out = option.Option::None;
+    var parsed = false;
+    borrow mut tape as &!w in {
+        parsed = json.parse(text, contents(w)) > 0;
+    }
+    borrow tape as &r in {
+        let tp = contents(r);
+        if parsed && json.is_object(tp, 0) {
+            let n = json.count(tp, 0);
+            var k = 1;
+            var j = 0;
+            var found = false;
+            while j < n && found == false {
+                let v = k + 1;
+                if json.is_object(tp, v) {
+                    let provider = json.string_view(text, tp, k);
+                    if is_note(provider) == false {
+                        let e = json.get(text, tp, v, model);
+                        if e >= 0 {
+                            found = true;
+                            out = entry_prices(text, tp, e);
+                        }
+                    }
+                }
+                k = json.skip(tp, v);
+                j = j + 1;
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
+
+// The prices of `model` under `provider`: the model's own entry, else that provider's `_any` entry (ollama), else None.
+pub fn parse_prices_for[&h, &t](heap: &!h Heap, text: &t [byte], provider: &static [byte], model: &static [byte]) -> [heap] option.Option[Prices] {
+    if len(text) < 2 || len(text) > max_table() || is_note(model) || is_note(provider) {
+        return option.Option::None;
+    }
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    var out = option.Option::None;
+    var parsed = false;
+    borrow mut tape as &!w in {
+        parsed = json.parse(text, contents(w)) > 0;
+    }
+    borrow tape as &r in {
+        let tp = contents(r);
+        if parsed && json.is_object(tp, 0) {
+            let pv = json.get(text, tp, 0, provider);
+            if pv >= 0 && json.is_object(tp, pv) {
+                var e = json.get(text, tp, pv, model);
+                if e < 0 {
+                    e = json.get(text, tp, pv, "_any");
+                }
+                if e >= 0 {
+                    out = entry_prices(text, tp, e);
+                }
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
+
+// ---- cost -----------------------------------------------------------------------------------------------------------------------
+
+// tokens * price / 1e6 split so nothing overflows: the whole part (tokens / 1e6 * price, at most cap) and the remainder part
+// (tokens % 1e6 * price, under 1e6 * 1e9), the second still in millionths.
+fn whole_part(tokens: int, price: int) -> [] int {
+    let w = tokens / 1000000 * price;
+    if w > cap() {
+        return cap();
+    }
+    return w;
+}
+
+fn rest_part(tokens: int, price: int) -> [] int {
+    return tokens % 1000000 * price;
+}
+
+// The cost of the usage in micro-dollars, rounded up (see "Rounding and range", "Tiers").
+pub fn cost_micro(u: Usage, p: Prices) -> [] int {
+    var whole = 0;
+    var rest = 0;
+    if p.has_over && u.tiered {
+        whole = whole_part(u.input - u.over_input, p.input) + whole_part(u.output - u.over_output, p.output) + whole_part(u.cache_write - u.over_cache_write, p.cache_write) + whole_part(u.cache_read - u.over_cache_read, p.cache_read);
+        rest = rest_part(u.input - u.over_input, p.input) + rest_part(u.output - u.over_output, p.output) + rest_part(u.cache_write - u.over_cache_write, p.cache_write) + rest_part(u.cache_read - u.over_cache_read, p.cache_read);
+        whole = whole + whole_part(u.over_input, p.over_input) + whole_part(u.over_output, p.over_output) + whole_part(u.over_cache_write, p.over_cache_write) + whole_part(u.over_cache_read, p.over_cache_read);
+        rest = rest + rest_part(u.over_input, p.over_input) + rest_part(u.over_output, p.over_output) + rest_part(u.over_cache_write, p.over_cache_write) + rest_part(u.over_cache_read, p.over_cache_read);
+    } else {
+        var pi = p.input;
+        var po = p.output;
+        var pw = p.cache_write;
+        var pr = p.cache_read;
+        if p.has_over {
+            pi = p.over_input;
+            po = p.over_output;
+            pw = p.over_cache_write;
+            pr = p.over_cache_read;
+        }
+        whole = whole_part(u.input, pi) + whole_part(u.output, po) + whole_part(u.cache_write, pw) + whole_part(u.cache_read, pr);
+        rest = rest_part(u.input, pi) + rest_part(u.output, po) + rest_part(u.cache_write, pw) + rest_part(u.cache_read, pr);
+    }
+    let up = (rest + 999999) / 1000000;
+    if whole > cap() - up {
+        return cap();
+    }
+    return whole + up;
+}
+
+// ---- ceiling --------------------------------------------------------------------------------------------------------------------
+
+// The manifest's `max_cost` (whole dollars) in micro-dollars; negative is 0, and anything past the cap saturates at it.
+pub fn dollars_to_micro(dollars: int) -> [] int {
+    if dollars <= 0 {
+        return 0;
+    }
+    if dollars > cap() / 1000000 {
+        return cap();
+    }
+    return dollars * 1000000;
+}
+
+// Is the budget spent: a class of `spent` over its limit, or `cost_micro` over `max_cost_micro` (see "Ceilings").
+pub fn exhausted(spent: Usage, limits: Limits, cost_micro: int, max_cost_micro: int) -> [] bool {
+    return spent.input > limits.input || spent.output > limits.output || spent.cache_write > limits.cache_write || spent.cache_read > limits.cache_read || cost_micro > max_cost_micro;
+}
