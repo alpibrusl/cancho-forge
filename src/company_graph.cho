@@ -34,27 +34,34 @@ fn is_accepted[&a](accepted: &a [bool], i: int) -> [] bool {
     return accepted[i];
 }
 
+// Is every need of step `i` a step that is accepted? A need that names no step is never met. A step outside the manifest has no
+// needs, so it is met; the caller keeps `i` in range.
+pub fn needs_met[&a, &m](m: &m company_manifest.Manifest, accepted: &a [bool], i: int) -> [] bool {
+    if i < 0 || i >= company_manifest.step_count(m) {
+        return true;
+    }
+    let s = company_manifest.step_at(m, i);
+    let k = company_manifest.step_needs_count(m, s);
+    var met = true;
+    var j = 0;
+    while j < k {
+        let at = index_of(m, company_manifest.step_need(m, s, j));
+        if at < 0 || is_accepted(accepted, at) == false {
+            met = false;
+        }
+        j = j + 1;
+    }
+    return met;
+}
+
 // The number of the first step that is not accepted and whose every need is a step that is accepted, or None when there is no
 // such step (all accepted, or what is left is waiting on a step that is not, or on a need that names no step).
 pub fn ready[&a, &m](m: &m company_manifest.Manifest, accepted: &a [bool]) -> [] option.Option[int] {
     let n = company_manifest.step_count(m);
     var i = 0;
     while i < n {
-        if is_accepted(accepted, i) == false {
-            let s = company_manifest.step_at(m, i);
-            let k = company_manifest.step_needs_count(m, s);
-            var met = true;
-            var j = 0;
-            while j < k {
-                let at = index_of(m, company_manifest.step_need(m, s, j));
-                if at < 0 || is_accepted(accepted, at) == false {
-                    met = false;
-                }
-                j = j + 1;
-            }
-            if met {
-                return option.Option::Some(i);
-            }
+        if is_accepted(accepted, i) == false && needs_met(m, accepted, i) {
+            return option.Option::Some(i);
         }
         i = i + 1;
     }

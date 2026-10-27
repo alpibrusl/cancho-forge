@@ -1,0 +1,134 @@
+edition 9;
+module forge.company_run;
+
+import std.option;
+import forge.company_budget;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_state;
+
+// The scheduling step of `forge company run` (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.3 and
+// 10): given the manifest and the state replayed from the company journal, what to do next. Pure: it reads, it starts nothing, so the
+// run loop that acts on the answer (replay, ask, run the step, check, journal, repeat) is the only part with authority. The answer is
+// deterministic: the lowest step number first.
+//
+//   Start(i)     run step i now: not accepted, every need accepted, its gate (if any) approved, and, for a model step, the
+//                budget not spent
+//   WaitGate(i)  nothing can start, and step i (the lowest such) is waiting on a human gate that has no decision
+//   Blocked(i)   nothing can start, and step i (the lowest such) is behind a gate that was rejected (or waits on a need that can
+//                never be accepted). Returned only when no other step can start or wait: an independent branch keeps running past
+//                a blocked one, and is finished before the run ends `gate-rejected`
+//   Stop(tag)    the budget is spent and a model step is held back by it (`stop_budget`, named `budget-exhausted`)
+//   Done         every step is accepted
+//
+// The order of the answers when no step can start: Stop, then WaitGate, then Blocked. The budget covers model steps only (section
+// 10): a builder or a writer step uses model tokens, the others (qa, analyst, reviewer, product) do not and may start with the
+// budget spent. The spent tokens are those the state replayed from `spend.recorded` events; the spent cost is the caller's (it
+// needs the price table).
+pub enum Action {
+    Start(int),
+    WaitGate(int),
+    Blocked(int),
+    Stop(int),
+    Done,
+}
+
+// The tag of `Stop` for a spent budget.
+pub fn stop_budget() -> [] int {
+    return 1;
+}
+
+// The rule name of a `Stop` tag; empty for a tag that is not one.
+pub fn stop_name(tag: int) -> [] &static [byte] {
+    if tag == stop_budget() {
+        return "budget-exhausted";
+    }
+    return "";
+}
+
+// Does a step of this role use model tokens (and so count against the budget)? Builder and writer steps do (section 4.2: both are
+// run by the builder adapter).
+pub fn uses_model(role: company_manifest.Role) -> [] bool {
+    match role {
+        company_manifest.Role::Builder => {
+            return true;
+        }
+        company_manifest.Role::Writer => {
+            return true;
+        }
+        company_manifest.Role::Qa => {
+            return false;
+        }
+        company_manifest.Role::Analyst => {
+            return false;
+        }
+        company_manifest.Role::Reviewer => {
+            return false;
+        }
+        company_manifest.Role::Product => {
+            return false;
+        }
+    }
+}
+
+// The next action. `limits` are the token ceilings of the manifest's budget, `spent_cost_micro` the cost so far and
+// `max_cost_micro` its ceiling, both in micro-dollars (`company_budget.exhausted`).
+pub fn next_action[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, limits: company_budget.Limits, spent_cost_micro: int, max_cost_micro: int) -> [] Action {
+    let n = company_manifest.step_count(m);
+    let flags = company_state.accepted_flags(s);
+    let spent = company_budget.usage_of(company_state.spend_input(s), company_state.spend_output(s), company_state.spend_cache_write(s), company_state.spend_cache_read(s));
+    let broke = company_budget.exhausted(spent, limits, spent_cost_micro, max_cost_micro);
+    var pending = 0;
+    var held = 0 - 1;
+    var waiting = 0 - 1;
+    var blocked = 0 - 1;
+    var first_left = 0 - 1;
+    var i = 0;
+    while i < n {
+        if company_state.accepted_at(s, i) == false {
+            pending = pending + 1;
+            if first_left < 0 {
+                first_left = i;
+            }
+            if company_graph.needs_met(m, flags, i) {
+                let gate = company_state.step_blocked_by_gate(m, s, i);
+                if gate == 1 {
+                    if waiting < 0 {
+                        waiting = i;
+                    }
+                }
+                if gate == 2 {
+                    if blocked < 0 {
+                        blocked = i;
+                    }
+                }
+                if gate == 0 {
+                    if broke && uses_model(company_manifest.step_at(m, i).role) {
+                        if held < 0 {
+                            held = i;
+                        }
+                    } else {
+                        return Action::Start(i);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if pending == 0 {
+        return Action::Done;
+    }
+    if held >= 0 {
+        return Action::Stop(stop_budget());
+    }
+    if waiting >= 0 {
+        return Action::WaitGate(waiting);
+    }
+    if blocked >= 0 {
+        return Action::Blocked(blocked);
+    }
+    // Steps are left and none is ready: they wait on a need that is not accepted and is itself not ready (a gate rejected
+    // earlier in the chain is `blocked` above; this is a need that names no step, which `parse` refuses, or a cycle). Blocked, so
+    // the run never loops.
+    return Action::Blocked(first_left);
+}
