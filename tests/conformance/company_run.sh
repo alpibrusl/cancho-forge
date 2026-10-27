@@ -13,7 +13,8 @@
 # cost Forge derived; (4) a rejected gate blocks its dependents and not an independent step (exit 11); and the other ways a run
 # stops: a worker that ends without a claim (15), an audit with no score (14), an artifact missing, no price table, a step
 # directory missing, a bad operator file, a corrupt journal, a held lock, bad usage; and resume: a step admitted and never accepted
-# (a run killed mid-step) is admitted again, once.
+# (a run killed mid-step) is admitted again, once. And needs (task 8c): a step that needs another is given a copy of its accepted
+# artifact and needs.json with the recorded sha256; one whose need changed or is gone is refused artifact-invalid and never admitted.
 # Prints `ok ...` / `FAIL ...` lines; exit 1 if any FAIL or a build failed.
 # Usage: CANCHO=path/to/cancho tests/conformance/company_run.sh <scratch directory, empty>
 set -u
@@ -138,6 +139,65 @@ mkco rej "$steps" 100000 lib side
 run rej 1
 check "rejected gate: the run ends gate-rejected, exit 11, naming the gate" sh -c "[ '$(rc rej 1)' = 11 ] && grep -qx 'refusal: gate-rejected' '$w/rej.1.out' && grep -qx 'gate: g' '$w/rej.1.out'"
 check "rejected gate: the independent step ran and was accepted; the gated step and its dependent were never admitted" sh -c "[ $(kinds rej company.step.accepted side) -eq 1 ] && [ $(kinds rej company.step.admitted brief) -eq 0 ] && [ $(kinds rej company.step.admitted lib) -eq 0 ]"
+
+# ---- (5) needs (task 8c): b needs a; Forge re-hashes a's accepted artifact and gives b a copy and needs.json in its execution dir
+sha_of() { sha256sum "$1" | cut -c1-64; }
+mkco needs "[$(builder a '' done audit_pass.sh),$(builder b '"a"' needs audit_pass.sh)]" 100000 a b
+run needs 1
+asha=$(sha_of "$w/needs/steps/a/ev/project.cho")
+check "needs: the run completes, exit 0, each step admitted once" sh -c "[ '$(rc needs 1)' = 0 ] && [ $(kinds needs company.step.admitted a) -eq 1 ] && [ $(kinds needs company.step.admitted b) -eq 1 ]"
+check "needs: b's execution directory holds a copy of a's accepted artifact, byte for byte, as a regular file" sh -c "[ -f '$w/needs/steps/b/ev/needs-a-project.cho' ] && [ ! -L '$w/needs/steps/b/ev/needs-a-project.cho' ] && cmp -s '$w/needs/steps/a/ev/project.cho' '$w/needs/steps/b/ev/needs-a-project.cho'"
+printf '[{"step":"a","artifact":"steps/a/ev/project.cho","path":"needs-a-project.cho","sha256":"%s"}]\n' "$asha" > "$w/needs.want"
+check "needs: b's needs.json lists a with the path and the sha256 the journal recorded for it" sh -c "cmp -s '$w/needs.want' '$w/needs/steps/b/ev/needs.json' && grep -q '\"kind\":\"company.step.accepted\",\"task\":\"a\",\"artifact\":\"steps/a/ev/project.cho\",\"sha256\":\"$asha\"' '$w/needs/company.journal'"
+check "needs: the worker of b read them (its product holds needs.json and a's bytes)" sh -c "grep -q '\"sha256\":\"$asha\"' '$w/needs/steps/b/ev/project.cho' && grep -qx 'product' '$w/needs/steps/b/ev/project.cho'"
+check "needs: a step with no needs is given nothing" sh -c "[ ! -e '$w/needs/steps/a/ev/needs.json' ] && ! ls '$w/needs/steps/a/ev' | grep -q '^needs-'"
+
+# ---- a's artifact changed (or gone) between its acceptance and b's start: b is refused, never admitted, nothing written
+gated="[$(builder a '' done audit_pass.sh),{\"id\":\"b\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"a\"],\"input\":\"needs\",\"check\":\"audit_pass.sh\",\"gate\":\"g\"}]"
+mkco tamper "$gated" 100000 a b
+run tamper 1
+cp "$w/tamper/steps/a/ev/project.cho" "$w/tamper.a.orig"
+printf 'tampered\n' >> "$w/tamper/steps/a/ev/project.cho"
+"$F" company decide "$w/tamper" g approved "go" > /dev/null
+lines=$(wc -l < "$w/tamper/company.journal")
+run tamper 2
+check "needs changed: the first run accepted a and stopped at b's gate" sh -c "[ '$(rc tamper 1)' = 10 ] && [ $(kinds tamper company.step.accepted a) -eq 1 ]"
+check "needs changed: b is refused artifact-invalid (needs-changed), exit 14, naming the need" sh -c "[ '$(rc tamper 2)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/tamper.2.out' && grep -qx 'step: b' '$w/tamper.2.out' && grep -qx 'need: a' '$w/tamper.2.out' && grep -qx 'artifact: steps/a/ev/project.cho' '$w/tamper.2.out' && grep -qx 'reason: needs-changed' '$w/tamper.2.out'"
+check "needs changed: b was never admitted, never built, given nothing, and the journal is unchanged" sh -c "[ $(kinds tamper company.step.admitted b) -eq 0 ] && [ ! -e '$w/tamper/steps/b/journal.jsonl' ] && [ ! -e '$w/tamper/steps/b/ev/needs.json' ] && [ ! -e '$w/tamper/steps/b/ev/needs-a-project.cho' ] && [ \$(wc -l < '$w/tamper/company.journal') -eq $lines ]"
+rm "$w/tamper/steps/a/ev/project.cho"
+run tamper 3
+check "needs missing: a's artifact gone, b refused artifact-invalid (needs-missing), exit 14, not admitted" sh -c "[ '$(rc tamper 3)' = 14 ] && grep -qx 'reason: needs-missing' '$w/tamper.3.out' && [ $(kinds tamper company.step.admitted b) -eq 0 ]"
+ln -s "$w/tamper.a.orig" "$w/tamper/steps/a/ev/project.cho"
+run tamper 4
+check "needs as a link to the very bytes accepted: still refused (needs-changed: not a regular file), not admitted" sh -c "[ '$(rc tamper 4)' = 14 ] && grep -qx 'reason: needs-changed' '$w/tamper.4.out' && [ $(kinds tamper company.step.admitted b) -eq 0 ]"
+rm "$w/tamper/steps/a/ev/project.cho"; cp "$w/tamper.a.orig" "$w/tamper/steps/a/ev/project.cho"
+run tamper 5
+check "needs restored: the same bytes again, b runs and is accepted, exit 0, given a's artifact" sh -c "[ '$(rc tamper 5)' = 0 ] && [ $(kinds tamper company.step.admitted b) -eq 1 ] && cmp -s '$w/tamper.a.orig' '$w/tamper/steps/b/ev/needs-a-project.cho'"
+
+# ---- a product step is verified too (not given copies: it has no execution directory)
+mkco ptamper "[$(builder lib '' done audit_pass.sh),{\"id\":\"ship\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[\"lib\"],\"input\":\"x\",\"gate\":\"ship\"}]" 100000 lib
+run ptamper 1
+printf 'tampered\n' >> "$w/ptamper/steps/lib/ev/project.cho"
+"$F" company decide "$w/ptamper" ship approved "go" > /dev/null
+run ptamper 2
+check "a product step whose need changed: artifact-invalid (needs-changed), exit 14, not admitted, not accepted" sh -c "[ '$(rc ptamper 1)' = 10 ] && [ '$(rc ptamper 2)' = 14 ] && grep -qx 'step: ship' '$w/ptamper.2.out' && grep -qx 'reason: needs-changed' '$w/ptamper.2.out' && [ $(kinds ptamper company.step.admitted ship) -eq 0 ] && [ $(kinds ptamper company.step.accepted ship) -eq 0 ]"
+
+# ---- resume: b admitted and never accepted (a run killed in it), and its execution directory left with stale and hostile files:
+# the next run delivers again, replacing them, never writing through a link
+mkco redo "$gated" 100000 a b
+run redo 1
+"$F" company decide "$w/redo" g approved "go" > /dev/null
+n=$(($(wc -l < "$w/redo/company.journal") + 1))
+printf '{"v":1,"seq":%s,"kind":"company.step.admitted","task":"b","forge_task":"steps/b"}\n{"v":1,"seq":%s,"kind":"compa' "$n" $((n + 1)) >> "$w/redo/company.journal"
+printf 'untouched\n' > "$w/redo.outside"
+ln -s "$w/redo.outside" "$w/redo/steps/b/ev/needs-a-project.cho"
+printf 'stale\n' > "$w/redo/steps/b/ev/needs.json"
+printf 'stale\n' > "$w/redo/steps/b/ev/needs.tmp"
+run redo 2
+check "resume with needs: b admitted again (twice in all), accepted once, exit 0" sh -c "[ '$(rc redo 2)' = 0 ] && [ $(kinds redo company.step.admitted b) -eq 2 ] && [ $(kinds redo company.step.accepted b) -eq 1 ]"
+check "resume with needs: delivered again, the link replaced by a regular copy, its target untouched, needs.json rewritten" sh -c "[ ! -L '$w/redo/steps/b/ev/needs-a-project.cho' ] && cmp -s '$w/redo/steps/a/ev/project.cho' '$w/redo/steps/b/ev/needs-a-project.cho' && [ \"\$(cat '$w/redo.outside')\" = untouched ] && grep -q '\"sha256\":\"$(sha_of "$w/redo/steps/a/ev/project.cho")\"' '$w/redo/steps/b/ev/needs.json' && ! grep -q stale '$w/redo/steps/b/ev/needs.json' && [ ! -e '$w/redo/steps/b/ev/needs.tmp' ]"
+run redo 3
+check "resume with needs: a run after that admits nothing more" sh -c "[ '$(rc redo 3)' = 0 ] && [ $(kinds redo company.step.admitted b) -eq 2 ]"
 
 # ---- a worker that ends without a claim: no accepted, exit 15
 mkco stuck "[$(builder lib '' stuck audit_pass.sh)]" 100000 lib

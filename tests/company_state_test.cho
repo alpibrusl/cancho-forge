@@ -829,3 +829,82 @@ fn test_an_accepted_gated_step_is_not_runnable_and_its_dependent_is[&h](heap: &!
     buffer.drop(heap, j);
     return 0;
 }
+
+// ---- the artifact an accepted step left (task 8c: what `needs` passes on) ------------------------------------------------
+
+// 1 when step number `i`'s recorded artifact is `path` with the digest `sha` (both empty: nothing recorded for it), else 0.
+fn artifact_is[&h, &t, &p, &x](heap: &!h Heap, text: &t [byte], i: int, path: &p [byte], sha: &x [byte]) -> [heap] int {
+    var got = 0 - 1;
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    let (ap, ah) = company_state.artifact_of(sr, i);
+                    got = 0;
+                    if bytes.equal(ap, path) {
+                        if bytes.equal(ah, sha) {
+                            got = 1;
+                        }
+                    }
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return got;
+}
+
+fn test_an_accepted_step_exposes_the_artifact_and_digest_it_was_accepted_with[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "steps/a"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "steps/a/ev/project.cho", "ab12"));
+    j = add(heap, j, company_state.admitted(heap, 3, "b", "steps/b"));
+    borrow j as &jb in {
+        let t = buffer.bytes(jb);
+        test.assert_eq(artifact_is(heap, t, 0, "steps/a/ev/project.cho", "ab12"), 1);
+        test.assert_eq(artifact_is(heap, t, 1, "", ""), 1);
+        test.assert_eq(artifact_is(heap, t, 2, "", ""), 1);
+        test.assert_eq(artifact_is(heap, t, 3, "", ""), 1);
+        test.assert_eq(artifact_is(heap, t, 0 - 1, "", ""), 1);
+        test.assert_eq(artifact_is(heap, t, 9223372036854775807, "", ""), 1);
+    }
+    buffer.drop(heap, j);
+    test.assert_eq(artifact_is(heap, "", 0, "", ""), 1);
+    return 0;
+}
+
+// The path is held decoded: an escape in the journal's string is the byte it stands for.
+fn test_an_escaped_artifact_path_is_held_decoded[&h](heap: &!h Heap) -> [heap] int {
+    let line = "{\"v\":1,\"seq\":1,\"kind\":\"company.step.accepted\",\"task\":\"b\",\"artifact\":\"steps/q\\\"x\\\\y/ev/p\",\"sha256\":\"ff\"}\n";
+    test.assert_eq(artifact_is(heap, line, 1, "steps/q\"x\\y/ev/p", "ff"), 1);
+    test.assert_eq(artifact_is(heap, line, 0, "", ""), 1);
+    return 0;
+}
+
+fn test_the_last_accepted_record_of_a_step_is_its_artifact[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.accepted(heap, 1, "c", "first", "11"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "of-a", "aa"));
+    j = add(heap, j, company_state.accepted(heap, 3, "c", "second", "22"));
+    j = add(heap, j, company_state.accepted(heap, 4, "zz", "unknown", "33"));
+    borrow j as &jb in {
+        let t = buffer.bytes(jb);
+        test.assert_eq(artifact_is(heap, t, 2, "second", "22"), 1);
+        test.assert_eq(artifact_is(heap, t, 0, "of-a", "aa"), 1);
+        test.assert_eq(artifact_is(heap, t, 1, "", ""), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// A malformed accepted record ends the replay: nothing of it is held.
+fn test_a_malformed_accepted_record_records_no_artifact[&h](heap: &!h Heap) -> [heap] int {
+    let line = "{\"v\":1,\"seq\":1,\"kind\":\"company.step.accepted\",\"task\":\"a\",\"artifact\":\"p\",\"sha256\":7}\n";
+    test.assert_eq(artifact_is(heap, line, 0, "", ""), 1);
+    return 0;
+}

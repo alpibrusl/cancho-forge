@@ -34,6 +34,10 @@ case "$mode" in
              printf '{"provider":"stand","model":"m1","task":"t","sample":0,"in":500,"out":20,"thinking":0,"cache_write":0,"cache_read":0,"stop":"end_turn","outcome":"ok","status":200,"reply_chars":1,"program_chars":1,"ms":1}\n' >> "$work/usage.jsonl"
              printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   linkart)   log; report done 2 done; printf 'secret\n' > "$work/../../../outside_artifact.txt"; ln -s "$work/../../../outside_artifact.txt" "$work/project.cho"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # company_run.sh
+  needs)     # task 8c (company_run.sh): a build that needs another step. Its product is what Forge gave it in its execution
+             # directory, needs.json and then each copy, so the oracle can see that it arrived.
+             log; report done 2 done; { cat "$work/needs.json"; for f in "$work"/needs-*; do cat "$f"; done; } > "$work/project.cho" 2> /dev/null
+             printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   bare)      log; report done 2 done; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # done, and no project.cho (company_run.sh)
   args)      log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   args2)     log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;

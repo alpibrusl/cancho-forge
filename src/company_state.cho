@@ -33,8 +33,11 @@ import forge.task;
 //
 // Replay keeps: which steps are accepted (by step number in the manifest, the shape `company_graph.ready` reads), the last
 // decision of each gate (0 open, 1 approved, 2 rejected; the last record wins), how many times each step id was admitted, and the
-// total tokens spent per class, and the same per step (by step number), and which steps are HELD by their check. A kind this build does not know is passed over, as the task journal does for the kinds it only
-// records, so a later build can add some. A known kind whose fields are not the ones above is `event-malformed`.
+// total tokens spent per class, and the same per step (by step number), which steps are HELD by their check, and the artifact
+// path and SHA-256 each accepted step was accepted with (`artifact_of`, decoded from the record; the last accepted record of a
+// step wins): what `needs` passes to a dependent step (task 8c, src/company_runner.cho). A kind this build does not know is passed
+// over, as the task journal does for the kinds it only records, so a later build can add some. A known kind whose fields are not
+// the ones above is `event-malformed`.
 //
 // Held (spec section 10: no retry at the Forge level). A `check_failed` or `check_unavailable` record holds its step: the run
 // never starts it again by itself (`company_run.next_action` answers `Held`). A person lets it go by recording a decision on the
@@ -55,6 +58,8 @@ pub res struct CompanyState {
     accepted: Box[[bool]],
     spend: Box[[int]],
     held: Box[[int]],
+    arts: buffer.Buffer,
+    art_at: Box[[int]],
     gates: map.Map[int],
     admitted: map.Map[int],
     report: journal.Report,
@@ -279,9 +284,10 @@ fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -
 }
 
 // Apply one complete line (no newline) that must carry `expect` as its `seq`. Answers the two maps and 0, or a rule code.
-fn apply[&h, &l, &m, &a, &s, &k](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], gates: map.Map[int], admitted: map.Map[int]) -> [heap] (map.Map[int], map.Map[int], int) {
+fn apply[&h, &l, &m, &a, &s, &k, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], buffer.Buffer, int) {
     var gs = gates;
     var ad = admitted;
+    var ar = arts;
     var rule = 0;
     let tape = box_slice(heap, json.tape_len(line), 0);
     borrow mut tape as &!tw in {
@@ -321,6 +327,7 @@ fn apply[&h, &l, &m, &a, &s, &k](heap: &!h Heap, line: &l [byte], expect: int, m
                             accepted[at] = true;
                         }
                         set_held(held, at, 0);
+                        ar = keep_artifact(heap, ar, art_at, at, line, tp, artifact, sha);
                     }
                 } else if bytes.equal(kind, kind_check_failed()) {
                     if named == false || field(line, tp, 0, "score") < 0 || field(line, tp, 0, "total") < 0 {
@@ -385,7 +392,54 @@ fn apply[&h, &l, &m, &a, &s, &k](heap: &!h Heap, line: &l [byte], expect: int, m
         }
     }
     unbox_slice(heap, tape);
-    return (gs, ad, rule);
+    return (gs, ad, ar, rule);
+}
+
+// `out` with the decoded text of the JSON string at `node` of `src` appended (nothing for a node that is not a string).
+fn put_decoded[&h, &s, &t](heap: &!h Heap, out: buffer.Buffer, src: &s [byte], tp: &t [int], node: int) -> [heap] buffer.Buffer {
+    let n = json.string_length(src, tp, node);
+    if n < 0 {
+        return out;
+    }
+    let room = box_slice(heap, n, byte_of(0));
+    borrow mut room as &!rw in {
+        json.string_into(src, tp, node, contents(rw));
+    }
+    var o = out;
+    borrow room as &rr in {
+        o = buffer.append(heap, o, contents(rr));
+    }
+    unbox_slice(heap, room);
+    return o;
+}
+
+fn size_of(b: buffer.Buffer) -> [] (buffer.Buffer, int) {
+    var n = 0;
+    borrow b as &bb in {
+        n = buffer.size(bb);
+    }
+    return (b, n);
+}
+
+// Keep the artifact path and digest of step number `at` (ignored outside the manifest): both decoded, appended to `arts`, and
+// where they are written in `art_at`'s four slots of the step (path start, path length, digest start, digest length).
+fn keep_artifact[&h, &x, &s, &t](heap: &!h Heap, arts: buffer.Buffer, art_at: &!x [int], at: int, src: &s [byte], tp: &t [int], artifact: int, sha: int) -> [heap] buffer.Buffer {
+    if at < 0 {
+        return arts;
+    }
+    if at >= len(art_at) / 4 {
+        return arts;
+    }
+    let (a0, start) = size_of(arts);
+    let a1 = put_decoded(heap, a0, src, tp, artifact);
+    let (a2, mid) = size_of(a1);
+    let a3 = put_decoded(heap, a2, src, tp, sha);
+    let (a4, end) = size_of(a3);
+    art_at[4 * at] = start;
+    art_at[4 * at + 1] = mid - start;
+    art_at[4 * at + 2] = mid;
+    art_at[4 * at + 3] = end - mid;
+    return a4;
 }
 
 // Replay `journal_text`, the whole company journal, against manifest `m` (whose steps number the accepted flags). A torn tail is
@@ -399,6 +453,8 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     let accepted = box_slice(heap, steps, false);
     let spend = box_slice(heap, step_base(steps), 0);
     let held = box_slice(heap, steps, 0);
+    let art_at = box_slice(heap, 4 * steps, 0 - 1);
+    var arts = buffer.empty(heap, 256);
     var gates = map.empty(heap, 16, 0, 0);
     var admitted = map.empty(heap, 16, 0, 0);
     var records = 0;
@@ -410,38 +466,44 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     borrow mut accepted as &!aw in {
         borrow mut spend as &!sw in {
             borrow mut held as &!kw in {
-                let acc = contents(aw);
-                let sp = contents(sw);
-                let hd = contents(kw);
-                while k < len(journal_text) && rule == 0 {
-                    if int_of(journal_text[k]) == 10 {
-                        let (g, a, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, gates, admitted);
-                        gates = g;
-                        admitted = a;
-                        if r == 0 {
-                            records = records + 1;
-                            good = k + 1;
-                        } else {
-                            rule = r;
-                            bad_line = records + 1;
+                borrow mut art_at as &!xw in {
+                    let acc = contents(aw);
+                    let sp = contents(sw);
+                    let hd = contents(kw);
+                    let xa = contents(xw);
+                    while k < len(journal_text) && rule == 0 {
+                        if int_of(journal_text[k]) == 10 {
+                            let (g, a, t, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, xa, gates, admitted, arts);
+                            gates = g;
+                            admitted = a;
+                            arts = t;
+                            if r == 0 {
+                                records = records + 1;
+                                good = k + 1;
+                            } else {
+                                rule = r;
+                                bad_line = records + 1;
+                            }
+                            start = k + 1;
                         }
-                        start = k + 1;
+                        k = k + 1;
                     }
-                    k = k + 1;
                 }
             }
         }
     }
     let torn = len(journal_text) - journal.after_last_newline(journal_text);
     let report = journal.Report { records: records, valid_bytes: good, total_bytes: len(journal_text), torn_bytes: torn, tasks: 0, rule: rule, line: bad_line };
-    return CompanyState { accepted: accepted, spend: spend, held: held, gates: gates, admitted: admitted, report: report };
+    return CompanyState { accepted: accepted, spend: spend, held: held, arts: arts, art_at: art_at, gates: gates, admitted: admitted, report: report };
 }
 
 pub fn drop[&h](heap: &!h Heap, s: CompanyState) -> [heap] int {
-    let CompanyState { accepted, spend, held, gates, admitted, report } = s;
+    let CompanyState { accepted, spend, held, arts, art_at, gates, admitted, report } = s;
     unbox_slice(heap, accepted);
     unbox_slice(heap, spend);
     unbox_slice(heap, held);
+    buffer.drop(heap, arts);
+    unbox_slice(heap, art_at);
     map.drop(heap, gates);
     map.drop(heap, admitted);
     return 0;
@@ -466,6 +528,25 @@ pub fn accepted_at[&s](s: &s CompanyState, i: int) -> [] bool {
         return false;
     }
     return contents(s.accepted)[i];
+}
+
+// The artifact step number `i` was accepted with: its path (relative to the company directory) and the SHA-256 Forge computed, as
+// hex, both as the last `company.step.accepted` record of the step wrote them (decoded). Two empty slices for a step that is not
+// accepted or outside the manifest.
+pub fn artifact_of[&s](s: &s CompanyState, i: int) -> [] (&s [byte], &s [byte]) {
+    let at = contents(s.art_at);
+    let text = buffer.bytes(s.arts);
+    if i < 0 {
+        return (text[0..0], text[0..0]);
+    }
+    if i >= len(at) / 4 {
+        return (text[0..0], text[0..0]);
+    }
+    let b = 4 * i;
+    if at[b] < 0 {
+        return (text[0..0], text[0..0]);
+    }
+    return (text[at[b]..at[b] + at[b + 1]], text[at[b + 2]..at[b + 2] + at[b + 3]]);
 }
 
 // 0 the gate is open (no decision), 1 approved, 2 rejected; the last decision wins.

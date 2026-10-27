@@ -7,8 +7,10 @@ import std.json;
 import std.process;
 import forge.company_budget;
 import forge.company_check;
+import forge.company_graph;
 import forge.company_manifest;
 import forge.company_run;
+import forge.company_state;
 
 // The pure half of `forge company run` (src/company_runner.cho is the half that acts; docs/superpowers/specs/
 // 2026-10-27-forge-company-layer-design.md, sections 4.3 and 10): which worker runs a step and which file it leaves as the artifact
@@ -28,7 +30,9 @@ import forge.company_run;
 //   13  a check ran and did not pass (`refusal: check-failed`, `score: a/b`); no Forge-level retry: the step is held, and every
 //       later run answers 13 again (`held:` and a `retry:` line) until a person approves `retry:<id>` with `forge company decide`
 //   14  the check could not be read as a score, did not end, wrote too much (`refusal: check-unavailable`), or the artifact is not
-//       a regular file beneath its directory or changed under the check (`refusal: artifact-invalid`); held as 13 is
+//       a regular file beneath its directory or changed under the check (`refusal: artifact-invalid`); held as 13 is. Also a
+//       step whose need is not the artifact that was accepted (`refusal: artifact-invalid`, `need:`, `reason: needs-missing` or
+//       `needs-changed`): that step is not admitted, nothing is recorded and nothing holds it
 //   15  the step's worker ended without a claim (stuck, gate_failed, a refusal, a deadline: what `forge build` / `forge gate` exit 4
 //       for), or was refused (`refusal: step-failed`, `exit: N` of the build or gate); no `accepted` is written
 
@@ -162,6 +166,108 @@ pub fn artifact_name(r: Runner) -> [] &static [byte] {
             return "";
         }
     }
+}
+
+// The artifact of a step of id `id` run by `r`, as the path relative to the company directory that `company.step.accepted`
+// records: `steps/<id>/ev/<artifact_name>`, or `company.json` for a person's step; empty for a runner that does not exist.
+pub fn artifact_rel[&h, &i](heap: &!h Heap, id: &i [byte], r: Runner) -> [heap] buffer.Buffer {
+    let name = artifact_name(r);
+    var out = buffer.empty(heap, 64);
+    match r {
+        Runner::Person => {
+            out = buffer.append(heap, out, name);
+        }
+        Runner::Unsupported => {
+            out = buffer.append(heap, out, "");
+        }
+        Runner::Build => {
+            out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
+        }
+        Runner::Gate => {
+            out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
+        }
+    }
+    return out;
+}
+
+// ---- needs: what an accepted step passes on (task 8c; spec section 10) ------------------------------------------------------
+//
+// When a step starts, every step it `needs` is accepted, and the journal holds the path and SHA-256 of the artifact each was
+// accepted with (`company_state.artifact_of`). The run re-hashes each such artifact exactly as at acceptance and refuses to start
+// the step if it is not the same bytes (`artifact-invalid`, `reason: needs-missing` or `needs-changed`). A builder or writer step
+// (`Runner::Build`) is also GIVEN them: in its execution directory, `needs-<need id>-<artifact name>` is a copy of each verified
+// artifact and `needs.json` is `needs_text`, the list of them. Flat names in the execution directory the operator made, because
+// Forge cannot make a directory. A qa, reviewer or product step is not given copies: what it reads is the operator's (a repository
+// checkout) or the manifest; its needs are still verified before it starts.
+
+// The name of the list in a builder's execution directory.
+pub fn needs_file() -> [] &static [byte] {
+    return "needs.json";
+}
+
+// The name the copy of the artifact of need `id` (run by `r`) has in the dependent step's execution directory:
+// `needs-<id>-<artifact_name>`. Unique per need: an id is letters, digits, `-`, `_` and `.`, and the suffix is one of three fixed
+// names, none a suffix of another; never `needs.json`, nor a name the build tool writes.
+pub fn needs_name[&h, &i](heap: &!h Heap, id: &i [byte], r: Runner) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), "needs-"), id), "-"), artifact_name(r));
+}
+
+// The `reason:` of a need that is not what was accepted: 1 (`artifact_reason`'s "not there") is `needs-missing`; anything else (a
+// different digest, a path that is not the step's artifact, not a regular file, too large, unreadable) is `needs-changed`.
+pub fn needs_reason(why: int) -> [] &static [byte] {
+    if why == 1 {
+        return "needs-missing";
+    }
+    return "needs-changed";
+}
+
+// The `needs.json` of step number `k`: a JSON array, one object per need that is accepted, in the order of `needs`,
+// `{"step": <need id>, "artifact": <path the journal recorded>, "path": <needs_name, in the execution directory>, "sha256": <the
+// journal's digest>}`, and a newline. Every value is written escaped, whatever the journal held. Empty (nothing to write) for a
+// step with no accepted need, or a `k` outside the manifest.
+pub fn needs_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, k: int) -> [heap] buffer.Buffer {
+    if k < 0 {
+        return buffer.empty(heap, 1);
+    }
+    if k >= company_manifest.step_count(m) {
+        return buffer.empty(heap, 1);
+    }
+    let step = company_manifest.step_at(m, k);
+    let n = company_manifest.step_needs_count(m, step);
+    var w = json.writer(heap, 256);
+    w = json.begin_array(heap, w);
+    var listed = 0;
+    var j = 0;
+    while j < n {
+        let id = company_manifest.step_need(m, step, j);
+        let at = company_graph.index_of(m, id);
+        if company_state.accepted_at(s, at) {
+            let (path, sha) = company_state.artifact_of(s, at);
+            let name = needs_name(heap, id, runner_of(company_manifest.step_at(m, at).role));
+            w = json.begin_object(heap, w);
+            w = json.put_key(heap, w, "step");
+            w = json.put_string(heap, w, id);
+            w = json.put_key(heap, w, "artifact");
+            w = json.put_string(heap, w, path);
+            w = json.put_key(heap, w, "path");
+            borrow name as &nb in {
+                w = json.put_string(heap, w, buffer.bytes(nb));
+            }
+            w = json.put_key(heap, w, "sha256");
+            w = json.put_string(heap, w, sha);
+            w = json.end_object(heap, w);
+            buffer.drop(heap, name);
+            listed = listed + 1;
+        }
+        j = j + 1;
+    }
+    w = json.end_array(heap, w);
+    let out = json.finish(w);
+    if listed == 0 {
+        buffer.drop(heap, out);
+        return buffer.empty(heap, 1);
+    }
+    return buffer.push(heap, out, byte_of(10));
 }
 
 // ---- the artifact ----------------------------------------------------------------------------------------------------------

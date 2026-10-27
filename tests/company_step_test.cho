@@ -9,6 +9,7 @@ import std.test;
 import forge.company_budget;
 import forge.company_manifest;
 import forge.company_run;
+import forge.company_state;
 import forge.company_step;
 
 // Unit tests for src/company_step.cho: the pure half of `forge company run` (exit status, worker and artifact of a role, the check
@@ -247,5 +248,127 @@ fn test_an_operator_file_inside_the_company_directory_is_seen_by_its_text() -> [
     test.assert(company_step.inside("", "/x") == false);
     test.assert(company_step.inside("/", "/x") == false);
     test.assert(company_step.inside("/co", "") == false);
+    return 0;
+}
+
+// ---- needs: what an accepted step passes to the step that needs it (task 8c) -------------------------------------------------
+
+fn test_the_artifact_of_a_step_and_its_delivered_name_follow_its_runner[&h](heap: &!h Heap) -> [heap] int {
+    var r = company_step.artifact_rel(heap, "lib", company_step.Runner::Build);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "steps/lib/ev/project.cho"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.artifact_rel(heap, "qa", company_step.Runner::Gate);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "steps/qa/ev/report.json"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.artifact_rel(heap, "brief", company_step.Runner::Person);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "company.json"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.artifact_rel(heap, "a", company_step.Runner::Unsupported);
+    borrow r as &rb in {
+        test.assert_eq(buffer.size(rb), 0);
+    }
+    buffer.drop(heap, r);
+    r = company_step.needs_name(heap, "lib", company_step.Runner::Build);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "needs-lib-project.cho"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.needs_name(heap, "brief", company_step.Runner::Person);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "needs-brief-company.json"));
+    }
+    buffer.drop(heap, r);
+    test.assert(bytes.equal(company_step.needs_file(), "needs.json"));
+    test.assert(bytes.equal(company_step.needs_reason(1), "needs-missing"));
+    test.assert(bytes.equal(company_step.needs_reason(2), "needs-changed"));
+    test.assert(bytes.equal(company_step.needs_reason(5), "needs-changed"));
+    test.assert(bytes.equal(company_step.needs_reason(0 - 1), "needs-changed"));
+    return 0;
+}
+
+// a (builder), q (qa), p (product), then b (builder) needs all three and c (builder) needs nothing.
+fn needs_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\",\"product\"],\"steps\":[{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"},{\"id\":\"q\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"},{\"id\":\"p\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"},{\"id\":\"b\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"a\",\"q\",\"p\"],\"input\":\"x\",\"check\":\"c.sh\"},{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"}]}";
+}
+
+// 1 when `needs_text` of step number `k` after replaying `journal` is exactly `want`, else 0.
+fn needs_text_is[&h, &j, &w](heap: &!h Heap, journal: &j [byte], k: int, want: &w [byte]) -> [heap] int {
+    var got = 0 - 1;
+    match company_manifest.parse(heap, needs_manifest()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, journal, mr);
+                borrow s as &sr in {
+                    let t = company_step.needs_text(heap, mr, sr, k);
+                    borrow t as &tb in {
+                        got = 0;
+                        if bytes.equal(buffer.bytes(tb), want) {
+                            got = 1;
+                        }
+                    }
+                    buffer.drop(heap, t);
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return got;
+}
+
+fn add_line[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = journal;
+    borrow record as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return out;
+}
+
+fn test_needs_text_lists_every_need_with_the_path_and_digest_the_journal_recorded[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add_line(heap, j, company_state.accepted(heap, 1, "a", "steps/a/ev/project.cho", "aa11"));
+    j = add_line(heap, j, company_state.accepted(heap, 2, "q", "steps/q/ev/report.json", "bb22"));
+    j = add_line(heap, j, company_state.accepted(heap, 3, "p", "company.json", "cc33"));
+    borrow j as &jb in {
+        let want = "[{\"step\":\"a\",\"artifact\":\"steps/a/ev/project.cho\",\"path\":\"needs-a-project.cho\",\"sha256\":\"aa11\"},{\"step\":\"q\",\"artifact\":\"steps/q/ev/report.json\",\"path\":\"needs-q-report.json\",\"sha256\":\"bb22\"},{\"step\":\"p\",\"artifact\":\"company.json\",\"path\":\"needs-p-company.json\",\"sha256\":\"cc33\"}]\n";
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 3, want), 1);
+        // A step with no needs gets nothing: no needs.json is written for it.
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 4, ""), 1);
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 0, ""), 1);
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 0 - 1, ""), 1);
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 9, ""), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// Only accepted needs are listed (the scheduler starts a step only when all are, so this is the defensive half).
+fn test_needs_text_lists_only_what_is_accepted[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add_line(heap, j, company_state.accepted(heap, 1, "q", "steps/q/ev/report.json", "bb22"));
+    borrow j as &jb in {
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 3, "[{\"step\":\"q\",\"artifact\":\"steps/q/ev/report.json\",\"path\":\"needs-q-report.json\",\"sha256\":\"bb22\"}]\n"), 1);
+    }
+    buffer.drop(heap, j);
+    test.assert_eq(needs_text_is(heap, "", 3, ""), 1);
+    return 0;
+}
+
+// A recorded path with a quote and a backslash (a hand-edited journal: the run never writes one) is written escaped, so the file
+// is JSON whatever the journal held, and the run's own check of the path against the step's artifact refuses it.
+fn test_needs_text_escapes_what_it_copies_from_the_journal[&h](heap: &!h Heap) -> [heap] int {
+    let journal = "{\"v\":1,\"seq\":1,\"kind\":\"company.step.accepted\",\"task\":\"a\",\"artifact\":\"steps/a\\\"x\\\\y\",\"sha256\":\"a\\\"b\"}\n";
+    let want = "[{\"step\":\"a\",\"artifact\":\"steps/a\\\"x\\\\y\",\"path\":\"needs-a-project.cho\",\"sha256\":\"a\\\"b\"}]\n";
+    test.assert_eq(needs_text_is(heap, journal, 3, want), 1);
     return 0;
 }

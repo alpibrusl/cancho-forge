@@ -3,6 +3,7 @@ performs
     child_signal
     clock
     dir_read
+    dir_write
     err_write
     exec_detached
     exec_under
