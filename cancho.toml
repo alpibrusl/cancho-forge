@@ -116,3 +116,8 @@ std = true
 name = "company_budget"
 sources = ["tests/company_budget_test.cho", "src/company_budget.cho"]
 std = true
+
+[[test]]
+name = "company_check"
+sources = ["tests/company_check_test.cho", "src/company_check.cho"]
+std = true

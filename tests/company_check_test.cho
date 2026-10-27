@@ -1,0 +1,177 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_check;
+
+// Unit tests for src/company_check.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 10): the score an
+// audit program prints, and the verdict a check gives. Run with `cancho test`.
+
+// The score of a text as a pair, or (-1, -1) for Unavailable.
+fn pair_a(text: &static [byte]) -> [] int {
+    match company_check.parse_score(text) {
+        company_check.ScoreResult::Score(a, b) => {
+            return a;
+        }
+        company_check.ScoreResult::Unavailable => {
+            return 0 - 1;
+        }
+    }
+}
+
+fn pair_b(text: &static [byte]) -> [] int {
+    match company_check.parse_score(text) {
+        company_check.ScoreResult::Score(a, b) => {
+            return b;
+        }
+        company_check.ScoreResult::Unavailable => {
+            return 0 - 1;
+        }
+    }
+}
+
+fn verdict_of(text: &static [byte]) -> [] int {
+    return company_check.verdict(company_check.parse_score(text));
+}
+
+fn test_the_real_audit_line_passes() -> [] int {
+    test.assert_eq(verdict_of("  TOTAL 221/221"), 0);
+    test.assert_eq(pair_a("  TOTAL 221/221"), 221);
+    test.assert_eq(pair_b("  TOTAL 221/221"), 221);
+    test.assert_eq(verdict_of("TOTAL 221/221"), 0);
+    test.assert_eq(verdict_of("TOTAL 221/221\n"), 0);
+    return 0;
+}
+
+fn test_a_score_below_the_total_is_check_failed() -> [] int {
+    test.assert_eq(verdict_of("TOTAL 117/221"), 1);
+    test.assert_eq(verdict_of("TOTAL 0/221"), 1);
+    test.assert_eq(verdict_of("TOTAL 220/221"), 1);
+    test.assert_eq(pair_a("TOTAL 117/221"), 117);
+    return 0;
+}
+
+fn test_no_score_a_negative_one_an_over_one_and_zero_of_zero_are_unavailable() -> [] int {
+    test.assert_eq(verdict_of(""), 2);
+    test.assert_eq(verdict_of("all cases ok\nnothing to see"), 2);
+    test.assert_eq(verdict_of("TOTAL -1/5"), 2);
+    test.assert_eq(verdict_of("TOTAL 6/5"), 2);
+    test.assert_eq(verdict_of("TOTAL 0/0"), 2);
+    test.assert_eq(verdict_of("TOTAL 1/-5"), 2);
+    test.assert_eq(verdict_of("TOTAL +5/5"), 2);
+    return 0;
+}
+
+fn test_parts_that_are_not_plain_digits_are_unavailable() -> [] int {
+    test.assert_eq(verdict_of("TOTAL a/b"), 2);
+    test.assert_eq(verdict_of("TOTAL 5/"), 2);
+    test.assert_eq(verdict_of("TOTAL /5"), 2);
+    test.assert_eq(verdict_of("TOTAL 5/5/5"), 2);
+    test.assert_eq(verdict_of("TOTAL 5"), 2);
+    test.assert_eq(verdict_of("TOTAL"), 2);
+    test.assert_eq(verdict_of("TOTAL 1.5/5"), 2);
+    test.assert_eq(verdict_of("TOTAL 5 / 5"), 2);
+    test.assert_eq(verdict_of("TOTAL 0x5/5"), 2);
+    test.assert_eq(verdict_of("TOTAL 1e1/5"), 2);
+    return 0;
+}
+
+fn test_text_after_the_score_on_its_line_is_unavailable_but_trailing_blanks_are_not() -> [] int {
+    test.assert_eq(verdict_of("TOTAL 5/5 passed"), 2);
+    test.assert_eq(verdict_of("TOTAL 5/5x"), 2);
+    test.assert_eq(verdict_of("TOTAL 5/5   "), 0);
+    test.assert_eq(verdict_of("TOTAL 5/5\t\n"), 0);
+    return 0;
+}
+
+fn test_the_last_total_line_decides_and_other_lines_are_ignored() -> [] int {
+    test.assert_eq(verdict_of("case 1 ok\ncase 2 FAIL\n  TOTAL 1/2\n"), 1);
+    test.assert_eq(verdict_of("TOTAL 1/2\nmore output\nTOTAL 2/2\n"), 0);
+    test.assert_eq(verdict_of("TOTAL 2/2\nmore output\nTOTAL 1/2\n"), 1);
+    // a later TOTAL line that cannot be read is not hidden by an earlier good one.
+    test.assert_eq(verdict_of("TOTAL 2/2\nTOTAL oops\n"), 2);
+    test.assert_eq(verdict_of("TOTAL 2/2\nTOTAL 3/2\n"), 2);
+    // output after the TOTAL line that is not a TOTAL line does not matter.
+    test.assert_eq(verdict_of("TOTAL 2/2\nbye\n"), 0);
+    // a line that merely mentions TOTAL later in it, or a longer word, is not the score line.
+    test.assert_eq(verdict_of("TOTAL 2/2\nthe TOTAL 1/2 was\nSUBTOTAL 1/2\nTOTALS 1/2\n"), 0);
+    return 0;
+}
+
+fn test_crlf_line_ends_parse() -> [] int {
+    test.assert_eq(verdict_of("case ok\r\n  TOTAL 221/221\r\n"), 0);
+    test.assert_eq(verdict_of("TOTAL 117/221\r\n"), 1);
+    test.assert_eq(verdict_of("TOTAL 5/5\r"), 0);
+    test.assert_eq(pair_b("a\r\nTOTAL 3/4\r\nb\r\n"), 4);
+    return 0;
+}
+
+fn test_numbers_of_more_than_fifteen_digits_are_unavailable_never_a_trap() -> [] int {
+    test.assert_eq(verdict_of("TOTAL 999999999999999/999999999999999"), 0);
+    test.assert_eq(verdict_of("TOTAL 1000000000000000/1000000000000000"), 2);
+    test.assert_eq(verdict_of("TOTAL 5/1000000000000000"), 2);
+    test.assert_eq(verdict_of("TOTAL 99999999999999999999/99999999999999999999"), 2);
+    test.assert_eq(verdict_of("TOTAL 9223372036854775807/9223372036854775807"), 2);
+    test.assert_eq(verdict_of("TOTAL 9223372036854775808/9223372036854775808"), 2);
+    test.assert_eq(verdict_of("TOTAL 0000000000000005/0000000000000005"), 2);
+    test.assert_eq(verdict_of("TOTAL 000000000000005/000000000000005"), 0);
+    test.assert_eq(verdict_of("TOTAL 005/005"), 0);
+    return 0;
+}
+
+fn test_a_huge_text_is_read_promptly[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 1100000);
+    var i = 0;
+    while i < 1048576 {
+        b = buffer.push(heap, b, byte_of(97));
+        i = i + 1;
+    }
+    borrow b as &bb in {
+        test.assert_eq(company_check.verdict(company_check.parse_score(buffer.bytes(bb))), 2);
+    }
+    buffer.drop(heap, b);
+    var c = buffer.empty(heap, 1100000);
+    i = 0;
+    while i < 1048576 {
+        c = buffer.push(heap, c, byte_of(10));
+        i = i + 1;
+    }
+    c = buffer.append(heap, c, "TOTAL 3/3");
+    borrow c as &cb in {
+        test.assert_eq(company_check.verdict(company_check.parse_score(buffer.bytes(cb))), 0);
+    }
+    buffer.drop(heap, c);
+    // a line of a million spaces and digits is refused, not scanned forever.
+    var d = buffer.append(heap, buffer.empty(heap, 1100000), "TOTAL ");
+    i = 0;
+    while i < 1048576 {
+        d = buffer.push(heap, d, byte_of(49));
+        i = i + 1;
+    }
+    borrow d as &db in {
+        test.assert_eq(company_check.verdict(company_check.parse_score(buffer.bytes(db))), 2);
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_the_rule_tags() -> [] int {
+    test.assert(bytes.equal(company_check.rule_of(1), "check-failed"));
+    test.assert(bytes.equal(company_check.rule_of(2), "check-unavailable"));
+    // a verdict that is not 1 or 2 is not a refusal; anything unknown is read as unavailable, never as a pass.
+    test.assert(bytes.equal(company_check.rule_of(0), ""));
+    test.assert(bytes.equal(company_check.rule_of(7), "check-unavailable"));
+    test.assert(bytes.equal(company_check.rule_of(0 - 3), "check-unavailable"));
+    return 0;
+}
+
+fn test_a_pass_needs_a_total_above_zero_and_a_score_equal_to_it() -> [] int {
+    test.assert_eq(company_check.verdict(company_check.ScoreResult::Score(5, 5)), 0);
+    test.assert_eq(company_check.verdict(company_check.ScoreResult::Score(4, 5)), 1);
+    test.assert_eq(company_check.verdict(company_check.ScoreResult::Score(0, 0)), 2);
+    test.assert_eq(company_check.verdict(company_check.ScoreResult::Score(0 - 1, 5)), 2);
+    test.assert_eq(company_check.verdict(company_check.ScoreResult::Score(6, 5)), 2);
+    test.assert_eq(company_check.verdict(company_check.ScoreResult::Unavailable), 2);
+    return 0;
+}

@@ -1,0 +1,212 @@
+edition 9;
+module forge.company_check;
+
+// Forge's check (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 10): what an audit program printed, read as a
+// score, and the verdict that gives. Pure: no effect row. Running the audit program is the IO wrapper of a later task, not here.
+// Pass means the audit's score EQUALS its total and the total is above zero; a worker's `done` never reaches `accepted` without it.
+//
+// The score line (the format eval/audit_*.py prints, e.g. `  TOTAL 221/221`)
+//   Lines end at `\n`; a `\r` before it is a blank. A score line is a line whose first non-blank (space, tab) text is the word `TOTAL`
+//   (followed by a blank or the end of the line, so `TOTALS` and `SUBTOTAL` are other words). The LAST such line decides, even if
+//   an earlier one reads well: if it cannot be read, the result is Unavailable. It reads as `TOTAL`, one or more blanks, digits,
+//   `/`, digits, then only blanks to the end of the line. Text after the score on its line (`TOTAL 5/5 passed`) is Unavailable: a
+//   line this loose is not the audit's own. A sign, a point, an exponent, a space around the `/`, a missing part, a second `/`, or
+//   more than 15 digits in a number (leading zeros count) is Unavailable. The score must also be at most the total, and the total
+//   above zero. Nothing is computed from a number of more than 15 digits, so nothing overflows. One pass over the text, no copy.
+//
+// Verdict
+//   0 pass (a == b, b > 0), 1 check-failed (a < b), 2 check-unavailable (no readable score, or one that makes no sense).
+
+pub enum ScoreResult {
+    Score(int, int),
+    Unavailable,
+}
+
+// The index of the first byte at or after `i` (before `end`) that is not a space or tab.
+fn skip_blanks[&t](text: &t [byte], i: int, end: int) -> [] int {
+    var j = i;
+    var going = true;
+    while going {
+        if j >= end {
+            going = false;
+        } else {
+            let c = int_of(text[j]);
+            if c == 32 || c == 9 {
+                j = j + 1;
+            } else {
+                going = false;
+            }
+        }
+    }
+    return j;
+}
+
+fn max_digits() -> [] int {
+    return 15;
+}
+
+fn is_blank_byte(c: int) -> [] bool {
+    return c == 32 || c == 9 || c == 13;
+}
+
+// The number of digits starting at `i` up to the first non-digit; -1 if more than 15, else the value is left to `digits_value`.
+fn digit_run[&t](text: &t [byte], i: int, end: int) -> [] int {
+    var j = i;
+    while j < end {
+        let c = int_of(text[j]);
+        if c < 48 || c > 57 {
+            return j - i;
+        }
+        j = j + 1;
+        if j - i > max_digits() {
+            return 0 - 1;
+        }
+    }
+    return j - i;
+}
+
+fn digits_value[&t](text: &t [byte], i: int, n: int) -> [] int {
+    var v = 0;
+    var k = 0;
+    while k < n {
+        v = v * 10 + (int_of(text[i + k]) - 48);
+        k = k + 1;
+    }
+    return v;
+}
+
+// Read the rest of a score line, text[start..end), from the end of the word TOTAL (end is at the `\n` or the end of the text).
+// Answers the score a, or -1 for Unavailable (a score is never negative).
+fn read_line_a[&t](text: &t [byte], start: int, end: int) -> [] int {
+    var i = start;
+    // after the word: at least one blank
+    if i >= end {
+        return 0 - 1;
+    }
+    if is_blank_byte(int_of(text[i])) == false {
+        return 0 - 1;
+    }
+    i = skip_blanks(text, i, end);
+    let na = digit_run(text, i, end);
+    if na < 1 {
+        return 0 - 1;
+    }
+    let a = digits_value(text, i, na);
+    i = i + na;
+    if i >= end {
+        return 0 - 1;
+    }
+    if int_of(text[i]) != 47 {
+        return 0 - 1;
+    }
+    i = i + 1;
+    let nb = digit_run(text, i, end);
+    if nb < 1 {
+        return 0 - 1;
+    }
+    let b = digits_value(text, i, nb);
+    i = i + nb;
+    while i < end {
+        if is_blank_byte(int_of(text[i])) == false {
+            return 0 - 1;
+        }
+        i = i + 1;
+    }
+    if b < 1 || a > b {
+        return 0 - 1;
+    }
+    return a;
+}
+
+// The total of a line that `read_line_a` read as a score (the same walk).
+fn read_line_b[&t](text: &t [byte], start: int, end: int) -> [] int {
+    var i = skip_blanks(text, start, end);
+    let na = digit_run(text, i, end);
+    i = i + na + 1;
+    let nb = digit_run(text, i, end);
+    return digits_value(text, i, nb);
+}
+
+// Does the line text[start..end) start (after blanks) with the word TOTAL? Answers the index just after the word, or -1.
+fn after_word[&t](text: &t [byte], start: int, end: int) -> [] int {
+    var i = start;
+    i = skip_blanks(text, i, end);
+    if end - i < 5 {
+        return 0 - 1;
+    }
+    if int_of(text[i]) != 84 || int_of(text[i + 1]) != 79 || int_of(text[i + 2]) != 84 || int_of(text[i + 3]) != 65 || int_of(text[i + 4]) != 76 {
+        return 0 - 1;
+    }
+    i = i + 5;
+    if i < end {
+        if is_blank_byte(int_of(text[i])) == false {
+            return 0 - 1;
+        }
+    }
+    return i;
+}
+
+pub fn parse_score[&t](text: &t [byte]) -> [] ScoreResult {
+    var found = false;
+    var fa = 0 - 1;
+    var fb = 0;
+    var start = 0;
+    var i = 0;
+    let n = len(text);
+    while start <= n {
+        i = start;
+        var scanning = true;
+        while scanning {
+            if i >= n {
+                scanning = false;
+            } else if int_of(text[i]) == 10 {
+                scanning = false;
+            } else {
+                i = i + 1;
+            }
+        }
+        let w = after_word(text, start, i);
+        if w >= 0 {
+            found = true;
+            // read from the word's end: the walk starts with the blank that must follow it
+            let a = read_line_a(text, w, i);
+            fa = a;
+            if a >= 0 {
+                fb = read_line_b(text, w, i);
+            }
+        }
+        start = i + 1;
+    }
+    if found == false || fa < 0 {
+        return ScoreResult::Unavailable;
+    }
+    return ScoreResult::Score(fa, fb);
+}
+
+pub fn verdict(r: ScoreResult) -> [] int {
+    match r {
+        ScoreResult::Score(a, b) => {
+            if b < 1 || a < 0 || a > b {
+                return 2;
+            }
+            if a == b {
+                return 0;
+            }
+            return 1;
+        }
+        ScoreResult::Unavailable => {
+            return 2;
+        }
+    }
+}
+
+// The rule tag of a verdict: 1 check-failed, anything else that is not a pass (0) check-unavailable; a pass has no tag (empty).
+pub fn rule_of(v: int) -> [] &static [byte] {
+    if v == 0 {
+        return "";
+    }
+    if v == 1 {
+        return "check-failed";
+    }
+    return "check-unavailable";
+}
