@@ -403,3 +403,58 @@ fn test_max_cost_is_whole_dollars_and_converts_with_saturation() -> [] int {
     test.assert_eq(company_budget.dollars_to_micro(9000000000000000000), 1000000000000000);
     return 0;
 }
+
+// ---- no input reaches a panic (journal-replayed totals, and a Usage or Prices built directly) -------------------------------------
+
+fn test_usage_of_clamps_huge_and_negative_totals_and_the_cost_never_traps[&h](heap: &!h Heap) -> [heap] int {
+    let big = 9223372036854775807;
+    let u = company_budget.usage_of(big, big, big, big);
+    test.assert_eq(u.input, 1000000000000000);
+    test.assert_eq(u.cache_read, 1000000000000000);
+    test.assert_eq(company_budget.cost_micro(u, plain(1000000000, 1000000000, 1000000000, 1000000000)), 1000000000000000);
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(9000000000000000000, 0, 0, 0), plain(1000000000, 0, 0, 0)), 1000000000000000);
+    // 1e15 tokens at 2,000,000 micro/M = 2e15 -> saturates; at 1 micro/M = 1e9.
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(big, 0, 0, 0), plain(2000000, 0, 0, 0)), 1000000000000000);
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(big, 0, 0, 0), plain(1, 0, 0, 0)), 1000000000);
+    let neg = company_budget.usage_of(0 - 5, 0 - big, 0 - 1, 0 - 9000000000000000000);
+    test.assert_eq(neg.input + neg.output + neg.cache_write + neg.cache_read, 0);
+    test.assert_eq(company_budget.cost_micro(neg, plain(1000000000, 1000000000, 1000000000, 1000000000)), 0);
+    let p = load(heap, table(), "claude-haiku-5-5");
+    test.assert(company_budget.cost_micro(company_budget.usage_of(big, big, big, big), p) > 0);
+    return 0;
+}
+
+fn test_a_usage_built_directly_with_huge_or_negative_fields_is_clamped_by_cost_micro[&h](heap: &!h Heap) -> [heap] int {
+    let big = 9223372036854775807;
+    let hi = company_budget.Usage { input: big, output: big, cache_write: big, cache_read: big, calls: 0, malformed: 0, tiered: true, over_input: big, over_output: big, over_cache_write: big, over_cache_read: big };
+    let p = load(heap, table(), "claude-haiku-5-5");
+    test.assert(company_budget.cost_micro(hi, p) > 0);
+    test.assert(company_budget.cost_micro(hi, p) <= 1000000000000000);
+    test.assert_eq(company_budget.cost_micro(hi, plain(1000000000, 1000000000, 1000000000, 1000000000)), 1000000000000000);
+    let lo = company_budget.Usage { input: 0 - big, output: 0 - 1, cache_write: 0 - 7, cache_read: 0 - 9, calls: 0, malformed: 0, tiered: true, over_input: 0 - 3, over_output: big, over_cache_write: 0 - big, over_cache_read: 5 };
+    test.assert_eq(company_budget.cost_micro(lo, p), 0);
+    // an over bucket larger than its total cannot make the base part negative: over capped at the total (1000 tokens at 500000/M = 500).
+    let odd = company_budget.Usage { input: 1000, output: 0, cache_write: 0, cache_read: 0, calls: 0, malformed: 0, tiered: true, over_input: 5000, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
+    test.assert_eq(company_budget.cost_micro(odd, p), 500);
+    // negative and huge prices are clamped too: negative -> 0; above $1000/M -> $1000/M (1,000,000 tokens = 1e9 micro).
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(1000000, 0, 0, 0), plain(0 - 5, 0, 0, 0)), 0);
+    test.assert_eq(company_budget.cost_micro(company_budget.usage_of(1000000, 0, 0, 0), plain(big, 0, 0, 0)), 1000000000);
+    return 0;
+}
+
+fn test_a_limit_at_or_above_one_quadrillion_is_reachable_by_a_saturated_total() -> [] int {
+    let cap = 1000000000000000;
+    let big = 9223372036854775807;
+    // A saturated spent (1e15, the most a total can say) against a limit of 1e15 or more: exhausted. Below saturation it is not.
+    test.assert(company_budget.exhausted(company_budget.usage_of(cap, 0, 0, 0), limits(cap, 5, 5, 5), 0, big));
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, cap, 0, 0), limits(5, big, 5, 5), 0, big));
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 0, cap, 0), limits(5, 5, cap + 1, 5), 0, big));
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 0, 0, cap), limits(5, 5, 5, big), 0, big));
+    test.assert(company_budget.exhausted(company_budget.usage_of(cap - 1, 0, 0, 0), limits(big, 5, 5, 5), 0, big) == false);
+    // the cost ceiling likewise: a saturated cost against a ceiling of 1e15 or more.
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 0, 0, 0), limits(5, 5, 5, 5), cap, big));
+    test.assert(company_budget.exhausted(company_budget.usage_of(0, 0, 0, 0), limits(5, 5, 5, 5), cap - 1, big) == false);
+    // negative inputs are zero: nothing spent, a negative limit allows nothing, a negative cost is no cost.
+    test.assert(company_budget.exhausted(company_budget.usage_of(0 - 4, 0, 0, 0), limits(0 - 1, 0, 0, 0), 0 - 9, 0 - 1) == false);
+    return 0;
+}

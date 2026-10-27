@@ -43,6 +43,7 @@ import std.option;
 //   micro-dollar, so a budget never under-counts. A cost above 1e15 micro-dollars (a billion dollars) saturates at 1e15.
 //
 // Ceilings
+//   (Every number is clamped to [0, 1e15] first; a saturated spent of 1e15 against a ceiling of 1e15 or more counts as over it.)
 //   A limit is a ceiling that may be reached and not passed: `exhausted` is true when a class SPENT is GREATER than its limit, or
 //   the cost is greater than the cost ceiling. A limit of 0 therefore allows no spending at all; it does NOT mean unlimited (the
 //   manifest requires every budget number, Task 1, so there is no "unset").
@@ -97,6 +98,28 @@ pub fn line_limit() -> [] int {
     return 2048;
 }
 
+// A count into [0, cap]: a negative is nothing, a huge is the cap.
+fn clamp(n: int) -> [] int {
+    if n < 0 {
+        return 0;
+    }
+    if n > cap() {
+        return cap();
+    }
+    return n;
+}
+
+// A price into [0, 1000 dollars] (micro-dollars per million), the most `parse_prices` ever answers.
+fn clamp_price(n: int) -> [] int {
+    if n < 0 {
+        return 0;
+    }
+    if n > 1000000000 {
+        return 1000000000;
+    }
+    return n;
+}
+
 fn clamp_add(total: int, n: int) -> [] int {
     if n > cap() - total {
         return cap();
@@ -108,7 +131,7 @@ fn clamp_add(total: int, n: int) -> [] int {
 
 // A usage made from four totals (a spend replayed from the journal). It carries no per-call information.
 pub fn usage_of(input: int, output: int, cache_write: int, cache_read: int) -> [] Usage {
-    return Usage { input: input, output: output, cache_write: cache_write, cache_read: cache_read, calls: 0, malformed: 0, tiered: false, over_input: 0, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
+    return Usage { input: clamp(input), output: clamp(output), cache_write: clamp(cache_write), cache_read: clamp(cache_read), calls: 0, malformed: 0, tiered: false, over_input: 0, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
 }
 
 struct Row {
@@ -400,9 +423,10 @@ pub fn parse_prices_for[&h, &t](heap: &!h Heap, text: &t [byte], provider: &stat
 // ---- cost -----------------------------------------------------------------------------------------------------------------------
 
 // tokens * price / 1e6 split so nothing overflows: the whole part (tokens / 1e6 * price, at most cap) and the remainder part
-// (tokens % 1e6 * price, under 1e6 * 1e9), the second still in millionths.
+// (tokens % 1e6 * price, under 1e6 * 1e9), the second still in millionths. Both clamp their arguments (`Usage` and `Prices` are
+// public structs a caller can build directly): tokens to [0, 1e15], a price to [0, 1e9].
 fn whole_part(tokens: int, price: int) -> [] int {
-    let w = tokens / 1000000 * price;
+    let w = clamp(tokens) / 1000000 * clamp_price(price);
     if w > cap() {
         return cap();
     }
@@ -410,18 +434,46 @@ fn whole_part(tokens: int, price: int) -> [] int {
 }
 
 fn rest_part(tokens: int, price: int) -> [] int {
-    return tokens % 1000000 * price;
+    return clamp(tokens) % 1000000 * clamp_price(price);
 }
 
-// The cost of the usage in micro-dollars, rounded up (see "Rounding and range", "Tiers").
+// The over-limit part of a total (the bucket capped at the total) and the rest of it; neither is ever negative.
+fn over_of(total: int, over: int) -> [] int {
+    let t = clamp(total);
+    let o = clamp(over);
+    if o > t {
+        return t;
+    }
+    return o;
+}
+
+fn base_of(total: int, over: int) -> [] int {
+    let t = clamp(total);
+    let o = clamp(over);
+    if o > t {
+        return 0;
+    }
+    return t - o;
+}
+
+// The cost of the usage in micro-dollars, rounded up (see "Rounding and range", "Tiers"). Total for any Usage and Prices: fields
+// outside their range are clamped (tokens to [0, 1e15], prices to [0, 1e9]), never a trap.
 pub fn cost_micro(u: Usage, p: Prices) -> [] int {
     var whole = 0;
     var rest = 0;
     if p.has_over && u.tiered {
-        whole = whole_part(u.input - u.over_input, p.input) + whole_part(u.output - u.over_output, p.output) + whole_part(u.cache_write - u.over_cache_write, p.cache_write) + whole_part(u.cache_read - u.over_cache_read, p.cache_read);
-        rest = rest_part(u.input - u.over_input, p.input) + rest_part(u.output - u.over_output, p.output) + rest_part(u.cache_write - u.over_cache_write, p.cache_write) + rest_part(u.cache_read - u.over_cache_read, p.cache_read);
-        whole = whole + whole_part(u.over_input, p.over_input) + whole_part(u.over_output, p.over_output) + whole_part(u.over_cache_write, p.over_cache_write) + whole_part(u.over_cache_read, p.over_cache_read);
-        rest = rest + rest_part(u.over_input, p.over_input) + rest_part(u.over_output, p.over_output) + rest_part(u.over_cache_write, p.over_cache_write) + rest_part(u.over_cache_read, p.over_cache_read);
+        let bi = base_of(u.input, u.over_input);
+        let bo = base_of(u.output, u.over_output);
+        let bw = base_of(u.cache_write, u.over_cache_write);
+        let br = base_of(u.cache_read, u.over_cache_read);
+        let oi = over_of(u.input, u.over_input);
+        let oo = over_of(u.output, u.over_output);
+        let ow = over_of(u.cache_write, u.over_cache_write);
+        let or_ = over_of(u.cache_read, u.over_cache_read);
+        whole = whole_part(bi, p.input) + whole_part(bo, p.output) + whole_part(bw, p.cache_write) + whole_part(br, p.cache_read);
+        rest = rest_part(bi, p.input) + rest_part(bo, p.output) + rest_part(bw, p.cache_write) + rest_part(br, p.cache_read);
+        whole = whole + whole_part(oi, p.over_input) + whole_part(oo, p.over_output) + whole_part(ow, p.over_cache_write) + whole_part(or_, p.over_cache_read);
+        rest = rest + rest_part(oi, p.over_input) + rest_part(oo, p.over_output) + rest_part(ow, p.over_cache_write) + rest_part(or_, p.over_cache_read);
     } else {
         var pi = p.input;
         var po = p.output;
@@ -458,5 +510,13 @@ pub fn dollars_to_micro(dollars: int) -> [] int {
 
 // Is the budget spent: a class of `spent` over its limit, or `cost_micro` over `max_cost_micro` (see "Ceilings").
 pub fn exhausted(spent: Usage, limits: Limits, cost_micro: int, max_cost_micro: int) -> [] bool {
-    return spent.input > limits.input || spent.output > limits.output || spent.cache_write > limits.cache_write || spent.cache_read > limits.cache_read || cost_micro > max_cost_micro;
+    return over_ceiling(spent.input, limits.input) || over_ceiling(spent.output, limits.output) || over_ceiling(spent.cache_write, limits.cache_write) || over_ceiling(spent.cache_read, limits.cache_read) || over_ceiling(cost_micro, max_cost_micro);
+}
+
+// Both sides are clamped to [0, 1e15]. A total cannot say more than 1e15 (it saturates), so a spent of exactly 1e15 against a ceiling
+// of 1e15 or more counts as over it: a ceiling that large is otherwise unreachable and would never stop anything the totals can show.
+fn over_ceiling(spent: int, limit: int) -> [] bool {
+    let s = clamp(spent);
+    let l = clamp(limit);
+    return s > l || s == cap() && l == cap();
 }
