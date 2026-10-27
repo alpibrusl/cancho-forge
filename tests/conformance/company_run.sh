@@ -199,6 +199,47 @@ check "resume with needs: delivered again, the link replaced by a regular copy, 
 run redo 3
 check "resume with needs: a run after that admits nothing more" sh -c "[ '$(rc redo 3)' = 0 ] && [ $(kinds redo company.step.admitted b) -eq 2 ]"
 
+# ---- fix round 1. I1: a need run by a person (its artifact is company.json) is not byte-verified: editing the manifest after it
+# was accepted does not block the step that needs it, and nothing of it is given
+pm="[{\"id\":\"brief\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"b\",\"gate\":\"g\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"brief\"],\"input\":\"needs\",\"check\":\"audit_pass.sh\",\"gate\":\"ship\"}]"
+mkco pedit "$pm" 100000 lib
+"$F" company decide "$w/pedit" g approved "go" > /dev/null
+run pedit 1
+printf '\n  \n' >> "$w/pedit/company.json"
+"$F" company decide "$w/pedit" ship approved "go" > /dev/null
+run pedit 2
+check "a product need: company.json edited after it was accepted does not block its dependent (exit 0), nothing of it given" sh -c "[ '$(rc pedit 1)' = 10 ] && [ $(kinds pedit company.step.accepted brief) -eq 1 ] && [ '$(rc pedit 2)' = 0 ] && [ $(kinds pedit company.step.accepted lib) -eq 1 ] && ! ls '$w/pedit/steps/lib/ev' | grep -q '^needs'"
+
+# I2: all needs are verified before anything is written: b needs a1 and a2, a2 is tampered; b's execution directory is unchanged
+two="[$(builder a1 '' done audit_pass.sh),$(builder a2 '' done audit_pass.sh),{\"id\":\"b\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"a1\",\"a2\"],\"input\":\"needs\",\"check\":\"audit_pass.sh\",\"gate\":\"g\"}]"
+mkco two "$two" 100000 a1 a2 b
+run two 1
+printf 'tampered\n' >> "$w/two/steps/a2/ev/project.cho"
+printf 'earlier\n' > "$w/two/steps/b/ev/needs.json"
+"$F" company decide "$w/two" g approved "go" > /dev/null
+ls -l --time-style=+%s "$w/two/steps/b/ev" > "$w/two.before"
+run two 2
+ls -l --time-style=+%s "$w/two/steps/b/ev" > "$w/two.after"
+check "two needs, the second changed: refused (need: a2), not admitted, the execution directory unchanged (no copy of a1, needs.json as it was)" sh -c "[ '$(rc two 2)' = 14 ] && grep -qx 'need: a2' '$w/two.2.out' && [ $(kinds two company.step.admitted b) -eq 0 ] && [ ! -e '$w/two/steps/b/ev/needs-a1-project.cho' ] && [ \"\$(cat '$w/two/steps/b/ev/needs.json')\" = earlier ] && cmp -s '$w/two.before' '$w/two.after'"
+
+# Stale needs files in a reused execution directory are Forge's to remove: a builder with no needs is left none, and one with needs
+# gets exactly the current ones; the files Forge makes are not group- or world-writable
+mkco stale "[$(builder a '' done audit_pass.sh),$(builder b '"a"' needs audit_pass.sh)]" 100000 a b
+printf 'stale\n' > "$w/stale/steps/a/ev/needs.json"; printf 'stale\n' > "$w/stale/steps/a/ev/needs-old-project.cho"
+printf 'stale\n' > "$w/stale/steps/b/ev/needs-old-project.cho"
+run stale 1
+check "stale needs: removed from a step with no needs, and only the current copy left beside needs.json for b" sh -c "[ '$(rc stale 1)' = 0 ] && ! ls '$w/stale/steps/a/ev' | grep -q '^needs' && [ \"\$(ls '$w/stale/steps/b/ev' | grep '^needs' | tr '\\n' ' ')\" = 'needs-a-project.cho needs.json ' ]"
+check "needs files are not group- or world-writable" sh -c "for f in '$w/stale/steps/b/ev/needs.json' '$w/stale/steps/b/ev/needs-a-project.cho'; do m=\$(stat -c %a \"\$f\"); case \$m in *[2367]?|*[2367]) exit 1;; esac; done"
+
+# A qa step whose need changed is refused too (verified, though it is given nothing)
+qm="[$(builder lib '' done audit_pass.sh),{\"id\":\"qa\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"lib\"],\"input\":\"gate\",\"check\":\"audit_report.sh\",\"gate\":\"g\"}]"
+mkco qtamper "$qm" 100000 lib qa
+run qtamper 1
+printf 'tampered\n' >> "$w/qtamper/steps/lib/ev/project.cho"
+"$F" company decide "$w/qtamper" g approved "go" > /dev/null
+run qtamper 2
+check "a qa step whose need changed: artifact-invalid (needs-changed), exit 14, not admitted" sh -c "[ '$(rc qtamper 1)' = 10 ] && [ '$(rc qtamper 2)' = 14 ] && grep -qx 'step: qa' '$w/qtamper.2.out' && grep -qx 'reason: needs-changed' '$w/qtamper.2.out' && [ $(kinds qtamper company.step.admitted qa) -eq 0 ]"
+
 # ---- a worker that ends without a claim: no accepted, exit 15
 mkco stuck "[$(builder lib '' stuck audit_pass.sh)]" 100000 lib
 run stuck 1

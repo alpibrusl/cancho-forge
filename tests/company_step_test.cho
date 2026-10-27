@@ -334,13 +334,15 @@ fn add_line[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -
     return out;
 }
 
+// A product step's need (`p`, run by a person) is not listed: its "artifact" is the manifest, which every run parses and trusts, and
+// there is nothing to give (fix round 1, I1).
 fn test_needs_text_lists_every_need_with_the_path_and_digest_the_journal_recorded[&h](heap: &!h Heap) -> [heap] int {
     var j = buffer.empty(heap, 512);
     j = add_line(heap, j, company_state.accepted(heap, 1, "a", "steps/a/ev/project.cho", "aa11"));
     j = add_line(heap, j, company_state.accepted(heap, 2, "q", "steps/q/ev/report.json", "bb22"));
     j = add_line(heap, j, company_state.accepted(heap, 3, "p", "company.json", "cc33"));
     borrow j as &jb in {
-        let want = "[{\"step\":\"a\",\"artifact\":\"steps/a/ev/project.cho\",\"path\":\"needs-a-project.cho\",\"sha256\":\"aa11\"},{\"step\":\"q\",\"artifact\":\"steps/q/ev/report.json\",\"path\":\"needs-q-report.json\",\"sha256\":\"bb22\"},{\"step\":\"p\",\"artifact\":\"company.json\",\"path\":\"needs-p-company.json\",\"sha256\":\"cc33\"}]\n";
+        let want = "[{\"step\":\"a\",\"artifact\":\"steps/a/ev/project.cho\",\"path\":\"needs-a-project.cho\",\"sha256\":\"aa11\"},{\"step\":\"q\",\"artifact\":\"steps/q/ev/report.json\",\"path\":\"needs-q-report.json\",\"sha256\":\"bb22\"}]\n";
         test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 3, want), 1);
         // A step with no needs gets nothing: no needs.json is written for it.
         test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 4, ""), 1);
@@ -356,11 +358,19 @@ fn test_needs_text_lists_every_need_with_the_path_and_digest_the_journal_recorde
 fn test_needs_text_lists_only_what_is_accepted[&h](heap: &!h Heap) -> [heap] int {
     var j = buffer.empty(heap, 256);
     j = add_line(heap, j, company_state.accepted(heap, 1, "q", "steps/q/ev/report.json", "bb22"));
+    j = add_line(heap, j, company_state.accepted(heap, 2, "p", "company.json", "cc33"));
     borrow j as &jb in {
         test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 3, "[{\"step\":\"q\",\"artifact\":\"steps/q/ev/report.json\",\"path\":\"needs-q-report.json\",\"sha256\":\"bb22\"}]\n"), 1);
     }
     buffer.drop(heap, j);
     test.assert_eq(needs_text_is(heap, "", 3, ""), 1);
+    // Only the person's need accepted: nothing to verify, nothing to give.
+    var k = buffer.empty(heap, 128);
+    k = add_line(heap, k, company_state.accepted(heap, 1, "p", "company.json", "cc33"));
+    borrow k as &kb in {
+        test.assert_eq(needs_text_is(heap, buffer.bytes(kb), 3, ""), 1);
+    }
+    buffer.drop(heap, k);
     return 0;
 }
 

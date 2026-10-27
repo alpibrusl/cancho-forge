@@ -198,7 +198,26 @@ pub fn artifact_rel[&h, &i](heap: &!h Heap, id: &i [byte], r: Runner) -> [heap] 
 // (`Runner::Build`) is also GIVEN them: in its execution directory, `needs-<need id>-<artifact name>` is a copy of each verified
 // artifact and `needs.json` is `needs_text`, the list of them. Flat names in the execution directory the operator made, because
 // Forge cannot make a directory. A qa, reviewer or product step is not given copies: what it reads is the operator's (a repository
-// checkout) or the manifest; its needs are still verified before it starts.
+// checkout) or the manifest; its needs are still verified before it starts. A need run by a PERSON (a product step) is neither
+// verified nor given (fix round 1, I1): its "artifact" is the whole manifest, which every run parses and trusts anyway, so
+// byte-verifying it would block every dependent on any later edit (whitespace, a new step) with nothing to deliver.
+
+fn is_person(r: Runner) -> [] bool {
+    match r {
+        Runner::Person => {
+            return true;
+        }
+        Runner::Build => {
+            return false;
+        }
+        Runner::Gate => {
+            return false;
+        }
+        Runner::Unsupported => {
+            return false;
+        }
+    }
+}
 
 // The name of the list in a builder's execution directory.
 pub fn needs_file() -> [] &static [byte] {
@@ -223,8 +242,8 @@ pub fn needs_reason(why: int) -> [] &static [byte] {
 
 // The `needs.json` of step number `k`: a JSON array, one object per need that is accepted, in the order of `needs`,
 // `{"step": <need id>, "artifact": <path the journal recorded>, "path": <needs_name, in the execution directory>, "sha256": <the
-// journal's digest>}`, and a newline. Every value is written escaped, whatever the journal held. Empty (nothing to write) for a
-// step with no accepted need, or a `k` outside the manifest.
+// journal's digest>}`, and a newline. Every value is written escaped, whatever the journal held. A need run by a person is left
+// out. Empty (nothing to verify or give) for a step with no such accepted need, or a `k` outside the manifest.
 pub fn needs_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, k: int) -> [heap] buffer.Buffer {
     if k < 0 {
         return buffer.empty(heap, 1);
@@ -241,7 +260,7 @@ pub fn needs_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, s
     while j < n {
         let id = company_manifest.step_need(m, step, j);
         let at = company_graph.index_of(m, id);
-        if company_state.accepted_at(s, at) {
+        if company_state.accepted_at(s, at) && is_person(runner_of(company_manifest.step_at(m, at).role)) == false {
             let (path, sha) = company_state.artifact_of(s, at);
             let name = needs_name(heap, id, runner_of(company_manifest.step_at(m, at).role));
             w = json.begin_object(heap, w);
