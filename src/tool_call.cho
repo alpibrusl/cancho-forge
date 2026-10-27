@@ -22,7 +22,8 @@ import forge.worker;
 //   the task is checked            (forge.tool_task.check: a refusal is a `refusal` record and the task stays `approved`)
 //   task.ready, task.running, execution.started
 //   the tool runner is started     (forge.worker.execute: a real child process, a deadline, an output cap, the evidence recomputed)
-//   a refusal record               (when the ending is one: its rule tag)
+//   a refusal record               (when the ending is one: its rule tag; and the runner's own `error.code`, one of
+//                                   `tool_task.known_code`, of a reply that is not `succeeded`: printed `worker-error: <code>`)
 //   execution.finished             (worker, basis "claimed": how the tool ended, `exited` or `signaled`, from report.json)
 //   task.verification | ready | blocked
 //
@@ -47,6 +48,26 @@ pub struct Finished {
     state: int,
     number: int,
     attempts: int,
+    // The tool runner's own `error.code` of the last attempt, when it is one it has (`tool_task.known_code`), else "": what a run
+    // that ended without a claim was refused or stopped for (fix round 1: the tag reaches the operator and the journal).
+    worker_code: &static [byte],
+}
+
+// The `error.code` of a worker's reply `out`, when it is one of the tool runner's own codes, else "".
+fn code_of[&h, &o](heap: &!h Heap, out: &o [byte]) -> [heap] &static [byte] {
+    var code = "";
+    let tape = box_slice(heap, json.tape_len(out), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(out, tp) > 0 && json.is_object(tp, 0) {
+            let c = json.get(out, tp, json.get(out, tp, 0, "error"), "code");
+            if json.is_string(tp, c) && json.string_plain(tp, c) {
+                code = tool_task.known_code(json.string_view(out, tp, c));
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return code;
 }
 
 pub fn claim_name(code: int) -> [] &static [byte] {
@@ -113,12 +134,13 @@ pub fn run[&h, &f, &x, &w, &c, &j, &d, &s, &t, &n, &i, &e](heap: &!h Heap, fs: &
         if rule == 0 {
             rule = 0 - 1;
         }
-        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, attempts: 0 };
+        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, attempts: 0, worker_code: "" };
     }
     let id = tool_task.task_id(heap, report.tasks + 1);
     var state = 0;
     var attempts = 0;
     var outcome = Outcome::Journal(0 - 1);
+    var worker_code = "";
     borrow id as &ib in {
         let tid = buffer.bytes(ib);
         let fresh = report.records == 0;
@@ -151,12 +173,26 @@ pub fn run[&h, &f, &x, &w, &c, &j, &d, &s, &t, &n, &i, &e](heap: &!h Heap, fs: &
                         borrow request_id as &rb in {
                             let req = tool_task.request(heap, buffer.bytes(rb), attempts, tid, tool, src, tp, argv, input, timeout_ms, 1048576, execution_dir, tools_dir, granted);
                             borrow req as &qb in {
-                                let ending = worker.execute(heap, exec, workers, fs, clock, "tool_run", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, false);
+                                // `worker.execute`, with the reply kept: a run that is not `succeeded` has its runner's own code
+                                // recorded as a refusal of the task and shown (`worker-error:`).
+                                let (out, ran) = worker.run(heap, exec, workers, clock, "tool_run", buffer.bytes(qb), 1048576, timeout_ms);
+                                var ending = dispatch.Ending::Timeout;
+                                borrow out as &ob in {
+                                    ending = worker.settle_run(heap, fs, ran, buffer.bytes(ob), buffer.bytes(rb), tid, execution_dir, false);
+                                    worker_code = "";
+                                    if !gate_run.succeeded(ending) {
+                                        worker_code = code_of(heap, buffer.bytes(ob));
+                                    }
+                                }
+                                buffer.drop(heap, out);
                                 let consequence = dispatch.consequence(ending);
                                 let decision = retry.decide(consequence, attempts, true);
                                 let tag = dispatch.rule_tag(ending);
                                 if len(tag) > 0 {
                                     seq = gate_run.note(heap, fs, journal_path, seq, tid, tag, false);
+                                }
+                                if len(worker_code) > 0 {
+                                    seq = gate_run.note(heap, fs, journal_path, seq, tid, worker_code, false);
                                 }
                                 match decision {
                                     retry.Decision::Again => {
@@ -207,7 +243,7 @@ pub fn run[&h, &f, &x, &w, &c, &j, &d, &s, &t, &n, &i, &e](heap: &!h Heap, fs: &
         map.drop(heap, tasks);
     }
     buffer.drop(heap, id);
-    return Finished { outcome: outcome, state: state, number: report.tasks + 1, attempts: attempts };
+    return Finished { outcome: outcome, state: state, number: report.tasks + 1, attempts: attempts, worker_code: worker_code };
 }
 
 fn line[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
@@ -249,6 +285,9 @@ fn show[&h, &i](heap: &!h Heap, io: &!i Io, done: Finished) -> [heap, io_write, 
                     line(io, "refusal: ", tag);
                 }
                 line(io, "ending: ", dispatch.consequence_name(dispatch.consequence(ending)));
+                if len(done.worker_code) > 0 {
+                    line(io, "worker-error: ", done.worker_code);
+                }
                 let again = retry.rule_tag(retry.decide(dispatch.consequence(ending), done.attempts, true));
                 if len(again) > 0 {
                     line(io, "refusal: ", again);

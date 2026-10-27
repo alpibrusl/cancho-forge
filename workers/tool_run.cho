@@ -34,9 +34,11 @@ import forge.verbs;
 //
 // Authority (`cancho authority`; the review artefact is docs/authority-tool-run.txt, compared by scripts/check_tool_run.sh):
 // `Exec("")` beneath a directory given at run time (`exec_under`, `exec_detached`: the report names no path), `child_signal` for
-// the group kill, `signals("INT,TERM")` and `signals_read` for the cancel, `Fs("")` to open the two directories and to write the
-// evidence (`fs_read`, `fs_write`, `file_write`; the path has passed `tool_task.check` and `journal_io.path_ok`), `dir_read` and
-// `file_read` for the input check, a clock, polling, pipes, the heap, stdio. No network, no foreign code, no arguments. What the
+// the group kill, `signals("INT,TERM")` and `signals_read` for the cancel, `Fs("")` to open the directories (`fs_read`; the path
+// has passed `tool_task.check` and `journal_io.path_ok`), `dir_write` and `file_write` for the evidence, written beneath the
+// execution directory's handle and never through a link (`put_evidence`: `tool.tmp` created O_EXCL|O_NOFOLLOW, renamed over the
+// name; fix round 1 replaced `fs_write("")`, which followed a link planted at `tool.out`), `dir_read` and `file_read` for the input
+// check, a clock, polling, pipes, the heap, stdio. No network, no foreign code, no arguments. What the
 // tool does once started is the tool's authority (docs/architecture.md, G2); a cancho-tools tool prints it under `authority`.
 
 fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] (buffer.Buffer, bool) {
@@ -52,32 +54,6 @@ fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] (buffer.B
         c = getchar(io);
     }
     return (all, true);
-}
-
-fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
-    if journal_io.path_ok(fs, path) == false {
-        return 0 - 2;
-    }
-    match open_write(fs, path) {
-        Opened::Failed(e) => {
-            return e;
-        }
-        Opened::Ok(opened) => {
-            var file = opened;
-            var rc = 0;
-            borrow mut file as &!x in {
-                rc = journal_io.write_all(x, contents);
-            }
-            file_close(file);
-            return rc;
-        }
-    }
-}
-
-fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
-    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
-    b = buffer.push(heap, b, byte_of(47));
-    return buffer.append(heap, b, name);
 }
 
 fn text_of[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] &s [byte] {
@@ -312,27 +288,86 @@ fn refuse[&h, &i, &r, &k](heap: &!h Heap, io: &!i Io, request_id: &r [byte], tas
     return answer(heap, io, request_id, task_id, "failed", tool_task.rule_name(why), "the task was refused before anything ran", "");
 }
 
-// Write one evidence file; 0 or why not.
-fn put_evidence[&h, &f, &e, &b](heap: &!h Heap, fs: &f Fs(""), exec_dir: &e [byte], name: &static [byte], data: &b [byte]) -> [heap, fs_write(""), file_write] int {
-    let path = under(heap, exec_dir, name);
-    var rc = 0;
-    borrow path as &pb in {
-        rc = write_file(fs, buffer.bytes(pb), data);
+// Replace `name` beneath the execution directory `d` with `data`, never through a link: written to `tool.tmp` (a stale one, or a link
+// of that name, removed first), created with O_EXCL and O_NOFOLLOW (`dir_open_new`), then renamed over `name` (a link there is
+// replaced, not followed; a directory there cannot be replaced, and the temporary is removed). 0 or an errno.
+fn put_evidence[&d, &b](d: &d Dir, name: &static [byte], data: &b [byte]) -> [dir_write, file_write] int {
+    var stale = 0;
+    match dir_remove(d, tool_task.tmp_name()) {
+        Done::Ok(n) => {
+            stale = 0;
+        }
+        Done::Failed(e) => {
+            stale = e;
+        }
     }
-    buffer.drop(heap, path);
-    return rc;
+    match dir_open_new(d, tool_task.tmp_name()) {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, data);
+            }
+            file_close(file);
+            if rc == 0 {
+                match dir_rename(d, tool_task.tmp_name(), name) {
+                    Done::Ok(n) => {
+                        rc = 0;
+                    }
+                    Done::Failed(e) => {
+                        rc = e;
+                    }
+                }
+            }
+            if rc != 0 {
+                match dir_remove(d, tool_task.tmp_name()) {
+                    Done::Ok(n) => {
+                        stale = 0;
+                    }
+                    Done::Failed(e) => {
+                        stale = e;
+                    }
+                }
+            }
+            return rc;
+        }
+    }
+}
+
+// The three evidence files beneath `exec_dir`, opened as a directory handle: 0 or why not.
+fn put_all[&f, &e, &o, &p, &q](fs: &f Fs(""), exec_dir: &e [byte], out: &o [byte], report: &p [byte], introspected: &q [byte]) -> [fs_read(""), dir_write, file_write] int {
+    if journal_io.path_ok(fs, exec_dir) == false {
+        return 0 - 2;
+    }
+    match open_dir(fs, exec_dir) {
+        DirOpened::Failed(e) => {
+            return e;
+        }
+        DirOpened::Ok(opened) => {
+            var d = opened;
+            var rc = 0;
+            borrow d as &db in {
+                rc = put_evidence(db, tool_task.out_name(), out);
+                if rc == 0 {
+                    rc = put_evidence(db, "report.json", report);
+                }
+                if rc == 0 && len(introspected) > 0 {
+                    rc = put_evidence(db, "introspect.json", introspected);
+                }
+            }
+            dir_close(d);
+            return rc;
+        }
+    }
 }
 
 // Write the evidence beneath `exec_dir` and answer: `tool.out`, `report.json`, and `introspect.json` when `introspected` is not empty.
 // A file that cannot be written is `evidence-unwritable` and no evidence is named.
-fn finish[&h, &i, &f, &r, &k, &e, &o, &p, &q](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), request_id: &r [byte], task_id: &k [byte], exec_dir: &e [byte], out: &o [byte], report: &p [byte], introspected: &q [byte], state: &static [byte], code: &static [byte], message: &static [byte]) -> [heap, io_write, fs_write(""), file_write] int {
-    var rc = put_evidence(heap, fs, exec_dir, tool_task.out_name(), out);
-    if rc == 0 {
-        rc = put_evidence(heap, fs, exec_dir, "report.json", report);
-    }
-    if rc == 0 && len(introspected) > 0 {
-        rc = put_evidence(heap, fs, exec_dir, "introspect.json", introspected);
-    }
+fn finish[&h, &i, &f, &r, &k, &e, &o, &p, &q](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), request_id: &r [byte], task_id: &k [byte], exec_dir: &e [byte], out: &o [byte], report: &p [byte], introspected: &q [byte], state: &static [byte], code: &static [byte], message: &static [byte]) -> [heap, io_write, fs_read(""), dir_write, file_write] int {
+    let rc = put_all(fs, exec_dir, out, report, introspected);
     if rc != 0 {
         return answer(heap, io, request_id, task_id, "failed", "evidence-unwritable", "the evidence could not be written in the execution directory", "");
     }
@@ -429,7 +464,7 @@ fn tool_args[&h, &s, &t, &p](heap: &!h Heap, src: &s [byte], tp: &t [int], argv:
 }
 
 // A task that passed `tool_task.check` and whose input is usable: ask the tool for its manifest, run it, write the evidence, answer.
-fn run_task[&h, &i, &f, &c, &x, &d, &r, &k, &n, &s, &t, &e, &p, &w](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], tool: &n [byte], src: &s [byte], tp: &t [int], argv: int, exec_dir: &e [byte], input_abs: &p [byte], timeout_ms: int, stop: &!w option.Option[SignalWatch]) -> [heap, io_write, fs_write(""), file_write, exec_under, exec_detached, clock, poll, signals_read] int {
+fn run_task[&h, &i, &f, &c, &x, &d, &r, &k, &n, &s, &t, &e, &p, &w](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], tool: &n [byte], src: &s [byte], tp: &t [int], argv: int, exec_dir: &e [byte], input_abs: &p [byte], timeout_ms: int, stop: &!w option.Option[SignalWatch]) -> [heap, io_write, fs_read(""), dir_write, file_write, exec_under, exec_detached, clock, poll, signals_read] int {
     let total = tool_task.runner_deadline_ms(timeout_ms);
     let start = clock_ms(clock);
     let env = env_block(heap);
@@ -529,7 +564,7 @@ fn run_task[&h, &i, &f, &c, &x, &d, &r, &k, &n, &s, &t, &e, &p, &w](heap: &!h He
 }
 
 // A task that passed `tool_task.check`: claim the signals, check the input and the tools directory, run it.
-fn execute_task[&h, &i, &f, &c, &x, &g, &r, &k, &n, &s, &t, &e, &d, &p](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), sig: &g Signals("INT,TERM"), request_id: &r [byte], task_id: &k [byte], tool: &n [byte], src: &s [byte], tp: &t [int], argv: int, exec_dir: &e [byte], tools_dir: &d [byte], input: &p [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll, signals("INT,TERM"), signals_read] int {
+fn execute_task[&h, &i, &f, &c, &x, &g, &r, &k, &n, &s, &t, &e, &d, &p](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), sig: &g Signals("INT,TERM"), request_id: &r [byte], task_id: &k [byte], tool: &n [byte], src: &s [byte], tp: &t [int], argv: int, exec_dir: &e [byte], tools_dir: &d [byte], input: &p [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), dir_read, dir_write, file_read, file_write, exec_under, exec_detached, clock, poll, signals("INT,TERM"), signals_read] int {
     if !input_usable(heap, fs, exec_dir, input) {
         return refuse(heap, io, request_id, task_id, tool_task.Refusal::InputUnusable);
     }
@@ -583,7 +618,7 @@ fn execute_task[&h, &i, &f, &c, &x, &g, &r, &k, &n, &s, &t, &e, &d, &p](heap: &!
     }
 }
 
-fn serve[&h, &i, &f, &c, &x, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), sig: &g Signals("INT,TERM")) -> [heap, io_read, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll, signals("INT,TERM"), signals_read] int {
+fn serve[&h, &i, &f, &c, &x, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), sig: &g Signals("INT,TERM")) -> [heap, io_read, io_write, fs_read(""), dir_read, dir_write, file_read, file_write, exec_under, exec_detached, clock, poll, signals("INT,TERM"), signals_read] int {
     let (request, whole) = read_request(heap, io);
     var code = 0;
     if !whole {

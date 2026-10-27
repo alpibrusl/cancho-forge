@@ -2,12 +2,12 @@ performs
     child_signal
     clock
     dir_read
+    dir_write
     exec_detached
     exec_under
     file_read
     file_write
     fs_read("")
-    fs_write("")
     heap
     io_read
     io_write

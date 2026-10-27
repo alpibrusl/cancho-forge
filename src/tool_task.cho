@@ -258,9 +258,66 @@ pub fn argv_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
 
 // Is `input` a file beneath the execution directory? The rule of a contract path (`build_task.contract_ok`): relative, or absolute
 // and beginning with the execution directory and a `/`; letters, digits and `._/-`, no `..`, no component starting with a dot or a
-// dash, no empty component, at most 512 bytes once resolved.
+// dash, no empty component, at most 512 bytes once resolved. And not one of the runner's own files (`own_file`).
 pub fn input_ok[&i, &e](input: &i [byte], execution_dir: &e [byte]) -> [] bool {
-    return build_task.contract_ok(input, execution_dir);
+    if !build_task.contract_ok(input, execution_dir) {
+        return false;
+    }
+    return !own_file(input_relative(input, execution_dir));
+}
+
+// The temporary name the runner writes each evidence file under before renaming it over its name.
+pub fn tmp_name() -> [] &static [byte] {
+    return "tool.tmp";
+}
+
+// Is `name` (relative to the execution directory) one of the files the runner writes there? An input of that name would be read by
+// the tool while the runner replaces it, so it is refused (`path-invalid`).
+pub fn own_file[&n](name: &n [byte]) -> [] bool {
+    return bytes.equal(name, out_name()) || bytes.equal(name, "report.json") || bytes.equal(name, "introspect.json") || bytes.equal(name, tmp_name());
+}
+
+// The error code a tool runner's reply carries, as the runner's own static text when it is one of its codes (every refusal tag of
+// this module, `tool-timeout`, `tool-output-overflow`, `tool-cancelled`, `evidence-unwritable`), else "". Forge records only a code
+// it knows: the reply is a worker's, untrusted text.
+pub fn known_code[&c](code: &c [byte]) -> [] &static [byte] {
+    if bytes.equal(code, "task-type-invalid") {
+        return "task-type-invalid";
+    }
+    if bytes.equal(code, "path-invalid") {
+        return "path-invalid";
+    }
+    if bytes.equal(code, "limits-invalid") {
+        return "limits-invalid";
+    }
+    if bytes.equal(code, "operator-invalid") {
+        return "operator-invalid";
+    }
+    if bytes.equal(code, "tool-not-granted") {
+        return "tool-not-granted";
+    }
+    if bytes.equal(code, "argv-malformed") {
+        return "argv-malformed";
+    }
+    if bytes.equal(code, "input-unusable") {
+        return "input-unusable";
+    }
+    if bytes.equal(code, "tool-unusable") {
+        return "tool-unusable";
+    }
+    if bytes.equal(code, "tool-timeout") {
+        return "tool-timeout";
+    }
+    if bytes.equal(code, "tool-output-overflow") {
+        return "tool-output-overflow";
+    }
+    if bytes.equal(code, "tool-cancelled") {
+        return "tool-cancelled";
+    }
+    if bytes.equal(code, "evidence-unwritable") {
+        return "evidence-unwritable";
+    }
+    return "";
 }
 
 // The absolute path of an input that passed `input_ok`.

@@ -66,5 +66,10 @@ four lines `service status latency`:
 **Not done.** forge#41's "Forge re-runs the same query and compares output hashes" is not built: determinism is asserted by the
 conformance (the same bytes twice, stand-in and real `tally`), and the step's check judges the output once. A SIGKILL of the
 runner or of Forge's group leaves the tool running until it ends by itself (a TERM or INT does not: the runner kills the tool's
-group first). The worker's own error code for a refusal after admission (`input-unusable`, `tool-unusable`) is not journalled by
-Forge; the run prints `step-failed` with the worker's ending.
+group first). The manifest hash is the tool's own self-report, unverified (see worker-contract 12.2).
+
+**When the runner refuses after admission** (the input is not there or not a regular file beneath the directory, the tool cannot be
+started, the evidence cannot be written) or stops the tool (its deadline, the 1 MiB cap, a signal), the run prints
+`worker-error: <code>` (`input-unusable`, `tool-unusable`, `evidence-unwritable`, `tool-timeout`, `tool-output-overflow`,
+`tool-cancelled`) before `refusal: step-failed` (exit 15), and the step's workspace journal records it as a refusal of the tool
+task. The operator's `tool_timeout_ms` is the deadline the run is given (the runner's own is four fifths of it).

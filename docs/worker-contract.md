@@ -626,8 +626,11 @@ worker's authority report with `docs/authority-tool-run.txt`).
   argument. Anything else is `argv-malformed`.
 * **`input` is a file beneath the execution directory**: the rule of a contract path (`build_task.contract_ok`: relative, or absolute
   and beginning with the execution directory; no `..`, no hidden or dash-led component, at most 512 bytes resolved), else
-  `path-invalid`. It is then opened beneath the directory one component at a time following no link, and one byte read: absent, a
-  link, a directory or unreadable is `input-unusable`. (Not handled: a named pipe there would block the open until Forge's deadline
+  `path-invalid`; so is an input that names one of the runner's own files (`tool.out`, `report.json`, `introspect.json`, `tool.tmp`).
+  It is then opened beneath the directory one component at a time following no link, and one byte read: absent, a link, reached
+  through a link, a directory or unreadable is `input-unusable`. **The check is by descriptor and the tool reopens the input by its
+  path** (time of check, time of use): something that can write the execution directory between the two could swap the file; the
+  execution directory is Forge's and the operator's, and nothing else runs there during a tool step. (Not handled: a named pipe there would block the open until Forge's deadline
   kills the worker; the execution directory is Forge's and the operator's.) The tool gets the input's absolute path as its **last**
   argument.
 * `timeout_ms` is 2 000 to 86 400 000. Order of the checks: type, paths (`execution_dir`, `tools_dir`: `gate_task.path_ok`),
@@ -637,16 +640,22 @@ worker's authority report with `docs/authority-tool-run.txt`).
 ### 12.2 What it does
 
 1. Claims `TERM` and `INT` (`signals("INT,TERM")`), before the first spawn.
-2. `<tool> introspect` (the cancho-tools convention), at most a tenth of the runner's deadline (10 s at most), 1 MiB: the SHA-256 of
-   the bytes of the top-level `authority` object of the answer (`tool_task.authority_span`: the tool's compiler-derived authority
-   report as the binary embeds and prints it) is recorded. A tool that does not answer `introspect` with such an object gets **no
-   invented hash**: `authority_manifest` is `{"source":"unavailable","sha256":null,"note":"<why>"}`.
-3. `<tool> <argv...> <input>` started with `exec_spawn_detached_under` beneath the tools directory (its working directory), `PATH`
+2. **Every granted tool is first run as `<tool> introspect`** (the cancho-tools convention), with the tools directory as its working
+   directory and the same environment and group kill as the real run, at most a tenth of the runner's deadline (10 s at most), 1 MiB:
+   the SHA-256 of the bytes of the top-level `authority` object of the answer (`tool_task.authority_span`: the authority report the
+   binary embeds and prints) is recorded. **This hash is the tool's own self-report and is unverified**: nothing checks that the
+   manifest is the one the binary was built with, or matches a ceiling; it names what the tool claimed, so that a later change is
+   visible. A tool that does not answer `introspect` with such an object gets **no invented hash**: `authority_manifest` is
+   `{"source":"unavailable","sha256":null,"note":"<why>"}`.
+3. `<tool> <argv...> <input>` started with `exec_spawn_detached_under` beneath the tools directory (its working directory; **a link
+   in the tools directory runs its target**: the kernel follows it, so what the directory holds is the operator's trust), `PATH`
    (the fixed `/usr/local/bin:/usr/bin:/bin`) its whole environment, its standard input empty (closed at once), standard error
    discarded, standard output kept up to 1 MiB. It leads a session and a group of its own; `supervise.watch_stop` kills that
    **group** at the runner's deadline (four fifths of Forge's, as the gate runner's: Forge's kill reaches the runner's pid only), one
    byte past the cap, and when a claimed signal arrives.
-4. Writes the evidence and answers.
+4. Writes the evidence and answers. Each file is written as `tool.tmp`, created O_EXCL and O_NOFOLLOW beneath the execution
+   directory's handle and renamed over its name: a link planted at any of the names is replaced, never written through; a name that
+   cannot be replaced (a directory) is `evidence-unwritable` (fix round 1; it was an `open_write` that followed a link).
 
 ### 12.3 The reply
 
@@ -657,19 +666,20 @@ worker's authority report with `docs/authority-tool-run.txt`).
 | `failed`, `tool-output-overflow` | more than 1 MiB on standard output; the group was killed | `tool.out` cut at exactly 1 MiB, the report with `stdout_truncated: true` |
 | `cancelled`, `tool-cancelled` | a `TERM` or `INT` reached the runner (Forge's cancel of a `sync` worker, section 3.3, or a signal to Forge's whole group); the group was killed | the three files, `ending: cancelled` |
 | `failed`, a refusal tag | `task-type-invalid`, `path-invalid`, `limits-invalid`, `operator-invalid`, `tool-not-granted`, `argv-malformed`, `input-unusable`, `tool-unusable`: nothing ran | none; nothing is written |
-| `failed`, `evidence-unwritable` | a file could not be written | none |
+| `failed`, `evidence-unwritable` | a file could not be put beneath the execution directory (a directory at its name) | none |
 
 `report.json`: `{"schema":"forge-tool-report/1","tool","argv","input","ending":"exited"|"signaled"|"timeout"|"output-overflow"|"cancelled",
 "exit_status","signal","stdout_bytes","stdout_cap","stdout_truncated","authority_manifest":{"source","sha256"[,"note"]}}`. Nothing in
 it depends on the clock: the same request in the same directory writes the same bytes (asserted, with the stand-in and with the real
 `tally`). A request that is not an `execute` or `capabilities` of this contract is not answered (exit 4); `cancel`, `status` and
-`result` are not sent to a `sync` worker (section 3.6).
+`result` are not sent to a `sync` worker (section 3.6). Forge (`tool_call`) records the `error.code` of a reply that is not
+`succeeded`, when it is one of the codes above, as a `refusal` of the task and prints it `worker-error: <code>`.
 
 ### 12.4 Authority, and what is not done
 
 `docs/authority-tool-run.txt`: `exec_under` and `exec_detached` (no path: the tools directory is given at run time), `child_signal`
-(the group kill), `signals("INT,TERM")`, `signals_read`, `fs_read("")`/`dir_read`/`file_read` (the two directories, the input
-check), `fs_write("")`/`file_write` (the evidence), a clock, polling, a pipe, the heap, stdio. No network, no arguments, no foreign
+(the group kill), `signals("INT,TERM")`, `signals_read`, `fs_read("")`/`dir_read`/`file_read` (the directories, the input
+check), `dir_write`/`file_write` (the evidence, beneath a directory handle; no `fs_write` since fix round 1), a clock, polling, a pipe, the heap, stdio. No network, no arguments, no foreign
 code. Not done: a SIGKILL of the runner (or of Forge's group) leaves the tool running until it ends by itself, as a qa step's gate
 (G4); the deterministic re-run comparison of forge#41 (Forge re-running the same query and comparing output hashes) is not
 built: determinism is asserted by the conformance, and the step's check judges the output; a tool that starts a descendant that

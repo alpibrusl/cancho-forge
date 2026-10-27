@@ -115,6 +115,23 @@ go absent absent '[]' checks.log 20000
 check "a granted tool that cannot be started (not executable, not there) is tool-unusable; nothing written" sh -c "grep -q '\"code\":\"tool-unusable\"' '$t/notexec.out' && grep -q '\"code\":\"tool-unusable\"' '$t/absent.out' && [ \$(ls -A '$t/ev_notexec') = checks.log ] && [ \$(ls -A '$t/ev_absent') = checks.log ]"
 check "every refusal is a valid failed reply with no evidence" sh -c "for x in unlisted nonarray escape type absentin notexec; do grep -q '\"state\":\"failed\".*\"evidence\":\[\]' \"$t/\$x.out\" || exit 1; done"
 
+check "dirin: nothing was written beside the directory named as input" sh -c "[ \$(ls -A '$t/ev_dirin') = checks.log ]"
+mkdir "$t/ev_midlink" && ln -s "$t/outside" "$t/ev_midlink/sub" || exit 1
+go midlink count '[]' sub/s.txt 20000
+check "an input reached through a link to a directory outside (sub/s.txt, sub a link) is input-unusable; nothing written" sh -c "grep -q '\"code\":\"input-unusable\"' '$t/midlink.out' && [ \$(ls -A '$t/ev_midlink') = sub ]"
+mkdir "$t/ev_ownin" && log ownin
+go ownin count '[]' tool.out 20000
+check "an input that names one of the runner's own files (tool.out) is path-invalid; nothing written" sh -c "grep -q '\"code\":\"path-invalid\"' '$t/ownin.out' && [ \$(ls -A '$t/ev_ownin') = checks.log ]"
+
+# ---- the evidence is never written through a link, and a name that cannot be replaced is evidence-unwritable
+mkdir "$t/ev_evdir" "$t/ev_evdir/tool.out" && log evdir
+go evdir count '[]' checks.log 20000
+check "a directory at tool.out: failed evidence-unwritable, no evidence named, the directory left" sh -c "grep -q '\"state\":\"failed\"' '$t/evdir.out' && grep -q '\"code\":\"evidence-unwritable\"' '$t/evdir.out' && grep -q '\"evidence\":\[\]' '$t/evdir.out' && [ -d '$t/ev_evdir/tool.out' ]"
+mkdir "$t/ev_links" && log links
+for f in tool.out report.json introspect.json tool.tmp; do echo keep > "$t/outside/$f.target"; ln -s "$t/outside/$f.target" "$t/ev_links/$f" || exit 1; done
+go links count '[]' checks.log 20000
+check "links planted at tool.out, report.json, introspect.json and tool.tmp are replaced, never written through: succeeded, regular files, the outside files untouched" sh -c "grep -q '\"state\":\"succeeded\"' '$t/links.out' && for f in tool.out report.json introspect.json; do [ -f '$t/ev_links/'\$f ] && [ ! -L '$t/ev_links/'\$f ] || exit 1; done && [ ! -e '$t/ev_links/tool.tmp' ] && for f in tool.out report.json introspect.json tool.tmp; do [ \"\$(cat '$t/outside/'\$f.target)\" = keep ] || exit 1; done && [ \"\$(cat '$t/ev_links/tool.out')\" = 4 ]"
+
 # ---- exit status, no manifest, the output cap, the deadline, the cancel
 mkdir "$t/ev_exit3" && log exit3
 go exit3 exit3 '[]' checks.log 20000

@@ -306,3 +306,30 @@ fn test_an_input_is_resolved_against_the_execution_directory_and_back[&h](heap: 
     buffer.drop(heap, r);
     return 0;
 }
+
+fn test_an_input_that_names_one_of_the_runners_own_files_is_path_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "tool.out"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "report.json"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "introspect.json"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "tool.tmp"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "/work/steps/a/ev/tool.out"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "sub/tool.out"), ""));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "tool.output"), ""));
+    return 0;
+}
+
+fn test_a_worker_error_code_is_known_only_when_it_is_one_of_the_runners() -> [] int {
+    test.assert(bytes.equal(tool_task.known_code("input-unusable"), "input-unusable"));
+    test.assert(bytes.equal(tool_task.known_code("tool-unusable"), "tool-unusable"));
+    test.assert(bytes.equal(tool_task.known_code("tool-not-granted"), "tool-not-granted"));
+    test.assert(bytes.equal(tool_task.known_code("argv-malformed"), "argv-malformed"));
+    test.assert(bytes.equal(tool_task.known_code("tool-timeout"), "tool-timeout"));
+    test.assert(bytes.equal(tool_task.known_code("tool-output-overflow"), "tool-output-overflow"));
+    test.assert(bytes.equal(tool_task.known_code("tool-cancelled"), "tool-cancelled"));
+    test.assert(bytes.equal(tool_task.known_code("evidence-unwritable"), "evidence-unwritable"));
+    test.assert(bytes.equal(tool_task.known_code("path-invalid"), "path-invalid"));
+    test.assert_eq(len(tool_task.known_code("rm -rf /")), 0);
+    test.assert_eq(len(tool_task.known_code("")), 0);
+    test.assert_eq(len(tool_task.known_code("input-unusable ")), 0);
+    return 0;
+}

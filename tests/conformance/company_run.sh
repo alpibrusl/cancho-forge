@@ -62,6 +62,7 @@ EOF
 cat > "$w/atools/recount" <<'EOT'
 #!/bin/sh
 if [ "$1" = introspect ]; then printf %s '{"tool":"recount","authority":{"bounded":true,"effects":["heap"]}}'; exit 0; fi
+if [ "$1" = --sleep ]; then sleep "$2"; fi
 awk -v s="$2" '$2 == s { n++ } END { print n+0 }' "$3"
 EOT
 chmod +x "$w/atools/recount" || exit 1
@@ -425,7 +426,22 @@ check "analyst: no entry for the step in the operator file is operator-invalid, 
 mkan anlgone 3
 rm "$w/anlgone/steps/an/ev/checks.log"
 run anlgone 1
-check "analyst: an input that is not there is refused by the worker (input-unusable; the worker's code is not journalled, so: it said failed, ran nothing): step-failed, exit 15" sh -c "[ '$(rc anlgone 1)' = 15 ] && grep -qx 'refusal: step-failed' '$w/anlgone.1.out' && grep -qx 'ending: worker-said' '$w/anlgone.1.out' && [ ! -e '$w/anlgone/steps/an/ev/tool.out' ] && grep -q '\"kind\":\"task.blocked\",\"task\":\"tool-1\"' '$w/anlgone/steps/an/journal.jsonl' && ! grep -q 'company.step.accepted' '$w/anlgone/company.journal'"
+check "analyst: an input that is not there is refused by the worker after admission: the operator is told its code (worker-error: input-unusable), the step's journal records it, step-failed, exit 15" sh -c "[ '$(rc anlgone 1)' = 15 ] && grep -qx 'refusal: step-failed' '$w/anlgone.1.out' && grep -qx 'worker-error: input-unusable' '$w/anlgone.1.out' && grep -q '\"kind\":\"refusal\",\"task\":\"tool-1\",\"rule\":\"input-unusable\"' '$w/anlgone/steps/an/journal.jsonl' && [ ! -e '$w/anlgone/steps/an/ev/tool.out' ] && ! grep -q 'company.step.accepted' '$w/anlgone/company.journal'"
+# the operator's tool_timeout_ms is the one the run is given: a tool that sleeps 30 s under a 10 s timeout (the runner's own deadline
+# is 8 s) ends as tool-timeout, well before the default of 600 s
+mkan anlslow 3
+sed 's|"tool_timeout_ms":20000|"tool_timeout_ms":10000|; s|"argv":\["--status","up"\]|"argv":["--sleep","30"]|' "$w/operator.json" > "$w/op_slow.json"
+slow_start=$(date +%s)
+run_op anlslow 1 "$w/op_slow.json"
+slow_took=$(( $(date +%s) - slow_start ))
+check "analyst: the operator's tool_timeout_ms is honoured: tool-timeout (worker-error) in about 8 s, step-failed, exit 15, the tool gone" sh -c "[ '$(rc anlslow 1)' = 15 ] && grep -qx 'worker-error: tool-timeout' '$w/anlslow.1.out' && [ $slow_took -lt 20 ] && grep -q '\"ending\":\"timeout\"' '$w/anlslow/steps/an/ev/report.json' && ! pgrep -f '^sleep 30\$' > /dev/null"
+# an analyst uses no model: a spent budget does not hold it (a build spends 1100 of a 1000-token ceiling first)
+mkco anlbudget "[$(builder one '' spend audit_pass.sh),$(analyst same_up.sh)]" 1000 one an
+printf 'svc1 up 12\nsvc1 down 0\nsvc2 up 30\nsvc1 up 15\n' > "$w/anlbudget/steps/an/ev/checks.log"
+printf '{"checks":4,"up":3}' > "$w/anlbudget/summary.json"
+cp "$w/anl/same_up.sh" "$w/anlbudget/same_up.sh" || exit 1
+run anlbudget 1
+check "analyst: not held by a spent budget: the build spends past the ceiling, the analyst still runs and is accepted, exit 0" sh -c "[ '$(rc anlbudget 1)' = 0 ] && grep -q 'company.spend.recorded' '$w/anlbudget/company.journal' && [ $(kinds anlbudget company.step.accepted one) -eq 1 ] && [ $(kinds anlbudget company.step.accepted an) -eq 1 ]"
 
 # ---- resume: a step admitted and never accepted (a run killed mid-step) is admitted again, once, and accepted once
 mkco resume "[$(builder lib '' done audit_pass.sh)]" 100000 lib
