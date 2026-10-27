@@ -1,0 +1,461 @@
+edition 9;
+module forge.tool_task;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import forge.build_task;
+import forge.gate_task;
+
+// The `tool.run` task (task 11; docs/worker-contract.md section 12; spec section 4.2, the analyst): one run of a deterministic data
+// tool, such as `tally` or `jsonq` of cancho-tools, over one input file of the execution directory. This module is the pure half:
+// what a task may say, the refusals with their rule tags, the deadline arithmetic, where the tool's own authority manifest lies in
+// its `introspect` answer, and the request Forge builds. It opens nothing and starts nothing; `workers/tool_run.cho` is the process
+// half and `forge.tool_call` is Forge's side.
+//
+// Three things come from three places, and the manifest author chooses none of them:
+//   * WHICH tools may run, and where they are, is the operator's: `grants.tools_dir` and `grants.granted_tools`, built by Forge from
+//     the operator file (never from the manifest or the task). A tool the list does not name is `tool-not-granted`.
+//   * WHAT the tool is run with, the tool name, its argument vector and the input, is also the operator's in a company run (the
+//     operator file's `analysts.<step id>`); the task carries it to the worker. The argument vector is a JSON ARRAY of plain strings,
+//     never shell text: no shell ever sees it. The input is a file beneath the execution directory, given to the tool as its LAST
+//     argument, by absolute path.
+//   * The execution directory is Forge's.
+
+// What a task is refused for. Each has a rule tag (docs/architecture.md, section 7) and a test that reaches it.
+pub enum Refusal {
+    // `task.type` is not `tool.run`.
+    TaskTypeInvalid,
+    // The execution directory or the tools directory is not a path the worker will use (`gate_task.path_ok`), or the input is not a
+    // file beneath the execution directory (`build_task.contract_ok`'s rule: no `..`, no other directory, no hidden component).
+    PathInvalid,
+    // `limits.timeout_ms` is outside 2 s to a day.
+    LimitsInvalid,
+    // `grants.granted_tools` is missing, not an array, longer than 32, or holds something that is not a tool name.
+    OperatorInvalid,
+    // The tool is not one of `grants.granted_tools`.
+    ToolNotGranted,
+    // The argument vector is not an array of 0 to 64 plain strings of 1 to 4096 bytes, 64 KiB in all, with no control byte.
+    ArgvMalformed,
+    // The input is not there, is reached through a link, or is not a regular file (decided by the worker, which opens it beneath
+    // the execution directory following no link).
+    InputUnusable,
+    // The tools directory cannot be opened or the tool cannot be started there (decided by the worker).
+    ToolUnusable,
+}
+
+pub enum Checked {
+    Held,
+    Refused(Refusal),
+}
+
+pub fn rule_name(r: Refusal) -> [] &static [byte] {
+    match r {
+        Refusal::TaskTypeInvalid => {
+            return "task-type-invalid";
+        }
+        Refusal::PathInvalid => {
+            return "path-invalid";
+        }
+        Refusal::LimitsInvalid => {
+            return "limits-invalid";
+        }
+        Refusal::OperatorInvalid => {
+            return "operator-invalid";
+        }
+        Refusal::ToolNotGranted => {
+            return "tool-not-granted";
+        }
+        Refusal::ArgvMalformed => {
+            return "argv-malformed";
+        }
+        Refusal::InputUnusable => {
+            return "input-unusable";
+        }
+        Refusal::ToolUnusable => {
+            return "tool-unusable";
+        }
+    }
+}
+
+pub fn task_type() -> [] &static [byte] {
+    return "tool.run";
+}
+
+pub fn min_timeout_ms() -> [] int {
+    return 2000;
+}
+
+pub fn max_timeout_ms() -> [] int {
+    return 86400000;
+}
+
+pub fn max_args() -> [] int {
+    return 64;
+}
+
+pub fn max_arg_bytes() -> [] int {
+    return 4096;
+}
+
+pub fn max_argv_bytes() -> [] int {
+    return 65536;
+}
+
+pub fn max_granted() -> [] int {
+    return 32;
+}
+
+// The most of the tool's standard output that is kept (`tool.out`); one byte more kills the tool's group and the run is
+// `tool-output-overflow`, with the first `out_cap` bytes kept and the report saying `stdout_truncated: true`.
+pub fn out_cap() -> [] int {
+    return 1048576;
+}
+
+// The most of the tool's `introspect` answer that is read.
+pub fn introspect_cap() -> [] int {
+    return 1048576;
+}
+
+// The name of the file that holds the tool's standard output: the step's artifact in a company run.
+pub fn out_name() -> [] &static [byte] {
+    return "tool.out";
+}
+
+// The worker's own deadline, four fifths of Forge's (as the gate runner's, `gate_task.runner_deadline_ms`): the tool is started in a
+// group of its own, which Forge's kill of the worker does not reach, so the worker must end it first.
+pub fn runner_deadline_ms(timeout_ms: int) -> [] int {
+    return timeout_ms / 5 * 4;
+}
+
+// The deadline of the `introspect` call: a tenth of the worker's, at most 10 s, at least 1 ms.
+pub fn introspect_deadline_ms(runner_ms: int) -> [] int {
+    var d = runner_ms / 10;
+    if d > 10000 {
+        d = 10000;
+    }
+    if d < 1 {
+        d = 1;
+    }
+    return d;
+}
+
+// A tool's name: 1 to 64 bytes of letters, digits, `.`, `_` and `-`, not starting with a dot or a dash. It is looked up beneath the
+// tools directory, so it can be neither a path nor `.` nor `..`.
+pub fn name_ok[&n](name: &n [byte]) -> [] bool {
+    if len(name) < 1 || len(name) > 64 {
+        return false;
+    }
+    var i = 0;
+    while i < len(name) {
+        let c = int_of(name[i]);
+        let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        let punct = c == 46 || c == 45 || c == 95;
+        if !letter && !digit && !punct {
+            return false;
+        }
+        if i == 0 && (c == 46 || c == 45) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// One argument: 1 to 4096 bytes, no control byte (below 32, or 127; so no NUL, newline or tab). Anything else, non-ASCII UTF-8
+// included, is passed as it is: no shell reads it.
+pub fn arg_ok[&a](arg: &a [byte]) -> [] bool {
+    if len(arg) < 1 || len(arg) > max_arg_bytes() {
+        return false;
+    }
+    var i = 0;
+    while i < len(arg) {
+        let c = int_of(arg[i]);
+        if c < 32 || c == 127 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn plain[&t](tp: &t [int], node: int) -> [] bool {
+    return json.is_string(tp, node) && json.string_plain(tp, node);
+}
+
+// Is the node an array of at most 32 plain strings, each a tool name? An empty list grants nothing: every tool is then
+// `tool-not-granted`.
+pub fn granted_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if !json.is_array(tp, node) {
+        return false;
+    }
+    let n = json.count(tp, node);
+    if n > max_granted() {
+        return false;
+    }
+    var k = node + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if !plain(tp, k) {
+            ok = false;
+        } else if !name_ok(json.string_view(src, tp, k)) {
+            ok = false;
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// Does the granted list at `node` (one `granted_ok` holds for) name `tool`?
+pub fn granted_has[&s, &t, &n](src: &s [byte], tp: &t [int], node: int, tool: &n [byte]) -> [] bool {
+    let n = json.count(tp, node);
+    var k = node + 1;
+    var j = 0;
+    var found = false;
+    while j < n {
+        if plain(tp, k) {
+            if bytes.equal(json.string_view(src, tp, k), tool) {
+                found = true;
+            }
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return found;
+}
+
+// Is the node an argument vector: an array of at most 64 plain strings, each `arg_ok`, at most 64 KiB in all?
+pub fn argv_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if !json.is_array(tp, node) {
+        return false;
+    }
+    let n = json.count(tp, node);
+    if n > max_args() {
+        return false;
+    }
+    var k = node + 1;
+    var j = 0;
+    var total = 0;
+    var ok = true;
+    while j < n {
+        if !plain(tp, k) {
+            ok = false;
+        } else {
+            let a = json.string_view(src, tp, k);
+            total = total + len(a);
+            if !arg_ok(a) {
+                ok = false;
+            }
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return ok && total <= max_argv_bytes();
+}
+
+// Is `input` a file beneath the execution directory? The rule of a contract path (`build_task.contract_ok`): relative, or absolute
+// and beginning with the execution directory and a `/`; letters, digits and `._/-`, no `..`, no component starting with a dot or a
+// dash, no empty component, at most 512 bytes once resolved.
+pub fn input_ok[&i, &e](input: &i [byte], execution_dir: &e [byte]) -> [] bool {
+    return build_task.contract_ok(input, execution_dir);
+}
+
+// The absolute path of an input that passed `input_ok`.
+pub fn input_resolved[&h, &i, &e](heap: &!h Heap, input: &i [byte], execution_dir: &e [byte]) -> [heap] buffer.Buffer {
+    return build_task.contract_resolved(heap, input, execution_dir);
+}
+
+// The input of `input_ok` as a path relative to the execution directory (for an open beneath it).
+pub fn input_relative[&i, &e](input: &i [byte], execution_dir: &e [byte]) -> [] &i [byte] {
+    if len(input) == 0 || int_of(input[0]) != 47 {
+        return input;
+    }
+    var base = len(execution_dir);
+    while base > 1 && int_of(execution_dir[base - 1]) == 47 {
+        base = base - 1;
+    }
+    if len(input) <= base + 1 {
+        return input[0..0];
+    }
+    return input[base + 1..len(input)];
+}
+
+// The first thing wrong with a task, in a fixed order: type, paths (the execution and tools directories), limits, the operator's
+// granted list, the tool, the argument vector, the input. `granted` and `argv` are nodes of `src` (the request, or the operator
+// file); a node that is not there is -1, which every check refuses.
+pub fn check[&y, &e, &d, &s, &t, &n, &i](task_type_text: &y [byte], execution_dir: &e [byte], tools_dir: &d [byte], timeout_ms: int, src: &s [byte], tp: &t [int], granted: int, tool: &n [byte], argv: int, input: &i [byte]) -> [] Checked {
+    if !bytes.equal(task_type_text, task_type()) {
+        return Checked::Refused(Refusal::TaskTypeInvalid);
+    }
+    if !gate_task.path_ok(execution_dir) || !gate_task.path_ok(tools_dir) {
+        return Checked::Refused(Refusal::PathInvalid);
+    }
+    if timeout_ms < min_timeout_ms() || timeout_ms > max_timeout_ms() {
+        return Checked::Refused(Refusal::LimitsInvalid);
+    }
+    if !granted_ok(src, tp, granted) {
+        return Checked::Refused(Refusal::OperatorInvalid);
+    }
+    if !name_ok(tool) || !granted_has(src, tp, granted, tool) {
+        return Checked::Refused(Refusal::ToolNotGranted);
+    }
+    if !argv_ok(src, tp, argv) {
+        return Checked::Refused(Refusal::ArgvMalformed);
+    }
+    if !input_ok(input, execution_dir) {
+        return Checked::Refused(Refusal::PathInvalid);
+    }
+    return Checked::Held;
+}
+
+fn is_ws(c: int) -> [] bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+// The byte range `[start, end)` of `src` that is the value of the top-level key `authority` of a parsed object, when that value is
+// an object: the tool's own authority manifest as it printed it (cancho-tools `introspect`, the compiler-derived report embedded in
+// the binary). `(-1, -1)` when the root is not an object, the key is not there (written plain), or its value is not an object.
+// The tape is `std.json`'s: a string node holds the byte range inside its quotes (`tp[3k+1]`, `tp[3k+2]`). From the key's closing
+// quote the colon and the white space are stepped over to the `{`, and the object is closed by counting braces outside strings.
+pub fn authority_span[&s, &t](src: &s [byte], tp: &t [int]) -> [] (int, int) {
+    if !json.is_object(tp, 0) {
+        return (0 - 1, 0 - 1);
+    }
+    let n = json.count(tp, 0);
+    var k = 1;
+    var j = 0;
+    var at = 0 - 1;
+    while j < n && at < 0 {
+        if plain(tp, k) && json.string_equals(src, tp, k, "authority") && json.is_object(tp, k + 1) {
+            if 3 * k + 2 < len(tp) {
+                at = tp[3 * k + 2] + 1;
+            }
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    if at < 0 {
+        return (0 - 1, 0 - 1);
+    }
+    var p = at;
+    var seen_colon = false;
+    var looking = true;
+    while looking && p < len(src) {
+        let c = int_of(src[p]);
+        if is_ws(c) {
+            p = p + 1;
+        } else if c == 58 && !seen_colon {
+            seen_colon = true;
+            p = p + 1;
+        } else {
+            looking = false;
+        }
+    }
+    if p >= len(src) || !seen_colon || int_of(src[p]) != 123 {
+        return (0 - 1, 0 - 1);
+    }
+    let start = p;
+    var depth = 0;
+    var in_string = false;
+    var escaped = false;
+    var end = 0 - 1;
+    while p < len(src) && end < 0 {
+        let c = int_of(src[p]);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == 92 {
+                escaped = true;
+            } else if c == 34 {
+                in_string = false;
+            }
+        } else if c == 34 {
+            in_string = true;
+        } else if c == 123 {
+            depth = depth + 1;
+        } else if c == 125 {
+            depth = depth - 1;
+            if depth == 0 {
+                end = p + 1;
+            }
+        }
+        p = p + 1;
+    }
+    if end < 0 {
+        return (0 - 1, 0 - 1);
+    }
+    return (start, end);
+}
+
+// The id of the `n`th tool task of a workspace: `tool-n`.
+pub fn task_id[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    return buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 16), "tool-"), n);
+}
+
+// The array of the plain strings of the array node `node`, written again (an `argv_ok` or `granted_ok` node).
+fn put_strings[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tp: &t [int], node: int) -> [heap] json.Writer {
+    var x = json.begin_array(heap, w);
+    let n = json.count(tp, node);
+    var k = node + 1;
+    var j = 0;
+    while j < n {
+        if plain(tp, k) {
+            x = json.put_string(heap, x, json.string_view(src, tp, k));
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return json.end_array(heap, x);
+}
+
+// The `execute` request of a `tool.run` task, as the worker reads it. `argv` and `granted` are nodes of `src` that passed `check`;
+// they are written again string by string. The tools directory and the granted list are in `grants`, never in `task.input`.
+pub fn request[&h, &r, &k, &n, &s, &t, &i, &e, &d](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &k [byte], tool: &n [byte], src: &s [byte], tp: &t [int], argv: int, input: &i [byte], timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], tools_dir: &d [byte], granted: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "verb");
+    w = json.put_string(heap, w, "execute");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "attempt");
+    w = json.put_int(heap, w, attempt);
+    w = json.put_key(heap, w, "task");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "id");
+    w = json.put_string(heap, w, task_id_text);
+    w = json.put_key(heap, w, "type");
+    w = json.put_string(heap, w, task_type());
+    w = json.put_key(heap, w, "input");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "tool");
+    w = json.put_string(heap, w, tool);
+    w = json.put_key(heap, w, "argv");
+    w = put_strings(heap, w, src, tp, argv);
+    w = json.put_key(heap, w, "input");
+    w = json.put_string(heap, w, input);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "limits");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "timeout_ms");
+    w = json.put_int(heap, w, timeout_ms);
+    w = json.put_key(heap, w, "max_output_bytes");
+    w = json.put_int(heap, w, max_output_bytes);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "grants");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "execution_dir");
+    w = json.put_string(heap, w, execution_dir);
+    w = json.put_key(heap, w, "tools_dir");
+    w = json.put_string(heap, w, tools_dir);
+    w = json.put_key(heap, w, "granted_tools");
+    w = put_strings(heap, w, src, tp, granted);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}

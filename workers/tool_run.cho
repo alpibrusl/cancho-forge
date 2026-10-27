@@ -1,0 +1,676 @@
+edition 9;
+
+import std.buffer;
+import std.dirs;
+import std.io;
+import std.json;
+import std.option;
+import std.process;
+import forge.gate_env;
+import forge.journal_io;
+import forge.snapshot;
+import forge.supervise;
+import forge.tool_task;
+import forge.verbs;
+
+// The tool runner (task 11; docs/worker-contract.md section 12; spec section 4.2, the analyst): a `sync` worker of the contract.
+// One `execute` request on stdin, one response on stdout, exit 0. The task is `tool.run`: it names a tool of the operator's granted
+// list (`grants.granted_tools`, beneath `grants.tools_dir`), the tool's argument vector as a JSON array of strings, and an input
+// file beneath `grants.execution_dir`. The runner checks it (`tool_task.check`, then the input opened beneath the execution
+// directory following no link), asks the tool for its own authority manifest (`<tool> introspect`, the cancho-tools convention:
+// forge#41), runs `<tool> <argv...> <absolute input path>` and writes what happened as evidence in the execution directory:
+//
+//   tool.out         kind `file`    the tool's standard output, at most 1 MiB (the step's artifact in a company run)
+//   report.json      kind `report`  how it ended, its exit status, the output's size and whether it was cut, and the SHA-256 of the
+//                                   tool's authority manifest (or why there is none)
+//   introspect.json  kind `log`     what `introspect` printed, when it printed anything
+//
+// No shell: the tool is started with `exec_spawn_detached_under` beneath the tools directory, with `PATH` (the fixed one) its whole
+// environment, an empty standard input and standard error discarded. It leads a session and a process group of its own, and the
+// runner kills that group at its deadline (four fifths of Forge's), one byte past the output cap, and when a claimed TERM or INT
+// arrives (worker-contract 3.3: a `sync` worker is cancelled by a signal; `supervise.watch_stop`). A tool that exits, with any
+// status, or is ended by a signal of its own is `succeeded` with that status in the report: what its output means is the check's
+// to say, never the runner's. The deadline, the cap and a cancel are `failed` / `cancelled`, with the evidence written all the same.
+//
+// Authority (`cancho authority`; the review artefact is docs/authority-tool-run.txt, compared by scripts/check_tool_run.sh):
+// `Exec("")` beneath a directory given at run time (`exec_under`, `exec_detached`: the report names no path), `child_signal` for
+// the group kill, `signals("INT,TERM")` and `signals_read` for the cancel, `Fs("")` to open the two directories and to write the
+// evidence (`fs_read`, `fs_write`, `file_write`; the path has passed `tool_task.check` and `journal_io.path_ok`), `dir_read` and
+// `file_read` for the input check, a clock, polling, pipes, the heap, stdio. No network, no foreign code, no arguments. What the
+// tool does once started is the tool's authority (docs/architecture.md, G2); a cancho-tools tool prints it under `authority`.
+
+fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] (buffer.Buffer, bool) {
+    var all = buffer.empty(heap, 1024);
+    var c = getchar(io);
+    var n = 0;
+    while c >= 0 {
+        if n >= 1048576 {
+            return (all, false);
+        }
+        all = buffer.push(heap, all, byte_of(c));
+        n = n + 1;
+        c = getchar(io);
+    }
+    return (all, true);
+}
+
+fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
+    if journal_io.path_ok(fs, path) == false {
+        return 0 - 2;
+    }
+    match open_write(fs, path) {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, contents);
+            }
+            file_close(file);
+            return rc;
+        }
+    }
+}
+
+fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of(47));
+    return buffer.append(heap, b, name);
+}
+
+fn text_of[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] &s [byte] {
+    if node >= 0 && json.is_string(tape, node) && json.string_plain(tape, node) {
+        return json.string_view(src, tape, node);
+    }
+    return src[0..0];
+}
+
+fn is[&s, &t](src: &s [byte], tape: &t [int], node: int, text: &static [byte]) -> [] bool {
+    return node >= 0 && json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+// `PATH=<the fixed path>`, the tool's whole environment.
+fn env_block[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var env = buffer.append(heap, buffer.empty(heap, 64), "PATH=");
+    env = buffer.append(heap, env, gate_env.fixed_path());
+    return buffer.push(heap, env, byte_of(0));
+}
+
+// Start `name` beneath `tools` with the argument list `args` and the environment `env`, in a session of its own, its input empty,
+// and wait under `most` bytes and `deadline_ms` milliseconds, or until a claimed signal: what it wrote, how it ended, and whether a
+// signal stopped it.
+fn run_tool[&h, &x, &d, &c, &n, &a, &v, &s](heap: &!h Heap, exec: &x Exec(""), tools: &d Dir, clock: &c Clock, name: &n [byte], args: &a [byte], env: &v [byte], most: int, deadline_ms: int, stop: &!s option.Option[SignalWatch]) -> [heap, exec_under, exec_detached, clock, poll, signals_read] (buffer.Buffer, process.Ran, bool) {
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            return (buffer.empty(heap, 1), process.Ran::Failed(e), false);
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            match exec_spawn_detached_under(exec, tools, name, args, env, Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                Spawned::Failed(e) => {
+                    process.close(to_child, from_child);
+                    return (buffer.empty(heap, 1), process.Ran::Failed(e), false);
+                }
+                Spawned::Ok(child) => {
+                    return supervise.watch_stop(heap, clock, child, to_child, from_child, most, deadline_ms, stop);
+                }
+            }
+        }
+    }
+}
+
+// The SHA-256 of the authority object of an `introspect` answer `out` (`tool_task.authority_span`), as hex, and "" when there is
+// one; else no digest and why.
+fn authority_of[&h, &o](heap: &!h Heap, out: &o [byte]) -> [heap] (buffer.Buffer, &static [byte]) {
+    var sha = buffer.empty(heap, 64);
+    var note = "the introspect answer is not JSON or holds no authority object";
+    let tape = box_slice(heap, json.tape_len(out), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(out, tp) > 0 {
+            let (a, b) = tool_task.authority_span(out, tp);
+            if a >= 0 && b > a && b <= len(out) {
+                buffer.drop(heap, sha);
+                sha = snapshot.hex_digest(heap, out[a..b]);
+                note = "";
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return (sha, note);
+}
+
+// Ask the tool for its own description (`<tool> introspect`): what it printed, the SHA-256 of its authority manifest as hex (empty
+// when there is none), why there is none (empty when there is), and whether a signal stopped the call.
+fn introspect[&h, &x, &d, &c, &n, &v, &s](heap: &!h Heap, exec: &x Exec(""), tools: &d Dir, clock: &c Clock, name: &n [byte], env: &v [byte], deadline_ms: int, stop: &!s option.Option[SignalWatch]) -> [heap, exec_under, exec_detached, clock, poll, signals_read] (buffer.Buffer, buffer.Buffer, &static [byte], bool) {
+    let (list, e) = process.add(heap, process.argv(heap, 16), "introspect");
+    var out = buffer.empty(heap, 1);
+    var sha = buffer.empty(heap, 1);
+    var note = "the tool could not be asked for its introspect answer";
+    var stopped = false;
+    if e == 0 {
+        borrow list as &lb in {
+            let (got, ran, asked) = run_tool(heap, exec, tools, clock, name, process.list(lb), env, tool_task.introspect_cap(), deadline_ms, stop);
+            buffer.drop(heap, out);
+            out = got;
+            stopped = asked;
+            match ran {
+                process.Ran::Code(n) => {
+                    if n == 0 {
+                        borrow out as &ob in {
+                            let (digest, why) = authority_of(heap, buffer.bytes(ob));
+                            buffer.drop(heap, sha);
+                            sha = digest;
+                            note = why;
+                        }
+                    } else {
+                        note = "the tool's introspect ended with a status other than 0: it publishes no authority manifest this runner can read";
+                    }
+                }
+                process.Ran::Signaled(s) => {
+                    note = "the tool's introspect was ended by a signal";
+                }
+                process.Ran::TimedOut => {
+                    note = "the tool's introspect did not answer inside its deadline; its group was killed";
+                }
+                process.Ran::TooMuch => {
+                    note = "the tool's introspect answer is over 1 MiB; its group was killed";
+                }
+                process.Ran::Failed(err) => {
+                    note = "the tool could not be started for its introspect answer";
+                }
+            }
+        }
+    }
+    process.drop(heap, list);
+    return (out, sha, note, stopped);
+}
+
+fn put_strings[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tp: &t [int], node: int) -> [heap] json.Writer {
+    var x = json.begin_array(heap, w);
+    let n = json.count(tp, node);
+    var k = node + 1;
+    var j = 0;
+    while j < n {
+        x = json.put_string(heap, x, text_of(src, tp, k));
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return json.end_array(heap, x);
+}
+
+// The report: what was run, how it ended, the output's size and whether it was cut, the tool's authority manifest. Nothing in it
+// depends on the clock, so the same run writes the same bytes.
+fn report_json[&h, &n, &s, &t, &i, &a](heap: &!h Heap, tool: &n [byte], src: &s [byte], tp: &t [int], argv: int, input: &i [byte], ending: &static [byte], exit_status: int, signal: int, out_bytes: int, truncated: bool, sha: &a [byte], note: &static [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "schema");
+    w = json.put_string(heap, w, "forge-tool-report/1");
+    w = json.put_key(heap, w, "tool");
+    w = json.put_string(heap, w, tool);
+    w = json.put_key(heap, w, "argv");
+    w = put_strings(heap, w, src, tp, argv);
+    w = json.put_key(heap, w, "input");
+    w = json.put_string(heap, w, input);
+    w = json.put_key(heap, w, "ending");
+    w = json.put_string(heap, w, ending);
+    w = json.put_key(heap, w, "exit_status");
+    w = json.put_int(heap, w, exit_status);
+    w = json.put_key(heap, w, "signal");
+    w = json.put_int(heap, w, signal);
+    w = json.put_key(heap, w, "stdout_bytes");
+    w = json.put_int(heap, w, out_bytes);
+    w = json.put_key(heap, w, "stdout_cap");
+    w = json.put_int(heap, w, tool_task.out_cap());
+    w = json.put_key(heap, w, "stdout_truncated");
+    w = json.put_bool(heap, w, truncated);
+    w = json.put_key(heap, w, "authority_manifest");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "source");
+    if len(sha) > 0 {
+        w = json.put_string(heap, w, "introspect");
+        w = json.put_key(heap, w, "sha256");
+        w = json.put_string(heap, w, sha);
+    } else {
+        w = json.put_string(heap, w, "unavailable");
+        w = json.put_key(heap, w, "sha256");
+        w = json.put_null(heap, w);
+        w = json.put_key(heap, w, "note");
+        w = json.put_string(heap, w, note);
+    }
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+fn entry[&h, &p, &s](heap: &!h Heap, w: json.Writer, id: &static [byte], kind: &static [byte], path: &p [byte], sha: &s [byte], size: int) -> [heap] json.Writer {
+    var x = json.begin_object(heap, w);
+    x = json.put_key(heap, x, "id");
+    x = json.put_string(heap, x, id);
+    x = json.put_key(heap, x, "kind");
+    x = json.put_string(heap, x, kind);
+    x = json.put_key(heap, x, "ref");
+    x = json.put_string(heap, x, path);
+    x = json.put_key(heap, x, "sha256");
+    x = json.put_string(heap, x, sha);
+    x = json.put_key(heap, x, "bytes");
+    x = json.put_int(heap, x, size);
+    return json.end_object(heap, x);
+}
+
+// The response. `state` is `succeeded`, `failed` or `cancelled`; `code` empty means no error object. `evidence` is the JSON text of
+// the evidence array.
+fn answer[&h, &i, &r, &k, &e](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], state: &static [byte], code: &static [byte], message: &static [byte], evidence: &e [byte]) -> [heap, io_write] int {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "state");
+    w = json.put_string(heap, w, state);
+    w = json.put_key(heap, w, "task_id");
+    w = json.put_string(heap, w, task_id);
+    w = json.put_key(heap, w, "summary");
+    if len(code) == 0 {
+        w = json.put_string(heap, w, "tool run; the ending is in report.json");
+    } else {
+        w = json.put_string(heap, w, message);
+    }
+    w = json.put_key(heap, w, "evidence");
+    if len(evidence) == 0 {
+        w = json.begin_array(heap, w);
+        w = json.end_array(heap, w);
+    } else {
+        w = json.put_fragment(heap, w, evidence);
+    }
+    w = json.put_key(heap, w, "error");
+    if len(code) == 0 {
+        w = json.put_null(heap, w);
+    } else {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "code");
+        w = json.put_string(heap, w, code);
+        w = json.put_key(heap, w, "message");
+        w = json.put_string(heap, w, message);
+        w = json.put_key(heap, w, "retryable");
+        w = json.put_bool(heap, w, false);
+        w = json.end_object(heap, w);
+    }
+    w = json.end_object(heap, w);
+    let out = json.finish(w);
+    borrow out as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, out);
+    return 0;
+}
+
+fn refuse[&h, &i, &r, &k](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], why: tool_task.Refusal) -> [heap, io_write] int {
+    return answer(heap, io, request_id, task_id, "failed", tool_task.rule_name(why), "the task was refused before anything ran", "");
+}
+
+// Write one evidence file; 0 or why not.
+fn put_evidence[&h, &f, &e, &b](heap: &!h Heap, fs: &f Fs(""), exec_dir: &e [byte], name: &static [byte], data: &b [byte]) -> [heap, fs_write(""), file_write] int {
+    let path = under(heap, exec_dir, name);
+    var rc = 0;
+    borrow path as &pb in {
+        rc = write_file(fs, buffer.bytes(pb), data);
+    }
+    buffer.drop(heap, path);
+    return rc;
+}
+
+// Write the evidence beneath `exec_dir` and answer: `tool.out`, `report.json`, and `introspect.json` when `introspected` is not empty.
+// A file that cannot be written is `evidence-unwritable` and no evidence is named.
+fn finish[&h, &i, &f, &r, &k, &e, &o, &p, &q](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), request_id: &r [byte], task_id: &k [byte], exec_dir: &e [byte], out: &o [byte], report: &p [byte], introspected: &q [byte], state: &static [byte], code: &static [byte], message: &static [byte]) -> [heap, io_write, fs_write(""), file_write] int {
+    var rc = put_evidence(heap, fs, exec_dir, tool_task.out_name(), out);
+    if rc == 0 {
+        rc = put_evidence(heap, fs, exec_dir, "report.json", report);
+    }
+    if rc == 0 && len(introspected) > 0 {
+        rc = put_evidence(heap, fs, exec_dir, "introspect.json", introspected);
+    }
+    if rc != 0 {
+        return answer(heap, io, request_id, task_id, "failed", "evidence-unwritable", "the evidence could not be written in the execution directory", "");
+    }
+    let out_sha = snapshot.hex_digest(heap, out);
+    let report_sha = snapshot.hex_digest(heap, report);
+    let intro_sha = snapshot.hex_digest(heap, introspected);
+    var w = json.writer(heap, 512);
+    w = json.begin_array(heap, w);
+    borrow out_sha as &a in {
+        w = entry(heap, w, "ev-1", "file", tool_task.out_name(), buffer.bytes(a), len(out));
+    }
+    borrow report_sha as &b in {
+        w = entry(heap, w, "ev-2", "report", "report.json", buffer.bytes(b), len(report));
+    }
+    if len(introspected) > 0 {
+        borrow intro_sha as &c in {
+            w = entry(heap, w, "ev-3", "log", "introspect.json", buffer.bytes(c), len(introspected));
+        }
+    }
+    w = json.end_array(heap, w);
+    let list = json.finish(w);
+    borrow list as &lb in {
+        answer(heap, io, request_id, task_id, state, code, message, buffer.bytes(lb));
+    }
+    buffer.drop(heap, list);
+    buffer.drop(heap, out_sha);
+    buffer.drop(heap, report_sha);
+    buffer.drop(heap, intro_sha);
+    return 0;
+}
+
+// Is the input a regular file beneath the execution directory, reached following no link? It is opened beneath the directory one
+// component at a time (`std.dirs.open_file`) and one byte is read: absent, a link, a directory or anything unreadable is no.
+fn input_usable[&h, &f, &e, &i](heap: &!h Heap, fs: &f Fs(""), exec_dir: &e [byte], input: &i [byte]) -> [heap, fs_read(""), dir_read, file_read] bool {
+    let rel = tool_task.input_relative(input, exec_dir);
+    if len(rel) == 0 || journal_io.path_ok(fs, exec_dir) == false {
+        return false;
+    }
+    match open_dir(fs, exec_dir) {
+        DirOpened::Failed(e) => {
+            return false;
+        }
+        DirOpened::Ok(opened) => {
+            var d = opened;
+            var usable = false;
+            borrow d as &db in {
+                match dirs.open_file(db, rel) {
+                    Opened::Failed(e) => {
+                        usable = false;
+                    }
+                    Opened::Ok(file_opened) => {
+                        var file = file_opened;
+                        var data = buffer.empty(heap, 4);
+                        var errno = 0;
+                        borrow mut file as &!x in {
+                            let (got, e2) = journal_io.drain(heap, x, data, 1);
+                            data = got;
+                            errno = e2;
+                        }
+                        file_close(file);
+                        buffer.drop(heap, data);
+                        usable = errno == 0 || errno == 0 - 3;
+                    }
+                }
+            }
+            dir_close(d);
+            return usable;
+        }
+    }
+}
+
+// The argument vector the tool is started with: the task's strings, then the input's absolute path. 0, or 22 for an entry the list
+// refused (it cannot happen for an `argv_ok` vector; it is handled all the same).
+fn tool_args[&h, &s, &t, &p](heap: &!h Heap, src: &s [byte], tp: &t [int], argv: int, input_abs: &p [byte]) -> [heap] (process.Argv, int) {
+    var list = process.argv(heap, 256);
+    var bad = 0;
+    let n = json.count(tp, argv);
+    var k = argv + 1;
+    var j = 0;
+    while j < n {
+        let (l2, e) = process.add(heap, list, text_of(src, tp, k));
+        list = l2;
+        if e != 0 {
+            bad = e;
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    let (l3, e3) = process.add(heap, list, input_abs);
+    if e3 != 0 {
+        bad = e3;
+    }
+    return (l3, bad);
+}
+
+// A task that passed `tool_task.check` and whose input is usable: ask the tool for its manifest, run it, write the evidence, answer.
+fn run_task[&h, &i, &f, &c, &x, &d, &r, &k, &n, &s, &t, &e, &p, &w](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), tools: &d Dir, request_id: &r [byte], task_id: &k [byte], tool: &n [byte], src: &s [byte], tp: &t [int], argv: int, exec_dir: &e [byte], input_abs: &p [byte], timeout_ms: int, stop: &!w option.Option[SignalWatch]) -> [heap, io_write, fs_write(""), file_write, exec_under, exec_detached, clock, poll, signals_read] int {
+    let total = tool_task.runner_deadline_ms(timeout_ms);
+    let start = clock_ms(clock);
+    let env = env_block(heap);
+    var code = 0;
+    borrow env as &vb in {
+        let (intro, sha, note, stopped_early) = introspect(heap, exec, tools, clock, tool, buffer.bytes(vb), tool_task.introspect_deadline_ms(total), stop);
+        let (list, bad) = tool_args(heap, src, tp, argv, input_abs);
+        var remaining = total - (clock_ms(clock) - start);
+        if remaining < 1 {
+            remaining = 1;
+        }
+        var out = buffer.empty(heap, 1);
+        var ending = "not-started";
+        var state = "failed";
+        var err = "tool-unusable";
+        var message = "the tool could not be started beneath the tools directory";
+        var exit_status = 0 - 1;
+        var signal = 0;
+        var write = false;
+        var truncated = false;
+        if stopped_early {
+            ending = "cancelled";
+            state = "cancelled";
+            err = "tool-cancelled";
+            message = "a signal asked the runner to stop; the tool's group was killed";
+            write = true;
+        } else if bad != 0 {
+            err = "argv-malformed";
+            message = "the task was refused before anything ran";
+        } else {
+            borrow list as &lb in {
+                let (got, ran, asked) = run_tool(heap, exec, tools, clock, tool, process.list(lb), buffer.bytes(vb), tool_task.out_cap(), remaining, stop);
+                buffer.drop(heap, out);
+                out = got;
+                write = true;
+                match ran {
+                    process.Ran::Code(n) => {
+                        ending = "exited";
+                        exit_status = n;
+                        state = "succeeded";
+                        err = "";
+                        message = "";
+                    }
+                    process.Ran::Signaled(sg) => {
+                        ending = "signaled";
+                        signal = sg;
+                        state = "succeeded";
+                        err = "";
+                        message = "";
+                    }
+                    process.Ran::TimedOut => {
+                        ending = "timeout";
+                        err = "tool-timeout";
+                        message = "the tool did not finish inside the runner's deadline; its group was killed";
+                    }
+                    process.Ran::TooMuch => {
+                        ending = "output-overflow";
+                        err = "tool-output-overflow";
+                        truncated = true;
+                        message = "the tool wrote more than the 1 MiB cap; its group was killed and its output cut at the cap";
+                    }
+                    process.Ran::Failed(e) => {
+                        write = false;
+                    }
+                }
+                if asked {
+                    ending = "cancelled";
+                    state = "cancelled";
+                    err = "tool-cancelled";
+                    message = "a signal asked the runner to stop; the tool's group was killed";
+                    write = true;
+                }
+            }
+        }
+        if write {
+            borrow out as &ob in {
+                borrow sha as &sb in {
+                    let report = report_json(heap, tool, src, tp, argv, input_abs, ending, exit_status, signal, buffer.size(ob), truncated, buffer.bytes(sb), note);
+                    borrow report as &rb in {
+                        borrow intro as &ib in {
+                            code = finish(heap, io, fs, request_id, task_id, exec_dir, buffer.bytes(ob), buffer.bytes(rb), buffer.bytes(ib), state, err, message);
+                        }
+                    }
+                    buffer.drop(heap, report);
+                }
+            }
+        } else {
+            code = answer(heap, io, request_id, task_id, "failed", err, message, "");
+        }
+        buffer.drop(heap, out);
+        process.drop(heap, list);
+        buffer.drop(heap, intro);
+        buffer.drop(heap, sha);
+    }
+    buffer.drop(heap, env);
+    return code;
+}
+
+// A task that passed `tool_task.check`: claim the signals, check the input and the tools directory, run it.
+fn execute_task[&h, &i, &f, &c, &x, &g, &r, &k, &n, &s, &t, &e, &d, &p](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), sig: &g Signals("INT,TERM"), request_id: &r [byte], task_id: &k [byte], tool: &n [byte], src: &s [byte], tp: &t [int], argv: int, exec_dir: &e [byte], tools_dir: &d [byte], input: &p [byte], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll, signals("INT,TERM"), signals_read] int {
+    if !input_usable(heap, fs, exec_dir, input) {
+        return refuse(heap, io, request_id, task_id, tool_task.Refusal::InputUnusable);
+    }
+    if journal_io.path_ok(fs, tools_dir) == false || !(len(tool) > 0 && int_of(tool[0]) != 47 && exec_covers(exec, tool)) {
+        return refuse(heap, io, request_id, task_id, tool_task.Refusal::ToolUnusable);
+    }
+    match open_dir(fs, tools_dir) {
+        DirOpened::Failed(e) => {
+            return refuse(heap, io, request_id, task_id, tool_task.Refusal::ToolUnusable);
+        }
+        DirOpened::Ok(opened) => {
+            var tools = opened;
+            var code = 0;
+            // The claim is made before the first spawn (docs/signals.md); a claim the runtime refuses leaves the run without a
+            // cancel, which then reaches only this process (the deadline still ends the tool).
+            var stop: option.Option[SignalWatch] = option.Option::None;
+            match signals_watch(sig) {
+                Watching::Ok(wt) => {
+                    match stop {
+                        option.Option::Some(none) => {
+                            signals_close(none);
+                        }
+                        option.Option::None => {
+                        }
+                    }
+                    stop = option.Option::Some(wt);
+                }
+                Watching::Failed(e) => {
+                    code = 0;
+                }
+            }
+            let input_abs = tool_task.input_resolved(heap, input, exec_dir);
+            borrow tools as &db in {
+                borrow input_abs as &ab in {
+                    borrow mut stop as &!sp in {
+                        code = run_task(heap, io, fs, clock, exec, db, request_id, task_id, tool, src, tp, argv, exec_dir, buffer.bytes(ab), timeout_ms, sp);
+                    }
+                }
+            }
+            buffer.drop(heap, input_abs);
+            match stop {
+                option.Option::Some(w2) => {
+                    signals_close(w2);
+                }
+                option.Option::None => {
+                }
+            }
+            dir_close(tools);
+            return code;
+        }
+    }
+}
+
+fn serve[&h, &i, &f, &c, &x, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec(""), sig: &g Signals("INT,TERM")) -> [heap, io_read, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, exec_detached, clock, poll, signals("INT,TERM"), signals_read] int {
+    let (request, whole) = read_request(heap, io);
+    var code = 0;
+    if !whole {
+        code = 4;
+    }
+    borrow request as &rb in {
+        let src = buffer.bytes(rb);
+        let tape = box_slice(heap, json.tape_len(src), 0);
+        borrow mut tape as &!t in {
+            let tp = contents(t);
+            if whole && json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                let task = json.get(src, tp, 0, "task");
+                let input = json.get(src, tp, task, "input");
+                let limits = json.get(src, tp, 0, "limits");
+                let grants = json.get(src, tp, 0, "grants");
+                let rid = json.get(src, tp, 0, "request_id");
+                let tid = json.get(src, tp, task, "id");
+                let timeout = json.get(src, tp, limits, "timeout_ms");
+                var timeout_ms = 0;
+                if timeout >= 0 && json.is_int(tp, timeout) && json.fits_int(src, tp, timeout) {
+                    timeout_ms = json.to_int(src, tp, timeout);
+                }
+                // A request that is not an `execute` of this contract, or that names no request and no task, is not answered.
+                if is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") && is(src, tp, json.get(src, tp, 0, "verb"), "capabilities") && len(text_of(src, tp, rid)) > 0 {
+                    let reply = verbs.capabilities_reply(heap, text_of(src, tp, rid), "tool-run", "0.1.0", "sync", tool_task.task_type(), tool_task.max_timeout_ms(), 1048576);
+                    borrow reply as &yb in {
+                        io.write_all(io, buffer.bytes(yb));
+                    }
+                    io.newline(io);
+                    buffer.drop(heap, reply);
+                } else if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
+                    code = 4;
+                } else {
+                    let tool = text_of(src, tp, json.get(src, tp, input, "tool"));
+                    let argv = json.get(src, tp, input, "argv");
+                    let in_path = text_of(src, tp, json.get(src, tp, input, "input"));
+                    let exec_dir = text_of(src, tp, json.get(src, tp, grants, "execution_dir"));
+                    let tools_dir = text_of(src, tp, json.get(src, tp, grants, "tools_dir"));
+                    let granted = json.get(src, tp, grants, "granted_tools");
+                    let kind = text_of(src, tp, json.get(src, tp, task, "type"));
+                    match tool_task.check(kind, exec_dir, tools_dir, timeout_ms, src, tp, granted, tool, argv, in_path) {
+                        tool_task.Checked::Refused(why) => {
+                            refuse(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), why);
+                        }
+                        tool_task.Checked::Held => {
+                            execute_task(heap, io, fs, clock, exec, sig, text_of(src, tp, rid), text_of(src, tp, tid), tool, src, tp, argv, exec_dir, tools_dir, in_path, timeout_ms);
+                        }
+                    }
+                }
+            } else {
+                code = 4;
+            }
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, request);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(tty);
+    release(args);
+    let claim = narrow(signals, "INT,TERM");
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow fs as &f in {
+        borrow clock as &c in {
+            borrow exec as &x in {
+                borrow claim as &g in {
+                    borrow mut console as &!i in {
+                        borrow mut memory as &!h in {
+                            code = serve(h, i, f, c, x, g);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(clock);
+    release(exec);
+    release(claim);
+    release(console);
+    release(memory);
+    return code;
+}

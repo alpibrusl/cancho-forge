@@ -600,3 +600,77 @@ checks, what it measured and what it does not do, in [`cancho-code-adapter.md`](
 * **Evidence:** `build.json` (report), `build.out` (log: the tool's standard output), `run.log` (log), `project.cho` (file),
   each only if it exists as an ordinary file beneath the execution directory.
 * **Not run against the real tool.** A stand-in `cancho-build` stands for it in the checks.
+
+---
+
+## 12. The tool runner: task type `tool.run` *(built, `sync` level: `workers/tool_run.cho`; task 11)*
+
+The analyst's worker (spec section 4.2; forge#41): one run of a deterministic data tool (`tally`, `jsonq` of cancho-tools) over one
+input file. The pure half is `src/tool_task.cho` (`tests/tool_task_test.cho`), the process half `workers/tool_run.cho`, Forge's side
+`src/tool_call.cho`; the conformance is `tests/conformance/tool_run.sh` (run by `scripts/check_tool_run.sh`, which first compares the
+worker's authority report with `docs/authority-tool-run.txt`).
+
+### 12.1 The task
+
+```json
+"task":   {"id": "tool-1", "type": "tool.run", "input": {"tool": "tally", "argv": ["--field", "2", "--delim", " "], "input": "checks.log"}},
+"limits": {"timeout_ms": 60000, "max_output_bytes": 1048576},
+"grants": {"execution_dir": "/abs/steps/a/ev", "tools_dir": "/abs/tools", "granted_tools": ["tally", "jsonq"]}
+```
+
+* **Which tools may run is the operator's**: `grants.tools_dir` and `grants.granted_tools` come from the operator file through Forge,
+  never from the manifest or the task. A tool the list does not name is `tool-not-granted`, whatever the task says; an empty list
+  grants nothing. A tool name is 1 to 64 bytes of letters, digits and `._-`, not starting with `.` or `-` (so never a path).
+* **`argv` is a JSON array of plain strings, never shell text**: at most 64 strings of 1 to 4096 bytes, 64 KiB in all, no escape
+  (so no `"`, `\` or control character can be spelled), no byte below 32 and no 127. No shell ever reads it: each string is one
+  argument. Anything else is `argv-malformed`.
+* **`input` is a file beneath the execution directory**: the rule of a contract path (`build_task.contract_ok`: relative, or absolute
+  and beginning with the execution directory; no `..`, no hidden or dash-led component, at most 512 bytes resolved), else
+  `path-invalid`. It is then opened beneath the directory one component at a time following no link, and one byte read: absent, a
+  link, a directory or unreadable is `input-unusable`. (Not handled: a named pipe there would block the open until Forge's deadline
+  kills the worker; the execution directory is Forge's and the operator's.) The tool gets the input's absolute path as its **last**
+  argument.
+* `timeout_ms` is 2 000 to 86 400 000. Order of the checks: type, paths (`execution_dir`, `tools_dir`: `gate_task.path_ok`),
+  limits, the granted list (`operator-invalid`), the tool, `argv`, the input; then, in the worker, the input file and the tool's
+  directory (`tool-unusable`: the directory cannot be opened, or the tool cannot be started there: not there, not executable).
+
+### 12.2 What it does
+
+1. Claims `TERM` and `INT` (`signals("INT,TERM")`), before the first spawn.
+2. `<tool> introspect` (the cancho-tools convention), at most a tenth of the runner's deadline (10 s at most), 1 MiB: the SHA-256 of
+   the bytes of the top-level `authority` object of the answer (`tool_task.authority_span`: the tool's compiler-derived authority
+   report as the binary embeds and prints it) is recorded. A tool that does not answer `introspect` with such an object gets **no
+   invented hash**: `authority_manifest` is `{"source":"unavailable","sha256":null,"note":"<why>"}`.
+3. `<tool> <argv...> <input>` started with `exec_spawn_detached_under` beneath the tools directory (its working directory), `PATH`
+   (the fixed `/usr/local/bin:/usr/bin:/bin`) its whole environment, its standard input empty (closed at once), standard error
+   discarded, standard output kept up to 1 MiB. It leads a session and a group of its own; `supervise.watch_stop` kills that
+   **group** at the runner's deadline (four fifths of Forge's, as the gate runner's: Forge's kill reaches the runner's pid only), one
+   byte past the cap, and when a claimed signal arrives.
+4. Writes the evidence and answers.
+
+### 12.3 The reply
+
+| state | when | evidence |
+|---|---|---|
+| `succeeded` | the tool exited, **with any status**, or was ended by a signal of its own (the status is recorded; what the output means is the check's to say) | `tool.out` (`file`), `report.json` (`report`), `introspect.json` (`log`, when introspect printed anything) |
+| `failed`, `tool-timeout` | the runner's deadline passed; the tool's group was killed | the three files, `ending: timeout` |
+| `failed`, `tool-output-overflow` | more than 1 MiB on standard output; the group was killed | `tool.out` cut at exactly 1 MiB, the report with `stdout_truncated: true` |
+| `cancelled`, `tool-cancelled` | a `TERM` or `INT` reached the runner (Forge's cancel of a `sync` worker, section 3.3, or a signal to Forge's whole group); the group was killed | the three files, `ending: cancelled` |
+| `failed`, a refusal tag | `task-type-invalid`, `path-invalid`, `limits-invalid`, `operator-invalid`, `tool-not-granted`, `argv-malformed`, `input-unusable`, `tool-unusable`: nothing ran | none; nothing is written |
+| `failed`, `evidence-unwritable` | a file could not be written | none |
+
+`report.json`: `{"schema":"forge-tool-report/1","tool","argv","input","ending":"exited"|"signaled"|"timeout"|"output-overflow"|"cancelled",
+"exit_status","signal","stdout_bytes","stdout_cap","stdout_truncated","authority_manifest":{"source","sha256"[,"note"]}}`. Nothing in
+it depends on the clock: the same request in the same directory writes the same bytes (asserted, with the stand-in and with the real
+`tally`). A request that is not an `execute` or `capabilities` of this contract is not answered (exit 4); `cancel`, `status` and
+`result` are not sent to a `sync` worker (section 3.6).
+
+### 12.4 Authority, and what is not done
+
+`docs/authority-tool-run.txt`: `exec_under` and `exec_detached` (no path: the tools directory is given at run time), `child_signal`
+(the group kill), `signals("INT,TERM")`, `signals_read`, `fs_read("")`/`dir_read`/`file_read` (the two directories, the input
+check), `fs_write("")`/`file_write` (the evidence), a clock, polling, a pipe, the heap, stdio. No network, no arguments, no foreign
+code. Not done: a SIGKILL of the runner (or of Forge's group) leaves the tool running until it ends by itself, as a qa step's gate
+(G4); the deterministic re-run comparison of forge#41 (Forge re-running the same query and comparing output hashes) is not
+built: determinism is asserted by the conformance, and the step's check judges the output; a tool that starts a descendant that
+leaves its group.

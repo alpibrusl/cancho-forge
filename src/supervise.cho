@@ -342,3 +342,176 @@ pub fn watch[&h, &c, &f, &p, &r, &l](heap: &!h Heap, clock: &c Clock, fs: &f Fs(
     }
     return (out, ran, how);
 }
+
+// `watch` with a signal claim in place of the two files (task 11, `workers/tool_run.cho`): a `sync` worker is cancelled by a signal
+// sent to it (worker-contract 3.3: Forge's TERM, or a TERM or INT to Forge's whole group), and the program it started in a group
+// of its own must not outlive it. Every slice the claim `stop` is read; when a claimed signal arrived the child's group is killed
+// with KILL and the third part of the answer is true. With `None` it is `capture` of a group leader with its input closed.
+fn stop_pending[&s](stop: &!s option.Option[SignalWatch]) -> [signals_read] bool {
+    match stop {
+        option.Option::Some(w) => {
+            return signals_pending(w) != 0;
+        }
+        option.Option::None => {
+            return false;
+        }
+    }
+}
+
+pub fn watch_stop[&h, &c, &s](heap: &!h Heap, clock: &c Clock, child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, stop: &!s option.Option[SignalWatch]) -> [heap, clock, poll, signals_read] (buffer.Buffer, process.Ran, bool) {
+    let deadline = clock_ms(clock) + timeout;
+    var out = buffer.empty(heap, 4096);
+    var reader = option.Option::Some(from_child);
+    var state = running();
+    var why = 0;
+    pipe_close(to_child);
+
+    match poller_new() {
+        Polling::Failed(e) => {
+            state = failed();
+            why = e;
+        }
+        Polling::Ok(p) => {
+            var poller = p;
+            var scratch_box = box_slice(heap, 4096, byte_of(0));
+            var events = box_slice(heap, 16, 0);
+            borrow mut poller as &!ph in {
+                borrow child as &ch in {
+                    let added = poller_add_child(ph, ch, child_token());
+                    if added != 0 {
+                        state = failed();
+                        why = added;
+                    }
+                }
+                borrow mut reader as &!r2 in {
+                    match r2 {
+                        option.Option::Some(rp) => {
+                            pipe_nonblocking(rp);
+                            let added = poller_add_pipe(ph, rp, output_token(), 1);
+                            if added != 0 && state == running() {
+                                state = failed();
+                                why = added;
+                            }
+                        }
+                        option.Option::None => {
+                        }
+                    }
+                }
+
+                while state == running() {
+                    let left = deadline - clock_ms(clock);
+                    if left <= 0 {
+                        state = timed_out();
+                    } else {
+                        var wait_ms = left;
+                        if wait_ms > slice_ms() {
+                            wait_ms = slice_ms();
+                        }
+                        var n = 0;
+                        borrow mut events as &!eb in {
+                            n = poller_wait(ph, contents(eb), wait_ms);
+                        }
+                        if n < 0 {
+                            state = failed();
+                            why = 0 - n;
+                        }
+                        var k = 0;
+                        var gone = false;
+                        var output_done = false;
+                        while k < n && state == running() {
+                            var token = 0;
+                            borrow events as &e in {
+                                token = contents(e)[2 * k];
+                            }
+                            if token == child_token() {
+                                gone = true;
+                            }
+                            if token == output_token() {
+                                borrow mut reader as &!r2 in {
+                                    match r2 {
+                                        option.Option::Some(rp) => {
+                                            borrow mut scratch_box as &!sb in {
+                                                let (kept, found) = drain(heap, rp, contents(sb), out, most);
+                                                out = kept;
+                                                if found == read_too_much() {
+                                                    state = too_much();
+                                                }
+                                                if found == read_end() {
+                                                    output_done = true;
+                                                }
+                                            }
+                                        }
+                                        option.Option::None => {
+                                        }
+                                    }
+                                }
+                            }
+                            k = k + 1;
+                        }
+                        if output_done {
+                            shut(reader);
+                            reader = option.Option::None;
+                        }
+                        if gone && state == running() {
+                            // Everything the child wrote is in the channel now.
+                            borrow mut reader as &!r2 in {
+                                match r2 {
+                                    option.Option::Some(rp) => {
+                                        borrow mut scratch_box as &!sb in {
+                                            let (kept, found) = drain(heap, rp, contents(sb), out, most);
+                                            out = kept;
+                                            if found == read_too_much() {
+                                                state = too_much();
+                                            }
+                                        }
+                                    }
+                                    option.Option::None => {
+                                    }
+                                }
+                            }
+                            if state == running() {
+                                state = exited();
+                            }
+                        }
+                        if state == running() && stop_pending(stop) {
+                            state = cancelled();
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, scratch_box);
+            unbox_slice(heap, events);
+            poller_close(poller);
+        }
+    }
+
+    shut(reader);
+    if state != exited() {
+        borrow child as &ch in {
+            child_kill_group(ch, 256);
+            child_kill(ch, 256);
+        }
+    }
+    var ran = process.Ran::Failed(why);
+    match child_wait(child) {
+        Exited::Code(n) => {
+            ran = process.Ran::Code(n);
+        }
+        Exited::Signaled(s) => {
+            ran = process.Ran::Signaled(s);
+        }
+        Exited::Failed(e) => {
+            ran = process.Ran::Failed(e);
+        }
+    }
+    if state == timed_out() {
+        ran = process.Ran::TimedOut;
+    }
+    if state == too_much() {
+        ran = process.Ran::TooMuch;
+    }
+    if state == failed() {
+        ran = process.Ran::Failed(why);
+    }
+    return (out, ran, state == cancelled());
+}

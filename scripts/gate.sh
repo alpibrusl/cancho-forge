@@ -4,6 +4,7 @@
 #   cancho check         every program type-checks, under its declared authority
 #   cancho test          every `fn test_*` passes (pure logic: tasks, journal replay)
 #   cancho code adapter  workers/cancho_code.cho against a stand-in build tool and real child processes (scripts/check_cancho_code.sh)
+#   tool runner          workers/tool_run.cho against stand-in tools and real child processes (scripts/check_tool_run.sh)
 #   forge build          `forge build` end to end against the adapter and a stand-in build tool (scripts/check_build_run.sh)
 #   forge gate           `forge gate` end to end against real git checkouts and a real runner (scripts/check_gate_run.sh)
 #   recover              `forge recover` on journals a crash left, one real crash included (scripts/check_recover.sh)
@@ -129,6 +130,10 @@ CANCHO="$C" sh scripts/check_gate_runner.sh "$scratch/gate-runner" || fail=1
 echo "== cancho code adapter (workers/cancho_code.cho against a stand-in build tool, real child processes, the build's group killed at its deadline)"
 mkdir "$scratch/cancho-code" || exit 1
 CANCHO="$C" sh scripts/check_cancho_code.sh "$scratch/cancho-code" || fail=1
+
+echo "== tool runner (workers/tool_run.cho, tool.run: stand-in tools, real child processes, the tool's group killed at its deadline and on TERM)"
+mkdir "$scratch/tool-run" || exit 1
+CANCHO="$C" sh scripts/check_tool_run.sh "$scratch/tool-run" || fail=1
 
 echo "== forge build (issue #34: the operator's configuration, the brief file, the adapter and a stand-in build tool, the journal)"
 mkdir "$scratch/build-run" || exit 1
