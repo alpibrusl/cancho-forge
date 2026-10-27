@@ -498,11 +498,13 @@ fi
 # company's lock), a sparse 17 MB file is refused unread: usage-invalid, recorded and held, exit 14, nothing accepted.
 for mode in usagelink usagefifo usagebig usagedir; do
   mkco "$mode" "[$(builder lib '' $mode audit_pass.sh)]" 100000 lib
-  # a memory bound of 4 GiB on the run, so that a Forge which did read /dev/zero is stopped by it and not by the machine
-  (ulimit -v 4194304; timeout 60 "$F" company run "$w/$mode" "$w/operator.json") > "$w/$mode.1.out" 2>&1; echo $? > "$w/$mode.1.rc"
+  # a memory bound of 4 GiB on the run, so that a Forge which did read /dev/zero is stopped by it and not by the machine; and a KILL
+  # 10 s after the TERM: a Forge blocked opening a FIFO never looks at its signals (measured on the code before this fix: TERM did
+  # not end it in 20 minutes)
+  (ulimit -v 4194304; timeout -k 10 60 "$F" company run "$w/$mode" "$w/operator.json") > "$w/$mode.1.out" 2>&1; echo $? > "$w/$mode.1.rc"
   check "$mode: usage-invalid with its reason, exit 14 (no hang, no memory trap), nothing accepted, the step held" sh -c "[ '$(rc $mode 1)' = 14 ] && grep -qx 'refusal: usage-invalid' '$w/$mode.1.out' && grep -q '^reason: ' '$w/$mode.1.out' && ! grep -q 'company.step.accepted' '$w/$mode/company.journal' && grep -q '\"kind\":\"company.step.check_unavailable\",\"task\":\"lib\",\"reason\":\"usage-invalid\"' '$w/$mode/company.journal'"
 done
-(ulimit -v 4194304; timeout 60 "$F" company run "$w/usagelink" "$w/operator.json") > "$w/usagelink.2.out" 2>&1; echo $? > "$w/usagelink.2.rc"
+(ulimit -v 4194304; timeout -k 10 60 "$F" company run "$w/usagelink" "$w/operator.json") > "$w/usagelink.2.out" 2>&1; echo $? > "$w/usagelink.2.rc"
 check "usage-invalid: a later run names the RECORDED refusal (usage-invalid, not check-unavailable), exit 14, nothing built" sh -c "[ '$(rc usagelink 2)' = 14 ] && grep -qx 'refusal: usage-invalid' '$w/usagelink.2.out' && [ $(kinds usagelink company.step.admitted lib) -eq 1 ]"
 timeout 120 "$F" company run "$w/linkart" "$w/operator.json" > "$w/linkart.2.out" 2>&1; echo $? > "$w/linkart.2.rc"
 check "artifact-invalid: a later run names the recorded refusal too" sh -c "[ '$(rc linkart 2)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/linkart.2.out'"
