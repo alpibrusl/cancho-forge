@@ -27,6 +27,13 @@ case "$mode" in
   hang)      log; report build 0 ""; sleep 79 & wait ;;
   noisy)     log; report build 0 ""; head -c 1100000 /dev/zero | tr '\0' x ;;
   sig)       log; kill -9 $$ ;;
+  spend)     # the company layer's budget (tests/conformance/company_run.sh): a build that ends done and, as the real agent does,
+             # leaves one usage.jsonl line per call: two calls, 600 + 500 input tokens, 10 + 20 output
+             log; report done 2 done; printf 'product\n' > "$work/project.cho"
+             printf '{"provider":"stand","model":"m1","task":"t","sample":0,"in":600,"out":10,"thinking":0,"cache_write":0,"cache_read":0,"stop":"end_turn","outcome":"ok","status":200,"reply_chars":1,"program_chars":1,"ms":1}\n' >> "$work/usage.jsonl"
+             printf '{"provider":"stand","model":"m1","task":"t","sample":0,"in":500,"out":20,"thinking":0,"cache_write":0,"cache_read":0,"stop":"end_turn","outcome":"ok","status":200,"reply_chars":1,"program_chars":1,"ms":1}\n' >> "$work/usage.jsonl"
+             printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
+  bare)      log; report done 2 done; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # done, and no project.cho (company_run.sh)
   args)      log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   args2)     log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   env)       log; report done 2 done; printf 'product\n' > "$work/project.cho"; env > "$work/env.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;

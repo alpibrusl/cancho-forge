@@ -163,7 +163,7 @@ pub fn status_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, 
 // ---- reading files --------------------------------------------------------------------------------------------------------
 
 // The file at `path` (an ok path), at most `limit` bytes: the bytes and 0, or an errno, or -3 for a file past the limit.
-fn read_limited[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], limit: int) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
+pub fn read_limited[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], limit: int) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
     let none = buffer.empty(heap, 1);
     match open_read(fs, path) {
         Opened::Failed(e) => {
@@ -184,19 +184,19 @@ fn read_limited[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], limi
     }
 }
 
-fn line[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
+pub fn line[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
     io.write_all(io, label);
     io.write_all(io, value);
     io.newline(io);
     return 0;
 }
 
-fn refuse[&i, &t](io: &!i Io, tag: &t [byte]) -> [io_write] int {
+pub fn refuse[&i, &t](io: &!i Io, tag: &t [byte]) -> [io_write] int {
     return line(io, "refusal: ", tag);
 }
 
 // `dir` + "/" + `name`.
-fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+pub fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
     var b = buffer.append(heap, buffer.empty(heap, 64), dir);
     b = buffer.append(heap, b, "/");
     return buffer.append(heap, b, name);

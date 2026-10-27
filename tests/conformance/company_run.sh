@@ -1,0 +1,188 @@
+#!/bin/sh
+# `forge company run` end to end (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.3, 7 and 10; task 8b).
+# The program under test is the forge binary; this script is the oracle only. Every step runs a REAL worker: a builder step the
+# Cancho Code adapter (workers/cancho_code.cho) over the stand-in build tool (scripts/standin_cancho_build.sh, whose mode is the
+# first line of the brief), a qa step the gate runner (workers/gate_runner.cho) on a real git checkout. Each step's check is a
+# shell script in the company directory that prints a TOTAL line, Forge runs it and reads the score. The oracle reads only what is
+# outside the program: exit status, stdout, `forge company status`, and `grep -c` on company.journal.
+#
+# The cases: (1) the lying worker of spec 7, a build that says `done` and an audit that scores 1/2: check-failed, and NO
+# company.step.accepted; (2) the good path builder -> qa -> human-gated product: the run stops at the gate (exit 10), `decide`
+# approves, the run again completes (exit 0) and no step was admitted twice; a third run admits nothing; (3) the budget: a build
+# that spends past the ceiling, the next model step is never admitted, `budget-exhausted` (exit 12), the spend record carries the
+# cost Forge derived; (4) a rejected gate blocks its dependents and not an independent step (exit 11); and the other ways a run
+# stops: a worker that ends without a claim (15), an audit with no score (14), an artifact missing, no price table, a step
+# directory missing, a bad operator file, a corrupt journal, a held lock, bad usage; and resume: a step admitted and never accepted
+# (a run killed mid-step) is admitted again, once.
+# Prints `ok ...` / `FAIL ...` lines; exit 1 if any FAIL or a build failed.
+# Usage: CANCHO=path/to/cancho tests/conformance/company_run.sh <scratch directory, empty>
+set -u
+C="${CANCHO:-cancho}"
+cd "$(dirname "$0")/../.." || exit 1
+scratch=$1
+fail=0
+libs=$(ls src/*.cho | grep -v '/main\.cho$')
+w="$scratch/cr"
+mkdir "$w" "$w/workers" "$w/tools" || exit 1
+cp scripts/standin_cancho_build.sh "$w/tools/cancho-build" && chmod +x "$w/tools/cancho-build" || exit 1
+if ! { $C build src/*.cho --std -o "$w/forge" && $C build workers/cancho_code.cho $libs --std -o "$w/workers/cancho_code" && $C build workers/gate_runner.cho $libs --std -o "$w/workers/gate_runner"; }; then
+  echo "FAIL company run: a program did not build"
+  exit 1
+fi
+F="$w/forge"
+ok() { echo "ok   company run: $1"; }
+bad() { echo "FAIL company run: $1"; fail=1; }
+check() { # name, command...
+  name=$1; shift
+  if "$@"; then ok "$name"; else bad "$name"; fi
+}
+
+# A git checkout of the row `alpibrusl/cancho-hdl` of the gate runner's allow-list (it runs scripts/gate_cancho.sh), for qa steps.
+git_in() { d=$1; shift; git -C "$d" -c user.email=forge@example.invalid -c user.name=forge -c commit.gpgsign=false "$@"; }
+mkdir -p "$w/checkout/scripts" && printf '#!/bin/sh\necho hello gate\nexit 0\n' > "$w/checkout/scripts/gate_cancho.sh" && chmod +x "$w/checkout/scripts/gate_cancho.sh" \
+  && git init -q "$w/checkout" && git_in "$w/checkout" add -A && git_in "$w/checkout" commit -q -m fixture || exit 1
+rev=$(git -C "$w/checkout" rev-parse HEAD)
+
+# The operator file: outside every company directory.
+cat > "$w/operator.json" <<EOF
+{"workers":"$w/workers","tools":"$w/tools","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent","check_timeout_ms":20000,"build_timeout_ms":20000,"gate_timeout_ms":20000,
+ "gates":{"qa":{"repo":"alpibrusl/cancho-hdl","revision":"$rev","checkout":"$w/checkout"}}}
+EOF
+
+# A company directory: <name>, the manifest's steps JSON, the budget's input ceiling; the steps listed after get steps/<id>/ev.
+# The price table prices the stand-in's model at $1 per million tokens of every class, one micro-dollar a token.
+mkco() { # name, steps json, input ceiling, step ids...
+  co="$w/$1"; steps=$2; ceiling=$3; shift 3
+  mkdir "$co" || exit 1
+  printf '{"id":"co","mission":"m","model":{"provider":"stand","name":"m1"},"budget":{"input":%s,"output":100000,"cache_write":100000,"cache_read":100000,"max_cost":10,"price_table":"prices.json"},"human_gates":["ship","g"],"roles":["builder","qa","product","analyst"],"steps":%s}' "$ceiling" "$steps" > "$co/company.json"
+  printf '{"_note":"test","stand":{"m1":{"in":1.0,"cache_write":1.0,"cache_read":1.0,"out":1.0}}}' > "$co/prices.json"
+  printf '#!/bin/sh\necho "audit of $1"\necho "TOTAL 2/2"\n' > "$co/audit_pass.sh"
+  printf '#!/bin/sh\necho "case 1 ok"\necho "case 2 FAILED"\necho "TOTAL 1/2"\nexit 1\n' > "$co/audit_half.sh"
+  printf '#!/bin/sh\necho "no score here"\n' > "$co/audit_none.sh"
+  printf '#!/bin/sh\ngrep -q verdict "$1" && echo "TOTAL 1/1"\n' > "$co/audit_report.sh"
+  chmod +x "$co"/audit_*.sh
+  for s in "$@"; do mkdir -p "$co/steps/$s/ev" || exit 1; done
+}
+run() { # company name, tag of this run: forge company run, stdout in $w/<name>.<tag>.out, status in .rc
+  "$F" company run "$w/$1" "$w/operator.json" > "$w/$1.$2.out" 2> "$w/$1.$2.err"; echo $? > "$w/$1.$2.rc"
+}
+rc() { cat "$w/$1.$2.rc"; }
+out_has() { grep -qx "$3" "$w/$1.$2.out"; } # name, tag, whole line
+kinds() { # name, kind, step: how many records of that kind for that step (0 with no journal)
+  if [ -f "$w/$1/company.journal" ]; then grep -c "\"kind\":\"$2\",\"task\":\"$3\"" "$w/$1/company.journal"; else echo 0; fi
+}
+builder() { printf '{"id":"%s","role":"builder","task_type":"project.build","needs":[%s],"input":"%s","check":"%s"}' "$1" "$2" "$3" "$4"; }
+
+# ---- (1) the lying worker (spec 7): the build says done, the audit scores 1/2
+mkco lie "[$(builder lib '' done audit_half.sh)]" 100000 lib
+run lie 1
+check "lying worker: the run ends check-failed, exit 13" sh -c "[ '$(rc lie 1)' = 13 ] && grep -qx 'refusal: check-failed' '$w/lie.1.out' && grep -qx 'score: 1/2' '$w/lie.1.out'"
+check "lying worker: the worker DID claim done (its own journal holds the claim, in verification)" sh -c "grep -q '\"kind\":\"execution.finished\".*\"verdict\":\"done\"' '$w/lie/steps/lib/journal.jsonl' && grep -qx 'claimed verdict: done' '$w/lie.1.out'"
+check "lying worker: company.journal holds NO company.step.accepted, and the check_failed with its score" sh -c "! grep -q 'company.step.accepted' '$w/lie/company.journal' && grep -q '\"kind\":\"company.step.check_failed\",\"task\":\"lib\",\"score\":1,\"total\":2' '$w/lie/company.journal'"
+"$F" company status "$w/lie" > "$w/lie.status"
+check "lying worker: status shows the step not accepted" sh -c "grep -qx 'lib ready' '$w/lie.status'"
+run lie 2
+check "lying worker: a second run does not accept it either (no Forge-level retry turns a failed check into acceptance)" sh -c "[ '$(rc lie 2)' = 13 ] && ! grep -q 'company.step.accepted' '$w/lie/company.journal'"
+
+# ---- (2) the good path: lib (builder) -> qa (qa) -> ship (product, gate ship)
+steps="[$(builder lib '' done audit_pass.sh),{\"id\":\"qa\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"lib\"],\"input\":\"gate\",\"check\":\"audit_report.sh\"},{\"id\":\"ship\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[\"qa\"],\"input\":\"ship it\",\"gate\":\"ship\"}]"
+mkco good "$steps" 100000 lib qa
+run good 1
+check "good path: the first run stops at the open gate, exit 10, naming it" sh -c "[ '$(rc good 1)' = 10 ] && grep -qx 'refusal: gate-open' '$w/good.1.out' && grep -qx 'gate: ship' '$w/good.1.out' && grep -qx 'step: ship' '$w/good.1.out'"
+check "good path: lib and qa are accepted with the artifact and its sha256, ship is not" sh -c "[ \$(grep -c '\"kind\":\"company.step.accepted\"' '$w/good/company.journal') -eq 2 ] && grep -q '\"kind\":\"company.step.accepted\",\"task\":\"lib\",\"artifact\":\"steps/lib/ev/project.cho\",\"sha256\":\"$(sha256sum "$w/good/steps/lib/ev/project.cho" | cut -c1-64)\"' '$w/good/company.journal' && grep -q '\"task\":\"qa\",\"artifact\":\"steps/qa/ev/report.json\"' '$w/good/company.journal'"
+check "good path: the builder's own task was left in verification, never accepted by the worker" sh -c "! grep -q 'task.accepted' '$w/good/steps/lib/journal.jsonl'"
+"$F" company decide "$w/good" ship approved "looks right" > /dev/null
+run good 2
+check "good path: after decide approved the run completes, exit 0" sh -c "[ '$(rc good 2)' = 0 ] && grep -q '\"kind\":\"company.step.accepted\",\"task\":\"ship\",\"artifact\":\"company.json\"' '$w/good/company.journal'"
+check "good path: every step admitted exactly once over the two runs" sh -c "[ $(kinds good company.step.admitted lib) -eq 1 ] && [ $(kinds good company.step.admitted qa) -eq 1 ] && [ $(kinds good company.step.admitted ship) -eq 1 ]"
+run good 3
+check "good path: a third run is done at once and admits nothing" sh -c "[ '$(rc good 3)' = 0 ] && [ \$(grep -c 'company.step.admitted' '$w/good/company.journal') -eq 3 ]"
+"$F" company status "$w/good" > "$w/good.status"
+check "good path: status shows all three accepted" sh -c "grep -qx 'lib accepted' '$w/good.status' && grep -qx 'qa accepted' '$w/good.status' && grep -qx 'ship accepted' '$w/good.status'"
+
+# ---- (3) the budget: the input ceiling is 1000; one build spends 1100 (two calls) and the next model step is never started
+mkco budget "[$(builder one '' spend audit_pass.sh),$(builder two '' done audit_pass.sh)]" 1000 one two
+run budget 1
+check "budget: the run stops budget-exhausted, exit 12" sh -c "[ '$(rc budget 1)' = 12 ] && grep -qx 'refusal: budget-exhausted' '$w/budget.1.out'"
+check "budget: the spend is recorded with the cost Forge derived (1130 micro-dollars at one a token)" grep -q '"kind":"company.spend.recorded","task":"one","input":1100,"output":30,"cache_write":0,"cache_read":0,"cost_micro":1130' "$w/budget/company.journal"
+check "budget: the step that spent is accepted (its check passed) and the next model step was never admitted" sh -c "[ $(kinds budget company.step.accepted one) -eq 1 ] && [ $(kinds budget company.step.admitted two) -eq 0 ]"
+run budget 2
+check "budget: run again, the same stop, still nothing admitted for the held step" sh -c "[ '$(rc budget 2)' = 12 ] && [ $(kinds budget company.step.admitted two) -eq 0 ] && [ \$(grep -c 'company.spend.recorded' '$w/budget/company.journal') -eq 1 ]"
+
+# ---- (4) a rejected gate blocks its dependents but not an independent step
+steps="[{\"id\":\"brief\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"b\",\"gate\":\"g\"},$(builder lib '"brief"' done audit_pass.sh),$(builder side '' done audit_pass.sh)]"
+mkco rej "$steps" 100000 lib side
+"$F" company decide "$w/rej" g rejected "not this" > /dev/null
+run rej 1
+check "rejected gate: the run ends gate-rejected, exit 11, naming the gate" sh -c "[ '$(rc rej 1)' = 11 ] && grep -qx 'refusal: gate-rejected' '$w/rej.1.out' && grep -qx 'gate: g' '$w/rej.1.out'"
+check "rejected gate: the independent step ran and was accepted; the gated step and its dependent were never admitted" sh -c "[ $(kinds rej company.step.accepted side) -eq 1 ] && [ $(kinds rej company.step.admitted brief) -eq 0 ] && [ $(kinds rej company.step.admitted lib) -eq 0 ]"
+
+# ---- a worker that ends without a claim: no accepted, exit 15
+mkco stuck "[$(builder lib '' stuck audit_pass.sh)]" 100000 lib
+run stuck 1
+check "stuck worker: step-failed, exit 15, the build's exit printed, nothing accepted" sh -c "[ '$(rc stuck 1)' = 15 ] && grep -qx 'refusal: step-failed' '$w/stuck.1.out' && grep -qx 'exit: 4' '$w/stuck.1.out' && ! grep -q 'company.step.accepted' '$w/stuck/company.journal' && [ $(kinds stuck company.step.admitted lib) -eq 1 ]"
+
+# ---- an audit with no score: check-unavailable, exit 14, nothing accepted and no check_failed
+mkco none "[$(builder lib '' done audit_none.sh)]" 100000 lib
+run none 1
+check "audit without a score: check-unavailable, exit 14, nothing accepted" sh -c "[ '$(rc none 1)' = 14 ] && grep -qx 'refusal: check-unavailable' '$w/none.1.out' && ! grep -q 'company.step.accepted\|check_failed' '$w/none/company.journal'"
+
+# ---- a build that claims done and leaves no artifact: Forge hashes nothing, so no check is run and nothing is accepted
+mkco noart "[$(builder lib '' bare audit_pass.sh)]" 100000 lib
+run noart 1
+check "no artifact: check-unavailable, exit 14, nothing accepted" sh -c "[ '$(rc noart 1)' = 14 ] && grep -qx 'refusal: check-unavailable' '$w/noart.1.out' && ! grep -q 'company.step.accepted' '$w/noart/company.journal'"
+
+# ---- steps the run will not start: nothing admitted, exit 1
+mkco nocheck "[{\"id\":\"qa\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"gate\"}]" 100000 qa
+run nocheck 1
+check "a qa step with no check: check-missing (the gate's verdict is a claim), exit 1, not admitted" sh -c "[ '$(rc nocheck 1)' = 1 ] && grep -qx 'refusal: check-missing' '$w/nocheck.1.out' && [ $(kinds nocheck company.step.admitted qa) -eq 0 ]"
+mkco person "[{\"id\":\"p\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\"}]" 100000
+run person 1
+check "a product step with neither a gate nor a check: check-missing, exit 1, not admitted" sh -c "[ '$(rc person 1)' = 1 ] && grep -qx 'refusal: check-missing' '$w/person.1.out' && [ $(kinds person company.step.admitted p) -eq 0 ]"
+mkco analyst "[{\"id\":\"a\",\"role\":\"analyst\",\"task_type\":\"tool.run\",\"needs\":[],\"input\":\"x\",\"check\":\"audit_pass.sh\"}]" 100000 a
+run analyst 1
+check "an analyst step (no tool.run adapter yet): task-type-unsupported, exit 1, not admitted" sh -c "[ '$(rc analyst 1)' = 1 ] && grep -qx 'refusal: task-type-unsupported' '$w/analyst.1.out' && [ $(kinds analyst company.step.admitted a) -eq 0 ]"
+
+# ---- resume: a step admitted and never accepted (a run killed mid-step) is admitted again, once, and accepted once
+mkco resume "[$(builder lib '' done audit_pass.sh)]" 100000 lib
+printf '{"v":1,"seq":1,"kind":"company.step.admitted","task":"lib","forge_task":"steps/lib"}\n{"v":1,"seq":2,"kind":"compa' > "$w/resume/company.journal"
+run resume 1
+check "resume: the half-run step is admitted again (twice in all), accepted once, the torn tail cut, exit 0" sh -c "[ '$(rc resume 1)' = 0 ] && [ $(kinds resume company.step.admitted lib) -eq 2 ] && [ $(kinds resume company.step.accepted lib) -eq 1 ] && ! grep -q 'compa\$' '$w/resume/company.journal'"
+run resume 2
+check "resume: a run after that admits nothing more" sh -c "[ '$(rc resume 2)' = 0 ] && [ $(kinds resume company.step.admitted lib) -eq 2 ]"
+
+# ---- refused before any step: exit 1, nothing appended
+mkco noprice "[$(builder lib '' done audit_pass.sh)]" 100000 lib
+rm "$w/noprice/prices.json"
+run noprice 1
+check "no price table: price-table-missing, exit 1, no journal written" sh -c "[ '$(rc noprice 1)' = 1 ] && grep -qx 'refusal: price-table-missing' '$w/noprice.1.out' && [ ! -e '$w/noprice/company.journal' ]"
+mkco badprice "[$(builder lib '' done audit_pass.sh)]" 100000 lib
+printf '{"stand":{"other":{"in":1.0,"cache_write":1.0,"cache_read":1.0,"out":1.0}}}' > "$w/badprice/prices.json"
+run badprice 1
+check "a price table without the model: price-table-missing, exit 1" sh -c "[ '$(rc badprice 1)' = 1 ] && grep -qx 'refusal: price-table-missing' '$w/badprice.1.out'"
+mkco nodir "[$(builder lib '' done audit_pass.sh)]" 100000
+run nodir 1
+check "a step directory that is not there: step-dir-missing, exit 1, the step not admitted" sh -c "[ '$(rc nodir 1)' = 1 ] && grep -qx 'refusal: step-dir-missing' '$w/nodir.1.out' && [ $(kinds nodir company.step.admitted lib) -eq 0 ]"
+mkco corrupt "[$(builder lib '' done audit_pass.sh)]" 100000 lib
+printf 'not json\n' > "$w/corrupt/company.journal"
+run corrupt 1
+check "a corrupt journal: journal-corrupt and its line, exit 1, unchanged" sh -c "[ '$(rc corrupt 1)' = 1 ] && grep -qx 'refusal: journal-corrupt' '$w/corrupt.1.out' && grep -qx 'line: 1' '$w/corrupt.1.out' && [ \"\$(cat '$w/corrupt/company.journal')\" = 'not json' ]"
+mkco badop "[$(builder lib '' done audit_pass.sh)]" 100000 lib
+printf '{"workers":"relative"}' > "$w/badop.json"
+"$F" company run "$w/badop" "$w/badop.json" > "$w/badop.out" 2>&1; echo $? > "$w/badop.rc"
+check "an operator file outside its shape: operator-invalid, exit 1" sh -c "[ \$(cat '$w/badop.rc') = 1 ] && grep -qx 'refusal: operator-invalid' '$w/badop.out' && [ ! -e '$w/badop/company.journal' ]"
+"$F" company run "$w/badop" "$w/nowhere.json" > "$w/noop.out" 2>&1; echo $? > "$w/noop.rc"
+check "an operator file that is not there: operator-invalid, exit 1" sh -c "[ \$(cat '$w/noop.rc') = 1 ] && grep -qx 'refusal: operator-invalid' '$w/noop.out'"
+check "bad usage: no operator file is exit 2, a relative company directory is path-invalid exit 2" sh -c "'$F' company run '$w/badop' > /dev/null 2>&1; [ \$? -eq 2 ] && '$F' company run relative '$w/operator.json' > '$w/rel.out' 2>&1; [ \$? -eq 2 ] && grep -qx 'refusal: path-invalid' '$w/rel.out'"
+if command -v flock > /dev/null 2>&1; then
+  mkco locked "[$(builder lib '' done audit_pass.sh)]" 100000 lib
+  flock -x "$w/locked/lock" sleep 3 &
+  lp=$!
+  sleep 0.5
+  run locked 1
+  wait "$lp"
+  check "a company directory locked by another writer: workspace-locked, exit 1, nothing written" sh -c "[ '$(rc locked 1)' = 1 ] && grep -qx 'refusal: workspace-locked' '$w/locked.1.out' && [ ! -e '$w/locked/company.journal' ]"
+else
+  echo "skip company run: flock is not installed, the held-lock case was not run"
+fi
+exit $fail

@@ -1,0 +1,804 @@
+edition 9;
+module forge.company_runner;
+
+import std.buffer;
+import std.bytes;
+import std.crypto;
+import std.io;
+import std.json;
+import std.option;
+import std.process;
+import forge.company_budget;
+import forge.company_cmd;
+import forge.company_manifest;
+import forge.company_run;
+import forge.company_state;
+import forge.company_step;
+import forge.gate_env;
+import forge.journal;
+import forge.journal_io;
+import forge.lock;
+import forge.step_run;
+import forge.task;
+import forge.worker;
+
+// `forge company run <company-dir> <operator-file>` (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.3,
+// 7 and 10): run the company's steps in dependency order until it is done or something stops it. The decisions are pure and live
+// elsewhere (`company_run.next_action`, `company_step`); this module is the loop that acts on them, and the only part of the company
+// layer that starts a process.
+//
+// The loop. It takes the writer lock of the company directory (`<dir>/lock`, the one `decide` takes, so a decision is never written
+// in the middle of a run), reads the manifest, the operator file and the price table once, and then, round after round: reads
+// company.journal and REPLAYS it (a journal the replay refuses is refused as `status` refuses it, and nothing is written; a torn tail
+// is cut), derives the spent cost from it (`company_state.spent_cost_micro`: the recorded cost, never re-priced), asks
+// `next_action`, and does that one thing. Nothing the loop knows is carried from one round to the next but what the journal says:
+// a step is done when the replay says it is accepted, never because a flag in memory says so.
+//
+// A step (`Start(i)`):
+//   1. Refusals that write nothing: a role no worker runs yet (analyst: `task-type-unsupported`), a worker step with no `check`
+//      or a product step with neither a gate nor a check (`check-missing`: a worker's claim is never acceptance), a missing
+//      `steps/<id>/ev` (`step-dir-missing`: Forge cannot make a directory; the operator makes `steps/<id>/ev` for each worker step),
+//      an operator file without what the step needs (`operator-invalid`).
+//   2. `company.step.admitted` (forge_task: the step's Forge workspace, `steps/<id>`). A step admitted and never accepted (a run
+//      killed in the middle of it, a check that failed) is admitted again by the next run: the count of admissions is the record.
+//   3. The worker, through the very runs `forge build` and `forge gate` are (`step_run.run_build` / `run_gate`, which print as those
+//      verbs do): a builder or writer step builds the step's `input` (decoded, written to `steps/<id>/brief.txt`) in `steps/<id>/ev`
+//      with the workspace `steps/<id>`; a qa or reviewer step reports the gate of the repository, revision and checkout the operator
+//      file gives for the step id. They take the lock of `steps/<id>/lock`, a different file from the company's lock, so holding
+//      the company's lock across them does not deadlock. A product step has no worker.
+//   4. A build's usage: `steps/<id>/ev/usage.jsonl` priced call by call (`company_budget.parse_usage_for`, the over tier per call),
+//      less what the journal has already recorded for the step, is appended as `company.spend.recorded` with its `cost_micro`,
+//      whatever the build's ending (tokens spent on a build that got stuck are spent).
+//   5. A worker that ended without a claim (`forge build` / `forge gate` exit status not 0) stops the run: `step-failed`, no check.
+//   6. The check: Forge hashes the artifact (`steps/<id>/ev/project.cho` for a build, `report.json` for a gate, `company.json` for a
+//      product step), runs the step's `check` program from the company directory with the artifact's path and the execution
+//      directory as its two arguments, `PATH` as its whole environment, a deadline and an output cap, and hashes the artifact again.
+//      The verdict (`company_step.check_verdict`): pass -> `company.step.accepted` with the artifact's path (relative to the company
+//      directory) and the SHA-256 Forge computed, and the next round; a score below its total -> `company.step.check_failed` and
+//      the run ends `check-failed` (no Forge-level retry: a person decides, spec section 10); anything else, or an artifact that is
+//      missing, too large or changed while the check ran -> `check-unavailable`, nothing written.
+//   A product step without a check is accepted on its approved gate alone: the human decision recorded in the journal is its
+//   check (section 4.2); its artifact is the manifest.
+//
+// A step's worker saying `done` therefore never writes `accepted`: only step 6 does, and only on a pass of Forge's own run of the
+// check against bytes Forge hashed (spec section 7, the lying-worker test in tests/conformance/company_run.sh).
+//
+// Exit status and the printed refusals: the head of src/company_step.cho. Everything is printed on standard output, except what the
+// build and gate runs print on standard error as `forge build` and `forge gate` do.
+//
+// Authority: the forge binary's, plus `exec_detached`: the check is started with `exec_spawn_detached_under` beneath the company
+// directory, so it leads a process group of its own and the deadline's kill reaches whatever it started. The program is a name in
+// the company directory (`exec_under`, no path in the report); the journal, the brief and the lock are written with the
+// `fs_write`/`file_write` the binary already holds.
+
+fn check_timeout_default() -> [] int {
+    return 600000;
+}
+
+fn rule_step_dir_missing() -> [] &static [byte] {
+    return "step-dir-missing";
+}
+
+fn rule_step_failed() -> [] &static [byte] {
+    return "step-failed";
+}
+
+fn rule_operator_invalid() -> [] &static [byte] {
+    return "operator-invalid";
+}
+
+fn rule_gate_open() -> [] &static [byte] {
+    return "gate-open";
+}
+
+fn rule_gate_rejected() -> [] &static [byte] {
+    return "gate-rejected";
+}
+
+fn say[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
+    return company_cmd.line(io, label, value);
+}
+
+fn refuse[&i, &t](io: &!i Io, tag: &t [byte]) -> [io_write] int {
+    return company_cmd.refuse(io, tag);
+}
+
+fn say_nat[&h, &i, &l](heap: &!h Heap, io: &!i Io, label: &l [byte], n: int) -> [heap, io_write] int {
+    var b = buffer.push_nat(heap, buffer.empty(heap, 8), n);
+    borrow b as &bb in {
+        say(io, label, buffer.bytes(bb));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn glue[&h, &a, &b](heap: &!h Heap, first: &a [byte], second: &b [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), first), second);
+}
+
+// ---- the verb --------------------------------------------------------------------------------------------------------------
+
+// `forge company run <company-dir> <operator-file>`: args are `forge company run <dir> <operator-file>`.
+pub fn run_cmd[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    if arg_count(args) != 5 {
+        return company_step.exit_usage();
+    }
+    let dir = arg(args, 3);
+    let opath = arg(args, 4);
+    let mpath = company_cmd.under(heap, dir, "company.json");
+    let jpath = company_cmd.under(heap, dir, "company.journal");
+    let lpath = company_cmd.under(heap, dir, "lock");
+    var code = company_step.exit_refused();
+    borrow mpath as &mp in {
+        borrow jpath as &jp in {
+            borrow lpath as &lp in {
+                if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false || journal_io.path_ok(fs, buffer.bytes(lp)) == false || journal_io.path_ok(fs, opath) == false {
+                    refuse(io, task.rule_name(task.Rule::PathInvalid));
+                    code = company_step.exit_usage();
+                } else {
+                    match lock.acquire(fs, buffer.bytes(lp)) {
+                        lock.Lock::Refused(rule) => {
+                            refuse(io, task.rule_code_name(rule));
+                            code = company_step.exit_refused();
+                        }
+                        lock.Lock::Failed(errno) => {
+                            say(io, "error: cannot take the lock of the company directory", "");
+                            code = company_step.exit_io();
+                        }
+                        lock.Lock::Held(held) => {
+                            code = run_locked(heap, fs, exec, clock, io, dir, buffer.bytes(mp), buffer.bytes(jp), opath);
+                            lock.let_go(held);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, mpath);
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, lpath);
+    return code;
+}
+
+// The lock is held: the manifest.
+fn run_locked[&h, &f, &x, &c, &i, &d, &m, &j, &o](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], opath: &o [byte]) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
+    var code = company_step.exit_refused();
+    if errno != 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(why) => {
+                    refuse(io, company_manifest.rule_name(why));
+                }
+                company_manifest.ManifestResult::Held(held) => {
+                    borrow held as &hm in {
+                        code = with_operator(heap, fs, exec, clock, io, hm, dir, jpath, opath);
+                    }
+                    company_manifest.drop(heap, held);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The operator file: read, parsed, checked for its shape (`company_step.operator_ok`).
+fn with_operator[&h, &f, &x, &c, &i, &m, &d, &j, &o](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], opath: &o [byte]) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, opath, 65536);
+    var code = company_step.exit_refused();
+    if errno != 0 {
+        refuse(io, rule_operator_invalid());
+    } else {
+        borrow text as &tb in {
+            let src = buffer.bytes(tb);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            var parsed = false;
+            borrow mut tape as &!tw in {
+                parsed = json.parse(src, contents(tw)) > 0;
+            }
+            borrow tape as &tr in {
+                let tp = contents(tr);
+                if parsed == false {
+                    refuse(io, rule_operator_invalid());
+                } else if company_step.operator_ok(src, tp) == false {
+                    refuse(io, rule_operator_invalid());
+                } else {
+                    code = with_prices(heap, fs, exec, clock, io, hm, dir, jpath, src, tp);
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The price table the manifest names, in the company directory, and the prices of the manifest's model in it.
+fn with_prices[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int]) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let ppath = company_cmd.under(heap, dir, company_manifest.price_table_of(hm));
+    var code = company_step.exit_refused();
+    borrow ppath as &pp in {
+        let (text, errno) = company_cmd.read_limited(heap, fs, buffer.bytes(pp), 1048576);
+        if errno != 0 {
+            refuse(io, company_manifest.rule_name(company_manifest.Refusal::PriceTableMissing));
+        } else {
+            borrow text as &tb in {
+                match company_budget.parse_prices_for(heap, buffer.bytes(tb), company_manifest.provider_of(hm), company_manifest.model_of(hm)) {
+                    option.Option::None => {
+                        refuse(io, company_manifest.rule_name(company_manifest.Refusal::PriceTableMissing));
+                    }
+                    option.Option::Some(prices) => {
+                        code = run_loop(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices);
+                    }
+                }
+            }
+        }
+        buffer.drop(heap, text);
+    }
+    buffer.drop(heap, ppath);
+    return code;
+}
+
+// Round after round until one ends the run. Each round either stops or accepts a step (or stops), so the number of rounds is at
+// most the number of steps plus one; a bound twice that turns a journal write that did not take into an I/O error, never a loop.
+fn run_loop[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices: company_budget.Prices) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let most = 2 * company_manifest.step_count(hm) + 2;
+    var code = 0 - 1;
+    var rounds = 0;
+    while code < 0 {
+        if rounds >= most {
+            say(io, "error: the run did not settle: a step was not accepted after its record was written", "");
+            code = company_step.exit_io();
+        } else {
+            code = one_round(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices);
+            rounds = rounds + 1;
+        }
+    }
+    return code;
+}
+
+fn limits_of[&m](hm: &m company_manifest.Manifest) -> [] company_budget.Limits {
+    return company_budget.Limits { input: company_manifest.budget_input(hm), output: company_manifest.budget_output(hm), cache_write: company_manifest.budget_cache_write(hm), cache_read: company_manifest.budget_cache_read(hm) };
+}
+
+// One round: replay, ask, act. -1 to go on, else the exit status.
+fn one_round[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices: company_budget.Prices) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let existed = journal_io.exists(fs, jpath);
+    let (data, errno) = journal_io.read_all(heap, fs, jpath);
+    if errno != 0 {
+        buffer.drop(heap, data);
+        say(io, "error: cannot read company.journal", "");
+        return company_step.exit_io();
+    }
+    var action = company_run.Action::Done;
+    var seq = 0;
+    var before = company_budget.usage_of(0, 0, 0, 0);
+    var before_cost = 0;
+    var bad = 0;
+    var bad_line = 0;
+    var cut = 0 - 1;
+    var rejected = false;
+    borrow data as &db in {
+        let state = company_state.replay(heap, buffer.bytes(db), hm);
+        borrow state as &sr in {
+            let rep = company_state.report_of(sr);
+            if rep.rule != 0 {
+                bad = rep.rule;
+                bad_line = rep.line;
+            } else {
+                cut = journal.recovery_cut(rep);
+                seq = rep.records + 1;
+                let spent = company_state.spent_cost_micro(sr, prices);
+                action = company_run.next_action(hm, sr, limits_of(hm), spent, company_budget.dollars_to_micro(company_manifest.budget_max_cost(hm)));
+                match action {
+                    company_run.Action::Start(k) => {
+                        before = company_state.step_recorded(sr, k);
+                        before_cost = company_state.step_cost_micro(sr, k);
+                    }
+                    company_run.Action::Blocked(k) => {
+                        rejected = company_state.step_blocked_by_gate(hm, sr, k) == 2;
+                    }
+                    company_run.Action::WaitGate(k) => {
+                        rejected = false;
+                    }
+                    company_run.Action::Stop(tag) => {
+                        rejected = false;
+                    }
+                    company_run.Action::Done => {
+                        rejected = false;
+                    }
+                }
+            }
+        }
+        company_state.drop(heap, state);
+    }
+    buffer.drop(heap, data);
+    if bad != 0 {
+        refuse(io, task.rule_code_name(bad));
+        say_nat(heap, io, "line: ", bad_line);
+        return company_step.exit_refused();
+    }
+    if cut >= 0 {
+        if journal_io.cut_torn_tail(fs, jpath, cut) != 0 {
+            say(io, "error: cannot cut the torn tail of company.journal", "");
+            return company_step.exit_io();
+        }
+    }
+    match action {
+        company_run.Action::Start(k) => {
+            return run_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, k, seq, existed, before, before_cost);
+        }
+        company_run.Action::WaitGate(k) => {
+            refuse(io, rule_gate_open());
+            name_step(io, hm, k, true);
+            return company_step.exit_wait_gate();
+        }
+        company_run.Action::Blocked(k) => {
+            if rejected {
+                refuse(io, rule_gate_rejected());
+            } else {
+                refuse(io, company_manifest.rule_name(company_manifest.Refusal::StepCycle));
+            }
+            name_step(io, hm, k, rejected);
+            return company_step.exit_blocked();
+        }
+        company_run.Action::Stop(tag) => {
+            refuse(io, company_run.stop_name(tag));
+            return company_step.exit_budget();
+        }
+        company_run.Action::Done => {
+            say_nat(heap, io, "done: steps accepted ", company_manifest.step_count(hm));
+            return company_step.exit_done();
+        }
+    }
+}
+
+// `gate: <name>` (when `with_gate`) and `step: <id>` of step `k`.
+fn name_step[&i, &m](io: &!i Io, hm: &m company_manifest.Manifest, k: int, with_gate: bool) -> [io_write] int {
+    let step = company_manifest.step_at(hm, k);
+    if with_gate {
+        say(io, "gate: ", company_manifest.step_gate(hm, step));
+    }
+    return say(io, "step: ", company_manifest.step_id(hm, step));
+}
+
+// ---- one step --------------------------------------------------------------------------------------------------------------
+
+// Append one record to the journal (a new file is made durable in its directory). 0, or the exit status of the failure (printed).
+fn record[&f, &i, &j, &r](fs: &f Fs(""), io: &!i Io, jpath: &j [byte], line: &r [byte], new_file: bool) -> [fs_read(""), fs_write(""), file_write, io_write] int {
+    if journal_io.append(fs, jpath, line, new_file) != 0 {
+        say(io, "error: cannot write company.journal", "");
+        return company_step.exit_io();
+    }
+    return 0;
+}
+
+fn record_buffer[&h, &f, &i, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], ev: buffer.Buffer, new_file: bool) -> [heap, fs_read(""), fs_write(""), file_write, io_write] int {
+    var status = 0;
+    borrow ev as &eb in {
+        status = record(fs, io, jpath, buffer.bytes(eb), new_file);
+    }
+    buffer.drop(heap, ev);
+    return status;
+}
+
+// Is there a directory at `path`?
+fn dir_present[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] bool {
+    if journal_io.path_ok(fs, path) == false {
+        return false;
+    }
+    match open_dir(fs, path) {
+        DirOpened::Failed(e) => {
+            return false;
+        }
+        DirOpened::Ok(d) => {
+            dir_close(d);
+            return true;
+        }
+    }
+}
+
+// Step `k`, the next record `seq`; `before` and `before_cost` are what the journal recorded for it so far.
+fn run_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices: company_budget.Prices, k: int, seq: int, existed: bool, before: company_budget.Usage, before_cost: int) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let step = company_manifest.step_at(hm, k);
+    let id = company_manifest.step_id(hm, step);
+    let check = company_manifest.step_check(hm, step);
+    let runner = company_step.runner_of(step.role);
+    let timeout = company_step.op_ms(op, tp, "check_timeout_ms", check_timeout_default());
+    match runner {
+        company_step.Runner::Unsupported => {
+            refuse(io, company_manifest.rule_name(company_manifest.Refusal::TaskTypeUnsupported));
+            say(io, "step: ", id);
+            return company_step.exit_refused();
+        }
+        company_step.Runner::Person => {
+            let gate = company_manifest.step_gate(hm, step);
+            if len(check) == 0 && len(gate) == 0 {
+                refuse(io, company_manifest.rule_name(company_manifest.Refusal::CheckMissing));
+                say(io, "step: ", id);
+                return company_step.exit_refused();
+            }
+            let mpath = company_cmd.under(heap, dir, "company.json");
+            var code = record_buffer(heap, fs, io, jpath, company_state.admitted(heap, seq, id, "person"), existed == false);
+            if code == 0 {
+                borrow mpath as &mp in {
+                    if len(check) == 0 {
+                        code = accept_unchecked(heap, fs, io, jpath, id, buffer.bytes(mp), seq + 1);
+                    } else {
+                        code = check_and_accept(heap, fs, exec, clock, io, dir, jpath, id, check, buffer.bytes(mp), "company.json", dir, seq + 1, timeout);
+                    }
+                }
+            }
+            buffer.drop(heap, mpath);
+            return code;
+        }
+        company_step.Runner::Build => {
+            return worker_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, k, seq, existed, before, before_cost, true);
+        }
+        company_step.Runner::Gate => {
+            return worker_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, k, seq, existed, before, before_cost, false);
+        }
+    }
+}
+
+// A product step with no check and an approved gate: accepted on the decision, its artifact the manifest Forge hashes now.
+fn accept_unchecked[&h, &f, &i, &j, &n, &a](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], id: &n [byte], artifact: &a [byte], seq: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let (sha, held) = hash_file(heap, fs, artifact);
+    var code = 0;
+    borrow sha as &hb in {
+        if held == false {
+            refuse(io, "check-unavailable");
+            say(io, "step: ", id);
+            code = company_step.exit_check_unavailable();
+        } else {
+            code = record_buffer(heap, fs, io, jpath, company_state.accepted(heap, seq, id, "company.json", buffer.bytes(hb)), false);
+            if code == 0 {
+                say(io, "accepted: ", id);
+                code = 0 - 1;
+            }
+        }
+    }
+    buffer.drop(heap, sha);
+    return code;
+}
+
+// A builder (`build`) or qa step: refusals, admission, the worker, the spend, the check.
+fn worker_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices: company_budget.Prices, k: int, seq: int, existed: bool, before: company_budget.Usage, before_cost: int, build: bool) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let step = company_manifest.step_at(hm, k);
+    let id = company_manifest.step_id(hm, step);
+    let check = company_manifest.step_check(hm, step);
+    if len(check) == 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::CheckMissing));
+        say(io, "step: ", id);
+        return company_step.exit_refused();
+    }
+    var ready = true;
+    if build {
+        if len(company_step.op_text(op, tp, "tools")) == 0 || len(company_step.op_text(op, tp, "checker")) == 0 || len(company_step.op_text(op, tp, "agent")) == 0 {
+            ready = false;
+        }
+    } else if len(company_step.op_gate(op, tp, id, "repo")) == 0 || len(company_step.op_gate(op, tp, id, "revision")) == 0 || len(company_step.op_gate(op, tp, id, "checkout")) == 0 {
+        ready = false;
+    }
+    let rel = glue(heap, "steps/", id);
+    var stepdir = buffer.empty(heap, 1);
+    borrow rel as &rb in {
+        buffer.drop(heap, stepdir);
+        stepdir = company_cmd.under(heap, dir, buffer.bytes(rb));
+    }
+    var code = 0;
+    borrow rel as &rb in {
+        borrow stepdir as &sb in {
+            let evdir = glue(heap, buffer.bytes(sb), "/ev");
+            borrow evdir as &eb in {
+                if dir_present(fs, buffer.bytes(eb)) == false {
+                    refuse(io, rule_step_dir_missing());
+                    say(io, "step: ", id);
+                    code = company_step.exit_refused();
+                } else if ready == false {
+                    refuse(io, rule_operator_invalid());
+                    say(io, "step: ", id);
+                    code = company_step.exit_refused();
+                } else {
+                    code = record_buffer(heap, fs, io, jpath, company_state.admitted(heap, seq, id, buffer.bytes(rb)), existed == false);
+                    if code == 0 {
+                        code = worker_run(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, k, seq + 1, before, before_cost, build, buffer.bytes(rb), buffer.bytes(sb), buffer.bytes(eb));
+                    }
+                }
+            }
+            buffer.drop(heap, evdir);
+        }
+    }
+    buffer.drop(heap, rel);
+    buffer.drop(heap, stepdir);
+    return code;
+}
+
+// The step is admitted: run its worker, record a build's spend, then the check (`seq` is the next record).
+fn worker_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &w, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices: company_budget.Prices, k: int, seq: int, before: company_budget.Usage, before_cost: int, build: bool, rel: &r [byte], stepdir: &w [byte], evdir: &e [byte]) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let step = company_manifest.step_at(hm, k);
+    let id = company_manifest.step_id(hm, step);
+    let workers = company_step.op_text(op, tp, "workers");
+    var next = seq;
+    var ran = 0;
+    if build {
+        let wrote = write_brief(heap, fs, hm, step, stepdir);
+        if wrote != 0 {
+            say(io, "error: cannot write the brief of step ", id);
+            return company_step.exit_io();
+        }
+        let brief = glue(heap, stepdir, "/brief.txt");
+        var spec = step_run.build_spec();
+        let bt = company_step.op_ms(op, tp, "build_timeout_ms", spec.timeout);
+        spec = step_run.BuildSpec { timeout: bt, attempts: spec.attempts, agent_seconds: spec.agent_seconds, rounds: spec.rounds, plan_seconds: spec.plan_seconds, jobs: spec.jobs };
+        borrow brief as &bb in {
+            ran = step_run.run_build(heap, fs, exec, clock, io, spec, stepdir, workers, company_step.op_text(op, tp, "tools"), buffer.bytes(bb), evdir, company_step.op_text(op, tp, "checker"), company_manifest.provider_of(hm), company_manifest.model_of(hm), company_step.op_text(op, tp, "agent"), "");
+        }
+        buffer.drop(heap, brief);
+        let (spent_code, after_seq) = record_spend(heap, fs, io, jpath, id, evdir, prices, before, before_cost, next);
+        if spent_code != 0 {
+            return spent_code;
+        }
+        next = after_seq;
+    } else {
+        let gt = company_step.op_ms(op, tp, "gate_timeout_ms", step_run.gate_spec().timeout);
+        ran = step_run.run_gate(heap, fs, exec, clock, io, step_run.GateSpec { timeout: gt }, stepdir, workers, company_step.op_gate(op, tp, id, "repo"), company_step.op_gate(op, tp, id, "revision"), company_step.op_gate(op, tp, id, "checkout"), evdir, "");
+    }
+    if ran != 0 {
+        refuse(io, rule_step_failed());
+        say(io, "step: ", id);
+        say_nat(heap, io, "exit: ", ran);
+        return company_step.exit_step_failed();
+    }
+    var name = company_step.artifact_name(company_step.Runner::Gate);
+    if build {
+        name = company_step.artifact_name(company_step.Runner::Build);
+    }
+    let artifact = company_cmd.under(heap, evdir, name);
+    var shown = buffer.append(heap, glue(heap, rel, "/ev/"), name);
+    var code = 0;
+    borrow artifact as &ab in {
+        borrow shown as &wb in {
+            code = check_and_accept(heap, fs, exec, clock, io, dir, jpath, id, company_manifest.step_check(hm, step), buffer.bytes(ab), buffer.bytes(wb), evdir, next, company_step.op_ms(op, tp, "check_timeout_ms", check_timeout_default()));
+        }
+    }
+    buffer.drop(heap, artifact);
+    buffer.drop(heap, shown);
+    return code;
+}
+
+// The step's `input`, decoded from its JSON string, written to `<stepdir>/brief.txt` (truncated first). 0 or an errno (-2: a path
+// that is not ok).
+fn write_brief[&h, &f, &m, &w](heap: &!h Heap, fs: &f Fs(""), hm: &m company_manifest.Manifest, step: company_manifest.Step, stepdir: &w [byte]) -> [heap, fs_write(""), file_write] int {
+    let text = company_manifest.step_input(hm, step);
+    let quoted = glue(heap, "\"", text);
+    var q = buffer.append(heap, quoted, "\"");
+    var rc = 0 - 2;
+    borrow q as &qb in {
+        let src = buffer.bytes(qb);
+        let tape = box_slice(heap, json.tape_len(src), 0);
+        borrow mut tape as &!tw in {
+            let tp = contents(tw);
+            if json.parse(src, tp) > 0 {
+                if json.is_string(tp, 0) {
+                    let n = json.string_length(src, tp, 0);
+                    if n >= 0 {
+                        let out = box_slice(heap, n, byte_of(0));
+                        borrow mut out as &!ow in {
+                            json.string_into(src, tp, 0, contents(ow));
+                        }
+                        let path = glue(heap, stepdir, "/brief.txt");
+                        borrow path as &pb in {
+                            borrow out as &or in {
+                                rc = write_file(fs, buffer.bytes(pb), contents(or));
+                            }
+                        }
+                        buffer.drop(heap, path);
+                        unbox_slice(heap, out);
+                    }
+                }
+            }
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, q);
+    return rc;
+}
+
+fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
+    if journal_io.path_ok(fs, path) == false {
+        return 0 - 2;
+    }
+    match open_write(fs, path) {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, contents);
+            }
+            file_close(file);
+            return rc;
+        }
+    }
+}
+
+// The build's `usage.jsonl` (none is no usage), priced call by call, less what was recorded for the step: appended as one priced
+// spend record when anything is new. (0 or the exit status of a failure, the next record).
+fn record_spend[&h, &f, &i, &j, &n, &e](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], id: &n [byte], evdir: &e [byte], prices: company_budget.Prices, before: company_budget.Usage, before_cost: int, seq: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] (int, int) {
+    let upath = glue(heap, evdir, "/usage.jsonl");
+    var code = 0;
+    var next = seq;
+    borrow upath as &ub in {
+        let (text, errno) = journal_io.read_all(heap, fs, buffer.bytes(ub));
+        if errno != 0 {
+            say(io, "error: cannot read the usage of step ", id);
+            code = company_step.exit_io();
+        } else {
+            borrow text as &tb in {
+                let after = company_budget.parse_usage_for(buffer.bytes(tb), prices);
+                let delta = company_step.usage_delta(after, before);
+                let cost = company_step.cost_delta(company_budget.cost_micro(after, prices), before_cost);
+                if company_step.any_tokens(delta) || cost > 0 {
+                    code = record_buffer(heap, fs, io, jpath, company_state.spend_priced(heap, seq, id, delta.input, delta.output, delta.cache_write, delta.cache_read, cost), false);
+                    next = seq + 1;
+                }
+            }
+        }
+        buffer.drop(heap, text);
+    }
+    buffer.drop(heap, upath);
+    return (code, next);
+}
+
+// ---- the check -------------------------------------------------------------------------------------------------------------
+
+// The SHA-256 of the file at `path` as hex, and whether it could be read (an ordinary file of at most `company_step.artifact_cap`).
+fn hash_file[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), file_read] (buffer.Buffer, bool) {
+    let (data, errno) = company_cmd.read_limited(heap, fs, path, company_step.artifact_cap());
+    var hex = buffer.empty(heap, 64);
+    var held = false;
+    if errno == 0 {
+        let digest = box_slice(heap, 32, byte_of(0));
+        borrow data as &db in {
+            borrow mut digest as &!dw in {
+                crypto.sha256(buffer.bytes(db), contents(dw));
+            }
+        }
+        borrow digest as &dr in {
+            hex = company_step.put_hex(heap, hex, contents(dr));
+        }
+        unbox_slice(heap, digest);
+        held = true;
+    }
+    buffer.drop(heap, data);
+    return (hex, held);
+}
+
+// Run the check `check` (a name in the company directory `dir`) with the arguments <artifact> <argdir>, PATH its environment, no
+// input, at most `company_step.check_output_cap` bytes of output and `timeout` ms. How it ended and what it wrote.
+fn run_check[&h, &f, &x, &c, &d, &n, &a, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, dir: &d [byte], check: &n [byte], artifact: &a [byte], argdir: &g [byte], timeout: int) -> [heap, exec_under, exec_detached, clock, poll, fs_read("")] (buffer.Buffer, process.Ran) {
+    if worker.name_ok(exec, check) == false {
+        return (buffer.empty(heap, 1), process.Ran::Failed(0 - 2));
+    }
+    match open_dir(fs, dir) {
+        DirOpened::Failed(e) => {
+            return (buffer.empty(heap, 1), process.Ran::Failed(e));
+        }
+        DirOpened::Ok(opened) => {
+            var cdir = opened;
+            var list = process.argv(heap, 256);
+            let (l1, e1) = process.add(heap, list, artifact);
+            let (l2, e2) = process.add(heap, l1, argdir);
+            list = l2;
+            var env = buffer.append(heap, buffer.empty(heap, 64), "PATH=");
+            env = buffer.append(heap, env, gate_env.fixed_path());
+            env = buffer.push(heap, env, byte_of(0));
+            var out = buffer.empty(heap, 1);
+            var ran = process.Ran::Failed(0 - 2);
+            if e1 == 0 && e2 == 0 {
+                match process.channels() {
+                    process.Channels::Failed(e) => {
+                        ran = process.Ran::Failed(e);
+                    }
+                    process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+                        borrow cdir as &dw in {
+                            borrow list as &lb in {
+                                borrow env as &vb in {
+                                    match exec_spawn_detached_under(exec, dw, check, process.list(lb), buffer.bytes(vb), Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                                        Spawned::Failed(e) => {
+                                            process.close(to_child, from_child);
+                                            ran = process.Ran::Failed(e);
+                                        }
+                                        Spawned::Ok(child) => {
+                                            buffer.drop(heap, out);
+                                            let (o, r) = process.capture(heap, clock, child, to_child, from_child, "", company_step.check_output_cap(), timeout);
+                                            out = o;
+                                            ran = r;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            process.drop(heap, list);
+            buffer.drop(heap, env);
+            dir_close(cdir);
+            return (out, ran);
+        }
+    }
+}
+
+// Hash the artifact, run the check, hash it again, and write what the verdict says (the head of this file, step 6). -1 to go on
+// (accepted), else the exit status.
+fn check_and_accept[&h, &f, &x, &c, &i, &d, &j, &n, &k, &a, &w, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, dir: &d [byte], jpath: &j [byte], id: &n [byte], check: &k [byte], artifact: &a [byte], shown: &w [byte], argdir: &g [byte], seq: int, timeout: int) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let (first, held) = hash_file(heap, fs, artifact);
+    if held == false {
+        buffer.drop(heap, first);
+        refuse(io, "check-unavailable");
+        say(io, "step: ", id);
+        say(io, "reason: the artifact cannot be read: ", shown);
+        return company_step.exit_check_unavailable();
+    }
+    let (out, ran) = run_check(heap, fs, exec, clock, dir, check, artifact, argdir, timeout);
+    var verdict = 2;
+    var score = 0 - 1;
+    var total = 0 - 1;
+    borrow out as &ob in {
+        verdict = company_step.check_verdict(ran, buffer.bytes(ob));
+        let (a, b) = company_step.score_of(buffer.bytes(ob));
+        score = a;
+        total = b;
+    }
+    buffer.drop(heap, out);
+    let (second, again) = hash_file(heap, fs, artifact);
+    var same = false;
+    borrow first as &fb in {
+        borrow second as &sb in {
+            if again {
+                same = bytes.equal(buffer.bytes(fb), buffer.bytes(sb));
+            }
+        }
+    }
+    buffer.drop(heap, second);
+    if verdict == 0 && same == false {
+        verdict = 2;
+    }
+    var code = company_step.verdict_exit(verdict);
+    if verdict == 0 {
+        borrow first as &fb in {
+            code = record_buffer(heap, fs, io, jpath, company_state.accepted(heap, seq, id, shown, buffer.bytes(fb)), false);
+            if code == 0 {
+                say(io, "accepted: ", id);
+                code = 0 - 1;
+            }
+        }
+    } else if verdict == 1 {
+        let failed = record_buffer(heap, fs, io, jpath, company_state.check_failed(heap, seq, id, score, total), false);
+        if failed != 0 {
+            code = failed;
+        } else {
+            refuse(io, "check-failed");
+            say(io, "step: ", id);
+            var sc = buffer.push_nat(heap, buffer.empty(heap, 16), score);
+            sc = buffer.push(heap, sc, byte_of(47));
+            sc = buffer.push_nat(heap, sc, total);
+            borrow sc as &cb in {
+                say(io, "score: ", buffer.bytes(cb));
+            }
+            buffer.drop(heap, sc);
+        }
+    } else {
+        refuse(io, "check-unavailable");
+        say(io, "step: ", id);
+    }
+    buffer.drop(heap, first);
+    return code;
+}

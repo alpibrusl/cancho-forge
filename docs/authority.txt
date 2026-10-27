@@ -4,6 +4,7 @@ performs
     clock
     dir_read
     err_write
+    exec_detached
     exec_under
     file_read
     file_write

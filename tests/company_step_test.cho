@@ -1,0 +1,223 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.crypto;
+import std.json;
+import std.process;
+import std.test;
+import forge.company_budget;
+import forge.company_manifest;
+import forge.company_run;
+import forge.company_step;
+
+// Unit tests for src/company_step.cho: the pure half of `forge company run` (exit status, worker and artifact of a role, the check
+// verdict from how the check program ended, the usage delta, hex of a digest, the operator file). Run with `cancho test`.
+
+// ---- exit status -----------------------------------------------------------------------------------------------------------
+
+fn test_every_way_a_run_stops_has_its_own_exit_status() -> [] int {
+    test.assert_eq(company_step.action_exit(company_run.Action::Done), 0);
+    test.assert_eq(company_step.action_exit(company_run.Action::Start(3)), 0 - 1);
+    test.assert_eq(company_step.action_exit(company_run.Action::WaitGate(1)), 10);
+    test.assert_eq(company_step.action_exit(company_run.Action::Blocked(1)), 11);
+    test.assert_eq(company_step.action_exit(company_run.Action::Stop(company_run.stop_budget())), 12);
+    test.assert_eq(company_step.verdict_exit(0), 0 - 1);
+    test.assert_eq(company_step.verdict_exit(1), 13);
+    test.assert_eq(company_step.verdict_exit(2), 14);
+    test.assert_eq(company_step.verdict_exit(0 - 7), 14);
+    test.assert_eq(company_step.verdict_exit(99), 14);
+    test.assert_eq(company_step.exit_step_failed(), 15);
+    test.assert_eq(company_step.exit_refused(), 1);
+    test.assert_eq(company_step.exit_usage(), 2);
+    test.assert_eq(company_step.exit_io(), 3);
+    return 0;
+}
+
+// ---- runner and artifact ---------------------------------------------------------------------------------------------------
+
+fn runner_code(r: company_step.Runner) -> [] int {
+    match r {
+        company_step.Runner::Build => {
+            return 1;
+        }
+        company_step.Runner::Gate => {
+            return 2;
+        }
+        company_step.Runner::Person => {
+            return 3;
+        }
+        company_step.Runner::Unsupported => {
+            return 4;
+        }
+    }
+}
+
+fn test_each_role_has_its_runner_and_artifact() -> [] int {
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Builder)), 1);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Writer)), 1);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Qa)), 2);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Reviewer)), 2);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Product)), 3);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Analyst)), 4);
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Build), "project.cho"));
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Gate), "report.json"));
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Person), "company.json"));
+    test.assert_eq(len(company_step.artifact_name(company_step.Runner::Unsupported)), 0);
+    return 0;
+}
+
+// ---- the check verdict -----------------------------------------------------------------------------------------------------
+
+fn test_a_full_score_with_exit_zero_passes() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), "case a ok\nTOTAL 2/2\n"), 0);
+    return 0;
+}
+
+// The lying worker of spec 7: whatever the worker said, an audit that scores 1/2 is check-failed, with exit 0 or 1.
+fn test_a_score_below_the_total_is_check_failed_whatever_the_exit() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), "TOTAL 1/2\n"), 1);
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(1), "TOTAL 1/2\n"), 1);
+    return 0;
+}
+
+fn test_a_pass_with_a_failing_exit_is_unavailable_not_a_pass() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(1), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(255), "TOTAL 2/2\n"), 2);
+    return 0;
+}
+
+fn test_a_check_that_did_not_end_by_itself_is_unavailable_even_with_a_full_score() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Signaled(9), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::TimedOut, "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::TooMuch, "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::Failed(2), "TOTAL 2/2\n"), 2);
+    return 0;
+}
+
+fn test_no_score_is_unavailable() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), ""), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), "done\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), "TOTAL 0/0\n"), 2);
+    return 0;
+}
+
+fn test_the_score_is_read_back_for_the_journal() -> [] int {
+    let (a, b) = company_step.score_of("x\nTOTAL 1/2\n");
+    test.assert_eq(a, 1);
+    test.assert_eq(b, 2);
+    let (c, d) = company_step.score_of("nothing");
+    test.assert_eq(c, 0 - 1);
+    test.assert_eq(d, 0 - 1);
+    return 0;
+}
+
+// ---- usage delta -----------------------------------------------------------------------------------------------------------
+
+fn test_the_usage_delta_is_what_is_new_per_class_never_negative() -> [] int {
+    let after = company_budget.usage_of(100, 50, 7, 0);
+    let before = company_budget.usage_of(40, 50, 9, 0);
+    let d = company_step.usage_delta(after, before);
+    test.assert_eq(d.input, 60);
+    test.assert_eq(d.output, 0);
+    test.assert_eq(d.cache_write, 0);
+    test.assert_eq(d.cache_read, 0);
+    test.assert(company_step.any_tokens(d));
+    test.assert(company_step.any_tokens(company_step.usage_delta(before, after)));
+    test.assert(company_step.any_tokens(company_step.usage_delta(after, after)) == false);
+    test.assert_eq(company_step.cost_delta(10, 3), 7);
+    test.assert_eq(company_step.cost_delta(3, 10), 0);
+    return 0;
+}
+
+fn test_the_usage_delta_of_extreme_values_never_traps() -> [] int {
+    let big = company_budget.usage_of(9223372036854775807, 0 - 9223372036854775807, 1000000000000000, 0);
+    let d = company_step.usage_delta(big, company_budget.usage_of(0 - 5, 9223372036854775807, 0, 0));
+    test.assert_eq(d.input, 1000000000000000);
+    test.assert_eq(d.output, 0);
+    test.assert_eq(company_step.cost_delta(9223372036854775807, 0 - 9223372036854775807), 1000000000000000);
+    return 0;
+}
+
+// ---- hex -------------------------------------------------------------------------------------------------------------------
+
+fn test_the_digest_is_written_as_lower_case_hex[&h](heap: &!h Heap) -> [heap] int {
+    let digest = box_slice(heap, 32, byte_of(0));
+    borrow mut digest as &!dw in {
+        crypto.sha256("abc", contents(dw));
+    }
+    var out = buffer.empty(heap, 64);
+    borrow digest as &dr in {
+        out = company_step.put_hex(heap, out, contents(dr));
+    }
+    borrow out as &ob in {
+        test.assert(bytes.equal(buffer.bytes(ob), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    }
+    buffer.drop(heap, out);
+    unbox_slice(heap, digest);
+    return 0;
+}
+
+// ---- the operator file -----------------------------------------------------------------------------------------------------
+
+fn operator_is_ok[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] bool {
+    var ok = false;
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(text, tp) > 0 {
+            ok = company_step.operator_ok(text, tp);
+        }
+    }
+    unbox_slice(heap, tape);
+    return ok;
+}
+
+fn good_operator() -> [] &static [byte] {
+    return "{\"workers\":\"/w\",\"tools\":\"/t\",\"checker\":\"/c/cancho\",\"agent\":\"stand-in --x\",\"gates\":{\"qa\":{\"repo\":\"alpibrusl/cancho-hdl\",\"revision\":\"0123456789012345678901234567890123456789\",\"checkout\":\"/co\"}},\"check_timeout_ms\":20000}";
+}
+
+fn test_a_good_operator_file_is_taken_and_read_back[&h](heap: &!h Heap) -> [heap] int {
+    let text = good_operator();
+    test.assert(operator_is_ok(heap, text));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\"}"));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(bytes.equal(company_step.op_text(text, tp, "workers"), "/w"));
+        test.assert(bytes.equal(company_step.op_text(text, tp, "agent"), "stand-in --x"));
+        test.assert(bytes.equal(company_step.op_gate(text, tp, "qa", "checkout"), "/co"));
+        test.assert(bytes.equal(company_step.op_gate(text, tp, "qa", "repo"), "alpibrusl/cancho-hdl"));
+        test.assert_eq(len(company_step.op_gate(text, tp, "nope", "repo")), 0);
+        test.assert_eq(len(company_step.op_text(text, tp, "gates")), 0);
+        test.assert_eq(company_step.op_ms(text, tp, "check_timeout_ms", 5), 20000);
+        test.assert_eq(company_step.op_ms(text, tp, "gate_timeout_ms", 5), 5);
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+fn test_an_operator_file_outside_the_shape_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(operator_is_ok(heap, "{}") == false);
+    test.assert(operator_is_ok(heap, "[]") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"w\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":3}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"extra\":1}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"workers\":\"/x\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\\n\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"tools\":\"t\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent\":7}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"check_timeout_ms\":9999}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"check_timeout_ms\":86400001}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"check_timeout_ms\":\"20000\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"check_timeout_ms\":99999999999999999999999}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":[]}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":3}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":{\"repo\":\"r\",\"revision\":\"v\",\"checkout\":\"co\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":{\"repo\":\"r\",\"revision\":\"v\",\"checkout\":\"/co\",\"x\":1}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":{\"repo\":\"r\",\"checkout\":\"/co\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"q\\u0061\":{\"repo\":\"r\",\"revision\":\"v\",\"checkout\":\"/co\"}}}") == false);
+    return 0;
+}

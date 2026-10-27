@@ -1,0 +1,485 @@
+edition 9;
+module forge.company_step;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.process;
+import forge.company_budget;
+import forge.company_check;
+import forge.company_manifest;
+import forge.company_run;
+
+// The pure half of `forge company run` (src/company_runner.cho is the half that acts; docs/superpowers/specs/
+// 2026-10-27-forge-company-layer-design.md, sections 4.3 and 10): which worker runs a step and which file it leaves as the artifact
+// Forge hashes, what the check program's ending and output come to, what is new in a step's usage, the exit status of each way a run
+// stops, and the operator file. No effect row here beyond `heap`: every decision is testable without a child
+// (tests/company_step_test.cho).
+//
+// Exit status of `forge company run` (the codes of the other verbs are kept: 1 refused, 2 usage, 3 I/O):
+//    0  every step is accepted                                                       (Done)
+//    1  refused before or between steps: the manifest, the journal, the operator file, the price table, a step directory that
+//       is not there, a step no worker can run; `refusal: <tag>` is printed
+//    2  bad usage, or a path that is not absolute (`refusal: path-invalid`)
+//    3  an I/O error: the lock, the journal, a file that cannot be written
+//   10  waiting for a human gate (`refusal: gate-open`, then `gate: <name>` and `step: <id>`): `forge company decide`, then run again
+//   11  blocked (`refusal: gate-rejected`, or `step-cycle` for the defensive Blocked a parsed manifest cannot reach)
+//   12  the budget is spent (`refusal: budget-exhausted`)
+//   13  a check ran and did not pass (`refusal: check-failed`, `score: a/b`); no Forge-level retry: a person decides
+//   14  the check could not be read as a score, did not end, wrote too much, or the artifact is missing or changed under it
+//       (`refusal: check-unavailable`)
+//   15  the step's worker ended without a claim (stuck, gate_failed, a refusal, a deadline: what `forge build` / `forge gate` exit 4
+//       for), or was refused (`refusal: step-failed`, `exit: N` of the build or gate); no `accepted` is written
+
+pub fn exit_done() -> [] int {
+    return 0;
+}
+
+pub fn exit_refused() -> [] int {
+    return 1;
+}
+
+pub fn exit_usage() -> [] int {
+    return 2;
+}
+
+pub fn exit_io() -> [] int {
+    return 3;
+}
+
+pub fn exit_wait_gate() -> [] int {
+    return 10;
+}
+
+pub fn exit_blocked() -> [] int {
+    return 11;
+}
+
+pub fn exit_budget() -> [] int {
+    return 12;
+}
+
+pub fn exit_check_failed() -> [] int {
+    return 13;
+}
+
+pub fn exit_check_unavailable() -> [] int {
+    return 14;
+}
+
+pub fn exit_step_failed() -> [] int {
+    return 15;
+}
+
+// The exit status a scheduling answer ends the run with; -1 for `Start`, which does not end it.
+pub fn action_exit(a: company_run.Action) -> [] int {
+    match a {
+        company_run.Action::Start(i) => {
+            return 0 - 1;
+        }
+        company_run.Action::WaitGate(i) => {
+            return exit_wait_gate();
+        }
+        company_run.Action::Blocked(i) => {
+            return exit_blocked();
+        }
+        company_run.Action::Stop(tag) => {
+            return exit_budget();
+        }
+        company_run.Action::Done => {
+            return exit_done();
+        }
+    }
+}
+
+// The exit status a check verdict (`company_check.verdict`) ends the run with; -1 for a pass, which does not end it. Anything that
+// is not a verdict is unavailable, never a pass.
+pub fn verdict_exit(v: int) -> [] int {
+    if v == 0 {
+        return 0 - 1;
+    }
+    if v == 1 {
+        return exit_check_failed();
+    }
+    return exit_check_unavailable();
+}
+
+// ---- which worker, which artifact ------------------------------------------------------------------------------------------
+
+// How a step is run. `Build`: `forge build`'s run (step_run.run_build), the Cancho Code adapter. `Gate`: `forge gate`'s run
+// (step_run.run_gate), the gate runner. `Person`: no worker; a human gate decides it. `Unsupported`: no adapter yet (an analyst's
+// `tool.run`, a later task): the run refuses it with `task-type-unsupported`.
+pub enum Runner {
+    Build,
+    Gate,
+    Person,
+    Unsupported,
+}
+
+pub fn runner_of(role: company_manifest.Role) -> [] Runner {
+    match role {
+        company_manifest.Role::Builder => {
+            return Runner::Build;
+        }
+        company_manifest.Role::Writer => {
+            return Runner::Build;
+        }
+        company_manifest.Role::Qa => {
+            return Runner::Gate;
+        }
+        company_manifest.Role::Reviewer => {
+            return Runner::Gate;
+        }
+        company_manifest.Role::Product => {
+            return Runner::Person;
+        }
+        company_manifest.Role::Analyst => {
+            return Runner::Unsupported;
+        }
+    }
+}
+
+// The artifact a step leaves, as a name in its execution directory: what the build tool writes (`project.cho`), what the gate
+// runner writes (`report.json`). A person's step has no execution directory: its artifact is the manifest itself, `company.json`
+// in the company directory, which holds what the person approved. Empty for a runner that does not exist.
+pub fn artifact_name(r: Runner) -> [] &static [byte] {
+    match r {
+        Runner::Build => {
+            return "project.cho";
+        }
+        Runner::Gate => {
+            return "report.json";
+        }
+        Runner::Person => {
+            return "company.json";
+        }
+        Runner::Unsupported => {
+            return "";
+        }
+    }
+}
+
+// ---- the check -------------------------------------------------------------------------------------------------------------
+
+// The verdict of a check program from how it ended and what it wrote on standard output: 0 pass, 1 check-failed, 2
+// check-unavailable. Only an exit of its own is read: a signal, the deadline, too much output or a spawn that failed is
+// unavailable. A score that passes with a non-zero exit is unavailable too (the program and its output disagree; fail closed); a
+// score below its total is check-failed whatever the exit (an audit that exits 1 on a failure is the common form).
+pub fn check_verdict[&t](ran: process.Ran, out: &t [byte]) -> [] int {
+    match ran {
+        process.Ran::Code(code) => {
+            let v = company_check.verdict(company_check.parse_score(out));
+            if code != 0 {
+                if v == 0 {
+                    return 2;
+                }
+            }
+            return v;
+        }
+        process.Ran::Signaled(s) => {
+            return 2;
+        }
+        process.Ran::TimedOut => {
+            return 2;
+        }
+        process.Ran::TooMuch => {
+            return 2;
+        }
+        process.Ran::Failed(e) => {
+            return 2;
+        }
+    }
+}
+
+// The score the check printed, (score, total), or (-1, -1) when there is none to show.
+pub fn score_of[&t](out: &t [byte]) -> [] (int, int) {
+    match company_check.parse_score(out) {
+        company_check.ScoreResult::Score(a, b) => {
+            return (a, b);
+        }
+        company_check.ScoreResult::Unavailable => {
+            return (0 - 1, 0 - 1);
+        }
+    }
+}
+
+// The most a check may write on standard output: 1 MiB, the bound `company_check.parse_score` is tested at. One byte more ends it.
+pub fn check_output_cap() -> [] int {
+    return 1048576;
+}
+
+// The most bytes of an artifact Forge reads to hash: 16 MiB. A larger one is check-unavailable.
+pub fn artifact_cap() -> [] int {
+    return 16777216;
+}
+
+// ---- usage -----------------------------------------------------------------------------------------------------------------
+
+// `a` clamped to 0 .. 10^15, the cap every count of the company layer saturates at.
+fn clamped(a: int) -> [] int {
+    if a < 0 {
+        return 0;
+    }
+    if a > 1000000000000000 {
+        return 1000000000000000;
+    }
+    return a;
+}
+
+// a - b of the clamped values, never below zero: no input overflows.
+fn minus(a: int, b: int) -> [] int {
+    let x = clamped(a);
+    let y = clamped(b);
+    if y >= x {
+        return 0;
+    }
+    return x - y;
+}
+
+// What is new in a step's usage: `after` (its whole `usage.jsonl` now) less `before` (what the journal has recorded for it), per
+// class, never below zero (a file that shrank records nothing, it does not refund).
+pub fn usage_delta(after: company_budget.Usage, before: company_budget.Usage) -> [] company_budget.Usage {
+    return company_budget.usage_of(minus(after.input, before.input), minus(after.output, before.output), minus(after.cache_write, before.cache_write), minus(after.cache_read, before.cache_read));
+}
+
+// The same for a cost in micro-dollars (both clamped to 0 .. 10^15).
+pub fn cost_delta(after: int, before: int) -> [] int {
+    return minus(after, before);
+}
+
+// Is there anything to record?
+pub fn any_tokens(u: company_budget.Usage) -> [] bool {
+    return u.input > 0 || u.output > 0 || u.cache_write > 0 || u.cache_read > 0;
+}
+
+// ---- hashing ---------------------------------------------------------------------------------------------------------------
+
+fn hex_digit(n: int) -> [] byte {
+    if n < 10 {
+        return byte_of(48 + n);
+    }
+    return byte_of(87 + n);
+}
+
+// `out` with `digest` appended as lower-case hex, two digits a byte (the form `response.sha256_ok` takes for 32 bytes).
+pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) -> [heap] buffer.Buffer {
+    var o = out;
+    var i = 0;
+    while i < len(digest) {
+        let v = int_of(digest[i]);
+        o = buffer.push(heap, o, hex_digit(v / 16));
+        o = buffer.push(heap, o, hex_digit(v % 16));
+        i = i + 1;
+    }
+    return o;
+}
+
+// ---- the operator file -----------------------------------------------------------------------------------------------------
+
+// What the operator gives a run, in a JSON file named on the command line (never in the company directory: the manifest declares
+// requirements and cannot name a worker, a tool or a checkout, section 4.1). A closed shape:
+//
+//   { "workers": "/abs", "tools": "/abs", "checker": "/abs", "agent": "command line",
+//     "gates": { "<step id>": { "repo": "<allow-list key>", "revision": "<40 hex>", "checkout": "/abs" } },
+//     "build_timeout_ms": N, "gate_timeout_ms": N, "check_timeout_ms": N }
+//
+// `workers` is required; `tools`, `checker` and `agent` are required when a step is a build (the run checks it when it starts
+// one); `gates` names, for each qa or reviewer step, the repository, revision and checkout `forge gate` takes. The timeouts are
+// optional, 10000 to 86400000 ms. A string is plain (no escape) and at most 4096 bytes; the paths absolute. Anything else (a key
+// outside the shape, a wrong type, a relative path) is `operator-invalid`. These are checks of form only: every value is checked
+// again by what uses it (`journal_io.path_ok`, `gate_task.check`, `build_task`), so the file grants nothing.
+
+fn root_keys() -> [] &static [byte] {
+    return " workers tools checker agent gates build_timeout_ms gate_timeout_ms check_timeout_ms ";
+}
+
+fn gate_keys() -> [] &static [byte] {
+    return " repo revision checkout ";
+}
+
+// Is `key` one of the space-separated words of `words`?
+fn listed[&k](words: &static [byte], key: &k [byte]) -> [] bool {
+    if len(key) == 0 {
+        return false;
+    }
+    var start = 0;
+    var k = 0;
+    while k < len(words) {
+        if int_of(words[k]) == 32 {
+            if k - start == len(key) {
+                if bytes.equal(words[start..k], key) {
+                    return true;
+                }
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+fn plain_string[&t](tp: &t [int], node: int) -> [] bool {
+    if json.is_string(tp, node) == false {
+        return false;
+    }
+    return json.string_plain(tp, node);
+}
+
+fn absolute[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if plain_string(tp, node) == false {
+        return false;
+    }
+    let v = json.string_view(src, tp, node);
+    if len(v) < 2 {
+        return false;
+    }
+    if len(v) > 4096 {
+        return false;
+    }
+    return int_of(v[0]) == 47;
+}
+
+// Does every key of the object at `obj` appear in `words`, written plain, each once?
+fn keys_ok[&s, &t](src: &s [byte], tp: &t [int], obj: int, words: &static [byte]) -> [] bool {
+    let n = json.count(tp, obj);
+    var k = obj + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if plain_string(tp, k) == false {
+            ok = false;
+        } else {
+            let name = json.string_view(src, tp, k);
+            if listed(words, name) == false {
+                ok = false;
+            } else if json.get(src, tp, obj, name) != k + 1 {
+                ok = false;
+            }
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    return ok;
+}
+
+fn timeout_ok[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte]) -> [] bool {
+    let node = json.get(src, tp, 0, name);
+    if node < 0 {
+        return true;
+    }
+    if json.fits_int(src, tp, node) == false {
+        return false;
+    }
+    let v = json.to_int(src, tp, node);
+    return v >= 10000 && v <= 86400000;
+}
+
+fn optional_absolute[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte]) -> [] bool {
+    let node = json.get(src, tp, 0, name);
+    if node < 0 {
+        return true;
+    }
+    return absolute(src, tp, node);
+}
+
+// Is the operator file `src`, parsed into `tp` (a parse that succeeded), of the shape above? The text of a parse that failed is
+// the caller's to refuse.
+pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
+    if json.is_object(tp, 0) == false {
+        return false;
+    }
+    if keys_ok(src, tp, 0, root_keys()) == false {
+        return false;
+    }
+    if absolute(src, tp, json.get(src, tp, 0, "workers")) == false {
+        return false;
+    }
+    if optional_absolute(src, tp, "tools") == false || optional_absolute(src, tp, "checker") == false {
+        return false;
+    }
+    let agent = json.get(src, tp, 0, "agent");
+    if agent >= 0 {
+        if plain_string(tp, agent) == false {
+            return false;
+        }
+        if len(json.string_view(src, tp, agent)) > 4096 {
+            return false;
+        }
+    }
+    if timeout_ok(src, tp, "build_timeout_ms") == false || timeout_ok(src, tp, "gate_timeout_ms") == false || timeout_ok(src, tp, "check_timeout_ms") == false {
+        return false;
+    }
+    let gates = json.get(src, tp, 0, "gates");
+    if gates < 0 {
+        return true;
+    }
+    if json.is_object(tp, gates) == false {
+        return false;
+    }
+    let n = json.count(tp, gates);
+    var k = gates + 1;
+    var j = 0;
+    var ok = keys_plain(tp, gates);
+    while j < n {
+        let v = k + 1;
+        if json.is_object(tp, v) == false {
+            ok = false;
+        } else if keys_ok(src, tp, v, gate_keys()) == false {
+            ok = false;
+        } else {
+            let repo = json.get(src, tp, v, "repo");
+            let revision = json.get(src, tp, v, "revision");
+            if plain_string(tp, repo) == false || plain_string(tp, revision) == false || absolute(src, tp, json.get(src, tp, v, "checkout")) == false {
+                ok = false;
+            }
+        }
+        k = json.skip(tp, v);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// Are the keys of the object at `obj` written plain? (A step id is a name, so an escaped key could never match one.)
+fn keys_plain[&t](tp: &t [int], obj: int) -> [] bool {
+    let n = json.count(tp, obj);
+    var k = obj + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if plain_string(tp, k) == false {
+            ok = false;
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// The string `name` of the operator file, or "" when it has none (an `operator_ok` file).
+pub fn op_text[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte]) -> [] &s [byte] {
+    let node = json.get(src, tp, 0, name);
+    if json.is_string(tp, node) == false {
+        return src[0..0];
+    }
+    return json.string_view(src, tp, node);
+}
+
+// The timeout `name`, in ms, or `default` when the file has none.
+pub fn op_ms[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte], default: int) -> [] int {
+    let node = json.get(src, tp, 0, name);
+    if json.fits_int(src, tp, node) == false {
+        return default;
+    }
+    return json.to_int(src, tp, node);
+}
+
+// The `field` (repo, revision, checkout) of the gate entry for step `step`, or "" when there is none.
+pub fn op_gate[&s, &t, &i](src: &s [byte], tp: &t [int], step: &i [byte], field: &static [byte]) -> [] &s [byte] {
+    let gates = json.get(src, tp, 0, "gates");
+    let entry = json.get(src, tp, gates, step);
+    let node = json.get(src, tp, entry, field);
+    if json.is_string(tp, node) == false {
+        return src[0..0];
+    }
+    return json.string_view(src, tp, node);
+}
