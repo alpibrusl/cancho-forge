@@ -50,6 +50,8 @@ proposes and executes.
   loss. The Cancho Code interface was audited, not exercised with a model:
   [`docs/cancho-code-audit.md`](docs/cancho-code-audit.md).
 
+- **Company layer (built, stand-in workers only).** `forge company check | status | decide | run` runs a manifest of steps through Forge's builder, gate and tool workers; a step is accepted only when a check Forge runs itself scores in full, human gates and a token-derived budget stop it, and a killed run resumes from its own journal. **No company has been run with a real model**, the reviewer role is not distinct from qa, and the writer role has never been run: [`docs/company.md`](docs/company.md).
+
 **[Project page](https://alpibrusl.github.io/cancho-forge)** ·
 [Architecture](docs/architecture.md) ·
 [Worker contract](docs/worker-contract.md) ·

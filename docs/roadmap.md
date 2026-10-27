@@ -115,6 +115,8 @@ workers directory is a compile-time literal: ship Forge built for a
 workspace, or hold `Exec("")` and rely on layer 2 -- decide in M2 and
 record it).
 
+**Status of the company layer (design `docs/superpowers/specs/2026-10-27-forge-company-layer-design.md`; [`company.md`](company.md)).** Built and in the gate, with stand-in workers: the manifest and its refusals, the step graph, the company journal and its replay, `forge company check | status | decide | run`, human gates and `retry:<id>`, a token-derived budget, acceptance only by a Forge-run check, needs delivery, a contract input, kill and resume, the analyst's `tool.run` worker. **Remains:** the StatusLite repository and its hidden audit; a company run with a real model (none has happened); the A/B of the contract arms and the semantic contract (arm C); the reviewer role (not distinct from qa); a writer run; forge#41's re-run comparison; holding a worker that ended without a claim; showing a held step and the cost in `status`.
+
 ## M3 -- Verification and evidence gate
 
 *Leans on:* the same `std.process` machinery run as a Forge-owned child;

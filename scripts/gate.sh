@@ -16,6 +16,7 @@
 #   conformance          tests/conformance/*.cho, programs that need an Fs, which
 #                        `cancho test` cannot hand a test: built, run against a
 #                        scratch directory made here and removed, exit 0 = held
+#   docs tags            every company rule tag appears in docs/company.md and docs/architecture.md
 #   file budget          no source file over 2,000 lines
 # Usage: CANCHO=path/to/cancho scripts/gate.sh
 set -u
@@ -250,6 +251,16 @@ if cmp -s "$scratch/authority.txt" docs/authority.txt; then
 else
   echo "FAIL authority: differs from docs/authority.txt"; diff docs/authority.txt "$scratch/authority.txt"; fail=1
 fi
+
+echo "== docs: every rule tag the company code can print is in docs/company.md and docs/architecture.md"
+# An oracle from outside the program: the tags are the kebab-case string literals of the files that print them.
+company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_manifest.cho src/company_step.cho src/company_runner.cho src/company_run.cho src/company_check.cho src/tool_task.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
+for t in $company_tags; do
+  for d in docs/company.md docs/architecture.md; do
+    if grep -qF "\`$t\`" "$d"; then :; else echo "FAIL docs: tag $t is not in $d"; fail=1; fi
+  done
+done
+echo "ok   docs: $(echo "$company_tags" | wc -l) company tags checked"
 
 echo "== file budget (2000 lines)"
 for f in $(find src tests spike workers -name '*.cho'); do
