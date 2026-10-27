@@ -65,6 +65,11 @@ fn nap[&h](heap: &!h Heap, ms: int) -> [heap, poll] int {
 // The `execute` request. `brief_json` is JSON text (so that a brief that is not a string can be sent), `tools` and
 // `exec_dir` are paths, `build` is the text of `grants.build`.
 fn request[&h, &b, &t, &e, &y, &u](heap: &!h Heap, brief_json: &b [byte], tools: &t [byte], exec_dir: &e [byte], task_type: &y [byte], timeout_ms: int, build: &u [byte]) -> [heap] buffer.Buffer {
+    return request_c(heap, brief_json, "", tools, exec_dir, task_type, timeout_ms, build);
+}
+
+// `request` with an `input.contract` given as JSON text (empty: the field is absent), so that one that is not a string can be sent.
+fn request_c[&h, &b, &c, &t, &e, &y, &u](heap: &!h Heap, brief_json: &b [byte], contract_json: &c [byte], tools: &t [byte], exec_dir: &e [byte], task_type: &y [byte], timeout_ms: int, build: &u [byte]) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 512);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "contract");
@@ -85,6 +90,10 @@ fn request[&h, &b, &t, &e, &y, &u](heap: &!h Heap, brief_json: &b [byte], tools:
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "brief");
     w = json.put_fragment(heap, w, brief_json);
+    if len(contract_json) > 0 {
+        w = json.put_key(heap, w, "contract");
+        w = json.put_fragment(heap, w, contract_json);
+    }
     w = json.end_object(heap, w);
     w = json.end_object(heap, w);
     w = json.put_key(heap, w, "limits");
@@ -211,7 +220,11 @@ fn ran_async[&h, &x, &w, &c, &q, &e](heap: &!h Heap, exec: &x Exec(""), workers:
 
 // One case through `worker.run`: the reply must be `state`/`code`/`retryable` with `evidence` entries, within `within_ms`.
 fn case[&h, &x, &w, &c, &i, &b, &t, &e, &u](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], task_type: &static [byte], brief_json: &b [byte], tools: &t [byte], exec_dir: &e [byte], build: &u [byte], timeout_ms: int, state: &static [byte], code: &static [byte], retryable: bool, evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
-    let req = request(heap, brief_json, tools, exec_dir, task_type, timeout_ms, build);
+    return case_c(heap, exec, workers, clock, io, label, task_type, brief_json, "", tools, exec_dir, build, timeout_ms, state, code, retryable, evidence, within_ms);
+}
+
+fn case_c[&h, &x, &w, &c, &i, &b, &k, &t, &e, &u](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, label: &static [byte], task_type: &static [byte], brief_json: &b [byte], contract_json: &k [byte], tools: &t [byte], exec_dir: &e [byte], build: &u [byte], timeout_ms: int, state: &static [byte], code: &static [byte], retryable: bool, evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let req = request_c(heap, brief_json, contract_json, tools, exec_dir, task_type, timeout_ms, build);
     let began = clock_ms(clock);
     var held = false;
     borrow req as &qb in {
@@ -249,6 +262,33 @@ fn go[&h, &x, &w, &c, &i, &s, &b, &u](heap: &!h Heap, exec: &x Exec(""), workers
     borrow tools as &tb in {
         borrow exec_dir as &eb in {
             bad = case(heap, exec, workers, clock, io, label, task_type, brief_json, buffer.bytes(tb), buffer.bytes(eb), build, timeout_ms, state, code, retryable, evidence, within_ms);
+        }
+    }
+    buffer.drop(heap, tools);
+    buffer.drop(heap, exec_dir);
+    return bad;
+}
+
+// `go` with an `input.contract` (JSON text; `@EXEC@` in it stands for the execution directory's path).
+fn go_c[&h, &x, &w, &c, &i, &s, &b, &k, &u](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, io: &!i Io, scratch: &s [byte], label: &static [byte], task_type: &static [byte], brief_json: &b [byte], contract_json: &k [byte], tools_name: &static [byte], ev_name: &static [byte], build: &u [byte], timeout_ms: int, state: &static [byte], code: &static [byte], retryable: bool, evidence: int, within_ms: int) -> [heap, exec_under, clock, poll, io_write] int {
+    let tools = support.under(heap, scratch, tools_name);
+    let exec_dir = support.under(heap, scratch, ev_name);
+    var bad = 0;
+    borrow tools as &tb in {
+        borrow exec_dir as &eb in {
+            var cj = buffer.empty(heap, 64);
+            var at = bytes.find(contract_json, "@EXEC@");
+            if at >= 0 {
+                cj = buffer.append(heap, cj, contract_json[0..at]);
+                cj = buffer.append(heap, cj, buffer.bytes(eb));
+                cj = buffer.append(heap, cj, contract_json[at + 6..len(contract_json)]);
+            } else {
+                cj = buffer.append(heap, cj, contract_json);
+            }
+            borrow cj as &cb in {
+                bad = case_c(heap, exec, workers, clock, io, label, task_type, brief_json, buffer.bytes(cb), buffer.bytes(tb), buffer.bytes(eb), build, timeout_ms, state, code, retryable, evidence, within_ms);
+            }
+            buffer.drop(heap, cj);
         }
     }
     buffer.drop(heap, tools);
@@ -384,6 +424,14 @@ fn run[&h, &x, &w, &f, &c, &i, &s](heap: &!h Heap, exec: &x Exec(""), workers: &
     bad = bad + go(heap, exec, workers, clock, io, scratch, "the argument vector is the operator's, and the brief is only in its file", task, "\"args\\nsecond line with \\\"quotes\\\"; $(x) `y` & | > <\\n\"", "tools", "ev_args", build, 20000, "succeeded", "", false, 4, 15000);
     bad = bad + go(heap, exec, workers, clock, io, scratch, "the build is started with an empty environment", task, "\"env\"", "tools", "ev_env", build, 20000, "succeeded", "", false, 4, 15000);
     bad = bad + go(heap, exec, workers, clock, io, scratch, "a guide and the ceilings reach the argument vector", task, "\"args2\"", "tools", "ev_args2", "{\"checker\":\"/opt/cancho/bin/cancho\",\"guide\":\"/opt/guides/plan.md\",\"agent\":\"stand-in-agent --x\",\"provider\":\"stand\",\"model\":\"m1\",\"attempts\":7,\"agent_seconds\":31,\"rounds\":2,\"plan_seconds\":901,\"jobs\":5}", 20000, "succeeded", "", false, 4, 15000);
+    // ---- the contract (task 10): input.contract is a file beneath the execution directory, or the task is refused before anything runs
+    bad = bad + go_c(heap, exec, workers, clock, io, scratch, "a contract beneath the execution directory reaches the argument vector as --contract <absolute path>", task, "\"args\"", "\"contract.txt\"", "tools", "ev_ctr", build, 20000, "succeeded", "", false, 4, 15000);
+    bad = bad + go_c(heap, exec, workers, clock, io, scratch, "a contract given as an absolute path beneath the execution directory is the same", task, "\"args\"", "\"@EXEC@/contract.txt\"", "tools", "ev_ctr2", build, 20000, "succeeded", "", false, 4, 15000);
+    bad = bad + go_c(heap, exec, workers, clock, io, scratch, "a contract with a .. component: failed, contract-path-invalid", task, "\"done\"", "\"../x\"", "tools", "ev_refuse", build, 20000, "failed", "contract-path-invalid", false, 0, 5000);
+    bad = bad + go_c(heap, exec, workers, clock, io, scratch, "an empty contract: failed, contract-path-invalid", task, "\"done\"", "\"\"", "tools", "ev_refuse", build, 20000, "failed", "contract-path-invalid", false, 0, 5000);
+    bad = bad + go_c(heap, exec, workers, clock, io, scratch, "a contract that is a number: failed, contract-path-invalid", task, "\"done\"", "5", "tools", "ev_refuse", build, 20000, "failed", "contract-path-invalid", false, 0, 5000);
+    bad = bad + go_c(heap, exec, workers, clock, io, scratch, "a contract that is null: failed, contract-path-invalid", task, "\"done\"", "null", "tools", "ev_refuse", build, 20000, "failed", "contract-path-invalid", false, 0, 5000);
+    bad = bad + go_c(heap, exec, workers, clock, io, scratch, "a contract at an absolute path outside the execution directory: failed, contract-path-invalid", task, "\"done\"", "\"/etc/passwd\"", "tools", "ev_refuse", build, 20000, "failed", "contract-path-invalid", false, 0, 5000);
     // ---- what cannot be started
     bad = bad + go(heap, exec, workers, clock, io, scratch, "a tools directory without the tool: failed, build-unavailable", task, "\"done\"", "tools_empty", "ev_notool", build, 20000, "failed", "build-unavailable", false, 0, 15000);
     bad = bad + go(heap, exec, workers, clock, io, scratch, "a tools directory that is not there: failed, tool-unusable", task, "\"done\"", "nowhere", "ev_refuse", build, 20000, "failed", "tool-unusable", false, 0, 5000);

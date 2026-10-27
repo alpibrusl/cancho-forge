@@ -886,6 +886,7 @@ fn worker_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &w, &e, &z](heap: &!h 
 fn take_contract[&h, &f, &i, &m, &d, &e](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], step: company_manifest.Step, evdir: &e [byte]) -> [heap, fs_read(""), dir_read, dir_write, file_read, file_write, io_write] int {
     let name = company_manifest.step_contract(hm, step);
     if len(name) == 0 {
+        company_files.clear_contract(fs, evdir);
         return 0;
     }
     let id = company_manifest.step_id(hm, step);

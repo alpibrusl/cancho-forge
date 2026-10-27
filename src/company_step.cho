@@ -307,6 +307,12 @@ pub fn rule_artifact_invalid() -> [] &static [byte] {
     return "artifact-invalid";
 }
 
+// The largest contract file Forge gives a build: 256 KiB, what the build tool's plan agent reads of it (a bigger file would make the
+// plan fail late). Over it, the file is refused up front as `contract-unreadable`.
+pub fn contract_cap() -> [] int {
+    return 262144;
+}
+
 // The `reason:` of a step's contract file that cannot be given (task 10): 1 (`artifact_reason`'s "not there") is `contract-missing`;
 // anything else (not a regular file, too large, unreadable) is `contract-unreadable`.
 pub fn contract_reason(why: int) -> [] &static [byte] {

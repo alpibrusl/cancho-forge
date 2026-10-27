@@ -286,6 +286,21 @@ check "contract changed by the build: artifact-invalid with reason contract-chan
 run ctrmut 2
 check "contract changed by the build: the company directory's contract is untouched, and a second run is held (nothing built again)" sh -c "cmp -s '$w/ctrmut.orig' '$w/ctrmut/api.txt' && [ '$(rc ctrmut 2)' = 14 ] && [ $(kinds ctrmut company.step.admitted withc) -eq 1 ]"
 
+# a contract over 256 KiB is refused up front (the plan agent reads 256 KiB of it): contract-unreadable, not admitted
+mkco ctrbig "[$(cbuilder withc contract api.txt)]" 100000 withc
+head -c 262145 /dev/zero | tr '\0' x > "$w/ctrbig/api.txt"
+run ctrbig 1
+check "contract over 256 KiB: artifact-invalid with reason contract-unreadable, exit 14, not admitted, nothing written" sh -c "[ '$(rc ctrbig 1)' = 14 ] && grep -qx 'reason: contract-unreadable' '$w/ctrbig.1.out' && [ $(kinds ctrbig company.step.admitted withc) -eq 0 ] && [ ! -e '$w/ctrbig/steps/withc/ev/contract.txt' ]"
+head -c 262144 /dev/zero | tr '\0' x > "$w/ctrbig/api.txt"
+run ctrbig 2
+check "contract of exactly 256 KiB: given" sh -c "[ '$(rc ctrbig 2)' = 0 ] && cmp -s '$w/ctrbig/api.txt' '$w/ctrbig/steps/withc/ev/contract.txt'"
+
+# a contract.txt left in the execution directory of a step that names none (an earlier manifest) is removed before the build
+mkco ctrstale "[$(builder plain '' contract audit_pass.sh)]" 100000 plain
+printf 'old contract\n' > "$w/ctrstale/steps/plain/ev/contract.txt"
+run ctrstale 1
+check "no contract named: a stale contract.txt is removed, the build gets no --contract and sees nocontract" sh -c "[ '$(rc ctrstale 1)' = 0 ] && ! grep -q -e '--contract' '$w/ctrstale/steps/plain/ev/args.txt' && grep -qx 'nocontract' '$w/ctrstale/steps/plain/ev/project.cho' && [ ! -e '$w/ctrstale/steps/plain/ev/contract.txt' ]"
+
 # the manifest: a contract on a step that builds nothing, and a bad contract name, are refused by `forge company check`
 printf '{"id":"c","mission":"m","model":{"provider":"p","name":"n"},"budget":{"input":1,"output":1,"cache_write":1,"cache_read":1,"max_cost":1,"price_table":"prices.json"},"human_gates":[],"roles":["qa"],"steps":[{"id":"a","role":"qa","task_type":"repo.gate","needs":[],"input":"x","contract":"api.txt"}]}' > "$w/ctr-qa.json"
 "$F" company check "$w/ctr-qa.json" > "$w/ctr-qa.out" 2>&1; echo $? > "$w/ctr-qa.rc"

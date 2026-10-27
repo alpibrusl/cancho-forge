@@ -136,7 +136,13 @@ pub fn contract_name() -> [] &static [byte] {
 pub fn deliver_contract[&h, &f, &d, &n, &e](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &n [byte], evdir: &e [byte]) -> [heap, fs_read(""), dir_read, dir_write, file_read, file_write] int {
     let (data, why) = read_artifact(heap, fs, dir, name);
     var code = why;
-    if why == 0 {
+    var size = 0;
+    borrow data as &sb in {
+        size = buffer.size(sb);
+    }
+    if why == 0 && size > company_step.contract_cap() {
+        code = 3;
+    } else if why == 0 {
         code = 6;
         if journal_io.path_ok(fs, evdir) {
             match open_dir(fs, evdir) {
@@ -159,6 +165,35 @@ pub fn deliver_contract[&h, &f, &d, &n, &e](heap: &!h Heap, fs: &f Fs(""), dir: 
     }
     buffer.drop(heap, data);
     return code;
+}
+
+// A step that names no contract: a `contract.txt` an earlier start (an earlier manifest) left in `evdir` is Forge's and is removed, so
+// a build never meets a contract it was not given. Nothing there is fine.
+pub fn clear_contract[&f, &e](fs: &f Fs(""), evdir: &e [byte]) -> [fs_read(""), dir_write] int {
+    if !journal_io.path_ok(fs, evdir) {
+        return 0;
+    }
+    match open_dir(fs, evdir) {
+        DirOpened::Failed(e2) => {
+            return 0;
+        }
+        DirOpened::Ok(opened) => {
+            var ed = opened;
+            var removed = 0;
+            borrow ed as &edr in {
+                match dir_remove(edr, contract_name()) {
+                    Done::Ok(n) => {
+                        removed = 1;
+                    }
+                    Done::Failed(e3) => {
+                        removed = 0;
+                    }
+                }
+            }
+            dir_close(ed);
+            return removed;
+        }
+    }
 }
 
 // After the build: is `contract.txt` in `evdir` still, byte for byte, the file `name` of the company directory? True when both can
