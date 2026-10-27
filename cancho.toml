@@ -96,3 +96,8 @@ std = true
 name = "company_manifest"
 sources = ["tests/company_manifest_test.cho", "src/company_manifest.cho"]
 std = true
+
+[[test]]
+name = "company_graph"
+sources = ["tests/company_graph_test.cho", "src/company_graph.cho", "src/company_manifest.cho"]
+std = true

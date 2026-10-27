@@ -1,0 +1,150 @@
+edition 9;
+module forge.company_graph;
+
+import std.bytes;
+import std.option;
+import forge.company_manifest;
+
+// The step graph of a company manifest (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.2): which step
+// is ready to run next, where a step is, and whether the needs make a cycle. Pure: it reads a held `Manifest` and the caller's
+// accepted flags, and starts nothing. `parse` already refuses a cycle and a need that names no step (its own check, which
+// cannot import this module), so these functions are total on any `Manifest` all the same: a need that names no step is a need
+// that is never met, and no input reaches a trap.
+//
+// The answer is deterministic: the lowest step number first.
+
+// The number of the step whose id is `id`, or -1. The first such step when an id is written twice (`parse` refuses that).
+pub fn index_of[&i, &m](m: &m company_manifest.Manifest, id: &i [byte]) -> [] int {
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        if bytes.equal(company_manifest.step_id(m, company_manifest.step_at(m, i)), id) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Is step `i` accepted? A step past the end of `accepted` is not.
+fn is_accepted[&a](accepted: &a [bool], i: int) -> [] bool {
+    if i < 0 || i >= len(accepted) {
+        return false;
+    }
+    return accepted[i];
+}
+
+// The number of the first step that is not accepted and whose every need is a step that is accepted, or None when there is no
+// such step (all accepted, or what is left is waiting on a step that is not, or on a need that names no step).
+pub fn ready[&a, &m](m: &m company_manifest.Manifest, accepted: &a [bool]) -> [] option.Option[int] {
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        if is_accepted(accepted, i) == false {
+            let s = company_manifest.step_at(m, i);
+            let k = company_manifest.step_needs_count(m, s);
+            var met = true;
+            var j = 0;
+            while j < k {
+                let at = index_of(m, company_manifest.step_need(m, s, j));
+                if at < 0 || is_accepted(accepted, at) == false {
+                    met = false;
+                }
+                j = j + 1;
+            }
+            if met {
+                return option.Option::Some(i);
+            }
+        }
+        i = i + 1;
+    }
+    return option.Option::None;
+}
+
+// Is there a cycle among `n` steps, given `edges`: pairs (from, to) flat, `from` needs `to`? A pair with an end outside 0 to
+// n - 1 is ignored. The steps are settled in passes (a step is settled once every step it needs is); a pass that settles nothing,
+// with a step left, is a cycle. At most n + 1 passes over the pairs.
+pub fn cycle_in[&h, &e](heap: &!h Heap, n: int, edges: &e [int]) -> [heap] bool {
+    if n <= 0 {
+        return false;
+    }
+    // done flags in [0, n), blocked flags in [n, 2n).
+    let work = box_slice(heap, 2 * n, 0);
+    var cyclic = false;
+    borrow mut work as &!w in {
+        let ws = contents(w);
+        var settled = 0;
+        var changed = true;
+        while changed {
+            changed = false;
+            var i = 0;
+            while i < n {
+                ws[n + i] = 0;
+                i = i + 1;
+            }
+            var p = 0;
+            while p + 1 < len(edges) {
+                let from = edges[p];
+                let to = edges[p + 1];
+                if from >= 0 && from < n && to >= 0 && to < n {
+                    if ws[to] == 0 {
+                        ws[n + from] = 1;
+                    }
+                }
+                p = p + 2;
+            }
+            i = 0;
+            while i < n {
+                if ws[i] == 0 && ws[n + i] == 0 {
+                    ws[i] = 1;
+                    settled = settled + 1;
+                    changed = true;
+                }
+                i = i + 1;
+            }
+        }
+        if settled < n {
+            cyclic = true;
+        }
+    }
+    unbox_slice(heap, work);
+    return cyclic;
+}
+
+// Do the needs of the manifest make a cycle (a step needing itself included)? A need that names no step is not an edge.
+pub fn has_cycle[&h, &m](heap: &!h Heap, m: &m company_manifest.Manifest) -> [heap] bool {
+    let n = company_manifest.step_count(m);
+    if n <= 0 {
+        return false;
+    }
+    var total = 0;
+    var i = 0;
+    while i < n {
+        total = total + company_manifest.step_needs_count(m, company_manifest.step_at(m, i));
+        i = i + 1;
+    }
+    let edges = box_slice(heap, 2 * total + 2, 0 - 1);
+    var at = 0;
+    borrow mut edges as &!w in {
+        let ws = contents(w);
+        i = 0;
+        while i < n {
+            let s = company_manifest.step_at(m, i);
+            let k = company_manifest.step_needs_count(m, s);
+            var j = 0;
+            while j < k {
+                ws[at] = i;
+                ws[at + 1] = index_of(m, company_manifest.step_need(m, s, j));
+                at = at + 2;
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+    var r = false;
+    borrow edges as &er in {
+        r = cycle_in(heap, n, contents(er));
+    }
+    unbox_slice(heap, edges);
+    return r;
+}

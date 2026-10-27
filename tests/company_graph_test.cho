@@ -1,0 +1,212 @@
+edition 9;
+
+import std.buffer;
+import std.option;
+import std.test;
+import forge.company_manifest;
+import forge.company_graph;
+
+// Unit tests for src/company_graph.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.2): which step
+// is ready next, where a step is, and whether a graph has a cycle. A manifest with a cycle is refused by `parse`, so the cycle
+// tests go through `cycle_in`, which takes the edges as numbers. Run with `cancho test`.
+
+fn head() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[],\"roles\":[\"qa\"],\"steps\":[";
+}
+
+// a, b needs a, c needs b.
+fn chain() -> [] &static [byte] {
+    return "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"},{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"b\"],\"input\":\"x\"}";
+}
+
+// a; b needs a; c needs a; d needs b and c.
+fn diamond() -> [] &static [byte] {
+    return "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"},{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"},{\"id\":\"d\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"b\",\"c\"],\"input\":\"x\"}";
+}
+
+fn manifest_text[&h, &s](heap: &!h Heap, steps: &s [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 512), head());
+    o = buffer.append(heap, o, steps);
+    return buffer.append(heap, o, "]}");
+}
+
+// The index `ready` answers, or -1 for none, with the steps of `accepted_ids` (indices) marked accepted.
+fn ready_after[&h, &s](heap: &!h Heap, steps: &s [byte], a0: bool, a1: bool, a2: bool, a3: bool) -> [heap] int {
+    let d = manifest_text(heap, steps);
+    var out = 0 - 2;
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                let flags = box_slice(heap, 4, false);
+                borrow mut flags as &!f in {
+                    let fs = contents(f);
+                    fs[0] = a0;
+                    fs[1] = a1;
+                    fs[2] = a2;
+                    fs[3] = a3;
+                }
+                borrow m as &mr in {
+                    borrow flags as &fr in {
+                        match company_graph.ready(mr, contents(fr)) {
+                            option.Option::Some(i) => {
+                                out = i;
+                            }
+                            option.Option::None => {
+                                out = 0 - 1;
+                            }
+                        }
+                    }
+                }
+                unbox_slice(heap, flags);
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return out;
+}
+
+fn test_a_chain_is_ready_in_order[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(ready_after(heap, chain(), false, false, false, false) == 0);
+    test.assert(ready_after(heap, chain(), true, false, false, false) == 1);
+    test.assert(ready_after(heap, chain(), true, true, false, false) == 2);
+    test.assert(ready_after(heap, chain(), true, true, true, false) == 0 - 1);
+    return 0;
+}
+
+fn test_a_diamond_joins_after_both_branches[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(ready_after(heap, diamond(), false, false, false, false) == 0);
+    test.assert(ready_after(heap, diamond(), true, false, false, false) == 1);
+    test.assert(ready_after(heap, diamond(), true, true, false, false) == 2);
+    test.assert(ready_after(heap, diamond(), true, false, true, false) == 1);
+    test.assert(ready_after(heap, diamond(), true, true, true, false) == 3);
+    test.assert(ready_after(heap, diamond(), true, true, true, true) == 0 - 1);
+    return 0;
+}
+
+fn test_a_step_out_of_order_does_not_unblock_its_dependents[&h](heap: &!h Heap) -> [heap] int {
+    // c accepted without b or a: a is still the first ready.
+    test.assert(ready_after(heap, chain(), false, false, true, false) == 0);
+    return 0;
+}
+
+fn test_a_short_flag_slice_counts_the_rest_as_not_accepted[&h](heap: &!h Heap) -> [heap] int {
+    let d = manifest_text(heap, chain());
+    var out = 0 - 2;
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                let flags = box_slice(heap, 1, true);
+                borrow m as &mr in {
+                    borrow flags as &fr in {
+                        match company_graph.ready(mr, contents(fr)) {
+                            option.Option::Some(i) => {
+                                out = i;
+                            }
+                            option.Option::None => {
+                                out = 0 - 1;
+                            }
+                        }
+                    }
+                }
+                unbox_slice(heap, flags);
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    test.assert(out == 1);
+    return 0;
+}
+
+fn test_index_of_finds_a_step_or_says_minus_one[&h](heap: &!h Heap) -> [heap] int {
+    let d = manifest_text(heap, diamond());
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert(company_graph.index_of(mr, "a") == 0);
+                    test.assert(company_graph.index_of(mr, "c") == 2);
+                    test.assert(company_graph.index_of(mr, "d") == 3);
+                    test.assert(company_graph.index_of(mr, "e") == 0 - 1);
+                    test.assert(company_graph.index_of(mr, "") == 0 - 1);
+                    test.assert(company_graph.index_of(mr, "ab") == 0 - 1);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_parsed_manifest_has_no_cycle[&h](heap: &!h Heap) -> [heap] int {
+    let d = manifest_text(heap, diamond());
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert(company_graph.has_cycle(heap, mr) == false);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+// Edge pairs (from, to): `from` needs `to`.
+fn cyclic[&h](heap: &!h Heap, n: int, e0: int, e1: int, e2: int, e3: int, e4: int, e5: int) -> [heap] bool {
+    let edges = box_slice(heap, 6, 0);
+    borrow mut edges as &!w in {
+        let ws = contents(w);
+        ws[0] = e0;
+        ws[1] = e1;
+        ws[2] = e2;
+        ws[3] = e3;
+        ws[4] = e4;
+        ws[5] = e5;
+    }
+    var r = false;
+    borrow edges as &er in {
+        r = company_graph.cycle_in(heap, n, contents(er));
+    }
+    unbox_slice(heap, edges);
+    return r;
+}
+
+fn test_a_self_need_is_a_cycle[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(cyclic(heap, 2, 1, 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1));
+    return 0;
+}
+
+fn test_a_two_cycle_is_a_cycle[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(cyclic(heap, 3, 0, 1, 1, 0, 0 - 1, 0 - 1));
+    return 0;
+}
+
+fn test_a_longer_cycle_behind_a_tail_is_a_cycle[&h](heap: &!h Heap) -> [heap] int {
+    // 0 needs 1, 1 needs 2, 2 needs 1.
+    test.assert(cyclic(heap, 3, 0, 1, 1, 2, 2, 1));
+    return 0;
+}
+
+fn test_a_dag_and_a_stray_edge_are_not_cycles[&h](heap: &!h Heap) -> [heap] int {
+    // 2 needs 1, 1 needs 0, 0 needs nothing; the last pair names a step outside the graph and is ignored.
+    test.assert(cyclic(heap, 3, 2, 1, 1, 0, 0, 9) == false);
+    test.assert(cyclic(heap, 0, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1) == false);
+    return 0;
+}
