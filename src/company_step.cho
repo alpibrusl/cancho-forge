@@ -35,6 +35,9 @@ import forge.company_state;
 //       `needs-changed`): that step is not admitted, nothing is recorded and nothing holds it
 //   15  the step's worker ended without a claim (stuck, gate_failed, a refusal, a deadline: what `forge build` / `forge gate` exit 4
 //       for), or was refused (`refusal: step-failed`, `exit: N` of the build or gate); no `accepted` is written
+//   16  a signal (TERM or INT) asked the run to stop while a build ran (`stopped: signal`, task 9): the build was cancelled through
+//       its worker (its group killed), what it spent recorded, and the step left admitted and not accepted; the next run starts
+//       it again. A signal at any other moment ends the process the default way (143, 130): see src/company_runner.cho
 
 pub fn exit_done() -> [] int {
     return 0;
@@ -74,6 +77,10 @@ pub fn exit_check_unavailable() -> [] int {
 
 pub fn exit_step_failed() -> [] int {
     return 15;
+}
+
+pub fn exit_stopped() -> [] int {
+    return 16;
 }
 
 // The exit status a scheduling answer ends the run with; -1 for `Start`, which does not end it. `Held` is check-failed here; the
@@ -403,6 +410,99 @@ pub fn check_output_cap() -> [] int {
 // The most bytes of an artifact Forge reads to hash: 16 MiB. A larger one is check-unavailable.
 pub fn artifact_cap() -> [] int {
     return 16777216;
+}
+
+// ---- the check guard (task 9) -------------------------------------------------------------------------------------------
+//
+// A check is run by the guard `check_guard` (workers/check_guard.cho), a program of the operator's workers directory that Forge
+// starts in a session of its own and that starts the check in another: the guard kills the check's group at the deadline, and also
+// when Forge is gone (it holds `check.lock` of the company directory while it waits: supervise.watch). So a Forge killed in the
+// middle of a check, even with SIGKILL, leaves no check running. The guard answers on standard output what the check wrote (at most
+// `check_output_cap` bytes) and, as its exit status, how the check ended: these two functions are the two ends of that code.
+
+pub fn guard_name() -> [] &static [byte] {
+    return "check_guard";
+}
+
+// The name of the lock Forge holds in the company directory while a check runs.
+pub fn guard_lock() -> [] &static [byte] {
+    return "check.lock";
+}
+
+// Forge's deadline for the guard is the check's plus this, so that the guard's own deadline always ends the check first.
+pub fn guard_margin_ms() -> [] int {
+    return 15000;
+}
+
+// The guard's exit status for its arguments refused (Forge reads it as a check that could not run).
+pub fn guard_usage() -> [] int {
+    return 8;
+}
+
+// The guard's exit status: 0 the check exited 0, 1 it exited with another code, 3 a signal ended it, 4 the deadline, 5 too much
+// output, 6 it could not be started or waited for, 7 the one who started the guard was gone (`how` 2 of supervise.watch).
+pub fn guard_code(ran: process.Ran, how: int) -> [] int {
+    if how == 2 {
+        return 7;
+    }
+    match ran {
+        process.Ran::Code(n) => {
+            if n == 0 {
+                return 0;
+            }
+            return 1;
+        }
+        process.Ran::Signaled(s) => {
+            return 3;
+        }
+        process.Ran::TimedOut => {
+            return 4;
+        }
+        process.Ran::TooMuch => {
+            return 5;
+        }
+        process.Ran::Failed(e) => {
+            return 6;
+        }
+    }
+}
+
+// How the check ended, from how its guard ended. Only the guard's own exits 0 and 1 are a check's exit; 3, 4 and 5 are the check's
+// signal, deadline and output cap; anything else (the guard refused, failed, or was itself stopped) is a check that did not run,
+// `Failed`, which `check_verdict` reads as unavailable.
+pub fn check_ran(guard: process.Ran) -> [] process.Ran {
+    match guard {
+        process.Ran::Code(n) => {
+            if n == 0 {
+                return process.Ran::Code(0);
+            }
+            if n == 1 {
+                return process.Ran::Code(1);
+            }
+            if n == 3 {
+                return process.Ran::Signaled(0);
+            }
+            if n == 4 {
+                return process.Ran::TimedOut;
+            }
+            if n == 5 {
+                return process.Ran::TooMuch;
+            }
+            return process.Ran::Failed(0 - 2);
+        }
+        process.Ran::Signaled(s) => {
+            return process.Ran::Failed(0 - 2);
+        }
+        process.Ran::TimedOut => {
+            return process.Ran::TimedOut;
+        }
+        process.Ran::TooMuch => {
+            return process.Ran::TooMuch;
+        }
+        process.Ran::Failed(e) => {
+            return process.Ran::Failed(e);
+        }
+    }
 }
 
 // ---- usage -----------------------------------------------------------------------------------------------------------------

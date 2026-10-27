@@ -6,6 +6,7 @@ import std.bytes;
 import std.option;
 import std.process;
 import forge.journal_io;
+import forge.lock;
 
 // The wait of a supervisor (docs/async-level.md section 2): `std.process.capture` for a child that was started as a group
 // leader, with one more way to end. `capture` runs the child to its end or to its deadline and cannot be asked to stop
@@ -18,6 +19,12 @@ import forge.journal_io;
 // more kills the build's group (`Ran::TooMuch`). The deadline is `timeout` milliseconds by `clock`. Every `slice_ms` the file
 // `cancel_path` is read: when its text is exactly `request_id` the build's group is killed with KILL and the answer's third
 // part is true. A cancel file for another request is ignored. The child is reaped on every path.
+//
+// `watch` is the same wait with one more way to end, for a guard that must not outlive the process that started it (task 9,
+// `workers/check_guard.cho`): every slice the lock file `live_lock` is tried. The one who started the guard holds that lock for as
+// long as it waits; when the lock can be TAKEN that process is gone (flock is released by the kernel however a process ends,
+// SIGKILL included: forge.lock), and the child's group is killed with KILL. An empty `live_lock` (or an empty `cancel_path`) is
+// not looked at. The third part of `watch`'s answer is 0, 1 (cancelled) or 2 (the starter was gone).
 
 fn output_token() -> [] int {
     return 1;
@@ -113,6 +120,27 @@ fn cancelled() -> [] int {
     return 5;
 }
 
+fn orphaned() -> [] int {
+    return 6;
+}
+
+// Can the lock at `path` be taken? Then whoever held it is gone; it is let go at once. A lock that cannot be opened is not taken
+// for gone (the deadline still ends the wait).
+pub fn left_alone[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_write(""), file_write] bool {
+    match lock.acquire(fs, path) {
+        lock.Lock::Held(file) => {
+            lock.let_go(file);
+            return true;
+        }
+        lock.Lock::Refused(rule) => {
+            return false;
+        }
+        lock.Lock::Failed(e) => {
+            return false;
+        }
+    }
+}
+
 // Is the file `path` there and exactly `request_id`? An absent file, an unreadable one, a longer one or another text is no.
 pub fn asks_for_cancel[&h, &f, &p, &r](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], request_id: &r [byte]) -> [heap, fs_read(""), file_read] bool {
     var asked = false;
@@ -138,7 +166,12 @@ pub fn asks_for_cancel[&h, &f, &p, &r](heap: &!h Heap, fs: &f Fs(""), path: &p [
     return asked;
 }
 
-pub fn wait[&h, &c, &f, &p, &r](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, cancel_path: &p [byte], request_id: &r [byte]) -> [heap, clock, poll, fs_read(""), file_read] (buffer.Buffer, process.Ran, bool) {
+pub fn wait[&h, &c, &f, &p, &r](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, cancel_path: &p [byte], request_id: &r [byte]) -> [heap, clock, poll, fs_read(""), fs_write(""), file_read, file_write] (buffer.Buffer, process.Ran, bool) {
+    let (out, ran, why) = watch(heap, clock, fs, child, to_child, from_child, most, timeout, cancel_path, request_id, "");
+    return (out, ran, why == 1);
+}
+
+pub fn watch[&h, &c, &f, &p, &r, &l](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, cancel_path: &p [byte], request_id: &r [byte], live_lock: &l [byte]) -> [heap, clock, poll, fs_read(""), fs_write(""), file_read, file_write] (buffer.Buffer, process.Ran, int) {
     let deadline = clock_ms(clock) + timeout;
     var out = buffer.empty(heap, 4096);
     var reader = option.Option::Some(from_child);
@@ -253,8 +286,15 @@ pub fn wait[&h, &c, &f, &p, &r](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), 
                                 state = exited();
                             }
                         }
-                        if state == running() && asks_for_cancel(heap, fs, cancel_path, request_id) {
-                            state = cancelled();
+                        if state == running() && len(cancel_path) > 0 {
+                            if asks_for_cancel(heap, fs, cancel_path, request_id) {
+                                state = cancelled();
+                            }
+                        }
+                        if state == running() && len(live_lock) > 0 {
+                            if left_alone(fs, live_lock) {
+                                state = orphaned();
+                            }
                         }
                     }
                 }
@@ -293,5 +333,12 @@ pub fn wait[&h, &c, &f, &p, &r](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), 
     if state == failed() {
         ran = process.Ran::Failed(why);
     }
-    return (out, ran, state == cancelled());
+    var how = 0;
+    if state == cancelled() {
+        how = 1;
+    }
+    if state == orphaned() {
+        how = 2;
+    }
+    return (out, ran, how);
 }

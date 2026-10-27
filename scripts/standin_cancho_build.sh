@@ -54,5 +54,20 @@ case "$mode" in
              while [ ! -e "$work/release" ]; do sleep 0.1; done
              kill $! 2> /dev/null
              report done 2 done; printf 'product of %s\n' "$tag" > "$work/project.cho"; printf '[BUILD_VERDICT]\tdone %s\n' "$tag"; exit 0 ;;
+  killable)  # task 9 (tests/conformance/company_kill.sh): a build that is killed in the middle. Unless `fast` is in the work
+             # directory it spends one call (a usage.jsonl line), starts a grandchild (`sleep 97`), writes both pids to pids.txt,
+             # says it is building (the file `building`) and waits for a `release` that never comes. Then (or at once, with
+             # `fast`) it spends a second call and ends `done`.
+             log; report build 0 ""
+             if [ ! -e "$work/fast" ]; then
+               printf '{"provider":"stand","model":"m1","task":"t","sample":0,"in":600,"out":10,"thinking":0,"cache_write":0,"cache_read":0,"stop":"end_turn","outcome":"ok","status":200,"reply_chars":1,"program_chars":1,"ms":1}\n' >> "$work/usage.jsonl"
+               sleep 97 &
+               printf '%s %s\n' "$$" "$!" >> "$work/pids.txt"
+               : > "$work/building"
+               while [ ! -e "$work/release" ]; do sleep 0.1; done
+               kill $! 2> /dev/null
+             fi
+             printf '{"provider":"stand","model":"m1","task":"t","sample":0,"in":500,"out":20,"thinking":0,"cache_write":0,"cache_read":0,"stop":"end_turn","outcome":"ok","status":200,"reply_chars":1,"program_chars":1,"ms":1}\n' >> "$work/usage.jsonl"
+             report done 2 done; printf 'product\n' > "$work/project.cho"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   *)         log; report done 1 wat; exit 1 ;;
 esac

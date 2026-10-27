@@ -26,7 +26,7 @@ libs=$(ls src/*.cho | grep -v '/main\.cho$')
 w="$scratch/cr"
 mkdir "$w" "$w/workers" "$w/tools" || exit 1
 cp scripts/standin_cancho_build.sh "$w/tools/cancho-build" && chmod +x "$w/tools/cancho-build" || exit 1
-if ! { $C build src/*.cho --std -o "$w/forge" && $C build workers/cancho_code.cho $libs --std -o "$w/workers/cancho_code" && $C build workers/gate_runner.cho $libs --std -o "$w/workers/gate_runner"; }; then
+if ! { $C build src/*.cho --std -o "$w/forge" && $C build workers/cancho_code.cho $libs --std -o "$w/workers/cancho_code" && $C build workers/gate_runner.cho $libs --std -o "$w/workers/gate_runner" && $C build workers/check_guard.cho $libs --std -o "$w/workers/check_guard"; }; then
   echo "FAIL company run: a program did not build"
   exit 1
 fi

@@ -2,6 +2,7 @@ edition 9;
 module forge.await_run;
 
 import std.buffer;
+import std.option;
 import std.process;
 import forge.dispatch;
 import forge.response;
@@ -193,4 +194,61 @@ pub fn finish[&h, &x, &w, &f, &c, &n, &r, &k, &e](heap: &!h Heap, exec: &x Exec(
         }
     }
     return ending;
+}
+
+// Has a signal the caller claimed arrived since the last look? No claim (`None`) is no.
+pub fn stop_asked[&s](stop: &!s option.Option[SignalWatch]) -> [signals_read] bool {
+    match stop {
+        option.Option::Some(w) => {
+            return signals_pending(w) != 0;
+        }
+        option.Option::None => {
+            return false;
+        }
+    }
+}
+
+// `finish`, and one more way to end (task 9, `forge company run`): before every look, and after a look that itself ended (a
+// signal sent to Forge's whole process group also ends the worker call that was running), the claim `stop` is read. When a
+// claimed signal arrived the run is asked to stop (`cancel`: the supervisor kills the build's group and keeps a `cancelled`
+// result), the ending is then what `result` says, and the second part of the answer is true. With `None` it is `finish`.
+pub fn finish_or_stop[&h, &x, &w, &f, &c, &n, &r, &k, &e, &s](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, fs: &f Fs(""), clock: &c Clock, name: &n [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte], budget_ms: int, interval_ms: int, stop: &!s option.Option[SignalWatch]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, file_read, signals_read] (dispatch.Ending, bool) {
+    let deadline = clock_ms(clock) + budget_ms;
+    var ending = dispatch.Ending::Timeout;
+    var waiting = true;
+    var stopped = false;
+    while waiting {
+        if stop_asked(stop) {
+            stopped = true;
+            waiting = false;
+        } else {
+            match probe(heap, exec, workers, clock, name, request_id, task_id, execution_dir) {
+                Probe::Ended(e2) => {
+                    ending = e2;
+                    waiting = false;
+                    if stop_asked(stop) {
+                        stopped = true;
+                    }
+                }
+                Probe::Finished => {
+                    ending = result_of(heap, exec, workers, fs, clock, name, request_id, task_id, execution_dir);
+                    waiting = false;
+                }
+                Probe::Running => {
+                    if clock_ms(clock) >= deadline {
+                        cancel(heap, exec, workers, clock, name, request_id, task_id, execution_dir);
+                        ending = dispatch.Ending::Timeout;
+                        waiting = false;
+                    } else {
+                        nap(heap, interval_ms);
+                    }
+                }
+            }
+        }
+    }
+    if stopped {
+        cancel(heap, exec, workers, clock, name, request_id, task_id, execution_dir);
+        ending = result_of(heap, exec, workers, fs, clock, name, request_id, task_id, execution_dir);
+    }
+    return (ending, stopped);
 }

@@ -9,6 +9,7 @@
 #   recover              `forge recover` on journals a crash left, one real crash included (scripts/check_recover.sh)
 #   company              `forge company check` / `status` end to end on the manifest fixtures (scripts/check_company.sh)
 #   company run          `forge company run` end to end, real workers, the lying-worker test (tests/conformance/company_run.sh)
+#   company kill         `forge company run` killed mid-step and run again: nothing left running, each step accepted once (tests/conformance/company_kill.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
 #   verbs                capabilities, cancel, status and result against the mock worker (every verdict) and the stub LLM and gate runner (capabilities), real child processes
 #   conformance          tests/conformance/*.cho, programs that need an Fs, which
@@ -99,6 +100,7 @@ echo "== worker contract verbs (capabilities, cancel, status, result: every verd
 # workers that answer capabilities and nothing else. They are built into the workers directory of the section above.
 $C check workers/stub_llm.cho $libs --std || fail=1
 $C check workers/gate_runner.cho $libs --std || fail=1
+$C check workers/check_guard.cho $libs --std || fail=1
 $C check tests/conformance/verbs.cho tests/conformance/support.cho $libs --std || fail=1
 if $C build workers/stub_llm.cho $libs --std -o "$wdir/stub_llm" \
   && $C build workers/gate_runner.cho $libs --std -o "$wdir/gate_runner" \
@@ -143,6 +145,10 @@ CANCHO="$C" sh scripts/check_company.sh "$scratch/company" || fail=1
 echo "== forge company run (real workers and a stand-in build tool; the lying worker, gates, budget, resume: tests/conformance/company_run.sh)"
 mkdir "$scratch/company-run" || exit 1
 CANCHO="$C" sh tests/conformance/company_run.sh "$scratch/company-run" || fail=1
+
+echo "== forge company run killed and resumed (a real run killed with SIGKILL and SIGTERM mid-build and mid-check: tests/conformance/company_kill.sh)"
+mkdir "$scratch/company-kill" || exit 1
+CANCHO="$C" sh tests/conformance/company_kill.sh "$scratch/company-kill" || fail=1
 
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of

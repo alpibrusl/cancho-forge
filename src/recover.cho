@@ -260,6 +260,17 @@ pub fn accepted_of[&h, &d, &i](heap: &!h Heap, data: &d [byte], id: &i [byte]) -
 // The ids of the tasks in phase 5 (an `async` worker took the job and nothing ended it), one per line, in the order of the
 // table the scan builds. What `forge recover <dir> <workers>` goes on to ask the worker about.
 pub fn awaiting[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer {
+    return in_phases(heap, data, 5, 5);
+}
+
+// The ids of the tasks whose worker may still be running: phase 2 (the intent was written, nothing after it: the worker may have
+// been started) and phase 5 (an `async` worker took the job). What `forge company run` asks to stop before it starts a step of an
+// earlier run again (task 9, src/company_runner.cho `reap_stale`).
+pub fn in_flight[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer {
+    return in_phases(heap, data, 2, 5);
+}
+
+fn in_phases[&h, &d](heap: &!h Heap, data: &d [byte], one: int, other: int) -> [heap] buffer.Buffer {
     var phase = map.empty(heap, 16, 0, 0);
     var starts = map.empty(heap, 16, 0, 0);
     var start = 0;
@@ -277,8 +288,11 @@ pub fn awaiting[&h, &d](heap: &!h Heap, data: &d [byte]) -> [heap] buffer.Buffer
     borrow phase as &pb in {
         var e = 0;
         while e < map.entries(pb) {
-            if map.is_live(pb, e) && map.value_at(pb, e) == 5 {
-                out = buffer.push(heap, buffer.append(heap, out, map.key_at(pb, e)), byte_of(10));
+            if map.is_live(pb, e) {
+                let v = map.value_at(pb, e);
+                if v == one || v == other {
+                    out = buffer.push(heap, buffer.append(heap, out, map.key_at(pb, e)), byte_of(10));
+                }
             }
             e = e + 1;
         }

@@ -3,6 +3,7 @@ module forge.step_run;
 
 import std.buffer;
 import std.io;
+import std.option;
 import forge.build_run;
 import forge.build_task;
 import forge.dispatch;
@@ -212,11 +213,13 @@ pub fn run_gate[&h, &f, &x, &c, &i, &d, &w, &r, &v, &k, &e, &n](heap: &!h Heap, 
 }
 
 // `forge build` after its arguments: build from the brief file with the Cancho Code adapter (`guide` is the optional guide path, or
-// empty). Exit status as in the head of src/main.cho.
-pub fn run_build[&h, &f, &x, &c, &i, &d, &w, &t, &b, &e, &k, &p, &m, &a, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, spec: BuildSpec, dir: &d [byte], workers: &w [byte], tools: &t [byte], brief_file: &b [byte], execution_dir: &e [byte], checker: &k [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], guide: &g [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+// empty). Exit status as in the head of src/main.cho, and whether a signal claimed in `stop` cancelled the build (`forge company
+// run` claims one, task 9; `forge build` passes `None`).
+pub fn run_build[&h, &f, &x, &c, &i, &d, &w, &t, &b, &e, &k, &p, &m, &a, &g, &s](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, spec: BuildSpec, dir: &d [byte], workers: &w [byte], tools: &t [byte], brief_file: &b [byte], execution_dir: &e [byte], checker: &k [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], guide: &g [byte], stop: &!s option.Option[SignalWatch]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write, signals_read] (int, bool) {
     let jpath = concat(heap, dir, "/journal.jsonl");
     let lpath = concat(heap, dir, "/lock");
     var code = 0;
+    var stopped = false;
     borrow jpath as &jb in {
         borrow lpath as &lb in {
             if journal_io.path_ok(fs, buffer.bytes(jb)) == false || journal_io.path_ok(fs, workers) == false || journal_io.path_ok(fs, brief_file) == false {
@@ -251,7 +254,8 @@ pub fn run_build[&h, &f, &x, &c, &i, &d, &w, &t, &b, &e, &k, &p, &m, &a, &g](hea
                                     var wdir = opened;
                                     borrow wdir as &w in {
                                         borrow brief as &bb in {
-                                            let done = build_run.run(heap, fs, exec, w, clock, buffer.bytes(jb), buffer.bytes(bb), execution_dir, tools, workers, checker, guide, provider, model, agent, spec.attempts, spec.agent_seconds, spec.rounds, spec.plan_seconds, spec.jobs, spec.timeout);
+                                            let done = build_run.run(heap, fs, exec, w, clock, buffer.bytes(jb), buffer.bytes(bb), execution_dir, tools, workers, checker, guide, provider, model, agent, spec.attempts, spec.agent_seconds, spec.rounds, spec.plan_seconds, spec.jobs, spec.timeout, stop);
+                                            stopped = done.stopped;
                                             code = show_build(heap, io, done);
                                         }
                                     }
@@ -268,5 +272,5 @@ pub fn run_build[&h, &f, &x, &c, &i, &d, &w, &t, &b, &e, &k, &p, &m, &a, &g](hea
     }
     buffer.drop(heap, jpath);
     buffer.drop(heap, lpath);
-    return code;
+    return (code, stopped);
 }

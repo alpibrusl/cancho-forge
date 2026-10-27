@@ -16,7 +16,8 @@ performs
     pipe_read
     pipe_write
     poll
+    signals("INT,TERM")
+    signals_read
 never touches
     the network
-    signals
     foreign code

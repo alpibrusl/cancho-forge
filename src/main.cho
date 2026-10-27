@@ -4,6 +4,7 @@ import std.buffer;
 import std.bytes;
 import std.io;
 import std.json;
+import std.option;
 import forge.await_run;
 import forge.await_task;
 import forge.build_run;
@@ -260,7 +261,7 @@ fn bit_set(seen: int, bit: int) -> [] bool {
     return bit > 0 && seen / bit % 2 == 1;
 }
 
-fn build[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+fn build[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write, signals_read] int {
     let count = arg_count(args);
     if count < 11 || count > 32 {
         return usage(io);
@@ -339,7 +340,21 @@ fn build[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""
         k = k + 1;
     }
     let spec = step_run.BuildSpec { timeout: timeout, attempts: attempts, agent_seconds: agent_seconds, rounds: rounds, plan_seconds: plan_seconds, jobs: jobs };
-    return step_run.run_build(heap, fs, exec, clock, io, spec, dir, workers, tools, brief_file, execution_dir, checker, provider, model, agent, guide);
+    // `forge build` claims no signal: a TERM ends it the default way and the build goes on, for `forge await` (docs/async-level.md).
+    var none: option.Option[SignalWatch] = option.Option::None;
+    var code = 0;
+    borrow mut none as &!s in {
+        let (c, stopped) = step_run.run_build(heap, fs, exec, clock, io, spec, dir, workers, tools, brief_file, execution_dir, checker, provider, model, agent, guide, s);
+        code = c;
+    }
+    match none {
+        option.Option::Some(w) => {
+            signals_close(w);
+        }
+        option.Option::None => {
+        }
+    }
+    return code;
 }
 
 // The ending of an awaited run, printed, and the exit status: 0 a claim was recorded, 4 the run ended without one, 1 the task
@@ -714,12 +729,12 @@ fn company[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g A
     return usage(io);
 }
 
-fn run[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+fn run[&h, &f, &x, &c, &i, &g, &z](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args, sig: &z Signals("INT,TERM")) -> [args, heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write, signals("INT,TERM"), signals_read] int {
     if arg_count(args) >= 3 && bytes.equal(arg(args, 1), "company") && bytes.equal(arg(args, 2), "run") {
         if arg_count(args) != 5 {
             return usage(io);
         }
-        return company_runner.run_cmd(heap, fs, exec, clock, io, args);
+        return company_runner.run_cmd(heap, fs, exec, clock, io, args, sig);
     }
     if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "gate") {
         return gate(heap, fs, exec, clock, io, args);
@@ -746,8 +761,9 @@ fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
     release(ffi);
     release(net);
-    release(signals);
     release(tty);
+    // The signals `forge company run` may claim while a build runs (task 9): it is narrowed here and claimed only there.
+    let stop = narrow(signals, "INT,TERM");
     var console = io;
     var memory = heap;
     var status = 2;
@@ -757,7 +773,9 @@ fn main(world: World) -> [] int {
                 borrow mut console as &!i in {
                     borrow mut memory as &!h in {
                         borrow args as &g in {
-                            status = run(h, f, x, c, i, g);
+                            borrow stop as &z in {
+                                status = run(h, f, x, c, i, g, z);
+                            }
                         }
                     }
                 }
@@ -770,5 +788,6 @@ fn main(world: World) -> [] int {
     release(console);
     release(memory);
     release(args);
+    release(stop);
     return status;
 }
