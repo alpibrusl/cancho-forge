@@ -25,9 +25,10 @@ import forge.company_run;
 //   10  waiting for a human gate (`refusal: gate-open`, then `gate: <name>` and `step: <id>`): `forge company decide`, then run again
 //   11  blocked (`refusal: gate-rejected`, or `step-cycle` for the defensive Blocked a parsed manifest cannot reach)
 //   12  the budget is spent (`refusal: budget-exhausted`)
-//   13  a check ran and did not pass (`refusal: check-failed`, `score: a/b`); no Forge-level retry: a person decides
-//   14  the check could not be read as a score, did not end, wrote too much, or the artifact is missing or changed under it
-//       (`refusal: check-unavailable`)
+//   13  a check ran and did not pass (`refusal: check-failed`, `score: a/b`); no Forge-level retry: the step is held, and every
+//       later run answers 13 again (`held:` and a `retry:` line) until a person approves `retry:<id>` with `forge company decide`
+//   14  the check could not be read as a score, did not end, wrote too much (`refusal: check-unavailable`), or the artifact is not
+//       a regular file beneath its directory or changed under the check (`refusal: artifact-invalid`); held as 13 is
 //   15  the step's worker ended without a claim (stuck, gate_failed, a refusal, a deadline: what `forge build` / `forge gate` exit 4
 //       for), or was refused (`refusal: step-failed`, `exit: N` of the build or gate); no `accepted` is written
 
@@ -71,7 +72,8 @@ pub fn exit_step_failed() -> [] int {
     return 15;
 }
 
-// The exit status a scheduling answer ends the run with; -1 for `Start`, which does not end it.
+// The exit status a scheduling answer ends the run with; -1 for `Start`, which does not end it. `Held` is check-failed here; the
+// run answers check-unavailable (14) for a step held by an unavailable check, which only the state knows.
 pub fn action_exit(a: company_run.Action) -> [] int {
     match a {
         company_run.Action::Start(i) => {
@@ -88,6 +90,9 @@ pub fn action_exit(a: company_run.Action) -> [] int {
         }
         company_run.Action::Done => {
             return exit_done();
+        }
+        company_run.Action::Held(i) => {
+            return exit_check_failed();
         }
     }
 }
@@ -157,6 +162,68 @@ pub fn artifact_name(r: Runner) -> [] &static [byte] {
             return "";
         }
     }
+}
+
+// ---- the artifact ----------------------------------------------------------------------------------------------------------
+
+// The rule tag of an artifact Forge will not hash: it is opened BENEATH its directory (the execution directory, or the company
+// directory for `company.json`) one name, following no link, and only when `dir_stat` (which never follows a link and never opens)
+// says it is a regular file of at most `artifact_cap` bytes. A link (even to a file Forge could read), a directory, a FIFO (which
+// would block an open while the run holds the lock), a device, a file too large, one that cannot be read, or one that changed while
+// the check ran is refused: printed with `reason:`, recorded as `company.step.check_unavailable`, exit 14, never accepted.
+pub fn rule_artifact_invalid() -> [] &static [byte] {
+    return "artifact-invalid";
+}
+
+// The `reason:` of an artifact refusal: 1 not there, 2 not a regular file, 3 too large, 4 unreadable, 5 changed; anything else is
+// "cannot be read".
+pub fn artifact_reason(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "not there";
+    }
+    if code == 2 {
+        return "not a regular file (a link, a directory, a FIFO or a device)";
+    }
+    if code == 3 {
+        return "over 16 MiB";
+    }
+    if code == 5 {
+        return "changed while the check ran";
+    }
+    return "cannot be read";
+}
+
+// Is `path` beneath the directory `dir` by its text (`dir` + "/" + more, a trailing `/` of `dir` ignored)? The run refuses an
+// operator file there: the company directory is the manifest author's, and what the operator grants must not be writable by
+// whoever writes the manifest. A text check: a link elsewhere that points inside is not seen (the operator's own doing). A `dir`
+// shorter than two bytes ("", "/") contains nothing here: the run's directory is an ok path anyway.
+pub fn inside[&d, &p](dir: &d [byte], path: &p [byte]) -> [] bool {
+    var n = len(dir);
+    var trimming = true;
+    while trimming {
+        if n <= 1 {
+            trimming = false;
+        } else if int_of(dir[n - 1]) == 47 {
+            n = n - 1;
+        } else {
+            trimming = false;
+        }
+    }
+    if n < 2 {
+        return false;
+    }
+    if len(path) <= n + 1 {
+        return false;
+    }
+    if bytes.equal(path[0..n], dir[0..n]) == false {
+        return false;
+    }
+    return int_of(path[n]) == 47;
+}
+
+// The start of the line that tells a person how to let a held step run again (`<dir> retry:<id> approved <reason>` follows).
+pub fn retry_hint() -> [] &static [byte] {
+    return "retry: forge company decide ";
 }
 
 // ---- the check -------------------------------------------------------------------------------------------------------------

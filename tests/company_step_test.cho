@@ -18,6 +18,7 @@ import forge.company_step;
 
 fn test_every_way_a_run_stops_has_its_own_exit_status() -> [] int {
     test.assert_eq(company_step.action_exit(company_run.Action::Done), 0);
+    test.assert_eq(company_step.action_exit(company_run.Action::Held(0)), 13);
     test.assert_eq(company_step.action_exit(company_run.Action::Start(3)), 0 - 1);
     test.assert_eq(company_step.action_exit(company_run.Action::WaitGate(1)), 10);
     test.assert_eq(company_step.action_exit(company_run.Action::Blocked(1)), 11);
@@ -219,5 +220,32 @@ fn test_an_operator_file_outside_the_shape_is_refused[&h](heap: &!h Heap) -> [he
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":{\"repo\":\"r\",\"revision\":\"v\",\"checkout\":\"/co\",\"x\":1}}}") == false);
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":{\"repo\":\"r\",\"checkout\":\"/co\"}}}") == false);
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"q\\u0061\":{\"repo\":\"r\",\"revision\":\"v\",\"checkout\":\"/co\"}}}") == false);
+    return 0;
+}
+
+// ---- the artifact ----------------------------------------------------------------------------------------------------------
+
+fn test_every_way_an_artifact_is_refused_has_its_reason() -> [] int {
+    test.assert(bytes.equal(company_step.rule_artifact_invalid(), "artifact-invalid"));
+    test.assert(bytes.equal(company_step.artifact_reason(1), "not there"));
+    test.assert(bytes.equal(company_step.artifact_reason(2), "not a regular file (a link, a directory, a FIFO or a device)"));
+    test.assert(bytes.equal(company_step.artifact_reason(3), "over 16 MiB"));
+    test.assert(bytes.equal(company_step.artifact_reason(4), "cannot be read"));
+    test.assert(bytes.equal(company_step.artifact_reason(5), "changed while the check ran"));
+    test.assert(bytes.equal(company_step.artifact_reason(0 - 9), "cannot be read"));
+    test.assert(bytes.equal(company_step.retry_hint(), "retry: forge company decide "));
+    return 0;
+}
+
+fn test_an_operator_file_inside_the_company_directory_is_seen_by_its_text() -> [] int {
+    test.assert(company_step.inside("/co", "/co/operator.json"));
+    test.assert(company_step.inside("/co/", "/co/sub/operator.json"));
+    test.assert(company_step.inside("/co", "/cox/operator.json") == false);
+    test.assert(company_step.inside("/co", "/co") == false);
+    test.assert(company_step.inside("/co", "/co/") == false);
+    test.assert(company_step.inside("/co", "/elsewhere/o.json") == false);
+    test.assert(company_step.inside("", "/x") == false);
+    test.assert(company_step.inside("/", "/x") == false);
+    test.assert(company_step.inside("/co", "") == false);
     return 0;
 }

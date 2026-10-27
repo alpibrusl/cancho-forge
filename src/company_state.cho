@@ -26,14 +26,21 @@ import forge.task;
 //   company.step.admitted       forge_task   the id of the Forge task the step became
 //   company.step.accepted       artifact, sha256   Forge's own check passed against the artifact it hashed
 //   company.step.check_failed   score, total       the check ran and did not pass
+//   company.step.check_unavailable   reason        the check could not judge the step (reason: the rule tag printed)
 //   company.gate.decided        gate, verdict (approved | rejected), user, reason
 //   company.spend.recorded      input, output, cache_write, cache_read   tokens a step used, and (since the run, task 8b)
 //                               cost_micro   what Forge derived they cost, in micro-dollars, when it recorded them
 //
 // Replay keeps: which steps are accepted (by step number in the manifest, the shape `company_graph.ready` reads), the last
 // decision of each gate (0 open, 1 approved, 2 rejected; the last record wins), how many times each step id was admitted, and the
-// total tokens spent per class, and the same per step (by step number). A kind this build does not know is passed over, as the task journal does for the kinds it only
+// total tokens spent per class, and the same per step (by step number), and which steps are HELD by their check. A kind this build does not know is passed over, as the task journal does for the kinds it only
 // records, so a later build can add some. A known kind whose fields are not the ones above is `event-malformed`.
+//
+// Held (spec section 10: no retry at the Forge level). A `check_failed` or `check_unavailable` record holds its step: the run
+// never starts it again by itself (`company_run.next_action` answers `Held`). A person lets it go by recording a decision on the
+// gate `retry:<step id>` with `forge company decide <dir> retry:<id> approved <reason>`: an `approved` decision recorded AFTER the
+// hold frees the step; a rejection, an approval recorded before the failure, or one for another step does not. A later failure
+// holds it again; `accepted` frees it. Order in the journal is the whole rule, so replay decides it.
 //
 // Cost. `cost_micro` is additive: a spend record that has it is PRICED, and the recorded cost is authoritative (the run prices each
 // step's `usage.jsonl` call by call, with the over-limit tier where a call crossed it, before it records; the totals replayed here
@@ -47,6 +54,7 @@ import forge.task;
 pub res struct CompanyState {
     accepted: Box[[bool]],
     spend: Box[[int]],
+    held: Box[[int]],
     gates: map.Map[int],
     admitted: map.Map[int],
     report: journal.Report,
@@ -70,6 +78,28 @@ pub fn kind_gate_decided() -> [] &static [byte] {
 
 pub fn kind_spend_recorded() -> [] &static [byte] {
     return "company.spend.recorded";
+}
+
+pub fn kind_check_unavailable() -> [] &static [byte] {
+    return "company.step.check_unavailable";
+}
+
+// The prefix of a retry gate: `retry:<step id>` is a decision a person records with `forge company decide` to let a step whose
+// check failed (or was unavailable) be run again. It is not in `human_gates`; any step id of the manifest makes one.
+pub fn retry_prefix() -> [] &static [byte] {
+    return "retry:";
+}
+
+// The step number a retry gate names (`retry:<id>` with `<id>` a step of the manifest), or -1 for any other name.
+pub fn retry_step[&m, &g](m: &m company_manifest.Manifest, gate: &g [byte]) -> [] int {
+    let p = retry_prefix();
+    if len(gate) <= len(p) {
+        return 0 - 1;
+    }
+    if bytes.equal(gate[0..len(p)], p) == false {
+        return 0 - 1;
+    }
+    return company_graph.index_of(m, gate[len(p)..len(gate)]);
 }
 
 // ---- the event builders ---------------------------------------------------------------------------------------------------
@@ -108,6 +138,14 @@ pub fn accepted[&h, &s, &a, &x](heap: &!h Heap, seq: int, step: &s [byte], artif
     w = json.put_string(heap, w, artifact);
     w = json.put_key(heap, w, "sha256");
     w = json.put_string(heap, w, sha256);
+    return closed(heap, w);
+}
+
+// Step `step`'s check could not judge it (`reason`: the rule tag printed, `check-unavailable` or `artifact-invalid`).
+pub fn check_unavailable[&h, &s, &r](heap: &!h Heap, seq: int, step: &s [byte], reason: &r [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_check_unavailable(), step);
+    w = json.put_key(heap, w, "reason");
+    w = json.put_string(heap, w, reason);
     return closed(heap, w);
 }
 
@@ -221,6 +259,16 @@ fn field[&s, &t, &n](src: &s [byte], tp: &t [int], obj: int, name: &n [byte]) ->
     return n;
 }
 
+// Set the held code of step number `at` (ignored outside the slice).
+fn set_held[&k](held: &!k [int], at: int, code: int) -> [] int {
+    if at >= 0 {
+        if at < len(held) {
+            held[at] = code;
+        }
+    }
+    return 0;
+}
+
 // Add four token counts to the four slots of `spend` from `base` (the caller keeps `base + 3` in range).
 fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -> [] int {
     spend[base] = clamp_add(spend[base], a);
@@ -231,7 +279,7 @@ fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -
 }
 
 // Apply one complete line (no newline) that must carry `expect` as its `seq`. Answers the two maps and 0, or a rule code.
-fn apply[&h, &l, &m, &a, &s](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], gates: map.Map[int], admitted: map.Map[int]) -> [heap] (map.Map[int], map.Map[int], int) {
+fn apply[&h, &l, &m, &a, &s, &k](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], gates: map.Map[int], admitted: map.Map[int]) -> [heap] (map.Map[int], map.Map[int], int) {
     var gs = gates;
     var ad = admitted;
     var rule = 0;
@@ -272,10 +320,19 @@ fn apply[&h, &l, &m, &a, &s](heap: &!h Heap, line: &l [byte], expect: int, man: 
                         if at >= 0 && at < len(accepted) {
                             accepted[at] = true;
                         }
+                        set_held(held, at, 0);
                     }
                 } else if bytes.equal(kind, kind_check_failed()) {
                     if named == false || field(line, tp, 0, "score") < 0 || field(line, tp, 0, "total") < 0 {
                         rule = bad;
+                    } else {
+                        set_held(held, company_graph.index_of(man, id), 1);
+                    }
+                } else if bytes.equal(kind, kind_check_unavailable()) {
+                    if named == false || json.is_string(tp, json.get(line, tp, 0, "reason")) == false {
+                        rule = bad;
+                    } else {
+                        set_held(held, company_graph.index_of(man, id), 2);
                     }
                 } else if bytes.equal(kind, kind_gate_decided()) {
                     let gate = json.get(line, tp, 0, "gate");
@@ -287,6 +344,7 @@ fn apply[&h, &l, &m, &a, &s](heap: &!h Heap, line: &l [byte], expect: int, man: 
                         rule = bad;
                     } else if json.string_equals(line, tp, verdict, "approved") {
                         gs = map.put(heap, gs, json.string_view(line, tp, gate), 1);
+                        set_held(held, retry_step(man, json.string_view(line, tp, gate)), 0);
                     } else if json.string_equals(line, tp, verdict, "rejected") {
                         gs = map.put(heap, gs, json.string_view(line, tp, gate), 2);
                     } else {
@@ -340,6 +398,7 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     }
     let accepted = box_slice(heap, steps, false);
     let spend = box_slice(heap, step_base(steps), 0);
+    let held = box_slice(heap, steps, 0);
     var gates = map.empty(heap, 16, 0, 0);
     var admitted = map.empty(heap, 16, 0, 0);
     var records = 0;
@@ -350,35 +409,39 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     var k = 0;
     borrow mut accepted as &!aw in {
         borrow mut spend as &!sw in {
-            let acc = contents(aw);
-            let sp = contents(sw);
-            while k < len(journal_text) && rule == 0 {
-                if int_of(journal_text[k]) == 10 {
-                    let (g, a, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, gates, admitted);
-                    gates = g;
-                    admitted = a;
-                    if r == 0 {
-                        records = records + 1;
-                        good = k + 1;
-                    } else {
-                        rule = r;
-                        bad_line = records + 1;
+            borrow mut held as &!kw in {
+                let acc = contents(aw);
+                let sp = contents(sw);
+                let hd = contents(kw);
+                while k < len(journal_text) && rule == 0 {
+                    if int_of(journal_text[k]) == 10 {
+                        let (g, a, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, gates, admitted);
+                        gates = g;
+                        admitted = a;
+                        if r == 0 {
+                            records = records + 1;
+                            good = k + 1;
+                        } else {
+                            rule = r;
+                            bad_line = records + 1;
+                        }
+                        start = k + 1;
                     }
-                    start = k + 1;
+                    k = k + 1;
                 }
-                k = k + 1;
             }
         }
     }
     let torn = len(journal_text) - journal.after_last_newline(journal_text);
     let report = journal.Report { records: records, valid_bytes: good, total_bytes: len(journal_text), torn_bytes: torn, tasks: 0, rule: rule, line: bad_line };
-    return CompanyState { accepted: accepted, spend: spend, gates: gates, admitted: admitted, report: report };
+    return CompanyState { accepted: accepted, spend: spend, held: held, gates: gates, admitted: admitted, report: report };
 }
 
 pub fn drop[&h](heap: &!h Heap, s: CompanyState) -> [heap] int {
-    let CompanyState { accepted, spend, gates, admitted, report } = s;
+    let CompanyState { accepted, spend, held, gates, admitted, report } = s;
     unbox_slice(heap, accepted);
     unbox_slice(heap, spend);
+    unbox_slice(heap, held);
     map.drop(heap, gates);
     map.drop(heap, admitted);
     return 0;
@@ -467,6 +530,20 @@ pub fn step_cost_micro[&s](s: &s CompanyState, i: int) -> [] int {
         return 0;
     }
     return sp[step_base(i) + 4];
+}
+
+// Is step number `i` held by its check? 0 no, 1 its last check failed (`check-failed`), 2 its last check could not judge it
+// (`check-unavailable`, or `artifact-invalid`), until a person approves `retry:<id>` after it (or the step is accepted). 0 outside
+// the manifest.
+pub fn held_by_check[&s](s: &s CompanyState, i: int) -> [] int {
+    let hd = contents(s.held);
+    if i < 0 {
+        return 0;
+    }
+    if i >= len(hd) {
+        return 0;
+    }
+    return hd[i];
 }
 
 // ---- human gates ----------------------------------------------------------------------------------------------------------

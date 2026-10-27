@@ -11,7 +11,7 @@ import forge.company_state;
 // Unit tests for src/company_run.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.3 and 10): the
 // pure scheduling step of `forge company run`. Each test replays a journal built with the event builders against a manifest and
 // reads the action `next_action` answers as one number (`code_of`): Start(i) is i, WaitGate(i) 10 + i, Blocked(i) 20 + i,
-// Stop(tag) 30 + tag, Done 40. Run with `cancho test`.
+// Stop(tag) 30 + tag, Done 40, Held(i) 50 + i. Run with `cancho test`.
 
 // lib (builder), qa (qa), lib2 (builder, after qa): the budget manifest.
 fn budget_manifest() -> [] &static [byte] {
@@ -53,6 +53,9 @@ fn code_of(a: company_run.Action) -> [] int {
         }
         company_run.Action::Done => {
             return 40;
+        }
+        company_run.Action::Held(i) => {
+            return 50 + i;
         }
     }
 }
@@ -303,21 +306,58 @@ fn test_a_gated_model_step_under_a_spent_budget_is_stop_not_wait[&h](heap: &!h H
 // ---- the answer when nothing can start (settle) -------------------------------------------------------------------------------
 
 fn test_settle_with_nothing_pending_is_done() -> [] int {
-    test.assert_eq(code_of(company_run.settle(0, 0 - 1, 0 - 1, 0 - 1, 0 - 1)), 40);
+    test.assert_eq(code_of(company_run.settle(0, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)), 40);
     return 0;
 }
 
 fn test_settle_orders_wait_then_stop_then_blocked() -> [] int {
-    test.assert_eq(code_of(company_run.settle(3, 2, 1, 0, 0)), 11);
-    test.assert_eq(code_of(company_run.settle(3, 2, 0 - 1, 0, 0)), 30 + company_run.stop_budget());
-    test.assert_eq(code_of(company_run.settle(3, 0 - 1, 0 - 1, 1, 0)), 21);
+    test.assert_eq(code_of(company_run.settle(3, 2, 1, 0 - 1, 0, 0)), 11);
+    test.assert_eq(code_of(company_run.settle(3, 2, 0 - 1, 0 - 1, 0, 0)), 30 + company_run.stop_budget());
+    test.assert_eq(code_of(company_run.settle(3, 0 - 1, 0 - 1, 0 - 1, 1, 0)), 21);
+    // A step held by its check comes first: the person must look at it.
+    test.assert_eq(code_of(company_run.settle(3, 2, 1, 0, 0, 0)), 50);
     return 0;
 }
 
 // Steps are left and none can start, wait or is blocked by a gate (a need that can never be met, which `parse` refuses): the
 // first step left is Blocked, so the run never loops.
 fn test_settle_falls_back_to_blocking_the_first_step_left() -> [] int {
-    test.assert_eq(code_of(company_run.settle(2, 0 - 1, 0 - 1, 0 - 1, 1)), 21);
-    test.assert_eq(code_of(company_run.settle(1, 0 - 1, 0 - 1, 0 - 1, 0)), 20);
+    test.assert_eq(code_of(company_run.settle(2, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 1)), 21);
+    test.assert_eq(code_of(company_run.settle(1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0)), 20);
     return 0;
+}
+
+// ---- held by a check ---------------------------------------------------------------------------------------------------------
+
+// A step whose check failed is never started again by the run itself: Held(lib), not Start(lib).
+fn test_a_step_whose_check_failed_is_held_not_started_again[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "lib", 1, 2));
+    test.assert_eq(act_and_drop(heap, chain_manifest_free(), j), 50);
+    return 0;
+}
+
+// An independent step still runs first; the held answer comes when nothing else can start.
+fn test_an_independent_step_runs_before_the_held_one_is_reported[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "lib", 1, 2));
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 1);
+    var k = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "lib", 1, 2));
+    k = accepted_step(heap, k, 2, "qa");
+    test.assert_eq(act_and_drop(heap, budget_manifest(), k), 2);
+    var n = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "lib", 1, 2));
+    n = accepted_step(heap, n, 2, "qa");
+    n = accepted_step(heap, n, 3, "lib2");
+    test.assert_eq(act_and_drop(heap, budget_manifest(), n), 50);
+    return 0;
+}
+
+fn test_an_approved_retry_lets_the_held_step_start_again[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.check_unavailable(heap, 1, "lib", "check-unavailable"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "retry:lib", "approved", "ana", "fixed the audit"));
+    test.assert_eq(act_and_drop(heap, chain_manifest_free(), j), 0);
+    return 0;
+}
+
+// lib (builder) alone.
+fn chain_manifest_free() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[],\"roles\":[\"builder\"],\"steps\":[{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}]}";
 }

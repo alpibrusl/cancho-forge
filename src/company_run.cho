@@ -22,8 +22,12 @@ import forge.company_state;
 //   Stop(tag)    the budget is spent and a model step is held back by it, behind an open gate or not (`stop_budget`, named
 //                `budget-exhausted`)
 //   Done         every step is accepted
+//   Held(i)      nothing else can start, and step i (the lowest such) is held by its check: its last check failed or could not
+//                judge it, and no person has approved `retry:<id>` since (`company_state.held_by_check`). The run never starts
+//                it again by itself (section 10: no Forge-level retry)
 //
-// The order of the answers when no step can start (`settle`): WaitGate, then Stop, then Blocked. A step that uses no model and
+// The order of the answers when no step can start (`settle`): Held, then WaitGate, then Stop, then Blocked. A step held by its check
+// comes first: it is the one a person must look at. A step that uses no model and
 // waits on a gate outranks the spent budget, because a person approving the gate lets it run (a qa step must not be hidden behind
 // `budget-exhausted`); a gated MODEL step under a spent budget counts as held, because approving its gate would not let it run, so
 // Stop outranks waiting for it. (Before the review of 8a, Stop outranked every WaitGate.) The budget covers model steps only (section
@@ -36,6 +40,7 @@ pub enum Action {
     Blocked(int),
     Stop(int),
     Done,
+    Held(int),
 }
 
 // The tag of `Stop` for a spent budget.
@@ -87,6 +92,7 @@ pub fn next_action[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.
     var held = 0 - 1;
     var waiting = 0 - 1;
     var blocked = 0 - 1;
+    var checked = 0 - 1;
     var first_left = 0 - 1;
     var i = 0;
     while i < n {
@@ -95,7 +101,11 @@ pub fn next_action[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.
             if first_left < 0 {
                 first_left = i;
             }
-            if company_graph.needs_met(m, flags, i) {
+            if company_state.held_by_check(s, i) != 0 {
+                if checked < 0 {
+                    checked = i;
+                }
+            } else if company_graph.needs_met(m, flags, i) {
                 let gate = company_state.step_blocked_by_gate(m, s, i);
                 if gate == 1 {
                     // A model step under a spent budget would not run if the gate were approved: the budget holds it.
@@ -125,15 +135,19 @@ pub fn next_action[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.
         }
         i = i + 1;
     }
-    return settle(pending, held, waiting, blocked, first_left);
+    return settle(pending, held, waiting, checked, blocked, first_left);
 }
 
 // The answer when no step can start: `pending` steps are not accepted; `held` is the lowest model step the spent budget holds back
-// (gated or not), `waiting` the lowest step that waits on an open gate and is not held, `blocked` the lowest behind a rejected gate,
-// `first_left` the lowest step not accepted; -1 for none. Done, then WaitGate, then Stop, then Blocked, then Blocked(first_left).
-pub fn settle(pending: int, held: int, waiting: int, blocked: int, first_left: int) -> [] Action {
+// (gated or not), `waiting` the lowest step that waits on an open gate and is not held, `checked` the lowest step held by its check,
+// `blocked` the lowest behind a rejected gate, `first_left` the lowest step not accepted; -1 for none. Done, then Held(checked),
+// then WaitGate, then Stop, then Blocked, then Blocked(first_left).
+pub fn settle(pending: int, held: int, waiting: int, checked: int, blocked: int, first_left: int) -> [] Action {
     if pending == 0 {
         return Action::Done;
+    }
+    if checked >= 0 {
+        return Action::Held(checked);
     }
     if waiting >= 0 {
         return Action::WaitGate(waiting);

@@ -41,6 +41,7 @@ import forge.worker;
 //      an operator file without what the step needs (`operator-invalid`).
 //   2. `company.step.admitted` (forge_task: the step's Forge workspace, `steps/<id>`). A step admitted and never accepted (a run
 //      killed in the middle of it, a check that failed) is admitted again by the next run: the count of admissions is the record.
+//      The operator file must not be inside the company directory (`company_step.inside`, `operator-invalid`).
 //   3. The worker, through the very runs `forge build` and `forge gate` are (`step_run.run_build` / `run_gate`, which print as those
 //      verbs do): a builder or writer step builds the step's `input` (decoded, written to `steps/<id>/brief.txt`) in `steps/<id>/ev`
 //      with the workspace `steps/<id>`; a qa or reviewer step reports the gate of the repository, revision and checkout the operator
@@ -51,12 +52,20 @@ import forge.worker;
 //      whatever the build's ending (tokens spent on a build that got stuck are spent).
 //   5. A worker that ended without a claim (`forge build` / `forge gate` exit status not 0) stops the run: `step-failed`, no check.
 //   6. The check: Forge hashes the artifact (`steps/<id>/ev/project.cho` for a build, `report.json` for a gate, `company.json` for a
-//      product step), runs the step's `check` program from the company directory with the artifact's path and the execution
+//      product step) opened BENEATH its directory with no link followed and only if it is a regular file (`hash_artifact`: anything
+//      else is `artifact-invalid`, `company_step.rule_artifact_invalid`), runs the step's `check` program from the company directory with the artifact's path and the execution
 //      directory as its two arguments, `PATH` as its whole environment, a deadline and an output cap, and hashes the artifact again.
 //      The verdict (`company_step.check_verdict`): pass -> `company.step.accepted` with the artifact's path (relative to the company
 //      directory) and the SHA-256 Forge computed, and the next round; a score below its total -> `company.step.check_failed` and
-//      the run ends `check-failed` (no Forge-level retry: a person decides, spec section 10); anything else, or an artifact that is
-//      missing, too large or changed while the check ran -> `check-unavailable`, nothing written.
+//      the run ends `check-failed`; anything else -> `company.step.check_unavailable` and `check-unavailable` (or `artifact-invalid`
+//      for an artifact that is missing, not a regular file, too large, or changed while the check ran).
+//   No Forge-level retry (spec section 10): a check_failed or check_unavailable record HOLDS the step (`company_state` header);
+//   `next_action` answers `Held` and the run prints the refusal again, with the `retry:` line, and exits 13 or 14 without starting
+//   or spending anything, until a person approves `retry:<id>` with `forge company decide`.
+//
+// Spend that lags (docs/architecture.md section 7, `budget-exhausted`): a run killed after a build and before its spend record has
+// spent tokens the journal does not hold until that step runs again; a `usage.jsonl` rewritten shorter loses its calls up to the old
+// total (the delta is never negative).
 //   A product step without a check is accepted on its approved gate alone: the human decision recorded in the journal is its
 //   check (section 4.2); its artifact is the manifest.
 //
@@ -135,6 +144,10 @@ pub fn run_cmd[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x E
                 if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false || journal_io.path_ok(fs, buffer.bytes(lp)) == false || journal_io.path_ok(fs, opath) == false {
                     refuse(io, task.rule_name(task.Rule::PathInvalid));
                     code = company_step.exit_usage();
+                } else if company_step.inside(dir, opath) {
+                    refuse(io, rule_operator_invalid());
+                    say(io, "reason: the operator file is inside the company directory", "");
+                    code = company_step.exit_refused();
                 } else {
                     match lock.acquire(fs, buffer.bytes(lp)) {
                         lock.Lock::Refused(rule) => {
@@ -281,6 +294,7 @@ fn one_round[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs("
     var bad_line = 0;
     var cut = 0 - 1;
     var rejected = false;
+    var held_code = 0;
     borrow data as &db in {
         let state = company_state.replay(heap, buffer.bytes(db), hm);
         borrow state as &sr in {
@@ -309,6 +323,9 @@ fn one_round[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs("
                     }
                     company_run.Action::Done => {
                         rejected = false;
+                    }
+                    company_run.Action::Held(k) => {
+                        held_code = company_state.held_by_check(sr, k);
                     }
                 }
             }
@@ -352,6 +369,25 @@ fn one_round[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs("
         company_run.Action::Done => {
             say_nat(heap, io, "done: steps accepted ", company_manifest.step_count(hm));
             return company_step.exit_done();
+        }
+        company_run.Action::Held(k) => {
+            let id = company_manifest.step_id(hm, company_manifest.step_at(hm, k));
+            if held_code == 1 {
+                refuse(io, "check-failed");
+            } else {
+                refuse(io, "check-unavailable");
+            }
+            say(io, "step: ", id);
+            say(io, "held: its last check did not pass; the run does not start it again by itself", "");
+            io.write_all(io, company_step.retry_hint());
+            io.write_all(io, dir);
+            io.write_all(io, " retry:");
+            io.write_all(io, id);
+            say(io, " approved <reason>", "");
+            if held_code == 1 {
+                return company_step.exit_check_failed();
+            }
+            return company_step.exit_check_unavailable();
         }
     }
 }
@@ -426,9 +462,9 @@ fn run_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""
             if code == 0 {
                 borrow mpath as &mp in {
                     if len(check) == 0 {
-                        code = accept_unchecked(heap, fs, io, jpath, id, buffer.bytes(mp), seq + 1);
+                        code = accept_unchecked(heap, fs, io, jpath, id, dir, seq + 1);
                     } else {
-                        code = check_and_accept(heap, fs, exec, clock, io, dir, jpath, id, check, buffer.bytes(mp), "company.json", dir, seq + 1, timeout);
+                        code = check_and_accept(heap, fs, exec, clock, io, dir, jpath, id, check, buffer.bytes(mp), "company.json", dir, "company.json", seq + 1, timeout);
                     }
                 }
             }
@@ -445,14 +481,12 @@ fn run_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""
 }
 
 // A product step with no check and an approved gate: accepted on the decision, its artifact the manifest Forge hashes now.
-fn accept_unchecked[&h, &f, &i, &j, &n, &a](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], id: &n [byte], artifact: &a [byte], seq: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
-    let (sha, held) = hash_file(heap, fs, artifact);
+fn accept_unchecked[&h, &f, &i, &j, &n, &d](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], id: &n [byte], dir: &d [byte], seq: int) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write] int {
+    let (sha, why) = hash_artifact(heap, fs, dir, "company.json");
     var code = 0;
     borrow sha as &hb in {
-        if held == false {
-            refuse(io, "check-unavailable");
-            say(io, "step: ", id);
-            code = company_step.exit_check_unavailable();
+        if why != 0 {
+            code = refuse_artifact(heap, fs, io, jpath, id, "company.json", why, seq);
         } else {
             code = record_buffer(heap, fs, io, jpath, company_state.accepted(heap, seq, id, "company.json", buffer.bytes(hb)), false);
             if code == 0 {
@@ -562,7 +596,7 @@ fn worker_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &w, &e](heap: &!h Heap
     var code = 0;
     borrow artifact as &ab in {
         borrow shown as &wb in {
-            code = check_and_accept(heap, fs, exec, clock, io, dir, jpath, id, company_manifest.step_check(hm, step), buffer.bytes(ab), buffer.bytes(wb), evdir, next, company_step.op_ms(op, tp, "check_timeout_ms", check_timeout_default()));
+            code = check_and_accept(heap, fs, exec, clock, io, dir, jpath, id, company_manifest.step_check(hm, step), buffer.bytes(ab), buffer.bytes(wb), evdir, name, next, company_step.op_ms(op, tp, "check_timeout_ms", check_timeout_default()));
         }
     }
     buffer.drop(heap, artifact);
@@ -658,26 +692,95 @@ fn record_spend[&h, &f, &i, &j, &n, &e](heap: &!h Heap, fs: &f Fs(""), io: &!i I
 
 // ---- the check -------------------------------------------------------------------------------------------------------------
 
-// The SHA-256 of the file at `path` as hex, and whether it could be read (an ordinary file of at most `company_step.artifact_cap`).
-fn hash_file[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte]) -> [heap, fs_read(""), file_read] (buffer.Buffer, bool) {
-    let (data, errno) = company_cmd.read_limited(heap, fs, path, company_step.artifact_cap());
+// The SHA-256 of the artifact `name` beneath the directory `dir` as hex, and 0, or why it is refused (`company_step.artifact_reason`:
+// 1 not there, 2 not a regular file, 3 too large, 4 unreadable). `dir_stat` never follows a link and never opens, so a link, a
+// directory or a FIFO is refused before any open (a FIFO would block it); the open is `dir_open_read`, beneath the directory with
+// O_NOFOLLOW, so a link put there between the two is refused too.
+fn hash_artifact[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], name: &static [byte]) -> [heap, fs_read(""), dir_read, file_read] (buffer.Buffer, int) {
     var hex = buffer.empty(heap, 64);
-    var held = false;
-    if errno == 0 {
-        let digest = box_slice(heap, 32, byte_of(0));
-        borrow data as &db in {
-            borrow mut digest as &!dw in {
-                crypto.sha256(buffer.bytes(db), contents(dw));
-            }
-        }
-        borrow digest as &dr in {
-            hex = company_step.put_hex(heap, hex, contents(dr));
-        }
-        unbox_slice(heap, digest);
-        held = true;
+    var why = 4;
+    if journal_io.path_ok(fs, dir) == false {
+        return (hex, why);
     }
-    buffer.drop(heap, data);
-    return (hex, held);
+    match open_dir(fs, dir) {
+        DirOpened::Failed(e) => {
+            why = 4;
+        }
+        DirOpened::Ok(opened) => {
+            var d = opened;
+            borrow d as &dr in {
+                match dir_stat(dr, name) {
+                    DirStat::Failed(e) => {
+                        why = 4;
+                        if e == 2 {
+                            why = 1;
+                        }
+                    }
+                    DirStat::Ok(kind, size, mtime) => {
+                        if kind != 1 {
+                            why = 2;
+                        } else if size > company_step.artifact_cap() {
+                            why = 3;
+                        } else {
+                            match dir_open_read(dr, name) {
+                                Opened::Failed(e) => {
+                                    why = 2;
+                                    if e == 2 {
+                                        why = 1;
+                                    }
+                                }
+                                Opened::Ok(file_opened) => {
+                                    var file = file_opened;
+                                    var data = buffer.empty(heap, 256);
+                                    var errno = 0;
+                                    borrow mut file as &!x in {
+                                        let (got, e2) = journal_io.drain(heap, x, data, company_step.artifact_cap());
+                                        data = got;
+                                        errno = e2;
+                                    }
+                                    file_close(file);
+                                    if errno == 0 - 3 {
+                                        why = 3;
+                                    } else if errno != 0 {
+                                        why = 4;
+                                    } else {
+                                        let digest = box_slice(heap, 32, byte_of(0));
+                                        borrow data as &db in {
+                                            borrow mut digest as &!dw in {
+                                                crypto.sha256(buffer.bytes(db), contents(dw));
+                                            }
+                                        }
+                                        borrow digest as &dg in {
+                                            hex = company_step.put_hex(heap, hex, contents(dg));
+                                        }
+                                        unbox_slice(heap, digest);
+                                        why = 0;
+                                    }
+                                    buffer.drop(heap, data);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            dir_close(d);
+        }
+    }
+    return (hex, why);
+}
+
+// The artifact of step `id` is refused (`why`, `company_step.artifact_reason`): print it and record it as an unavailable check,
+// which holds the step. The exit status.
+fn refuse_artifact[&h, &f, &i, &j, &n, &w](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], id: &n [byte], shown: &w [byte], why: int, seq: int) -> [heap, fs_read(""), fs_write(""), file_write, io_write] int {
+    let wrote = record_buffer(heap, fs, io, jpath, company_state.check_unavailable(heap, seq, id, company_step.rule_artifact_invalid()), false);
+    if wrote != 0 {
+        return wrote;
+    }
+    refuse(io, company_step.rule_artifact_invalid());
+    say(io, "step: ", id);
+    say(io, "artifact: ", shown);
+    say(io, "reason: ", company_step.artifact_reason(why));
+    return company_step.exit_check_unavailable();
 }
 
 // Run the check `check` (a name in the company directory `dir`) with the arguments <artifact> <argdir>, PATH its environment, no
@@ -738,14 +841,11 @@ fn run_check[&h, &f, &x, &c, &d, &n, &a, &g](heap: &!h Heap, fs: &f Fs(""), exec
 
 // Hash the artifact, run the check, hash it again, and write what the verdict says (the head of this file, step 6). -1 to go on
 // (accepted), else the exit status.
-fn check_and_accept[&h, &f, &x, &c, &i, &d, &j, &n, &k, &a, &w, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, dir: &d [byte], jpath: &j [byte], id: &n [byte], check: &k [byte], artifact: &a [byte], shown: &w [byte], argdir: &g [byte], seq: int, timeout: int) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
-    let (first, held) = hash_file(heap, fs, artifact);
-    if held == false {
+fn check_and_accept[&h, &f, &x, &c, &i, &d, &j, &n, &k, &a, &w, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, dir: &d [byte], jpath: &j [byte], id: &n [byte], check: &k [byte], artifact: &a [byte], shown: &w [byte], argdir: &g [byte], name: &static [byte], seq: int, timeout: int) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write] int {
+    let (first, why) = hash_artifact(heap, fs, argdir, name);
+    if why != 0 {
         buffer.drop(heap, first);
-        refuse(io, "check-unavailable");
-        say(io, "step: ", id);
-        say(io, "reason: the artifact cannot be read: ", shown);
-        return company_step.exit_check_unavailable();
+        return refuse_artifact(heap, fs, io, jpath, id, shown, why, seq);
     }
     let (out, ran) = run_check(heap, fs, exec, clock, dir, check, artifact, argdir, timeout);
     var verdict = 2;
@@ -758,18 +858,24 @@ fn check_and_accept[&h, &f, &x, &c, &i, &d, &j, &n, &k, &a, &w, &g](heap: &!h He
         total = b;
     }
     buffer.drop(heap, out);
-    let (second, again) = hash_file(heap, fs, artifact);
+    let (second, again) = hash_artifact(heap, fs, argdir, name);
     var same = false;
     borrow first as &fb in {
         borrow second as &sb in {
-            if again {
+            if again == 0 {
                 same = bytes.equal(buffer.bytes(fb), buffer.bytes(sb));
             }
         }
     }
     buffer.drop(heap, second);
-    if verdict == 0 && same == false {
-        verdict = 2;
+    if same == false {
+        // Whatever the check said, it judged bytes that are not the ones Forge hashed first.
+        buffer.drop(heap, first);
+        var reason = 5;
+        if again != 0 {
+            reason = again;
+        }
+        return refuse_artifact(heap, fs, io, jpath, id, shown, reason, seq);
     }
     var code = company_step.verdict_exit(verdict);
     if verdict == 0 {
@@ -796,8 +902,13 @@ fn check_and_accept[&h, &f, &x, &c, &i, &d, &j, &n, &k, &a, &w, &g](heap: &!h He
             buffer.drop(heap, sc);
         }
     } else {
-        refuse(io, "check-unavailable");
-        say(io, "step: ", id);
+        let wrote = record_buffer(heap, fs, io, jpath, company_state.check_unavailable(heap, seq, id, "check-unavailable"), false);
+        if wrote != 0 {
+            code = wrote;
+        } else {
+            refuse(io, "check-unavailable");
+            say(io, "step: ", id);
+        }
     }
     buffer.drop(heap, first);
     return code;

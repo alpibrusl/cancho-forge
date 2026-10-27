@@ -26,7 +26,8 @@ import forge.task;
 // authenticates nothing: it records the OS user (`USER` in the process environment, read from /proc/self/environ through the
 // `fs_read` the verb already holds; "unknown" when there is none) and the reason, and nothing more. It takes the writer lock
 // (`<dir>/lock`), replays the journal and refuses a corrupt one as `status` does, refuses a gate the manifest does not list
-// (`gate-unknown`), cuts a torn tail (which replay does not read) and appends `company.gate.decided`. A rejected gate may be
+// (`gate-unknown`; besides `human_gates`, every step id makes a retry gate `retry:<id>`, the decision that lets `forge company run`
+// start a step held by its check again, `company_state` header), cuts a torn tail (which replay does not read) and appends `company.gate.decided`. A rejected gate may be
 // approved later: the last decision wins. Its row adds `fs_write` and `file_write` to the verbs above, and no other capability.
 //
 // Exit status: 0 valid / status shown; 1 refused, the line `refusal: <rule tag>` printed (an unusable manifest is
@@ -477,7 +478,7 @@ fn event_for[&h, &f, &g, &r](heap: &!h Heap, fs: &f Fs(""), seq: int, gate: &g [
 fn decide_with[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, held: company_manifest.Manifest, jpath: &j [byte], gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     var code = 1;
     borrow held as &hm in {
-        if company_manifest.has_gate(hm, gate) == false {
+        if company_manifest.has_gate(hm, gate) == false && company_state.retry_step(hm, gate) < 0 {
             refuse(io, company_manifest.rule_name(company_manifest.Refusal::GateUnknown));
         } else {
             let existed = journal_io.exists(fs, jpath);

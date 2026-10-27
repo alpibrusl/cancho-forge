@@ -581,6 +581,118 @@ fn test_the_recorded_cost_saturates[&h](heap: &!h Heap) -> [heap] int {
     return 0;
 }
 
+// ---- held by a check (no Forge-level retry) ----------------------------------------------------------------------------------
+
+// The held codes of steps a, b, c (0 free, 1 check-failed, 2 check-unavailable) as one number a + 10 b + 100 c, the rule, and the
+// step number of a few gate names.
+struct HeldProbe {
+    held: int,
+    rule: int,
+    retry_a: int,
+    retry_c: int,
+    retry_none: int,
+    retry_bare: int,
+}
+
+fn held_probe[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] HeldProbe {
+    var p = HeldProbe { held: 0 - 1, rule: 0 - 1, retry_a: 0, retry_c: 0, retry_none: 0, retry_bare: 0 };
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    let held = company_state.held_by_check(sr, 0) + 10 * company_state.held_by_check(sr, 1) + 100 * company_state.held_by_check(sr, 2) + company_state.held_by_check(sr, 3) + company_state.held_by_check(sr, 0 - 1) + company_state.held_by_check(sr, 9223372036854775807);
+                    p = HeldProbe { held: held, rule: company_state.report_of(sr).rule, retry_a: company_state.retry_step(mr, "retry:a"), retry_c: company_state.retry_step(mr, "retry:c"), retry_none: company_state.retry_step(mr, "retry:zz"), retry_bare: company_state.retry_step(mr, "a") + company_state.retry_step(mr, "retry:") + company_state.retry_step(mr, "") };
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return p;
+}
+
+fn test_a_retry_gate_names_a_step_of_the_manifest[&h](heap: &!h Heap) -> [heap] int {
+    let p = held_probe(heap, "");
+    test.assert_eq(p.held, 0);
+    test.assert_eq(p.retry_a, 0);
+    test.assert_eq(p.retry_c, 2);
+    test.assert_eq(p.retry_none, 0 - 1);
+    test.assert_eq(p.retry_bare, 0 - 3);
+    test.assert(bytes.equal(company_state.retry_prefix(), "retry:"));
+    return 0;
+}
+
+// A failed check holds its step: the run will not start it again by itself (spec section 10: no Forge-level retry).
+fn test_a_failed_check_holds_the_step[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "steps/a"));
+    j = add(heap, j, company_state.check_failed(heap, 2, "a", 1, 2));
+    borrow j as &jb in {
+        let p = held_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.held, 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_an_unavailable_check_holds_the_step_and_says_so[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.check_unavailable(heap, 1, "b", "artifact-invalid"));
+    borrow j as &jb in {
+        let p = held_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.held, 20);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// A person approving `retry:<step>` AFTER the failure lets it go; a rejection, a retry of another step, or an approval made
+// BEFORE the failure does not; a later failure holds it again; acceptance frees it.
+fn test_only_an_approved_retry_recorded_after_the_failure_frees_the_step[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 1024);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "retry:a", "approved", "ana", "early"));
+    j = add(heap, j, company_state.check_failed(heap, 2, "a", 1, 2));
+    j = add(heap, j, company_state.gate_decided(heap, 3, "retry:a", "rejected", "ana", "no"));
+    j = add(heap, j, company_state.gate_decided(heap, 4, "retry:b", "approved", "ana", "other"));
+    borrow j as &jb in {
+        test.assert_eq(held_probe(heap, buffer.bytes(jb)).held, 1);
+    }
+    j = add(heap, j, company_state.gate_decided(heap, 5, "retry:a", "approved", "ana", "try again"));
+    borrow j as &jb in {
+        test.assert_eq(held_probe(heap, buffer.bytes(jb)).held, 0);
+    }
+    j = add(heap, j, company_state.check_unavailable(heap, 6, "a", "check-unavailable"));
+    borrow j as &jb in {
+        test.assert_eq(held_probe(heap, buffer.bytes(jb)).held, 2);
+    }
+    j = add(heap, j, company_state.gate_decided(heap, 7, "retry:a", "approved", "ana", "again"));
+    j = add(heap, j, company_state.check_failed(heap, 8, "c", 0, 3));
+    j = add(heap, j, company_state.accepted(heap, 9, "c", "x", "y"));
+    borrow j as &jb in {
+        let p = held_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.held, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_an_unavailable_record_without_a_reason_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":1,\"kind\":\"company.step.check_unavailable\",\"task\":\"a\"}\n");
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(jb)), "event-malformed"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
 // ---- the builders ---------------------------------------------------------------------------------------------------------
 
 fn test_every_builder_writes_one_complete_line[&h](heap: &!h Heap) -> [heap] int {

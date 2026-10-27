@@ -60,8 +60,14 @@ mkco() { # name, steps json, input ceiling, step ids...
   printf '#!/bin/sh\necho "case 1 ok"\necho "case 2 FAILED"\necho "TOTAL 1/2"\nexit 1\n' > "$co/audit_half.sh"
   printf '#!/bin/sh\necho "no score here"\n' > "$co/audit_none.sh"
   printf '#!/bin/sh\ngrep -q verdict "$1" && echo "TOTAL 1/1"\n' > "$co/audit_report.sh"
+  printf '#!/bin/sh\nprintf x >> "$1"\necho "TOTAL 2/2"\n' > "$co/audit_mutate.sh"
+  printf '#!/bin/sh\nsleep 37\necho "TOTAL 2/2"\n' > "$co/audit_hang.sh"
+  printf '#!/bin/sh\nhead -c 1100000 /dev/zero | tr "\\0" x\necho "TOTAL 2/2"\n' > "$co/audit_noisy.sh"
   chmod +x "$co"/audit_*.sh
   for s in "$@"; do mkdir -p "$co/steps/$s/ev" || exit 1; done
+}
+run_op() { # company name, tag, operator file
+  "$F" company run "$w/$1" "$3" > "$w/$1.$2.out" 2> "$w/$1.$2.err"; echo $? > "$w/$1.$2.rc"
 }
 run() { # company name, tag of this run: forge company run, stdout in $w/<name>.<tag>.out, status in .rc
   "$F" company run "$w/$1" "$w/operator.json" > "$w/$1.$2.out" 2> "$w/$1.$2.err"; echo $? > "$w/$1.$2.rc"
@@ -81,8 +87,24 @@ check "lying worker: the worker DID claim done (its own journal holds the claim,
 check "lying worker: company.journal holds NO company.step.accepted, and the check_failed with its score" sh -c "! grep -q 'company.step.accepted' '$w/lie/company.journal' && grep -q '\"kind\":\"company.step.check_failed\",\"task\":\"lib\",\"score\":1,\"total\":2' '$w/lie/company.journal'"
 "$F" company status "$w/lie" > "$w/lie.status"
 check "lying worker: status shows the step not accepted" sh -c "grep -qx 'lib ready' '$w/lie.status'"
+proposed() { grep -c '"kind":"task.proposed"' "$w/$1/steps/$2/journal.jsonl"; } # name, step: builds the step's workspace saw
 run lie 2
-check "lying worker: a second run does not accept it either (no Forge-level retry turns a failed check into acceptance)" sh -c "[ '$(rc lie 2)' = 13 ] && ! grep -q 'company.step.accepted' '$w/lie/company.journal'"
+check "lying worker: a second run does NOT build again (no Forge-level retry): exit 13, the step held, admitted once, one build" sh -c "[ '$(rc lie 2)' = 13 ] && grep -qx 'refusal: check-failed' '$w/lie.2.out' && grep -qx 'retry: forge company decide $w/lie retry:lib approved <reason>' '$w/lie.2.out' && [ $(kinds lie company.step.admitted lib) -eq 1 ] && [ $(proposed lie lib) -eq 1 ] && ! grep -q 'company.step.accepted' '$w/lie/company.journal'"
+"$F" company decide "$w/lie" retry:lib rejected "not yet" > /dev/null
+run lie 3
+check "lying worker: a rejected retry keeps it held, nothing built" sh -c "[ '$(rc lie 3)' = 13 ] && [ $(kinds lie company.step.admitted lib) -eq 1 ] && [ $(proposed lie lib) -eq 1 ]"
+"$F" company decide "$w/lie" retry:lib approved "audit looked at" > "$w/lie.decide.out"; echo $? > "$w/lie.decide.rc"
+check "lying worker: decide records the retry of a step (retry:<id> is a gate of every step)" sh -c "[ \$(cat '$w/lie.decide.rc') = 0 ] && grep -qx 'gate retry:lib: approved' '$w/lie.decide.out'"
+run lie 4
+check "lying worker: after an approved retry the next run admits it exactly once more (and its check fails again)" sh -c "[ '$(rc lie 4)' = 13 ] && [ $(kinds lie company.step.admitted lib) -eq 2 ] && [ $(proposed lie lib) -eq 2 ] && [ \$(grep -c 'company.step.check_failed' '$w/lie/company.journal') -eq 2 ]"
+run lie 5
+check "lying worker: and the new failure holds it again: nothing more is built" sh -c "[ '$(rc lie 5)' = 13 ] && [ $(kinds lie company.step.admitted lib) -eq 2 ] && [ $(proposed lie lib) -eq 2 ] && ! grep -q 'company.step.accepted' '$w/lie/company.journal'"
+"$F" company decide "$w/lie" retry:nostep approved "x" > "$w/lie.nostep.out"; echo $? > "$w/lie.nostep.rc"
+check "decide: a retry of a step the manifest does not have is gate-unknown, exit 1" sh -c "[ \$(cat '$w/lie.nostep.rc') = 1 ] && grep -qx 'refusal: gate-unknown' '$w/lie.nostep.out'"
+mkco liespend "[$(builder lib '' spend audit_half.sh)]" 100000 lib
+run liespend 1
+run liespend 2
+check "lying worker that spends: the held second run spends nothing (one spend record, one build)" sh -c "[ '$(rc liespend 2)' = 13 ] && [ \$(grep -c 'company.spend.recorded' '$w/liespend/company.journal') -eq 1 ] && [ $(proposed liespend lib) -eq 1 ]"
 
 # ---- (2) the good path: lib (builder) -> qa (qa) -> ship (product, gate ship)
 steps="[$(builder lib '' done audit_pass.sh),{\"id\":\"qa\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"lib\"],\"input\":\"gate\",\"check\":\"audit_report.sh\"},{\"id\":\"ship\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[\"qa\"],\"input\":\"ship it\",\"gate\":\"ship\"}]"
@@ -125,12 +147,47 @@ check "stuck worker: step-failed, exit 15, the build's exit printed, nothing acc
 # ---- an audit with no score: check-unavailable, exit 14, nothing accepted and no check_failed
 mkco none "[$(builder lib '' done audit_none.sh)]" 100000 lib
 run none 1
-check "audit without a score: check-unavailable, exit 14, nothing accepted" sh -c "[ '$(rc none 1)' = 14 ] && grep -qx 'refusal: check-unavailable' '$w/none.1.out' && ! grep -q 'company.step.accepted\|check_failed' '$w/none/company.journal'"
+check "audit without a score: check-unavailable, exit 14, recorded, nothing accepted" sh -c "[ '$(rc none 1)' = 14 ] && grep -qx 'refusal: check-unavailable' '$w/none.1.out' && ! grep -q 'company.step.accepted\|check_failed' '$w/none/company.journal' && grep -q '\"kind\":\"company.step.check_unavailable\",\"task\":\"lib\",\"reason\":\"check-unavailable\"' '$w/none/company.journal'"
+run none 2
+check "audit without a score: a second run is held too (exit 14), nothing built" sh -c "[ '$(rc none 2)' = 14 ] && [ $(kinds none company.step.admitted lib) -eq 1 ] && [ $(proposed none lib) -eq 1 ]"
 
 # ---- a build that claims done and leaves no artifact: Forge hashes nothing, so no check is run and nothing is accepted
 mkco noart "[$(builder lib '' bare audit_pass.sh)]" 100000 lib
 run noart 1
-check "no artifact: check-unavailable, exit 14, nothing accepted" sh -c "[ '$(rc noart 1)' = 14 ] && grep -qx 'refusal: check-unavailable' '$w/noart.1.out' && ! grep -q 'company.step.accepted' '$w/noart/company.journal'"
+check "no artifact: artifact-invalid, exit 14, nothing accepted" sh -c "[ '$(rc noart 1)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/noart.1.out' && ! grep -q 'company.step.accepted' '$w/noart/company.journal'"
+
+# ---- an artifact that is not a regular file beneath the execution directory: never hashed through, never accepted
+mkco linkart "[$(builder lib '' linkart audit_pass.sh)]" 100000 lib
+run linkart 1
+check "a symlink artifact (to a file outside the company): artifact-invalid, exit 14, not accepted" sh -c "[ -L '$w/linkart/steps/lib/ev/project.cho' ] && [ '$(rc linkart 1)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/linkart.1.out' && ! grep -q 'company.step.accepted' '$w/linkart/company.journal'"
+mkco dirart "[$(builder lib '' bare audit_pass.sh)]" 100000 lib
+mkdir "$w/dirart/steps/lib/ev/project.cho"
+run dirart 1
+check "a directory where the artifact should be: artifact-invalid, exit 14" sh -c "[ '$(rc dirart 1)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/dirart.1.out' && ! grep -q 'company.step.accepted' '$w/dirart/company.journal'"
+# A FIFO cannot be left by the build itself here: the Cancho Code adapter opens its evidence files and blocks on one (its own
+# deadline ends that build: a finding about the adapter, not about the run). So the FIFO is put in the artifact's place by the
+# step's check, after the first hash: the second hash meets it, and must refuse it without opening it.
+if command -v mkfifo > /dev/null 2>&1; then
+  mkco fifoart "[$(builder lib '' done audit_fifo.sh)]" 100000 lib
+  printf '#!/bin/sh\nrm -f "$1"\nmkfifo "$1"\necho "TOTAL 2/2"\n' > "$w/fifoart/audit_fifo.sh"; chmod +x "$w/fifoart/audit_fifo.sh"
+  timeout 120 "$F" company run "$w/fifoart" "$w/operator.json" > "$w/fifoart.1.out" 2>&1; echo $? > "$w/fifoart.1.rc"
+  check "a FIFO in the artifact's place: artifact-invalid (not a regular file), exit 14, and the run did not hang on it" sh -c "[ -p '$w/fifoart/steps/lib/ev/project.cho' ] && [ '$(rc fifoart 1)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/fifoart.1.out' && grep -qx 'reason: not a regular file (a link, a directory, a FIFO or a device)' '$w/fifoart.1.out' && ! grep -q 'company.step.accepted' '$w/fifoart/company.journal'"
+fi
+
+# ---- the check itself misbehaves (short deadlines: an operator file of its own)
+sed 's/"check_timeout_ms":20000/"check_timeout_ms":10000/' "$w/operator.json" > "$w/operator-short.json"
+mkco mutate "[$(builder lib '' done audit_mutate.sh)]" 100000 lib
+run mutate 1
+check "a check that changes the artifact it judges: artifact-invalid (changed), exit 14, not accepted" sh -c "[ '$(rc mutate 1)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/mutate.1.out' && grep -qx 'reason: changed while the check ran' '$w/mutate.1.out' && ! grep -q 'company.step.accepted' '$w/mutate/company.journal'"
+mkco hang "[$(builder lib '' done audit_hang.sh)]" 100000 lib
+run_op hang 1 "$w/operator-short.json"
+check "a check that does not end: its deadline, check-unavailable, exit 14, and its process group is gone" sh -c "[ '$(rc hang 1)' = 14 ] && grep -qx 'refusal: check-unavailable' '$w/hang.1.out' && ! pgrep -f '^sleep 37\$' > /dev/null"
+mkco noisy "[$(builder lib '' done audit_noisy.sh)]" 100000 lib
+run noisy 1
+check "a check that writes more than 1 MiB: check-unavailable, exit 14" sh -c "[ '$(rc noisy 1)' = 14 ] && grep -qx 'refusal: check-unavailable' '$w/noisy.1.out' && ! grep -q 'company.step.accepted' '$w/noisy/company.journal'"
+cp "$w/operator.json" "$w/noisy/operator.json"
+"$F" company run "$w/noisy" "$w/noisy/operator.json" > "$w/opin.out" 2>&1; echo $? > "$w/opin.rc"
+check "an operator file inside the company directory: operator-invalid, exit 1" sh -c "[ \$(cat '$w/opin.rc') = 1 ] && grep -qx 'refusal: operator-invalid' '$w/opin.out'"
 
 # ---- steps the run will not start: nothing admitted, exit 1
 mkco nocheck "[{\"id\":\"qa\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"gate\"}]" 100000 qa
