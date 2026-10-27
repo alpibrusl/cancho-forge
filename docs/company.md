@@ -591,6 +591,14 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
 * **FIFOs**: a FIFO swapped into place *between* Forge's `dir_stat` and its open still blocks the open; a FIFO named as an analyst's
   input blocks the tool runner until Forge's deadline; the Cancho Code adapter blocks on a FIFO left as `project.cho` until its own
   deadline (an adapter issue, not fixed).
+* **Other build-written files in `ev`** (`build.json` read by `build_run`, a gate's `report.json` in `gate_run`, `run.json` and
+  `result.json` in the adapter) are still read with a plain open: a link or FIFO planted there by a hostile build that left a
+  background process behind can exhaust memory (1 TiB cap) or block Forge while it holds the lock. Only `usage.jsonl`, artifacts and the
+  tool `report.json` are read beneath `ev`, without links and capped. Not fixed; routing these through `company_files.read_artifact`
+  is the follow-up.
+* A tool's `report.json` that is a link, a FIFO or oversize is read as "no claim"; no test plants one.
+* A `usage-invalid` run records no spend: tokens spent in it are not counted, an honest tool that leaves a directory or an oversize
+  file included (the step is held, so nothing is silently rebuilt).
 * The budget's two lags (kill-before-spend, shrinking `usage.jsonl`, section 9) are read from the code, not tested.
 
 **Gate**
