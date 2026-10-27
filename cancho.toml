@@ -91,3 +91,8 @@ std = true
 name = "run_files"
 sources = ["tests/run_files_test.cho", "src/run_files.cho"]
 std = true
+
+[[test]]
+name = "company_manifest"
+sources = ["tests/company_manifest_test.cho", "src/company_manifest.cho"]
+std = true

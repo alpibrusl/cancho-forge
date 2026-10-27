@@ -1,0 +1,864 @@
+edition 9;
+module forge.company_manifest;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+
+// The company manifest (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.1, 4.2 and 4.4): a JSON file
+// parsed against a closed shape. This module is pure: it opens no file and starts nothing. `parse` takes the text and answers
+// either a `Manifest` that has passed every check here, or the first refusal, with a rule tag. A manifest declares requirements
+// only; it cannot widen what a worker can reach (section 4.1), so nothing here grants anything.
+//
+//   { "id", "mission",
+//     "model":  { "provider", "name" },
+//     "budget": { "input", "output", "cache_write", "cache_read", "max_cost", "price_table" },
+//     "human_gates": [name...], "roles": [role...],
+//     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "gate"? } ... ] }
+//
+// The order the checks run in, so that a manifest with two faults is always refused for the same one:
+//   1. size (over 1 MiB), JSON, the root an object                                       manifest-malformed
+//   2. the keys of the root, `model`, `budget` and each step: a name outside the shape   manifest-unknown-field
+//      (a key twice, or a key written with an escape, is manifest-malformed)
+//   3. the shape and types of everything but the budget's presence                       manifest-malformed
+//   4. `budget` missing, a budget number missing / `price_table` missing                 budget-missing / price-table-missing
+//   5. `roles` names a role outside the six                                               role-unknown
+//   6. step ids twice                                                                    step-id-duplicate
+//   7. per step, in order: role (not one of the six, or not in `roles`)                  role-unknown
+//      task type (not the one the role offers)                                           task-type-unsupported
+//      check (a builder or writer without one)                                           check-missing
+//      gate (not in `human_gates`)                                                       gate-unknown
+//   8. a `needs` entry that is no step id                                                step-needs-unknown
+//   9. a step that needs itself, or any cycle                                            step-cycle
+//
+// Names (a step id, a gate, a role) are 1 to 64 bytes of letters, digits, `-`, `_` and `.`, written without an escape: a control
+// character or a space in an id is `manifest-malformed`, a value like any other, never a trap. Text (`mission`, `input`) is a
+// string of at most 16 KiB that does not spell a NUL (`\u0000`). File names (`check`, `price_table`) are 1 to 128 bytes of
+// letters, digits, `-`, `_` and `.`, not starting with `.`: a name in the company directory, never a path.
+
+// What a manifest is refused for. Each has a rule tag and a test that reaches it (tests/company_manifest_test.cho).
+pub enum Refusal {
+    // Not JSON, over 1 MiB, the wrong type or a missing required field, an empty `steps`, a name that is not a name, a key twice.
+    ManifestMalformed,
+    // A key in the root, `model`, `budget` or a step that the shape does not have.
+    ManifestUnknownField,
+    // Two steps with the same `id`.
+    StepIdDuplicate,
+    // A `needs` entry that names no step.
+    StepNeedsUnknown,
+    // A step needs itself, or the steps need each other in a ring.
+    StepCycle,
+    // A role outside `builder, qa, analyst, reviewer, writer, product`, or a step's role that `roles` does not list.
+    RoleUnknown,
+    // A `task_type` that is not one of `project.build, repo.gate, tool.run, none`, or not the one the step's role offers.
+    TaskTypeUnsupported,
+    // A builder or writer step with no `check` (absent or empty).
+    CheckMissing,
+    // A step's `gate` that is not in `human_gates`.
+    GateUnknown,
+    // No `budget` object, or one of its five numbers is absent.
+    BudgetMissing,
+    // No `budget.price_table`, or an empty one.
+    PriceTableMissing,
+}
+
+pub fn rule_name(r: Refusal) -> [] &static [byte] {
+    match r {
+        Refusal::ManifestMalformed => {
+            return "manifest-malformed";
+        }
+        Refusal::ManifestUnknownField => {
+            return "manifest-unknown-field";
+        }
+        Refusal::StepIdDuplicate => {
+            return "step-id-duplicate";
+        }
+        Refusal::StepNeedsUnknown => {
+            return "step-needs-unknown";
+        }
+        Refusal::StepCycle => {
+            return "step-cycle";
+        }
+        Refusal::RoleUnknown => {
+            return "role-unknown";
+        }
+        Refusal::TaskTypeUnsupported => {
+            return "task-type-unsupported";
+        }
+        Refusal::CheckMissing => {
+            return "check-missing";
+        }
+        Refusal::GateUnknown => {
+            return "gate-unknown";
+        }
+        Refusal::BudgetMissing => {
+            return "budget-missing";
+        }
+        Refusal::PriceTableMissing => {
+            return "price-table-missing";
+        }
+    }
+}
+
+// The six roles of section 4.2.
+pub enum Role {
+    Builder,
+    Qa,
+    Analyst,
+    Reviewer,
+    Writer,
+    Product,
+}
+
+// The task types of section 4.2. `None` is the product role's: a person, no worker.
+pub enum TaskType {
+    ProjectBuild,
+    RepoGate,
+    ToolRun,
+    None,
+}
+
+// A step, as the nodes of the manifest's tape: read the text of a field with `step_id`, `step_input`, `step_check`, `step_gate`
+// and `step_need`. `check` and `gate` are -1 when the step has none.
+pub struct Step {
+    id: int,
+    role: Role,
+    task_type: TaskType,
+    needs: int,
+    input: int,
+    check: int,
+    gate: int,
+}
+
+// A manifest that passed every check. It owns its text and the tape over it, so it is `res`: end it with `drop`.
+pub res struct Manifest {
+    text: buffer.Buffer,
+    tape: Box[[int]],
+    id: int,
+    provider: int,
+    price_table: int,
+    steps: int,
+    step_count: int,
+    input: int,
+    output: int,
+    cache_write: int,
+    cache_read: int,
+    max_cost: int,
+}
+
+pub enum ManifestResult {
+    Held(Manifest),
+    Refused(Refusal),
+}
+
+// The longest manifest, in bytes. A longer text is `manifest-malformed` before it is parsed.
+pub fn max_bytes() -> [] int {
+    return 1048576;
+}
+
+// The most steps, `needs` entries of one step, gates, and keys of one object. Beyond them the manifest is malformed: bounds
+// on what the checks below walk, so no input makes them slow.
+pub fn max_steps() -> [] int {
+    return 256;
+}
+
+pub fn max_needs() -> [] int {
+    return 64;
+}
+
+pub fn max_gates() -> [] int {
+    return 64;
+}
+
+pub fn max_keys() -> [] int {
+    return 32;
+}
+
+pub fn max_text() -> [] int {
+    return 16384;
+}
+
+// ---- the checks -----------------------------------------------------------------------------------------------------------
+// Each answers 0 for held, else a code: 1 malformed, 2 unknown field, 3 duplicate, 4 needs unknown, 5 cycle, 6 role unknown, 7 task
+// type, 8 check missing, 9 gate unknown, 10 budget missing, 11 price table missing.
+
+fn refusal_of(code: int) -> [] Refusal {
+    if code == 2 {
+        return Refusal::ManifestUnknownField;
+    }
+    if code == 3 {
+        return Refusal::StepIdDuplicate;
+    }
+    if code == 4 {
+        return Refusal::StepNeedsUnknown;
+    }
+    if code == 5 {
+        return Refusal::StepCycle;
+    }
+    if code == 6 {
+        return Refusal::RoleUnknown;
+    }
+    if code == 7 {
+        return Refusal::TaskTypeUnsupported;
+    }
+    if code == 8 {
+        return Refusal::CheckMissing;
+    }
+    if code == 9 {
+        return Refusal::GateUnknown;
+    }
+    if code == 10 {
+        return Refusal::BudgetMissing;
+    }
+    if code == 11 {
+        return Refusal::PriceTableMissing;
+    }
+    return Refusal::ManifestMalformed;
+}
+
+fn name_char_ok(c: int) -> [] bool {
+    let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+    let digit = c >= 48 && c <= 57;
+    return letter || digit || c == 45 || c == 95 || c == 46;
+}
+
+// 1 to `limit` bytes of letters, digits, `-`, `_`, `.`.
+fn name_ok[&v](view: &v [byte], limit: int) -> [] bool {
+    if len(view) < 1 || len(view) > limit {
+        return false;
+    }
+    var i = 0;
+    while i < len(view) {
+        if !name_char_ok(int_of(view[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// A file name of the company directory: a name that does not start with `.`.
+fn file_ok[&v](view: &v [byte]) -> [] bool {
+    return name_ok(view, 128) && int_of(view[0]) != 46;
+}
+
+// Is node `i` a string written without an escape, whose bytes are a name?
+fn is_name[&s, &t](src: &s [byte], tp: &t [int], i: int) -> [] bool {
+    return json.string_plain(tp, i) && name_ok(json.string_view(src, tp, i), 64);
+}
+
+// Is node `i` a string of at most 16 KiB that does not spell `\u0000`? An escaped string is allowed (a brief has newlines).
+fn is_text[&s, &t](src: &s [byte], tp: &t [int], i: int) -> [] bool {
+    if !json.is_string(tp, i) {
+        return false;
+    }
+    let view = json.string_view(src, tp, i);
+    if len(view) > max_text() {
+        return false;
+    }
+    var k = 0;
+    while k + 5 < len(view) {
+        if int_of(view[k]) == 92 && int_of(view[k + 1]) == 117 && int_of(view[k + 2]) == 48 && int_of(view[k + 3]) == 48 && int_of(view[k + 4]) == 48 && int_of(view[k + 5]) == 48 {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn is_count[&s, &t](src: &s [byte], tp: &t [int], i: int) -> [] bool {
+    return json.is_int(tp, i) && json.fits_int(src, tp, i) && json.to_int(src, tp, i) >= 0;
+}
+
+// Is `key` one of the space-separated `names`?
+fn listed[&k](key: &k [byte], names: &static [byte]) -> [] bool {
+    var start = 0;
+    var i = 0;
+    while i <= len(names) {
+        if i == len(names) || int_of(names[i]) == 32 {
+            if bytes.equal(key, names[start..i]) {
+                return true;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// The keys of object `obj` against `names`: at most `max_keys`, each written without an escape, none twice (malformed), none
+// outside the list (unknown field). Malformed is reported before unknown.
+fn keys_code[&s, &t](src: &s [byte], tp: &t [int], obj: int, names: &static [byte]) -> [] int {
+    let n = json.count(tp, obj);
+    if n > max_keys() {
+        return 1;
+    }
+    var unknown = false;
+    var j = obj + 1;
+    var k = 0;
+    while k < n {
+        if !json.string_plain(tp, j) {
+            return 1;
+        }
+        let key = json.string_view(src, tp, j);
+        if !listed(key, names) {
+            unknown = true;
+        }
+        var e = obj + 1;
+        var q = 0;
+        while q < k {
+            if bytes.equal(key, json.string_view(src, tp, e)) {
+                return 1;
+            }
+            e = json.skip(tp, e + 1);
+            q = q + 1;
+        }
+        j = json.skip(tp, j + 1);
+        k = k + 1;
+    }
+    if unknown {
+        return 2;
+    }
+    return 0;
+}
+
+// A role name as a number 0 to 5, or -1.
+fn role_code[&v](name: &v [byte]) -> [] int {
+    if bytes.equal(name, "builder") {
+        return 0;
+    }
+    if bytes.equal(name, "qa") {
+        return 1;
+    }
+    if bytes.equal(name, "analyst") {
+        return 2;
+    }
+    if bytes.equal(name, "reviewer") {
+        return 3;
+    }
+    if bytes.equal(name, "writer") {
+        return 4;
+    }
+    if bytes.equal(name, "product") {
+        return 5;
+    }
+    return 0 - 1;
+}
+
+// A task type name as a number 0 to 3, or -1.
+fn type_code[&v](name: &v [byte]) -> [] int {
+    if bytes.equal(name, "project.build") {
+        return 0;
+    }
+    if bytes.equal(name, "repo.gate") {
+        return 1;
+    }
+    if bytes.equal(name, "tool.run") {
+        return 2;
+    }
+    if bytes.equal(name, "none") {
+        return 3;
+    }
+    return 0 - 1;
+}
+
+// The task type each role offers (section 4.2): builder and writer `project.build`, qa and reviewer `repo.gate`, analyst
+// `tool.run`, product `none`.
+fn type_of_role(role: int) -> [] int {
+    if role == 0 || role == 4 {
+        return 0;
+    }
+    if role == 1 || role == 3 {
+        return 1;
+    }
+    if role == 2 {
+        return 2;
+    }
+    return 3;
+}
+
+fn role_of(code: int) -> [] Role {
+    if code == 0 {
+        return Role::Builder;
+    }
+    if code == 1 {
+        return Role::Qa;
+    }
+    if code == 2 {
+        return Role::Analyst;
+    }
+    if code == 3 {
+        return Role::Reviewer;
+    }
+    if code == 4 {
+        return Role::Writer;
+    }
+    return Role::Product;
+}
+
+fn type_of(code: int) -> [] TaskType {
+    if code == 0 {
+        return TaskType::ProjectBuild;
+    }
+    if code == 1 {
+        return TaskType::RepoGate;
+    }
+    if code == 2 {
+        return TaskType::ToolRun;
+    }
+    return TaskType::None;
+}
+
+// The `model` object: `provider` and `name`, both names.
+fn model_code[&s, &t](src: &s [byte], tp: &t [int], model: int) -> [] int {
+    if !json.is_object(tp, model) {
+        return 1;
+    }
+    let keys = keys_code(src, tp, model, "provider name");
+    if keys != 0 {
+        return keys;
+    }
+    let provider = json.get(src, tp, model, "provider");
+    let name = json.get(src, tp, model, "name");
+    if !is_name(src, tp, provider) || !is_name(src, tp, name) {
+        return 1;
+    }
+    return 0;
+}
+
+// The `budget` object when present: its keys and types (malformed, unknown field), then the presence of its numbers.
+fn budget_shape_code[&s, &t](src: &s [byte], tp: &t [int], budget: int) -> [] int {
+    if !json.is_object(tp, budget) {
+        return 1;
+    }
+    let keys = keys_code(src, tp, budget, "input output cache_write cache_read max_cost price_table");
+    if keys != 0 {
+        return keys;
+    }
+    let names = "input output cache_write cache_read max_cost";
+    var start = 0;
+    var i = 0;
+    while i <= len(names) {
+        if i == len(names) || int_of(names[i]) == 32 {
+            let v = json.get(src, tp, budget, names[start..i]);
+            if v >= 0 && !is_count(src, tp, v) {
+                return 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    let price = json.get(src, tp, budget, "price_table");
+    if price >= 0 && (!json.string_plain(tp, price) || len(json.string_view(src, tp, price)) > 0 && !file_ok(json.string_view(src, tp, price))) {
+        return 1;
+    }
+    return 0;
+}
+
+// The presence rules of the budget, after every shape rule held: a missing number is `budget-missing`, a missing or empty
+// `price_table` is `price-table-missing`.
+fn budget_presence_code[&s, &t](src: &s [byte], tp: &t [int], budget: int) -> [] int {
+    if budget < 0 {
+        return 10;
+    }
+    if json.get(src, tp, budget, "input") < 0 || json.get(src, tp, budget, "output") < 0 || json.get(src, tp, budget, "cache_write") < 0 || json.get(src, tp, budget, "cache_read") < 0 || json.get(src, tp, budget, "max_cost") < 0 {
+        return 10;
+    }
+    let price = json.get(src, tp, budget, "price_table");
+    if price < 0 || len(json.string_view(src, tp, price)) == 0 {
+        return 11;
+    }
+    return 0;
+}
+
+// A list of names (`human_gates`, `roles`): an array of at most `limit` names.
+fn names_ok[&s, &t](src: &s [byte], tp: &t [int], arr: int, limit: int) -> [] bool {
+    if !json.is_array(tp, arr) || json.count(tp, arr) > limit {
+        return false;
+    }
+    var k = 0;
+    while k < json.count(tp, arr) {
+        if !is_name(src, tp, json.at(tp, arr, k)) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// Is the string at node `i` one of the names in the array at node `arr`?
+fn in_names[&s, &t](src: &s [byte], tp: &t [int], arr: int, i: int) -> [] bool {
+    let view = json.string_view(src, tp, i);
+    var k = 0;
+    while k < json.count(tp, arr) {
+        if json.string_equals(src, tp, json.at(tp, arr, k), view) {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+// The shape of one step: keys, and the type of every field. Presence of `check` and `gate` is judged later.
+fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
+    if !json.is_object(tp, step) {
+        return 1;
+    }
+    let keys = keys_code(src, tp, step, "id role task_type needs input check gate");
+    if keys != 0 {
+        return keys;
+    }
+    let role = json.get(src, tp, step, "role");
+    let task_type = json.get(src, tp, step, "task_type");
+    let input = json.get(src, tp, step, "input");
+    let check = json.get(src, tp, step, "check");
+    let gate = json.get(src, tp, step, "gate");
+    if !is_name(src, tp, json.get(src, tp, step, "id")) || !json.string_plain(tp, role) || !json.string_plain(tp, task_type) {
+        return 1;
+    }
+    if !is_text(src, tp, input) || len(json.string_view(src, tp, input)) == 0 {
+        return 1;
+    }
+    if !names_ok(src, tp, json.get(src, tp, step, "needs"), max_needs()) {
+        return 1;
+    }
+    if check >= 0 && (!json.string_plain(tp, check) || len(json.string_view(src, tp, check)) > 0 && !file_ok(json.string_view(src, tp, check))) {
+        return 1;
+    }
+    if gate >= 0 && !is_name(src, tp, gate) {
+        return 1;
+    }
+    return 0;
+}
+
+// Role, task type, check and gate of one step, against the roles in use and the human gates.
+fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, gates: int) -> [] int {
+    let role_node = json.get(src, tp, step, "role");
+    let role = role_code(json.string_view(src, tp, role_node));
+    if role < 0 || !in_names(src, tp, roles, role_node) {
+        return 6;
+    }
+    let tcode = type_code(json.string_view(src, tp, json.get(src, tp, step, "task_type")));
+    if tcode < 0 || tcode != type_of_role(role) {
+        return 7;
+    }
+    let check = json.get(src, tp, step, "check");
+    if (role == 0 || role == 4) && (check < 0 || len(json.string_view(src, tp, check)) == 0) {
+        return 8;
+    }
+    let gate = json.get(src, tp, step, "gate");
+    if gate >= 0 && !in_names(src, tp, gates, gate) {
+        return 9;
+    }
+    return 0;
+}
+
+// Step ids twice. Steps are at most 256, so the pairs are at most about 33,000.
+fn duplicate_code[&s, &t](src: &s [byte], tp: &t [int], steps: int) -> [] int {
+    let n = json.count(tp, steps);
+    var a = 0;
+    while a < n {
+        let ida = json.string_view(src, tp, json.get(src, tp, json.at(tp, steps, a), "id"));
+        var b = a + 1;
+        while b < n {
+            if bytes.equal(ida, json.string_view(src, tp, json.get(src, tp, json.at(tp, steps, b), "id"))) {
+                return 3;
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+    return 0;
+}
+
+// Every `needs` entry names a step (4), and the steps can be ordered so that each comes after what it needs (5 when they cannot,
+// a step needing itself included). The needs are resolved to step numbers into one work slice -- step nodes, starts, the flat needs,
+// then a done flag per step -- and the steps are then settled in passes: a step is settled once everything it needs is. A pass that
+// settles nothing, with a step left, is a cycle. At most 256 passes over at most 16,384 needs.
+fn graph_code[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], steps: int) -> [heap] int {
+    let n = json.count(tp, steps);
+    var total = 0;
+    var i = 0;
+    while i < n {
+        total = total + json.count(tp, json.get(src, tp, json.at(tp, steps, i), "needs"));
+        i = i + 1;
+    }
+    let starts = n;
+    let flat = 2 * n + 1;
+    let done = flat + total;
+    let work = box_slice(heap, done + n, 0);
+    var code = 0;
+    borrow mut work as &!w in {
+        let ws = contents(w);
+        i = 0;
+        while i < n {
+            ws[i] = json.at(tp, steps, i);
+            i = i + 1;
+        }
+        i = 0;
+        var at = 0;
+        while i < n {
+            let step = ws[i];
+            ws[starts + i] = at;
+            let needs = json.get(src, tp, step, "needs");
+            var k = 0;
+            while k < json.count(tp, needs) {
+                let want = json.string_view(src, tp, json.at(tp, needs, k));
+                var found = 0 - 1;
+                var j = 0;
+                while j < n {
+                    if bytes.equal(want, json.string_view(src, tp, json.get(src, tp, ws[j], "id"))) {
+                        found = j;
+                    }
+                    j = j + 1;
+                }
+                if found < 0 {
+                    code = 4;
+                } else {
+                    ws[flat + at] = found;
+                }
+                at = at + 1;
+                k = k + 1;
+            }
+            i = i + 1;
+        }
+        ws[starts + n] = at;
+        if code == 0 {
+            var changed = true;
+            var settled = 0;
+            while changed {
+                changed = false;
+                i = 0;
+                while i < n {
+                    if ws[done + i] == 0 {
+                        var ready = true;
+                        var e = ws[starts + i];
+                        while e < ws[starts + i + 1] {
+                            if ws[done + ws[flat + e]] == 0 {
+                                ready = false;
+                            }
+                            e = e + 1;
+                        }
+                        if ready {
+                            ws[done + i] = 1;
+                            settled = settled + 1;
+                            changed = true;
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+            if settled < n {
+                code = 5;
+            }
+        }
+    }
+    unbox_slice(heap, work);
+    return code;
+}
+
+// Everything but the size and the JSON: the root object `0` of the tape over `src`.
+fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] int {
+    let keys = keys_code(src, tp, 0, "id mission model budget human_gates roles steps");
+    if keys != 0 {
+        return keys;
+    }
+    let model = json.get(src, tp, 0, "model");
+    let budget = json.get(src, tp, 0, "budget");
+    let gates = json.get(src, tp, 0, "human_gates");
+    let roles = json.get(src, tp, 0, "roles");
+    let steps = json.get(src, tp, 0, "steps");
+    if !is_name(src, tp, json.get(src, tp, 0, "id")) || !is_text(src, tp, json.get(src, tp, 0, "mission")) {
+        return 1;
+    }
+    let m = model_code(src, tp, model);
+    if m != 0 {
+        return m;
+    }
+    if budget >= 0 {
+        let b = budget_shape_code(src, tp, budget);
+        if b != 0 {
+            return b;
+        }
+    }
+    if !names_ok(src, tp, gates, max_gates()) || !names_ok(src, tp, roles, 6) {
+        return 1;
+    }
+    if !json.is_array(tp, steps) || json.count(tp, steps) < 1 || json.count(tp, steps) > max_steps() {
+        return 1;
+    }
+    var i = 0;
+    while i < json.count(tp, steps) {
+        let c = step_shape_code(src, tp, json.at(tp, steps, i));
+        if c != 0 {
+            return c;
+        }
+        i = i + 1;
+    }
+    let presence = budget_presence_code(src, tp, budget);
+    if presence != 0 {
+        return presence;
+    }
+    i = 0;
+    while i < json.count(tp, roles) {
+        if role_code(json.string_view(src, tp, json.at(tp, roles, i))) < 0 {
+            return 6;
+        }
+        i = i + 1;
+    }
+    let dup = duplicate_code(src, tp, steps);
+    if dup != 0 {
+        return dup;
+    }
+    i = 0;
+    while i < json.count(tp, steps) {
+        let c = step_rules_code(src, tp, json.at(tp, steps, i), roles, gates);
+        if c != 0 {
+            return c;
+        }
+        i = i + 1;
+    }
+    return graph_code(heap, src, tp, steps);
+}
+
+// ---- parse ----------------------------------------------------------------------------------------------------------------
+
+// Parse and validate `text`. A manifest that passes owns a copy of the text and the tape over it; end it with `drop`. Nothing a
+// text can say reaches a trap: the size is checked before the tape is made, every walk is bounded, every index is a node the
+// tape answered.
+pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
+    if len(text) < 1 || len(text) > max_bytes() {
+        return ManifestResult::Refused(Refusal::ManifestMalformed);
+    }
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    var code = 1;
+    borrow mut tape as &!w in {
+        let tp = contents(w);
+        if json.parse(text, tp) > 0 && json.is_object(tp, 0) {
+            code = validate(heap, text, tp);
+        }
+    }
+    if code != 0 {
+        unbox_slice(heap, tape);
+        return ManifestResult::Refused(refusal_of(code));
+    }
+    var id = 0 - 1;
+    var provider = 0 - 1;
+    var price_table = 0 - 1;
+    var steps = 0 - 1;
+    var count = 0;
+    var input = 0;
+    var output = 0;
+    var cache_write = 0;
+    var cache_read = 0;
+    var max_cost = 0;
+    borrow tape as &r in {
+        let tp = contents(r);
+        id = json.get(text, tp, 0, "id");
+        provider = json.get(text, tp, json.get(text, tp, 0, "model"), "provider");
+        let budget = json.get(text, tp, 0, "budget");
+        price_table = json.get(text, tp, budget, "price_table");
+        steps = json.get(text, tp, 0, "steps");
+        count = json.count(tp, steps);
+        input = json.to_int(text, tp, json.get(text, tp, budget, "input"));
+        output = json.to_int(text, tp, json.get(text, tp, budget, "output"));
+        cache_write = json.to_int(text, tp, json.get(text, tp, budget, "cache_write"));
+        cache_read = json.to_int(text, tp, json.get(text, tp, budget, "cache_read"));
+        max_cost = json.to_int(text, tp, json.get(text, tp, budget, "max_cost"));
+    }
+    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
+}
+
+pub fn drop[&h](heap: &!h Heap, m: Manifest) -> [heap] int {
+    let Manifest { text, tape, id, provider, price_table, steps, step_count, input, output, cache_write, cache_read, max_cost } = m;
+    buffer.drop(heap, text);
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+// ---- reading a held manifest ----------------------------------------------------------------------------------------------
+
+fn text_at[&m](m: &m Manifest, node: int) -> [] &m [byte] {
+    if node < 0 {
+        return buffer.bytes(m.text)[0..0];
+    }
+    return json.string_view(buffer.bytes(m.text), contents(m.tape), node);
+}
+
+pub fn id_of[&m](m: &m Manifest) -> [] &m [byte] {
+    return text_at(m, m.id);
+}
+
+pub fn provider_of[&m](m: &m Manifest) -> [] &m [byte] {
+    return text_at(m, m.provider);
+}
+
+pub fn price_table_of[&m](m: &m Manifest) -> [] &m [byte] {
+    return text_at(m, m.price_table);
+}
+
+pub fn budget_input[&m](m: &m Manifest) -> [] int {
+    return m.input;
+}
+
+pub fn budget_output[&m](m: &m Manifest) -> [] int {
+    return m.output;
+}
+
+pub fn budget_cache_write[&m](m: &m Manifest) -> [] int {
+    return m.cache_write;
+}
+
+pub fn budget_cache_read[&m](m: &m Manifest) -> [] int {
+    return m.cache_read;
+}
+
+pub fn budget_max_cost[&m](m: &m Manifest) -> [] int {
+    return m.max_cost;
+}
+
+pub fn step_count[&m](m: &m Manifest) -> [] int {
+    return m.step_count;
+}
+
+// Step `i`, 0-based; an `i` outside 0 to `step_count - 1` is the first step.
+pub fn step_at[&m](m: &m Manifest, i: int) -> [] Step {
+    let tp = contents(m.tape);
+    let src = buffer.bytes(m.text);
+    var at = i;
+    if at < 0 || at >= m.step_count {
+        at = 0;
+    }
+    let node = json.at(tp, m.steps, at);
+    let role = role_code(json.string_view(src, tp, json.get(src, tp, node, "role")));
+    let tcode = type_code(json.string_view(src, tp, json.get(src, tp, node, "task_type")));
+    return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), gate: json.get(src, tp, node, "gate") };
+}
+
+pub fn step_id[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
+    return text_at(m, s.id);
+}
+
+// The step's input as written (an escape in it is still escaped).
+pub fn step_input[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
+    return text_at(m, s.input);
+}
+
+// The step's check file name, empty when it has none.
+pub fn step_check[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
+    return text_at(m, s.check);
+}
+
+// The step's gate, empty when it has none.
+pub fn step_gate[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
+    return text_at(m, s.gate);
+}
+
+pub fn step_needs_count[&m](m: &m Manifest, s: Step) -> [] int {
+    return json.count(contents(m.tape), s.needs);
+}
+
+// The id of what the step needs, `k`th (0-based); empty outside the list.
+pub fn step_need[&m](m: &m Manifest, s: Step, k: int) -> [] &m [byte] {
+    return text_at(m, json.at(contents(m.tape), s.needs, k));
+}

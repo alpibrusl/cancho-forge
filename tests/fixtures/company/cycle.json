@@ -1,0 +1,1 @@
+{"id":"c","mission":"m","model":{"provider":"p","name":"n"},"budget":{"input":1,"output":1,"cache_write":1,"cache_read":1,"max_cost":1,"price_table":"prices.json"},"human_gates":[],"roles":["qa"],"steps":[{"id":"a","role":"qa","task_type":"repo.gate","needs":["b"],"input":"x"},{"id":"b","role":"qa","task_type":"repo.gate","needs":["a"],"input":"y"}]}
