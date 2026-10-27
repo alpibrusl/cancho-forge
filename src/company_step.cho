@@ -123,13 +123,16 @@ pub fn verdict_exit(v: int) -> [] int {
 // ---- which worker, which artifact ------------------------------------------------------------------------------------------
 
 // How a step is run. `Build`: `forge build`'s run (step_run.run_build), the Cancho Code adapter. `Gate`: `forge gate`'s run
-// (step_run.run_gate), the gate runner. `Person`: no worker; a human gate decides it. `Unsupported`: no adapter yet (an analyst's
-// `tool.run`, a later task): the run refuses it with `task-type-unsupported`.
+// (step_run.run_gate), the gate runner. `Tool` (task 11): an analyst's `tool.run`, the tool runner (`tool_call.run_step`,
+// workers/tool_run.cho), the tool, its argv and its input named by the operator file (`analysts.<id>`), never by the manifest.
+// `Person`: no worker; a human gate decides it. `Unsupported`: no adapter (no role maps to it now; kept so that a role without
+// one is refused, `task-type-unsupported`, rather than guessed at).
 pub enum Runner {
     Build,
     Gate,
     Person,
     Unsupported,
+    Tool,
 }
 
 pub fn runner_of(role: company_manifest.Role) -> [] Runner {
@@ -150,13 +153,13 @@ pub fn runner_of(role: company_manifest.Role) -> [] Runner {
             return Runner::Person;
         }
         company_manifest.Role::Analyst => {
-            return Runner::Unsupported;
+            return Runner::Tool;
         }
     }
 }
 
 // The artifact a step leaves, as a name in its execution directory: what the build tool writes (`project.cho`), what the gate
-// runner writes (`report.json`). A person's step has no execution directory: its artifact is the manifest itself, `company.json`
+// runner writes (`report.json`), the tool's standard output the tool runner keeps (`tool.out`). A person's step has no execution directory: its artifact is the manifest itself, `company.json`
 // in the company directory, which holds what the person approved. Empty for a runner that does not exist.
 pub fn artifact_name(r: Runner) -> [] &static [byte] {
     match r {
@@ -171,6 +174,9 @@ pub fn artifact_name(r: Runner) -> [] &static [byte] {
         }
         Runner::Unsupported => {
             return "";
+        }
+        Runner::Tool => {
+            return "tool.out";
         }
     }
 }
@@ -191,6 +197,9 @@ pub fn artifact_rel[&h, &i](heap: &!h Heap, id: &i [byte], r: Runner) -> [heap] 
             out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
         }
         Runner::Gate => {
+            out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
+        }
+        Runner::Tool => {
             out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
         }
     }
@@ -221,6 +230,9 @@ fn is_person(r: Runner) -> [] bool {
             return false;
         }
         Runner::Unsupported => {
+            return false;
+        }
+        Runner::Tool => {
             return false;
         }
     }
@@ -618,16 +630,24 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 //
 //   { "workers": "/abs", "tools": "/abs", "checker": "/abs", "agent": "command line",
 //     "gates": { "<step id>": { "repo": "<allow-list key>", "revision": "<40 hex>", "checkout": "/abs" } },
-//     "build_timeout_ms": N, "gate_timeout_ms": N, "check_timeout_ms": N }
+//     "analyst_tools": "/abs", "granted_tools": ["<tool>", ...],
+//     "analysts": { "<step id>": { "tool": "<tool>", "argv": ["<arg>", ...], "input": "<file beneath the step's ev>" } },
+//     "build_timeout_ms": N, "gate_timeout_ms": N, "check_timeout_ms": N, "tool_timeout_ms": N }
 //
 // `workers` is required; `tools`, `checker` and `agent` are required when a step is a build (the run checks it when it starts
-// one); `gates` names, for each qa or reviewer step, the repository, revision and checkout `forge gate` takes. The timeouts are
+// one); `gates` names, for each qa or reviewer step, the repository, revision and checkout `forge gate` takes; `analysts` names, for
+// each analyst step, the tool, its argument vector (a JSON array) and its input, and `analyst_tools` and `granted_tools` the
+// directory of the tools and the only ones that may run (task 11: the manifest names no tool and no argument). The timeouts are
 // optional, 10000 to 86400000 ms. A string is plain (no escape) and at most 4096 bytes; the paths absolute. Anything else (a key
 // outside the shape, a wrong type, a relative path) is `operator-invalid`. These are checks of form only: every value is checked
 // again by what uses it (`journal_io.path_ok`, `gate_task.check`, `build_task`), so the file grants nothing.
 
 fn root_keys() -> [] &static [byte] {
-    return " workers tools checker agent gates build_timeout_ms gate_timeout_ms check_timeout_ms ";
+    return " workers tools checker agent gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms ";
+}
+
+fn analyst_keys() -> [] &static [byte] {
+    return " tool argv input ";
 }
 
 fn gate_keys() -> [] &static [byte] {
@@ -731,7 +751,14 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
     if absolute(src, tp, json.get(src, tp, 0, "workers")) == false {
         return false;
     }
-    if optional_absolute(src, tp, "tools") == false || optional_absolute(src, tp, "checker") == false {
+    if optional_absolute(src, tp, "tools") == false || optional_absolute(src, tp, "checker") == false || optional_absolute(src, tp, "analyst_tools") == false {
+        return false;
+    }
+    let granted = json.get(src, tp, 0, "granted_tools");
+    if granted >= 0 && json.is_array(tp, granted) == false {
+        return false;
+    }
+    if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false {
         return false;
     }
     let agent = json.get(src, tp, 0, "agent");
@@ -769,6 +796,35 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
             if plain_string(tp, repo) == false || plain_string(tp, revision) == false || absolute(src, tp, json.get(src, tp, v, "checkout")) == false {
                 ok = false;
             }
+        }
+        k = json.skip(tp, v);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// `analysts`, when there: an object whose every value is an object of exactly `tool` (a plain string), `argv` (an array) and
+// `input` (a plain string). What the strings say is `tool_task.check`'s, when the step starts.
+fn analysts_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
+    let all = json.get(src, tp, 0, "analysts");
+    if all < 0 {
+        return true;
+    }
+    if json.is_object(tp, all) == false || keys_plain(tp, all) == false {
+        return false;
+    }
+    let n = json.count(tp, all);
+    var k = all + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        let v = k + 1;
+        if json.is_object(tp, v) == false {
+            ok = false;
+        } else if keys_ok(src, tp, v, analyst_keys()) == false || json.count(tp, v) != 3 {
+            ok = false;
+        } else if plain_string(tp, json.get(src, tp, v, "tool")) == false || plain_string(tp, json.get(src, tp, v, "input")) == false || json.is_array(tp, json.get(src, tp, v, "argv")) == false {
+            ok = false;
         }
         k = json.skip(tp, v);
         j = j + 1;
@@ -819,4 +875,27 @@ pub fn op_gate[&s, &t, &i](src: &s [byte], tp: &t [int], step: &i [byte], field:
         return src[0..0];
     }
     return json.string_view(src, tp, node);
+}
+
+// The `field` (tool, input) of the analyst entry for step `step`, or "" when there is none.
+pub fn op_analyst[&s, &t, &i](src: &s [byte], tp: &t [int], step: &i [byte], field: &static [byte]) -> [] &s [byte] {
+    let all = json.get(src, tp, 0, "analysts");
+    let entry = json.get(src, tp, all, step);
+    let node = json.get(src, tp, entry, field);
+    if json.is_string(tp, node) == false {
+        return src[0..0];
+    }
+    return json.string_view(src, tp, node);
+}
+
+// The node of the `field` (argv) of the analyst entry for step `step`, or -1.
+pub fn op_analyst_node[&s, &t, &i](src: &s [byte], tp: &t [int], step: &i [byte], field: &static [byte]) -> [] int {
+    let all = json.get(src, tp, 0, "analysts");
+    let entry = json.get(src, tp, all, step);
+    return json.get(src, tp, entry, field);
+}
+
+// The node of the top-level `name` of the operator file (granted_tools), or -1.
+pub fn op_node[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte]) -> [] int {
+    return json.get(src, tp, 0, name);
 }

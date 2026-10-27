@@ -18,6 +18,9 @@
 # And the contract (task 10): a builder step that names a `contract` file is given a Forge-written copy (contract.txt) in its
 # execution directory and the build tool is started with `--contract <that path>`; a step that names none is started without the
 # option; a missing contract is refused before the step is admitted; a build that changes its contract is not accepted.
+# And analyst steps (task 11): `tool.run` through the real tool runner (workers/tool_run.cho) over a stand-in tool the operator file
+# names and grants; the check compares the recomputed number with the product's summary (agree: accepted; disagree: check-failed);
+# a tool not granted, an argv with a number, an escaping input, no entry for the step: refused before admission.
 # Prints `ok ...` / `FAIL ...` lines; exit 1 if any FAIL or a build failed.
 # Usage: CANCHO=path/to/cancho tests/conformance/company_run.sh <scratch directory, empty>
 set -u
@@ -27,9 +30,9 @@ scratch=$1
 fail=0
 libs=$(ls src/*.cho | grep -v '/main\.cho$')
 w="$scratch/cr"
-mkdir "$w" "$w/workers" "$w/tools" || exit 1
+mkdir "$w" "$w/workers" "$w/tools" "$w/atools" || exit 1
 cp scripts/standin_cancho_build.sh "$w/tools/cancho-build" && chmod +x "$w/tools/cancho-build" || exit 1
-if ! { $C build src/*.cho --std -o "$w/forge" && $C build workers/cancho_code.cho $libs --std -o "$w/workers/cancho_code" && $C build workers/gate_runner.cho $libs --std -o "$w/workers/gate_runner" && $C build workers/check_guard.cho $libs --std -o "$w/workers/check_guard"; }; then
+if ! { $C build src/*.cho --std -o "$w/forge" && $C build workers/cancho_code.cho $libs --std -o "$w/workers/cancho_code" && $C build workers/gate_runner.cho $libs --std -o "$w/workers/gate_runner" && $C build workers/check_guard.cho $libs --std -o "$w/workers/check_guard" && $C build workers/tool_run.cho $libs --std -o "$w/workers/tool_run"; }; then
   echo "FAIL company run: a program did not build"
   exit 1
 fi
@@ -50,8 +53,18 @@ rev=$(git -C "$w/checkout" rev-parse HEAD)
 # The operator file: outside every company directory.
 cat > "$w/operator.json" <<EOF
 {"workers":"$w/workers","tools":"$w/tools","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent","check_timeout_ms":20000,"build_timeout_ms":20000,"gate_timeout_ms":20000,
- "gates":{"qa":{"repo":"alpibrusl/cancho-hdl","revision":"$rev","checkout":"$w/checkout"}}}
+ "gates":{"qa":{"repo":"alpibrusl/cancho-hdl","revision":"$rev","checkout":"$w/checkout"}},
+ "analyst_tools":"$w/atools","granted_tools":["recount"],"tool_timeout_ms":20000,
+ "analysts":{"an":{"tool":"recount","argv":["--status","up"],"input":"checks.log"}}}
 EOF
+# The analyst's stand-in tool (task 11): `recount --status S <input>` prints how many lines of the check log have the status S (the
+# second field), the number a product's summary also states. It answers `introspect` as a cancho-tools tool does.
+cat > "$w/atools/recount" <<'EOT'
+#!/bin/sh
+if [ "$1" = introspect ]; then printf %s '{"tool":"recount","authority":{"bounded":true,"effects":["heap"]}}'; exit 0; fi
+awk -v s="$2" '$2 == s { n++ } END { print n+0 }' "$3"
+EOT
+chmod +x "$w/atools/recount" || exit 1
 
 # A company directory: <name>, the manifest's steps JSON, the budget's input ceiling; the steps listed after get steps/<id>/ev.
 # The price table prices the stand-in's model at $1 per million tokens of every class, one micro-dollar a token.
@@ -366,9 +379,53 @@ check "a qa step with no check: check-missing (the gate's verdict is a claim), e
 mkco person "[{\"id\":\"p\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\"}]" 100000
 run person 1
 check "a product step with neither a gate nor a check: check-missing, exit 1, not admitted" sh -c "[ '$(rc person 1)' = 1 ] && grep -qx 'refusal: check-missing' '$w/person.1.out' && [ $(kinds person company.step.admitted p) -eq 0 ]"
-mkco analyst "[{\"id\":\"a\",\"role\":\"analyst\",\"task_type\":\"tool.run\",\"needs\":[],\"input\":\"x\",\"check\":\"audit_pass.sh\"}]" 100000 a
-run analyst 1
-check "an analyst step (no tool.run adapter yet): task-type-unsupported, exit 1, not admitted" sh -c "[ '$(rc analyst 1)' = 1 ] && grep -qx 'refusal: task-type-unsupported' '$w/analyst.1.out' && [ $(kinds analyst company.step.admitted a) -eq 0 ]"
+# ---- analyst steps (task 11): tool.run through the tool runner (workers/tool_run.cho); the operator file names the tool, its argv
+# and its input, the manifest none of them. The check compares the analyst's number (tool.out, the artifact) with the product's
+# summary in the company directory.
+analyst() { printf '{"id":"an","role":"analyst","task_type":"tool.run","needs":[],"input":"recompute the uptime count","check":"%s"}' "$1"; }
+mkan() { # name, summary's up count
+  mkco "$1" "[$(analyst same_up.sh)]" 100000 an
+  printf 'svc1 up 12\nsvc1 down 0\nsvc2 up 30\nsvc1 up 15\n' > "$w/$1/steps/an/ev/checks.log"
+  printf '{"checks":4,"up":%s}' "$2" > "$w/$1/summary.json"
+  cat > "$w/$1/same_up.sh" <<'EOT'
+#!/bin/sh
+want=$(sed -n 's/.*"up":\([0-9]*\).*/\1/p' summary.json)
+got=$(cat "$1")
+echo "analyst $got, product $want"
+if [ "$got" = "$want" ]; then echo "TOTAL 1/1"; else echo "TOTAL 0/1"; fi
+EOT
+  chmod +x "$w/$1/same_up.sh" || exit 1
+}
+an_sha=$(printf '3\n' | sha256sum | cut -c1-64)
+auth_sha=$(printf '%s' '{"bounded":true,"effects":["heap"]}' | sha256sum | cut -c1-64)
+mkan anl 3
+run anl 1
+check "analyst: the step runs through the tool runner and its check agrees with the product: accepted, exit 0" sh -c "[ '$(rc anl 1)' = 0 ] && [ \"\$(cat '$w/anl/steps/an/ev/tool.out')\" = 3 ] && grep -q '\"kind\":\"company.step.accepted\",\"task\":\"an\",\"artifact\":\"steps/an/ev/tool.out\",\"sha256\":\"$an_sha\"' '$w/anl/company.journal'"
+check "analyst: the runner recorded the tool's authority manifest hash; the tool task is in verification, not accepted" sh -c "grep -q '\"authority_manifest\":{\"source\":\"introspect\",\"sha256\":\"$auth_sha\"}' '$w/anl/steps/an/ev/report.json' && grep -q '\"kind\":\"execution.finished\".*\"verdict\":\"exited\"' '$w/anl/steps/an/journal.jsonl' && ! grep -q 'task.accepted' '$w/anl/steps/an/journal.jsonl'"
+check "analyst: no model budget is used (no spend record)" sh -c "! grep -q 'company.spend.recorded' '$w/anl/company.journal'"
+mkan anlbad 5
+run anlbad 1
+check "analyst: a number that disagrees with the product's summary is check-failed, exit 13, not accepted" sh -c "[ '$(rc anlbad 1)' = 13 ] && grep -qx 'refusal: check-failed' '$w/anlbad.1.out' && grep -qx 'score: 0/1' '$w/anlbad.1.out' && ! grep -q 'company.step.accepted' '$w/anlbad/company.journal'"
+mkan anlng 3
+sed 's|"tool":"recount","argv"|"tool":"seek","argv"|' "$w/operator.json" > "$w/op_ng.json"
+run_op anlng 1 "$w/op_ng.json"
+check "analyst: a tool the operator did not grant is tool-not-granted, exit 1, not admitted, nothing run" sh -c "[ '$(rc anlng 1)' = 1 ] && grep -qx 'refusal: tool-not-granted' '$w/anlng.1.out' && grep -qx 'step: an' '$w/anlng.1.out' && [ $(kinds anlng company.step.admitted an) -eq 0 ] && [ \$(ls -A '$w/anlng/steps/an/ev') = checks.log ] && [ ! -e '$w/anlng/steps/an/journal.jsonl' ]"
+mkan anlargv 3
+sed 's|"argv":\["--status","up"\]|"argv":["--status",3]|' "$w/operator.json" > "$w/op_argv.json"
+run_op anlargv 1 "$w/op_argv.json"
+check "analyst: an argv with a number in the operator file is argv-malformed, exit 1, not admitted" sh -c "[ '$(rc anlargv 1)' = 1 ] && grep -qx 'refusal: argv-malformed' '$w/anlargv.1.out' && [ $(kinds anlargv company.step.admitted an) -eq 0 ]"
+mkan anlpath 3
+sed 's|"input":"checks.log"|"input":"../../../summary.json"|' "$w/operator.json" > "$w/op_path.json"
+run_op anlpath 1 "$w/op_path.json"
+check "analyst: an input that escapes the step's execution directory is path-invalid, exit 1, not admitted" sh -c "[ '$(rc anlpath 1)' = 1 ] && grep -qx 'refusal: path-invalid' '$w/anlpath.1.out' && [ $(kinds anlpath company.step.admitted an) -eq 0 ]"
+mkan anlnone 3
+sed 's|"analysts":{"an"|"analysts":{"other"|' "$w/operator.json" > "$w/op_none.json"
+run_op anlnone 1 "$w/op_none.json"
+check "analyst: no entry for the step in the operator file is operator-invalid, exit 1 (the manifest cannot name a tool)" sh -c "[ '$(rc anlnone 1)' = 1 ] && grep -qx 'refusal: operator-invalid' '$w/anlnone.1.out' && [ $(kinds anlnone company.step.admitted an) -eq 0 ]"
+mkan anlgone 3
+rm "$w/anlgone/steps/an/ev/checks.log"
+run anlgone 1
+check "analyst: an input that is not there is refused by the worker (input-unusable; the worker's code is not journalled, so: it said failed, ran nothing): step-failed, exit 15" sh -c "[ '$(rc anlgone 1)' = 15 ] && grep -qx 'refusal: step-failed' '$w/anlgone.1.out' && grep -qx 'ending: worker-said' '$w/anlgone.1.out' && [ ! -e '$w/anlgone/steps/an/ev/tool.out' ] && grep -q '\"kind\":\"task.blocked\",\"task\":\"tool-1\"' '$w/anlgone/steps/an/journal.jsonl' && ! grep -q 'company.step.accepted' '$w/anlgone/company.journal'"
 
 # ---- resume: a step admitted and never accepted (a run killed mid-step) is admitted again, once, and accepted once
 mkco resume "[$(builder lib '' done audit_pass.sh)]" 100000 lib

@@ -28,6 +28,8 @@ import forge.recover;
 import forge.recover_io;
 import forge.step_run;
 import forge.task;
+import forge.tool_call;
+import forge.tool_task;
 import forge.worker;
 
 // `forge company run <company-dir> <operator-file>` (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.3,
@@ -43,7 +45,7 @@ import forge.worker;
 // a step is done when the replay says it is accepted, never because a flag in memory says so.
 //
 // A step (`Start(i)`):
-//   1. Refusals that write nothing: a role no worker runs yet (analyst: `task-type-unsupported`), a worker step with no `check`
+//   1. Refusals that write nothing: a role no worker runs (none since task 11: `task-type-unsupported`), a worker step with no `check`
 //      or a product step with neither a gate nor a check (`check-missing`: a worker's claim is never acceptance), a missing
 //      `steps/<id>/ev` (`step-dir-missing`: Forge cannot make a directory; the operator makes `steps/<id>/ev` for each worker step),
 //      an operator file without what the step needs (`operator-invalid`).
@@ -83,7 +85,8 @@ import forge.worker;
 //   3. The worker, through the very runs `forge build` and `forge gate` are (`step_run.run_build` / `run_gate`, which print as those
 //      verbs do): a builder or writer step builds the step's `input` (decoded, written to `steps/<id>/brief.txt`) in `steps/<id>/ev`
 //      with the workspace `steps/<id>`; a qa or reviewer step reports the gate of the repository, revision and checkout the operator
-//      file gives for the step id. They take the lock of `steps/<id>/lock`, a different file from the company's lock, so holding
+//      file gives for the step id; an analyst step (task 11, `tool_step`) runs the tool, argv and input the operator file gives for
+//      the step id through the tool runner (`tool_call.run_step`), its artifact the tool's kept standard output `tool.out`. They take the lock of `steps/<id>/lock`, a different file from the company's lock, so holding
 //      the company's lock across them does not deadlock. A product step has no worker.
 //   4. A build's usage: `steps/<id>/ev/usage.jsonl` priced call by call (`company_budget.parse_usage_for`, the over tier per call),
 //      less what the journal has already recorded for the step, is appended as `company.spend.recorded` with its `cost_micro`,
@@ -561,7 +564,98 @@ fn run_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n, &z](heap: &!h Heap, fs: 
         company_step.Runner::Gate => {
             return worker_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, k, seq, existed, before, before_cost, false, needs, sig);
         }
+        company_step.Runner::Tool => {
+            return tool_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, k, seq, existed, needs);
+        }
     }
+}
+
+fn tool_timeout_default() -> [] int {
+    return 600000;
+}
+
+// An analyst step (task 11): `tool.run` through the tool runner (workers/tool_run.cho, `tool_call.run_step`). What runs is the
+// operator's, never the manifest's: the tools directory `analyst_tools`, the list `granted_tools`, and `analysts.<id>` (the tool, its
+// argv as a JSON array, its input beneath `steps/<id>/ev`, which the operator puts there). Refusals that write nothing: no check
+// (`check-missing`), no execution directory (`step-dir-missing`), no `analyst_tools` or no entry for the step (`operator-invalid`),
+// and every refusal of `tool_task.check` (`tool-not-granted`, `argv-malformed`, `path-invalid`, ...), exit 1, the step not admitted.
+// Then the needs are verified (not delivered: the input is the operator's), the step admitted, the tool run, and its standard output
+// (`tool.out`, kept by the runner) is the artifact the check judges, hashed beneath the execution directory as every artifact is. An
+// analyst uses no model: no spend is read or recorded. A run that ended without a claim (a refusal of the worker, the deadline, the
+// output cap, a cancel) is `step-failed`, exit 15.
+fn tool_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], k: int, seq: int, existed: bool, needs: &n [byte]) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let step = company_manifest.step_at(hm, k);
+    let id = company_manifest.step_id(hm, step);
+    let check = company_manifest.step_check(hm, step);
+    if len(check) == 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::CheckMissing));
+        say(io, "step: ", id);
+        return company_step.exit_refused();
+    }
+    let tools_dir = company_step.op_text(op, tp, "analyst_tools");
+    let tool = company_step.op_analyst(op, tp, id, "tool");
+    let argv = company_step.op_analyst_node(op, tp, id, "argv");
+    let input = company_step.op_analyst(op, tp, id, "input");
+    let granted = company_step.op_node(op, tp, "granted_tools");
+    let timeout = company_step.op_ms(op, tp, "tool_timeout_ms", tool_timeout_default());
+    let workers = company_step.op_text(op, tp, "workers");
+    let rel = glue(heap, "steps/", id);
+    var code = 0;
+    borrow rel as &rb in {
+        let stepdir = company_cmd.under(heap, dir, buffer.bytes(rb));
+        borrow stepdir as &sb in {
+            let evdir = glue(heap, buffer.bytes(sb), "/ev");
+            borrow evdir as &eb in {
+                if dir_present(fs, buffer.bytes(eb)) == false {
+                    refuse(io, rule_step_dir_missing());
+                    say(io, "step: ", id);
+                    code = company_step.exit_refused();
+                } else if len(tools_dir) == 0 || argv < 0 {
+                    refuse(io, rule_operator_invalid());
+                    say(io, "step: ", id);
+                    code = company_step.exit_refused();
+                } else {
+                    match tool_task.check(tool_task.task_type(), buffer.bytes(eb), tools_dir, timeout, op, tp, granted, tool, argv, input) {
+                        tool_task.Checked::Refused(why) => {
+                            refuse(io, tool_task.rule_name(why));
+                            say(io, "step: ", id);
+                            code = company_step.exit_refused();
+                        }
+                        tool_task.Checked::Held => {
+                            code = take_needs(heap, fs, io, hm, dir, id, needs, false, buffer.bytes(eb));
+                            if code == 0 {
+                                code = record_buffer(heap, fs, io, jpath, company_state.admitted(heap, seq, id, buffer.bytes(rb)), existed == false);
+                            }
+                            if code == 0 {
+                                let ran = tool_call.run_step(heap, fs, exec, clock, io, timeout, buffer.bytes(sb), workers, tools_dir, op, tp, granted, tool, argv, input, buffer.bytes(eb));
+                                if ran != 0 {
+                                    refuse(io, rule_step_failed());
+                                    say(io, "step: ", id);
+                                    say_nat(heap, io, "exit: ", ran);
+                                    code = company_step.exit_step_failed();
+                                } else {
+                                    let name = company_step.artifact_name(company_step.Runner::Tool);
+                                    let artifact = company_cmd.under(heap, buffer.bytes(eb), name);
+                                    let shown = buffer.append(heap, glue(heap, buffer.bytes(rb), "/ev/"), name);
+                                    borrow artifact as &ab in {
+                                        borrow shown as &wb in {
+                                            code = check_and_accept(heap, fs, exec, clock, io, dir, workers, jpath, id, check, buffer.bytes(ab), buffer.bytes(wb), buffer.bytes(eb), name, seq + 1, company_step.op_ms(op, tp, "check_timeout_ms", check_timeout_default()));
+                                        }
+                                    }
+                                    buffer.drop(heap, artifact);
+                                    buffer.drop(heap, shown);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            buffer.drop(heap, evdir);
+        }
+        buffer.drop(heap, stepdir);
+    }
+    buffer.drop(heap, rel);
+    return code;
 }
 
 // A product step with no check and an approved gate: accepted on the decision, its artifact the manifest Forge hashes now.

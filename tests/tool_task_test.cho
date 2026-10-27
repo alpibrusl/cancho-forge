@@ -293,3 +293,16 @@ fn test_the_request_carries_the_tool_its_argv_and_the_operator_grants[&h](heap: 
     unbox_slice(heap, tape);
     return 0;
 }
+
+fn test_an_input_is_resolved_against_the_execution_directory_and_back[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(tool_task.input_relative("checks.log", "/w/ev"), "checks.log"));
+    test.assert(bytes.equal(tool_task.input_relative("/w/ev/a/checks.log", "/w/ev"), "a/checks.log"));
+    test.assert(bytes.equal(tool_task.input_relative("/w/ev/x", "/w/ev/"), "x"));
+    test.assert_eq(len(tool_task.input_relative("/w/ev", "/w/ev")), 0);
+    let r = tool_task.input_resolved(heap, "checks.log", "/w/ev");
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "/w/ev/checks.log"));
+    }
+    buffer.drop(heap, r);
+    return 0;
+}

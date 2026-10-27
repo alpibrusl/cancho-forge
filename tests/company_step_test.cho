@@ -52,6 +52,9 @@ fn runner_code(r: company_step.Runner) -> [] int {
         company_step.Runner::Unsupported => {
             return 4;
         }
+        company_step.Runner::Tool => {
+            return 5;
+        }
     }
 }
 
@@ -61,11 +64,12 @@ fn test_each_role_has_its_runner_and_artifact() -> [] int {
     test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Qa)), 2);
     test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Reviewer)), 2);
     test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Product)), 3);
-    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Analyst)), 4);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Analyst)), 5);
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Build), "project.cho"));
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Gate), "report.json"));
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Person), "company.json"));
     test.assert_eq(len(company_step.artifact_name(company_step.Runner::Unsupported)), 0);
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Tool), "tool.out"));
     return 0;
 }
 
@@ -200,6 +204,48 @@ fn test_a_good_operator_file_is_taken_and_read_back[&h](heap: &!h Heap) -> [heap
     return 0;
 }
 
+fn analyst_operator() -> [] &static [byte] {
+    return "{\"workers\":\"/w\",\"analyst_tools\":\"/t2\",\"granted_tools\":[\"tally\",\"jsonq\"],\"analysts\":{\"an\":{\"tool\":\"tally\",\"argv\":[\"--field\",\"2\"],\"input\":\"checks.log\"}},\"tool_timeout_ms\":30000}";
+}
+
+fn test_an_operator_file_names_each_analyst_steps_tool_argv_and_input[&h](heap: &!h Heap) -> [heap] int {
+    let text = analyst_operator();
+    test.assert(operator_is_ok(heap, text));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(bytes.equal(company_step.op_text(text, tp, "analyst_tools"), "/t2"));
+        test.assert(bytes.equal(company_step.op_analyst(text, tp, "an", "tool"), "tally"));
+        test.assert(bytes.equal(company_step.op_analyst(text, tp, "an", "input"), "checks.log"));
+        test.assert_eq(len(company_step.op_analyst(text, tp, "nope", "tool")), 0);
+        test.assert(json.is_array(tp, company_step.op_analyst_node(text, tp, "an", "argv")));
+        test.assert_eq(json.count(tp, company_step.op_analyst_node(text, tp, "an", "argv")), 2);
+        test.assert(company_step.op_analyst_node(text, tp, "nope", "argv") < 0);
+        test.assert(json.is_array(tp, company_step.op_node(text, tp, "granted_tools")));
+        test.assert(company_step.op_node(text, tp, "nothing") < 0);
+        test.assert_eq(company_step.op_ms(text, tp, "tool_timeout_ms", 5), 30000);
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+fn test_an_analyst_entry_outside_its_shape_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analyst_tools\":\"t\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"granted_tools\":\"tally\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":[]}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":3}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":\"t\",\"argv\":[],\"input\":\"i\",\"x\":1}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":\"t\",\"input\":\"i\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":3,\"argv\":[],\"input\":\"i\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":\"t\",\"argv\":\"--x\",\"input\":\"i\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":\"t\",\"argv\":[],\"input\":7}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"tool_timeout_ms\":9999}") == false);
+    // the strings of argv and the granted list are judged by `tool_task.check` when the step starts, not by the shape
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"granted_tools\":[3],\"analysts\":{\"an\":{\"tool\":\"t\",\"argv\":[1],\"input\":\"i\"}}}"));
+    return 0;
+}
+
 fn test_an_operator_file_outside_the_shape_is_refused[&h](heap: &!h Heap) -> [heap] int {
     test.assert(operator_is_ok(heap, "{}") == false);
     test.assert(operator_is_ok(heap, "[]") == false);
@@ -273,6 +319,16 @@ fn test_the_artifact_of_a_step_and_its_delivered_name_follow_its_runner[&h](heap
     r = company_step.artifact_rel(heap, "brief", company_step.Runner::Person);
     borrow r as &rb in {
         test.assert(bytes.equal(buffer.bytes(rb), "company.json"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.artifact_rel(heap, "an", company_step.Runner::Tool);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "steps/an/ev/tool.out"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.needs_name(heap, "an", company_step.Runner::Tool);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "needs-an-tool.out"));
     }
     buffer.drop(heap, r);
     r = company_step.artifact_rel(heap, "a", company_step.Runner::Unsupported);
