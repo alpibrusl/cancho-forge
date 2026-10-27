@@ -19,6 +19,7 @@ import forge.recover_io;
 import forge.retry;
 import forge.lock;
 import forge.report;
+import forge.step_run;
 import forge.task;
 import forge.verbs;
 
@@ -192,62 +193,6 @@ fn line[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write
     return 0;
 }
 
-// What a run of `forge gate` came to, printed, and the exit status (see the head of this file).
-fn show_gate[&h, &i, &r](heap: &!h Heap, io: &!i Io, revision: &r [byte], done: gate_run.Finished) -> [heap, io_write, err_write] int {
-    var code = 4;
-    var id = gate_run.task_id(heap, revision, done.number);
-    borrow id as &ib in {
-        if done.number > 0 {
-            line(io, "task: ", buffer.bytes(ib));
-            line(io, "state: ", task.code_name(done.state));
-        }
-        match done.outcome {
-            gate_run.Outcome::Journal(rule) => {
-                if rule > 0 {
-                    io.error_all(io, "forge: the journal is refused: ");
-                    io.error_all(io, task.rule_code_name(rule));
-                    io.error_all(io, "\n");
-                    code = 1;
-                } else {
-                    io.error_all(io, "forge: the journal cannot be read or written\n");
-                    code = 3;
-                }
-            }
-            gate_run.Outcome::Refused(why) => {
-                line(io, "refused: ", gate_task.rule_name(why));
-                code = 1;
-            }
-            gate_run.Outcome::Ended(ending, claim) => {
-                let tag = dispatch.rule_tag(ending);
-                if len(tag) > 0 {
-                    line(io, "refusal: ", tag);
-                }
-                line(io, "ending: ", dispatch.consequence_name(dispatch.consequence(ending)));
-                if done.attempts > 1 {
-                    io.write_all(io, "attempts: ");
-                    var n = buffer.push_nat(heap, buffer.empty(heap, 4), done.attempts);
-                    borrow n as &nb in {
-                        io.write_all(io, buffer.bytes(nb));
-                    }
-                    buffer.drop(heap, n);
-                    io.newline(io);
-                }
-                let again = retry.rule_tag(retry.decide(dispatch.consequence(ending), done.attempts, true));
-                if len(again) > 0 {
-                    line(io, "refusal: ", again);
-                }
-                if claim > 0 {
-                    line(io, "claimed verdict: ", gate_run.verdict_name(claim));
-                    io.write_all(io, "(a worker's claim: the task is in verification, not accepted)\n");
-                    code = 0;
-                }
-            }
-        }
-    }
-    buffer.drop(heap, id);
-    return code;
-}
-
 // The operator's `NAME=value` arguments from `first` on, as the text of a JSON array (empty when there are none). Nothing is
 // checked here beyond the shape: an argument with no `=` after a name is not an entry (-1 in `bad`); `forge.gate_run` checks
 // the entries.
@@ -295,99 +240,12 @@ fn gate[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec("")
         buffer.drop(heap, env);
         return usage(io);
     }
-    let jpath = concat(heap, dir, "/journal.jsonl");
-    let lpath = concat(heap, dir, "/lock");
+    let spec = step_run.GateSpec { timeout: timeout };
     var code = 0;
-    borrow jpath as &jb in {
-        borrow lpath as &lb in {
-            if journal_io.path_ok(fs, buffer.bytes(jb)) == false || journal_io.path_ok(fs, workers) == false {
-                io.error_all(io, "forge: path-invalid: <dir> and <workers> must be absolute, with no .. component\n");
-                code = 2;
-            } else {
-                match lock.acquire(fs, buffer.bytes(lb)) {
-                    lock.Lock::Refused(rule) => {
-                        io.error_all(io, "forge: ");
-                        io.error_all(io, task.rule_code_name(rule));
-                        io.error_all(io, ": the workspace cannot be written\n");
-                        code = 3;
-                    }
-                    lock.Lock::Failed(errno) => {
-                        io.error_all(io, "forge: the lock of the workspace could not be taken\n");
-                        code = 3;
-                    }
-                    lock.Lock::Held(held) => {
-                        match open_dir(fs, workers) {
-                            DirOpened::Failed(errno) => {
-                                io.error_all(io, "forge: cannot open the workers directory\n");
-                                code = 3;
-                            }
-                            DirOpened::Ok(opened) => {
-                                var wdir = opened;
-                                borrow wdir as &w in {
-                                    borrow env as &eb in {
-                                        let done = gate_run.run(heap, fs, exec, w, clock, buffer.bytes(jb), repo, revision, checkout, execution_dir, buffer.bytes(eb), timeout);
-                                        code = show_gate(heap, io, revision, done);
-                                    }
-                                }
-                                dir_close(wdir);
-                            }
-                        }
-                        lock.let_go(held);
-                    }
-                }
-            }
-        }
+    borrow env as &eb in {
+        code = step_run.run_gate(heap, fs, exec, clock, io, spec, dir, workers, repo, revision, checkout, execution_dir, buffer.bytes(eb));
     }
     buffer.drop(heap, env);
-    buffer.drop(heap, jpath);
-    buffer.drop(heap, lpath);
-    return code;
-}
-
-// What a run of `forge build` came to, printed, and the exit status (see the head of this file).
-fn show_build[&h, &i](heap: &!h Heap, io: &!i Io, done: build_run.Finished) -> [heap, io_write, err_write] int {
-    var code = 4;
-    var id = build_task.task_id(heap, done.number);
-    borrow id as &ib in {
-        if done.number > 0 {
-            line(io, "task: ", buffer.bytes(ib));
-            line(io, "state: ", task.code_name(done.state));
-        }
-        match done.outcome {
-            build_run.Outcome::Journal(rule) => {
-                if rule > 0 {
-                    io.error_all(io, "forge: the journal is refused: ");
-                    io.error_all(io, task.rule_code_name(rule));
-                    io.error_all(io, "\n");
-                    code = 1;
-                } else {
-                    io.error_all(io, "forge: the journal cannot be read or written\n");
-                    code = 3;
-                }
-            }
-            build_run.Outcome::Refused(why) => {
-                line(io, "refused: ", build_task.rule_name(why));
-                code = 1;
-            }
-            build_run.Outcome::Ended(ending, claim) => {
-                let tag = dispatch.rule_tag(ending);
-                if len(tag) > 0 {
-                    line(io, "refusal: ", tag);
-                }
-                line(io, "ending: ", dispatch.consequence_name(dispatch.consequence(ending)));
-                let again = retry.rule_tag(retry.decide(dispatch.consequence(ending), done.attempts, false));
-                if len(again) > 0 {
-                    line(io, "refusal: ", again);
-                }
-                if claim > 0 {
-                    line(io, "claimed verdict: ", build_task.verdict_name(claim));
-                    io.write_all(io, "(a worker's claim: the task is in verification, not accepted)\n");
-                    code = 0;
-                }
-            }
-        }
-    }
-    buffer.drop(heap, id);
     return code;
 }
 
@@ -479,61 +337,8 @@ fn build[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""
         seen = seen + bit;
         k = k + 1;
     }
-    let jpath = concat(heap, dir, "/journal.jsonl");
-    let lpath = concat(heap, dir, "/lock");
-    var code = 0;
-    borrow jpath as &jb in {
-        borrow lpath as &lb in {
-            if journal_io.path_ok(fs, buffer.bytes(jb)) == false || journal_io.path_ok(fs, workers) == false || journal_io.path_ok(fs, brief_file) == false {
-                io.error_all(io, "forge: path-invalid: <dir>, <workers> and <brief-file> must be absolute, with no .. component\n");
-                code = 2;
-            } else {
-                let (brief, errno) = build_run.read_brief(heap, fs, brief_file);
-                if errno != 0 {
-                    io.error_all(io, "forge: ");
-                    io.error_all(io, build_task.rule_name(build_task.Refusal::BriefUnreadable));
-                    io.error_all(io, ": the brief file cannot be read, or is over 16 KiB; nothing was journalled\n");
-                    code = 1;
-                } else {
-                    match lock.acquire(fs, buffer.bytes(lb)) {
-                        lock.Lock::Refused(rule) => {
-                            io.error_all(io, "forge: ");
-                            io.error_all(io, task.rule_code_name(rule));
-                            io.error_all(io, ": the workspace cannot be written\n");
-                            code = 3;
-                        }
-                        lock.Lock::Failed(errno2) => {
-                            io.error_all(io, "forge: the lock of the workspace could not be taken\n");
-                            code = 3;
-                        }
-                        lock.Lock::Held(held) => {
-                            match open_dir(fs, workers) {
-                                DirOpened::Failed(errno3) => {
-                                    io.error_all(io, "forge: cannot open the workers directory\n");
-                                    code = 3;
-                                }
-                                DirOpened::Ok(opened) => {
-                                    var wdir = opened;
-                                    borrow wdir as &w in {
-                                        borrow brief as &bb in {
-                                            let done = build_run.run(heap, fs, exec, w, clock, buffer.bytes(jb), buffer.bytes(bb), execution_dir, tools, workers, checker, guide, provider, model, agent, attempts, agent_seconds, rounds, plan_seconds, jobs, timeout);
-                                            code = show_build(heap, io, done);
-                                        }
-                                    }
-                                    dir_close(wdir);
-                                }
-                            }
-                            lock.let_go(held);
-                        }
-                    }
-                }
-                buffer.drop(heap, brief);
-            }
-        }
-    }
-    buffer.drop(heap, jpath);
-    buffer.drop(heap, lpath);
-    return code;
+    let spec = step_run.BuildSpec { timeout: timeout, attempts: attempts, agent_seconds: agent_seconds, rounds: rounds, plan_seconds: plan_seconds, jobs: jobs };
+    return step_run.run_build(heap, fs, exec, clock, io, spec, dir, workers, tools, brief_file, execution_dir, checker, provider, model, agent, guide);
 }
 
 // The ending of an awaited run, printed, and the exit status: 0 a claim was recorded, 4 the run ended without one, 1 the task
