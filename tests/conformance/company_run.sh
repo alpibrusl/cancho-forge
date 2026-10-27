@@ -332,6 +332,14 @@ check "an operator file outside its shape: operator-invalid, exit 1" sh -c "[ \$
 "$F" company run "$w/badop" "$w/nowhere.json" > "$w/noop.out" 2>&1; echo $? > "$w/noop.rc"
 check "an operator file that is not there: operator-invalid, exit 1" sh -c "[ \$(cat '$w/noop.rc') = 1 ] && grep -qx 'refusal: operator-invalid' '$w/noop.out'"
 check "bad usage: no operator file is exit 2, a relative company directory is path-invalid exit 2" sh -c "'$F' company run '$w/badop' > /dev/null 2>&1; [ \$? -eq 2 ] && '$F' company run relative '$w/operator.json' > '$w/rel.out' 2>&1; [ \$? -eq 2 ] && grep -qx 'refusal: path-invalid' '$w/rel.out'"
+# ---- task 9 fix round 1: an operator workers directory without the check guard: the check cannot run, check-unavailable, exit 14,
+# and the reason says what is missing
+mkdir "$w/noguard" && cp "$w/workers/cancho_code" "$w/workers/gate_runner" "$w/noguard/" || exit 1
+sed "s|\"workers\":\"$w/workers\"|\"workers\":\"$w/noguard\"|" "$w/operator.json" > "$w/noguard.json"
+mkco ng "[$(builder lib '' done audit_pass.sh)]" 100000 lib
+run_op ng 1 "$w/noguard.json"
+check "no check_guard in the workers directory: check-unavailable, exit 14, the reason printed, lib not accepted" sh -c "[ '$(rc ng 1)' = 14 ] && grep -qx 'refusal: check-unavailable' '$w/ng.1.out' && grep -qx \"reason: the operator's workers directory has no check_guard\" '$w/ng.1.out' && ! grep -q company.step.accepted '$w/ng/company.journal'"
+
 if command -v flock > /dev/null 2>&1; then
   mkco locked "[$(builder lib '' done audit_pass.sh)]" 100000 lib
   flock -x "$w/locked/lock" sleep 3 &

@@ -110,7 +110,8 @@ import forge.worker;
 //
 // Kill and resume (task 9; docs/architecture.md section 4.4.2; tests/conformance/company_kill.sh). TERM and INT are claimed while
 // a build runs (`worker_run`, `signals("INT,TERM")`, passed down from main): a signal then cancels the build through the adapter
-// (`await_run.finish_or_stop`: the supervisor kills the build's group), the spend is recorded, `stopped: signal` is printed and the
+// (`await_run.finish_or_stop`: the supervisor kills the build's group; a signal during `execute` itself, before `accepted`, is
+// cancelled by the request id, `await_run.cancel_unaccepted` in `build_run.run`), the spend is recorded, `stopped: signal` is printed and the
 // run exits 16; the step stays admitted and not accepted. At any other moment, and for SIGKILL always, Forge ends the default way:
 // a check's guard then kills the check; a build's supervisor and its build run on (they are meant to outlive a Forge, for `forge
 // await`) until the next run reaps them (1c). The lock is a flock, so the next run is never refused by a dead one.
@@ -798,6 +799,13 @@ fn worker_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &w, &e, &z](heap: &!h 
         buffer.drop(heap, brief);
         // What the build spent is recorded before the claim ends: a second signal then ends Forge at once.
         let (spent_code, after_seq) = record_spend(heap, fs, io, jpath, id, evdir, prices, before, before_cost, next);
+        // A signal that came after the build's last look is read here rather than let through by the close (it would end Forge
+        // the default way): the run then stops as for one during the build (fix round 1).
+        borrow mut stop as &!sp in {
+            if await_run.stop_asked(sp) {
+                stopped = true;
+            }
+        }
         match stop {
             option.Option::Some(w2) => {
                 signals_close(w2);
@@ -1286,6 +1294,15 @@ fn run_check[&h, &f, &x, &c, &d, &o, &n, &a, &g](heap: &!h Heap, fs: &f Fs(""), 
     if worker.name_ok(exec, check) == false || worker.name_ok(exec, company_step.guard_name()) == false || journal_io.path_ok(fs, workers) == false {
         return (buffer.empty(heap, 1), process.Ran::Failed(0 - 2));
     }
+    let gpath = company_cmd.under(heap, workers, company_step.guard_name());
+    var present = false;
+    borrow gpath as &gp in {
+        present = journal_io.exists(fs, buffer.bytes(gp));
+    }
+    buffer.drop(heap, gpath);
+    if present == false {
+        return (buffer.empty(heap, 1), process.Ran::Failed(company_step.guard_missing()));
+    }
     var limit = timeout;
     if limit > 999999999 {
         limit = 999999999;
@@ -1460,6 +1477,9 @@ fn check_and_accept[&h, &f, &x, &c, &i, &d, &o, &j, &n, &k, &a, &w, &g](heap: &!
         } else {
             refuse(io, "check-unavailable");
             say(io, "step: ", id);
+            if company_step.is_guard_missing(ran) {
+                say(io, "reason: the operator's workers directory has no ", company_step.guard_name());
+            }
         }
     }
     buffer.drop(heap, first);

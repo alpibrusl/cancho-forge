@@ -417,3 +417,18 @@ fn test_the_guard_says_how_the_check_ended_and_forge_reads_it_back() -> [] int {
     test.assert(company_step.guard_margin_ms() > 0);
     return 0;
 }
+
+fn test_a_missing_guard_is_told_apart_from_every_other_ending() -> [] int {
+    test.assert(company_step.is_guard_missing(process.Ran::Failed(company_step.guard_missing())));
+    test.assert(!company_step.is_guard_missing(process.Ran::Failed(0 - 2)));
+    test.assert(!company_step.is_guard_missing(process.Ran::Failed(2)));
+    test.assert(!company_step.is_guard_missing(process.Ran::Code(0 - 3)));
+    test.assert(!company_step.is_guard_missing(process.Ran::Signaled(0 - 3)));
+    test.assert(!company_step.is_guard_missing(process.Ran::TimedOut));
+    test.assert(!company_step.is_guard_missing(process.Ran::TooMuch));
+    // a guard's own ending never maps to it
+    test.assert(!company_step.is_guard_missing(company_step.check_ran(process.Ran::Code(3))));
+    test.assert(!company_step.is_guard_missing(company_step.check_ran(process.Ran::Code(8))));
+    test.assert_eq(company_step.check_verdict(process.Ran::Failed(company_step.guard_missing()), "TOTAL 2/2\n"), 2);
+    return 0;
+}

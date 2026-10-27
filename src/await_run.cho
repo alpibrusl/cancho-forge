@@ -252,3 +252,52 @@ pub fn finish_or_stop[&h, &x, &w, &f, &c, &n, &r, &k, &e, &s](heap: &!h Heap, ex
     }
     return (ending, stopped);
 }
+
+// Ask a run that `execute` never answered `accepted` for to stop (task 9, fix round 1): a signal Forge claimed arrived while
+// `execute` itself ran (a signal to Forge's group also ends that call), and the adapter may already have started its supervisor
+// and the build, which no journal record names. `cancel` is asked by the request id; while the adapter answers `not_running` (its
+// supervisor has not yet written `run.json`, or none was started) it is asked again, 200 ms apart, up to ten times in all. True
+// when the run was cancelled or was already over (`too_late`).
+pub fn cancel_unaccepted[&h, &x, &w, &c, &n, &r, &k, &e](heap: &!h Heap, exec: &x Exec(""), workers: &w Dir, clock: &c Clock, name: &n [byte], request_id: &r [byte], task_id: &k [byte], execution_dir: &e [byte]) -> [heap, exec_under, clock, poll] bool {
+    var tries = 0;
+    while tries < 10 {
+        match cancel(heap, exec, workers, clock, name, request_id, task_id, execution_dir) {
+            verbs.Settled::Reply(judged) => {
+                match judged {
+                    verbs.Judged::Cancel(c2) => {
+                        match c2 {
+                            verbs.CancelState::Cancelled => {
+                                return true;
+                            }
+                            verbs.CancelState::TooLate => {
+                                return true;
+                            }
+                            verbs.CancelState::NotRunning => {
+                                tries = tries + 1;
+                            }
+                        }
+                    }
+                    verbs.Judged::Refused(rule, reason) => {
+                        tries = tries + 1;
+                    }
+                    verbs.Judged::Capabilities(level) => {
+                        tries = tries + 1;
+                    }
+                    verbs.Judged::Status(st) => {
+                        tries = tries + 1;
+                    }
+                    verbs.Judged::Result(r2) => {
+                        tries = tries + 1;
+                    }
+                }
+            }
+            verbs.Settled::Ended(e2) => {
+                tries = tries + 1;
+            }
+        }
+        if tries < 10 {
+            nap(heap, 200);
+        }
+    }
+    return false;
+}

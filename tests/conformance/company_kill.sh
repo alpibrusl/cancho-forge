@@ -54,6 +54,7 @@ cat > "$w/operator.json" <<EOF
 {"workers":"$w/workers","tools":"$w/tools","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent","check_timeout_ms":60000,"build_timeout_ms":600000,"gate_timeout_ms":60000,
  "gates":{"qa":{"repo":"alpibrusl/cancho-hdl","revision":"$rev","checkout":"$w/checkout"}}}
 EOF
+op="$w/operator.json"
 
 # The processes a company left: every live, non-zombie process (not an ancestor of this script) whose command line or working
 # directory names the scratch directory. One pid per line; succeeds when there is one.
@@ -93,7 +94,7 @@ wait_for() { # file: up to 30 s
 }
 # A `forge company run` in a process group of its own, in the background: its pid is the group's id (set in $runpid).
 start() { # company, tag
-  setsid "$F" company run "$w/$1" "$w/operator.json" > "$w/$1.$2.out" 2> "$w/$1.$2.err" &
+  setsid "$F" company run "$w/$1" "$op" > "$w/$1.$2.out" 2> "$w/$1.$2.err" &
   runpid=$!
 }
 # Kill the group and wait for the forge process to be gone (up to 30 s); its exit status in $w/<co>.<tag>.rc.
@@ -105,7 +106,7 @@ kill_group() { # company, tag, signal
   wait "$runpid"; echo $? > "$w/$1.$2.rc"
 }
 run() { # company, tag: a run in the foreground
-  "$F" company run "$w/$1" "$w/operator.json" > "$w/$1.$2.out" 2> "$w/$1.$2.err"; echo $? > "$w/$1.$2.rc"
+  "$F" company run "$w/$1" "$op" > "$w/$1.$2.out" 2> "$w/$1.$2.err"; echo $? > "$w/$1.$2.rc"
 }
 rc() { cat "$w/$1.$2.rc"; }
 kinds() { grep -c "\"kind\":\"$2\",\"task\":\"$3\"" "$w/$1/company.journal"; }
@@ -212,6 +213,40 @@ if ! settles; then show_strays; fi
 check "CT: once forge is gone nothing is left, the check and its grandchild included, BEFORE any next run" settles
 check "CT: the pids the check recorded are gone" both_gone "$w/tcheck"
 after_kill tcheck CT 1000
+
+# ---- (E) SIGTERM of the group while `execute` itself runs: the adapter has started its supervisor and the build, and has not yet
+# answered `accepted` (fix round 1). The adapter in this workers directory is a fixture around the real one: while the file
+# `hold_execute` is there, the first call that is not the supervisor's runs the real adapter, keeps its answer and then holds,
+# so Forge is still waiting in `execute` when the signal comes. Forge must cancel the run it never heard accepted.
+mkdir "$w/eworkers" || exit 1
+cp "$w/workers/cancho_code" "$w/eworkers/cancho_code.real" && cp "$w/workers/check_guard" "$w/workers/gate_runner" "$w/eworkers/" || exit 1
+cat > "$w/eworkers/cancho_code" <<'WRAP'
+#!/bin/sh
+# oracle fixture: the real Cancho Code adapter, the answer of one `execute` held back (tests/conformance/company_kill.sh, case E)
+pre=$(dd bs=1 count=9 2> /dev/null)
+if [ "$pre" != supervise ] && [ -e ./hold_execute ]; then
+  rm -f ./hold_execute
+  { printf '%s' "$pre"; cat; } | ./cancho_code.real > ./held_answer
+  : > ./execute_held
+  while :; do sleep 0.1; done
+fi
+{ printf '%s' "$pre"; cat; } | ./cancho_code.real
+WRAP
+chmod +x "$w/eworkers/cancho_code"
+sed "s|\"workers\":\"$w/workers\"|\"workers\":\"$w/eworkers\"|" "$w/operator.json" > "$w/eoperator.json"
+op="$w/eoperator.json"
+mkco ebuild
+: > "$w/eworkers/hold_execute"
+start ebuild 1
+if wait_for "$w/eworkers/execute_held" && wait_for "$w/ebuild/steps/lib/ev/building"; then ok "E: the build runs and Forge is still in execute (its accepted answer held back)"; else bad "E: the held execute never came"; fi
+check "E: lib's journal has no accepted run yet" sh -c "! grep -q '\"kind\":\"execution.accepted\"' '$w/ebuild/steps/lib/journal.jsonl'"
+kill_group ebuild 1 TERM
+check "E: forge stopped on the signal and said so (exit 16, stopped: signal)" sh -c "[ '$(rc ebuild 1)' = 16 ] && grep -qx 'stopped: signal' '$w/ebuild.1.out'"
+if ! settles; then show_strays; fi
+check "E: once forge is gone nothing is left, the supervisor and build included, BEFORE any next run" settles
+check "E: the pids the stub recorded are gone" both_gone "$w/ebuild"
+after_kill ebuild E 1100
+op="$w/operator.json"
 
 # Whatever this script could not see reaped is killed here, so that a FAIL leaves nothing behind.
 for p in $(strays); do kill -9 "$p" 2> /dev/null; done

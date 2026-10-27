@@ -217,6 +217,12 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a, &s](heap:
                                     ending = got;
                                     stopped = asked;
                                 }
+                            } else if await_run.stop_asked(stop) {
+                                // A signal the caller claimed came while `execute` ran (only `forge company run` claims one; `forge
+                                // build` passes `None` and never comes here): the supervisor and build it may have started are
+                                // named by no record, so they are cancelled now, before Forge returns (task 9, fix round 1).
+                                await_run.cancel_unaccepted(heap, exec, workers, clock, "cancho_code", buffer.bytes(rb), tid, execution_dir);
+                                stopped = true;
                             }
                             let consequence = dispatch.consequence(ending);
                             let decision = retry.decide(consequence, attempts, false);

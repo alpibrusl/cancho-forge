@@ -434,6 +434,32 @@ pub fn guard_margin_ms() -> [] int {
     return 15000;
 }
 
+// How `run_check` says that the operator's workers directory has no guard (`process.Ran::Failed` of it): printed as
+// `reason: the operator's workers directory has no check_guard` with check-unavailable.
+pub fn guard_missing() -> [] int {
+    return 0 - 3;
+}
+
+pub fn is_guard_missing(ran: process.Ran) -> [] bool {
+    match ran {
+        process.Ran::Failed(e) => {
+            return e == guard_missing();
+        }
+        process.Ran::Code(n) => {
+            return false;
+        }
+        process.Ran::Signaled(s) => {
+            return false;
+        }
+        process.Ran::TimedOut => {
+            return false;
+        }
+        process.Ran::TooMuch => {
+            return false;
+        }
+    }
+}
+
 // The guard's exit status for its arguments refused (Forge reads it as a check that could not run).
 pub fn guard_usage() -> [] int {
     return 8;

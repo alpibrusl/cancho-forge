@@ -26,9 +26,12 @@ import forge.worker;
 // started in its own group (needed so the deadline reaches what the check starts) is not in Forge's group, so a kill of Forge's
 // group does not reach it. Only a process that outlives Forge and holds the check's `Child` can stop it.
 //
-// Authority (`cancho authority`): `Exec("")` beneath the company directory (`exec_under`, `exec_detached`; the report names no
-// path), `Fs("")` to open that directory and to try the lock (`fs_write`/`file_write`: `forge.lock` opens it to append, and writes
-// nothing), a clock, polling, the arguments, standard output. No network, no signals.
+// Authority (`cancho authority`; the review artefact is docs/authority-check-guard.txt, compared by scripts/gate.sh):
+// `Exec("")` beneath the company directory (`exec_under`, `exec_detached`; the report names no path), `child_signal` to kill the
+// check's group (`child_kill_group`, `child_kill`), `pipe_read` for its output, `Fs("")` to open that directory and to try the lock
+// (`fs_read`, `fs_write`/`file_write`: `forge.lock` opens it to append and writes nothing; `file_read` is `supervise.watch`'s
+// cancel file, never looked at here since the guard passes no cancel path), a clock, polling, the heap, the arguments, standard
+// output. No network, no signals, no foreign code.
 
 // The number written in `text` (1 to 9 digits), or -1.
 fn nat_of[&t](text: &t [byte]) -> [] int {

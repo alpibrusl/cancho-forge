@@ -101,6 +101,14 @@ echo "== worker contract verbs (capabilities, cancel, status, result: every verd
 $C check workers/stub_llm.cho $libs --std || fail=1
 $C check workers/gate_runner.cho $libs --std || fail=1
 $C check workers/check_guard.cho $libs --std || fail=1
+# The check guard's authority report is its review artefact (docs/authority-check-guard.txt); a change that widens it changes that
+# file in the same commit and says so in the message.
+$C authority workers/check_guard.cho $libs --std | sed -n '/^performs/,/^provably/p' | sed '$d' > "$scratch/authority-check-guard.txt"
+if cmp -s "$scratch/authority-check-guard.txt" docs/authority-check-guard.txt; then
+  echo "ok   check guard authority: the report is the checked-in one"
+else
+  echo "FAIL check guard authority: differs from docs/authority-check-guard.txt"; diff docs/authority-check-guard.txt "$scratch/authority-check-guard.txt"; fail=1
+fi
 $C check tests/conformance/verbs.cho tests/conformance/support.cho $libs --std || fail=1
 if $C build workers/stub_llm.cho $libs --std -o "$wdir/stub_llm" \
   && $C build workers/gate_runner.cho $libs --std -o "$wdir/gate_runner" \
