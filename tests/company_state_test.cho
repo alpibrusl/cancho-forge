@@ -1,0 +1,446 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.option;
+import std.test;
+import forge.company_manifest;
+import forge.company_graph;
+import forge.company_state;
+import forge.journal;
+import forge.task;
+
+// Unit tests for src/company_state.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.3): the company
+// journal's events and their replay. The journals are built with the event builders or written out by hand; a hand-written line is
+// the way to reach a line a builder cannot write. Run with `cancho test`.
+
+fn manifest_text() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"qa\"],\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"},{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"b\"],\"input\":\"x\"}]}";
+}
+
+// Everything a test asks of a replay, as plain numbers: the state is `res` and cannot leave the borrow of the manifest it was
+// replayed against.
+struct Probe {
+    rule: int,
+    line: int,
+    records: int,
+    valid: int,
+    torn: int,
+    cut: int,
+    mask: int,
+    oob: int,
+    next: int,
+    gate: int,
+    other_gate: int,
+    input: int,
+    output: int,
+    cache_write: int,
+    cache_read: int,
+    admitted_a: int,
+    admitted_b: int,
+    admitted_c: int,
+}
+
+fn probe_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] Probe {
+    var p = Probe { rule: 0 - 1, line: 0, records: 0, valid: 0, torn: 0, cut: 0, mask: 0, oob: 0, next: 0 - 2, gate: 0, other_gate: 0, input: 0, output: 0, cache_write: 0, cache_read: 0, admitted_a: 0, admitted_b: 0, admitted_c: 0 };
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    let r = company_state.report_of(sr);
+                    var mask = 0;
+                    var i = 0;
+                    while i < 3 {
+                        if company_state.accepted_at(sr, i) {
+                            mask = mask + 1 * pow2(i);
+                        }
+                        i = i + 1;
+                    }
+                    var oob = 0;
+                    if company_state.accepted_at(sr, 3) || company_state.accepted_at(sr, 0 - 1) {
+                        oob = 1;
+                    }
+                    var next = 0 - 1;
+                    match company_graph.ready(mr, company_state.accepted_flags(sr)) {
+                        option.Option::Some(n) => {
+                            next = n;
+                        }
+                        option.Option::None => {
+                            next = 0 - 1;
+                        }
+                    }
+                    p = Probe { rule: r.rule, line: r.line, records: r.records, valid: r.valid_bytes, torn: r.torn_bytes, cut: journal.recovery_cut(r), mask: mask, oob: oob, next: next, gate: company_state.gate_state(sr, "g"), other_gate: company_state.gate_state(sr, "h"), input: company_state.spend_input(sr), output: company_state.spend_output(sr), cache_write: company_state.spend_cache_write(sr), cache_read: company_state.spend_cache_read(sr), admitted_a: company_state.admitted_count(sr, "a"), admitted_b: company_state.admitted_count(sr, "b"), admitted_c: company_state.admitted_count(sr, "c") };
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return p;
+}
+
+fn pow2(n: int) -> [] int {
+    var v = 1;
+    var i = 0;
+    while i < n {
+        v = v * 2;
+        i = i + 1;
+    }
+    return v;
+}
+
+// `journal` with `record` appended.
+fn add[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = journal;
+    borrow record as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return out;
+}
+
+fn rule_name_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] &static [byte] {
+    return task.rule_code_name(probe_of(heap, text).rule);
+}
+
+// ---- accepted flags -------------------------------------------------------------------------------------------------------
+
+fn test_an_empty_journal_has_nothing_accepted_and_nothing_spent[&h](heap: &!h Heap) -> [heap] int {
+    let p = probe_of(heap, "");
+    test.assert_eq(p.records, 0);
+    test.assert_eq(p.rule, 0);
+    test.assert_eq(p.mask, 0);
+    test.assert_eq(p.next, 0);
+    test.assert_eq(p.gate, 0);
+    test.assert_eq(p.input, 0);
+    test.assert_eq(p.admitted_a, 0);
+    return 0;
+}
+
+fn test_accepted_steps_are_flagged_by_step_number_and_the_graph_reads_them[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "out/a.txt", "abc"));
+    j = add(heap, j, company_state.admitted(heap, 3, "b", "t-2"));
+    j = add(heap, j, company_state.check_failed(heap, 4, "b", 1, 3));
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.records, 4);
+        test.assert_eq(p.mask, 1);
+        test.assert_eq(p.oob, 0);
+        test.assert_eq(p.admitted_a, 1);
+        test.assert_eq(p.admitted_b, 1);
+        test.assert_eq(p.admitted_c, 0);
+        // b was admitted and failed its check: it is still the next step to run
+        test.assert_eq(p.next, 1);
+    }
+    var k = j;
+    k = add(heap, k, company_state.accepted(heap, 5, "b", "out/b.txt", "def"));
+    k = add(heap, k, company_state.accepted(heap, 6, "c", "out/c.txt", "ghi"));
+    borrow k as &kb in {
+        let p = probe_of(heap, buffer.bytes(kb));
+        test.assert_eq(p.mask, 7);
+        test.assert_eq(p.next, 0 - 1);
+    }
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_an_accepted_event_for_a_step_not_in_the_manifest_changes_nothing[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.accepted(heap, 1, "zzz", "out", "abc"));
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.mask, 0);
+        test.assert_eq(p.oob, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_step_admitted_twice_counts_twice[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = add(heap, j, company_state.admitted(heap, 2, "a", "t-2"));
+    borrow j as &jb in {
+        test.assert_eq(probe_of(heap, buffer.bytes(jb)).admitted_a, 2);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- gates ----------------------------------------------------------------------------------------------------------------
+
+fn test_a_gate_with_no_decision_is_open[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    borrow j as &jb in {
+        test.assert_eq(probe_of(heap, buffer.bytes(jb)).gate, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_approved_is_1_and_rejected_is_2[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "ana", "fine"));
+    borrow j as &jb in {
+        test.assert_eq(probe_of(heap, buffer.bytes(jb)).gate, 1);
+    }
+    var k = buffer.empty(heap, 256);
+    k = add(heap, k, company_state.gate_decided(heap, 1, "g", "rejected", "ana", "no"));
+    borrow k as &kb in {
+        test.assert_eq(probe_of(heap, buffer.bytes(kb)).gate, 2);
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_approved_then_rejected_is_2_the_last_decision_wins[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "ana", "fine"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "g", "rejected", "ana", "changed my mind"));
+    borrow j as &jb in {
+        test.assert_eq(probe_of(heap, buffer.bytes(jb)).gate, 2);
+    }
+    var k = buffer.empty(heap, 256);
+    k = add(heap, k, company_state.gate_decided(heap, 1, "g", "rejected", "ana", "no"));
+    k = add(heap, k, company_state.gate_decided(heap, 2, "g", "approved", "ana", "yes"));
+    borrow k as &kb in {
+        test.assert_eq(probe_of(heap, buffer.bytes(kb)).gate, 1);
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_a_decision_on_one_gate_does_not_touch_another[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "h", "approved", "ana", "fine"));
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.gate, 0);
+        test.assert_eq(p.other_gate, 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- a torn tail ----------------------------------------------------------------------------------------------------------
+
+// The last gate decision is cut mid-record, at every byte: the gate stays open, the report counts the torn bytes, and the cut
+// recovery would make is the valid prefix.
+fn test_a_journal_cut_mid_record_in_the_last_gate_decision_leaves_the_gate_open[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    let whole = company_state.gate_decided(heap, 2, "g", "approved", "ana", "fine");
+    borrow whole as &wb in {
+        let w = buffer.bytes(wb);
+        var k = 1;
+        while k < len(w) {
+            var cut = buffer.empty(heap, 256);
+            borrow j as &jb in {
+                cut = buffer.append(heap, cut, buffer.bytes(jb));
+            }
+            cut = buffer.append(heap, cut, w[0..k]);
+            borrow cut as &cb in {
+                let p = probe_of(heap, buffer.bytes(cb));
+                test.assert_eq(p.rule, 0);
+                test.assert_eq(p.records, 1);
+                test.assert_eq(p.torn, k);
+                test.assert_eq(p.gate, 0);
+                test.assert_eq(p.cut, p.valid);
+            }
+            buffer.drop(heap, cut);
+            k = k + 1;
+        }
+    }
+    buffer.drop(heap, whole);
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_torn_decision_after_an_approval_leaves_the_approval[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "ana", "fine"));
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":2,\"kind\":\"company.gate.decided\",\"task\":\"g\",\"gate\":\"g\",\"verdict\":\"reje");
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.gate, 1);
+        test.assert(p.torn > 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- unknown kinds, and what is refused -----------------------------------------------------------------------------------
+
+fn test_an_unknown_kind_is_ignored_and_its_seq_still_counts[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":2,\"kind\":\"company.future.thing\",\"task\":\"a\",\"x\":7}\n");
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":3,\"kind\":\"something.else\",\"task\":\"a\"}\n");
+    j = add(heap, j, company_state.accepted(heap, 4, "a", "out", "abc"));
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.records, 4);
+        test.assert_eq(p.mask, 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_seq_gap_is_journal_corrupt_and_replay_stops_there[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.accepted(heap, 1, "a", "out", "abc"));
+    j = add(heap, j, company_state.accepted(heap, 3, "b", "out", "abc"));
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert(bytes.equal(task.rule_code_name(p.rule), "journal-corrupt"));
+        test.assert_eq(p.line, 2);
+        test.assert_eq(p.records, 1);
+        test.assert_eq(p.mask, 1);
+        // a complete wrong line is never cut
+        test.assert_eq(p.cut, 0 - 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_duplicate_seq_and_a_journal_not_starting_at_1_are_corrupt[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(jb)), "journal-corrupt"));
+    }
+    var k = buffer.empty(heap, 256);
+    k = add(heap, k, company_state.admitted(heap, 2, "a", "t-1"));
+    borrow k as &kb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(kb)), "journal-corrupt"));
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_a_complete_line_that_is_not_a_record_is_corrupt_and_nothing_is_cut_even_with_a_torn_tail[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = buffer.append(heap, j, "not json at all\n");
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":3,\"kind\":\"company.step.acc");
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert(bytes.equal(task.rule_code_name(p.rule), "journal-corrupt"));
+        test.assert_eq(p.line, 2);
+        test.assert_eq(p.cut, 0 - 1);
+    }
+    var k = buffer.empty(heap, 256);
+    k = buffer.append(heap, k, "{\"v\":2,\"seq\":1,\"kind\":\"company.step.admitted\",\"task\":\"a\",\"forge_task\":\"t\"}\n");
+    borrow k as &kb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(kb)), "journal-corrupt"));
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_a_known_kind_with_the_wrong_fields_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "maybe", "ana", "hm"));
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(jb)), "event-malformed"));
+    }
+    var k = buffer.empty(heap, 256);
+    k = buffer.append(heap, k, "{\"v\":1,\"seq\":1,\"kind\":\"company.step.accepted\",\"task\":\"a\",\"artifact\":3}\n");
+    borrow k as &kb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(kb)), "event-malformed"));
+    }
+    var m = buffer.empty(heap, 256);
+    m = add(heap, m, company_state.spend_recorded(heap, 1, "a", 0 - 5, 0, 0, 0));
+    borrow m as &mb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(mb)), "event-malformed"));
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, k);
+    buffer.drop(heap, m);
+    return 0;
+}
+
+// ---- spend ----------------------------------------------------------------------------------------------------------------
+
+fn test_spend_adds_up_per_token_class[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.spend_recorded(heap, 1, "a", 100, 20, 3, 4));
+    j = add(heap, j, company_state.spend_recorded(heap, 2, "b", 10, 2, 0, 400));
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.input, 110);
+        test.assert_eq(p.output, 22);
+        test.assert_eq(p.cache_write, 3);
+        test.assert_eq(p.cache_read, 404);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_torn_spend_record_is_not_counted[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.spend_recorded(heap, 1, "a", 100, 20, 3, 4));
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":2,\"kind\":\"company.spend.recorded\",\"task\":\"a\",\"input\":999,\"out");
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.input, 100);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_spend_saturates_instead_of_overflowing[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.spend_recorded(heap, 1, "a", 1000000000000000, 0, 0, 0));
+    j = add(heap, j, company_state.spend_recorded(heap, 2, "a", 1000000000000000, 0, 0, 0));
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":3,\"kind\":\"company.spend.recorded\",\"task\":\"a\",\"input\":9223372036854775807,\"output\":0,\"cache_write\":0,\"cache_read\":0}\n");
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert(bytes.equal(task.rule_code_name(p.rule), "event-malformed"));
+        test.assert_eq(p.input, 1000000000000000);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- the builders ---------------------------------------------------------------------------------------------------------
+
+fn test_every_builder_writes_one_complete_line[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "out", "abc"));
+    j = add(heap, j, company_state.check_failed(heap, 3, "b", 0, 2));
+    j = add(heap, j, company_state.gate_decided(heap, 4, "g", "approved", "ana", "ok"));
+    j = add(heap, j, company_state.spend_recorded(heap, 5, "a", 1, 2, 3, 4));
+    borrow j as &jb in {
+        let data = buffer.bytes(jb);
+        test.assert_eq(journal.after_last_newline(data), len(data));
+        let p = probe_of(heap, data);
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.records, 5);
+        test.assert_eq(p.torn, 0);
+        test.assert_eq(p.valid, len(data));
+        test.assert_eq(p.gate, 1);
+        test.assert_eq(p.input, 1);
+        test.assert_eq(p.cache_read, 4);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
