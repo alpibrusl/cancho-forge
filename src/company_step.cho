@@ -491,6 +491,65 @@ pub fn is_guard_missing(ran: process.Ran) -> [] bool {
     }
 }
 
+// How `run_check` says that `<dir>/check.lock` stayed held for five seconds (the guard of a check of an earlier run that has not
+// yet seen that run gone; the company's own lock keeps a second run out): printed as `reason: another check guard still holds
+// check.lock` with check-unavailable, and recorded, so the step is held with a reason rather than rebuilt.
+pub fn guard_busy() -> [] int {
+    return 0 - 4;
+}
+
+pub fn is_guard_busy(ran: process.Ran) -> [] bool {
+    match ran {
+        process.Ran::Failed(e) => {
+            return e == guard_busy();
+        }
+        process.Ran::Code(n) => {
+            return false;
+        }
+        process.Ran::Signaled(s) => {
+            return false;
+        }
+        process.Ran::TimedOut => {
+            return false;
+        }
+        process.Ran::TooMuch => {
+            return false;
+        }
+    }
+}
+
+// The tag a held step is refused with on every later run, by its held code (`company_state.held_by_check`): the refusal it was
+// recorded with. 1 check-failed, 2 check-unavailable, 3 artifact-invalid, 4 usage-invalid; anything else check-unavailable.
+pub fn held_tag(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "check-failed";
+    }
+    if code == 3 {
+        return rule_artifact_invalid();
+    }
+    if code == 4 {
+        return rule_usage_invalid();
+    }
+    return "check-unavailable";
+}
+
+// The exit status of a held step: 13 for a failed check, 14 for every other hold.
+pub fn held_exit(code: int) -> [] int {
+    if code == 1 {
+        return exit_check_failed();
+    }
+    return exit_check_unavailable();
+}
+
+// The rule tag of a build's `usage.jsonl` Forge will not read (final review, I1): read like an artifact (`company_files.
+// read_artifact`: beneath the execution directory, no link followed, a regular file of at most 16 MiB, a FIFO never opened). A
+// link (to /dev/zero, say), a FIFO, a directory, a file too large or unreadable is refused with `reason:`, recorded as
+// `company.step.check_unavailable` (reason `usage-invalid`), held, exit 14; no check is run and nothing is accepted. A file that is
+// not there is no usage, as before (a build that did not call the model).
+pub fn rule_usage_invalid() -> [] &static [byte] {
+    return "usage-invalid";
+}
+
 // The guard's exit status for its arguments refused (Forge reads it as a check that could not run).
 pub fn guard_usage() -> [] int {
     return 8;

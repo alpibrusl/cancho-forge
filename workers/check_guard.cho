@@ -19,7 +19,8 @@ import forge.worker;
 // `company_step.check_output_cap()` bytes of output and `<timeout-ms>`, and, every 100 ms, a try at the lock `<live-lock>`, which
 // the Forge that started the guard holds for as long as it waits. A lock the guard can take means that Forge is gone (killed,
 // SIGKILL included: the kernel lets go of a flock however a process ends), and the check's whole group is killed then; so is it at
-// the deadline and past the cap. What the check wrote is written on standard output, and the exit status says how it ended
+// the deadline and past the cap, and when the check exits by itself (final review, I2: `watch`'s `reap_group`), so that nothing the
+// check started in the background outlives it. What the check wrote is written on standard output, and the exit status says how it ended
 // (`company_step.guard_code`; `guard_usage()` for arguments refused).
 //
 // Why a program and not Forge itself: cancho has no kill by pid and no parent-death signal (docs/processes.md 4.7), and a check
@@ -96,7 +97,7 @@ fn guard[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""
                                             code = company_step.guard_code(process.Ran::Failed(e), 0);
                                         }
                                         Spawned::Ok(child) => {
-                                            let (out, ran, how) = supervise.watch(heap, clock, fs, child, to_child, from_child, company_step.check_output_cap(), timeout, "", "", live);
+                                            let (out, ran, how) = supervise.watch(heap, clock, fs, child, to_child, from_child, company_step.check_output_cap(), timeout, "", "", live, true);
                                             borrow out as &ob in {
                                                 io.write_all(io, buffer.bytes(ob));
                                             }

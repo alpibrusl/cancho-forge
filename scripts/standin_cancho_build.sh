@@ -47,6 +47,10 @@ case "$mode" in
              if [ -n "$c" ]; then cat "$c" > "$work/project.cho"; else printf 'nocontract\n' > "$work/project.cho"; fi
              if [ "$mode" = contractmut ] && [ -n "$c" ]; then printf 'tampered\n' >> "$c"; fi
              printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
+  usagelink) log; report done 2 done; printf 'product\n' > "$work/project.cho"; ln -s /dev/zero "$work/usage.jsonl"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # company_run.sh
+  usagefifo) log; report done 2 done; printf 'product\n' > "$work/project.cho"; mkfifo "$work/usage.jsonl"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # company_run.sh
+  usagebig)  log; report done 2 done; printf 'product\n' > "$work/project.cho"; truncate -s 17000000 "$work/usage.jsonl"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # company_run.sh
+  usagedir)  log; report done 2 done; printf 'product\n' > "$work/project.cho"; mkdir "$work/usage.jsonl"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # company_run.sh
   bare)      log; report done 2 done; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # done, and no project.cho (company_run.sh)
   args)      log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   args2)     log; report done 2 done; printf 'product\n' > "$work/project.cho"; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;

@@ -25,6 +25,11 @@ import forge.lock;
 // long as it waits; when the lock can be TAKEN that process is gone (flock is released by the kernel however a process ends,
 // SIGKILL included: forge.lock), and the child's group is killed with KILL. An empty `live_lock` (or an empty `cancel_path`) is
 // not looked at. The third part of `watch`'s answer is 0, 1 (cancelled) or 2 (the starter was gone).
+//
+// `reap_group` (final review, I2): when true the child's whole group is killed on EVERY ending, its own exit included, before it is
+// reaped (the group still exists while the exited leader is unreaped, so the kill reaches what it left running in the background).
+// The check guard passes true: a check's background children must not outlive the check. `wait` (the Cancho Code adapter's
+// supervisor) passes false and is unchanged: a build that exited by itself keeps what it left, as `std.process.capture` does.
 
 fn output_token() -> [] int {
     return 1;
@@ -167,11 +172,11 @@ pub fn asks_for_cancel[&h, &f, &p, &r](heap: &!h Heap, fs: &f Fs(""), path: &p [
 }
 
 pub fn wait[&h, &c, &f, &p, &r](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, cancel_path: &p [byte], request_id: &r [byte]) -> [heap, clock, poll, fs_read(""), fs_write(""), file_read, file_write] (buffer.Buffer, process.Ran, bool) {
-    let (out, ran, why) = watch(heap, clock, fs, child, to_child, from_child, most, timeout, cancel_path, request_id, "");
+    let (out, ran, why) = watch(heap, clock, fs, child, to_child, from_child, most, timeout, cancel_path, request_id, "", false);
     return (out, ran, why == 1);
 }
 
-pub fn watch[&h, &c, &f, &p, &r, &l](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, cancel_path: &p [byte], request_id: &r [byte], live_lock: &l [byte]) -> [heap, clock, poll, fs_read(""), fs_write(""), file_read, file_write] (buffer.Buffer, process.Ran, int) {
+pub fn watch[&h, &c, &f, &p, &r, &l](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, cancel_path: &p [byte], request_id: &r [byte], live_lock: &l [byte], reap_group: bool) -> [heap, clock, poll, fs_read(""), fs_write(""), file_read, file_write] (buffer.Buffer, process.Ran, int) {
     let deadline = clock_ms(clock) + timeout;
     var out = buffer.empty(heap, 4096);
     var reader = option.Option::Some(from_child);
@@ -310,6 +315,10 @@ pub fn watch[&h, &c, &f, &p, &r, &l](heap: &!h Heap, clock: &c Clock, fs: &f Fs(
         borrow child as &ch in {
             child_kill_group(ch, 256);
             child_kill(ch, 256);
+        }
+    } else if reap_group {
+        borrow child as &ch in {
+            child_kill_group(ch, 256);
         }
     }
     var ran = process.Ran::Failed(why);

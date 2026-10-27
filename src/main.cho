@@ -81,11 +81,14 @@ import forge.verbs;
 // 0 done (maybe nothing to do); 1 the journal is refused (the rule tag is printed, nothing is written); 2 bad usage or a
 // path that is not ok; 3 the workspace is locked, no journal there, or an I/O error.
 //
-// Its authority is, with `gate`, exactly what `cancho authority src/*.cho --std` prints and docs/authority.txt checks:
-// the journal and the evidence (`fs_read`, `fs_write`, `file_read`, `file_write`), one directory of workers
-// (`dir_read`, `exec_under`: the program is a name beneath it, so the report names no path), a clock and a poller (the
-// deadline), standard input and output, the command line. Not the network, signals, foreign code. The prefix of the
-// file capability is empty because a library cannot be generic in it (gap G9, cancho #534).
+// The binary's authority is exactly what `cancho authority src/*.cho --std` prints and docs/authority.txt checks: the
+// journals, the evidence and the company files (`fs_read`, `fs_write`, `file_read`, `file_write`; `dir_read` and
+// `dir_write` beneath a directory it opened, no link followed: evidence, artifacts, needs and contract copies), workers
+// and checks started beneath a directory (`exec_under`; `exec_detached` for the check guard and the tool runner, leaders of
+// their own group), their pipes and a kill of their group (`pipe_read`, `pipe_write`, `child_signal`), a clock and a
+// poller (the deadlines), the signals INT and TERM (`signals("INT,TERM")`, `signals_read`: `forge company run` stops a
+// step on them), standard input and output, the command line. Not the network, not foreign code. The prefix of the file
+// capability is empty because a library cannot be generic in it (gap G9, cancho #534).
 
 fn concat[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
     var b = buffer.append(heap, buffer.empty(heap, 64), dir);

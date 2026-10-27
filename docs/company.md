@@ -47,6 +47,23 @@ Design: [`docs/superpowers/specs/2026-10-27-forge-company-layer-design.md`](supe
 <operator-file>               OUTSIDE <company-dir> (section 4)
 ```
 
+**The trust model (one statement; [`architecture.md`](architecture.md) section 7 says the same).** The company directory, its check
+programs, its price table, its contract files and `company.journal` are **trusted: they are the operator's**. The person who runs the
+company is the manifest's author; nothing below contains an author who is not trusted. The operator file lives outside the company
+directory as **hygiene** (what grants programs and checkouts is kept apart from what a manifest edit touches), not as a boundary against
+a hostile author. Acceptance holds only against:
+
+* a **builder that writes nothing outside its execution directory** (`steps/<id>/ev`). The adapter's arguments name only that directory,
+  but nothing confines the build *process*: Cancho Code's own tests run with no `Fs`, so a model-written program does not reach the file
+  system when it is tested, and that is the whole of the containment;
+* an **audit that does not run the artifact with ambient authority** (the check runs with Forge's user, `PATH` only, under the check
+  guard; if it executes the artifact, the artifact runs with all of that).
+
+**Not contained:** a manifest author who is not the operator. Such an author can name any program of the company directory as a
+check (and so run it with Forge's authority), edit `company.journal` (accept a step by hand, approve a gate, erase spend), put an
+already-approved gate on a product step (accepted on that decision alone), or point a contract at any file of the directory. That is why
+the operator is the author. Both limits are listed in section 14.
+
 Every path on the command line is absolute with no `..` (the rule of every Forge verb; a relative path is `path-invalid`, exit 2).
 `forge company check` takes the manifest file itself, so it can check a manifest before it is in a company directory.
 
@@ -55,7 +72,8 @@ Every path on the command line is absolute with no `..` (the rule of every Forge
 A JSON file of at most 1 MiB, parsed against a **closed** shape: a key the shape does not have is `manifest-unknown-field`, a key
 written twice or with an escape is `manifest-malformed`. It *declares requirements only*; no field grants a capability (design
 4.1). In particular **the manifest cannot name a tool, a worker, a repository, a checkout, a compiler or an agent command**: those are
-the operator's (section 4), so whoever edits `company.json` cannot widen what Forge runs.
+the operator's (section 4). It CAN name programs of the company directory as checks, and Forge runs them: so editing `company.json`
+does widen what Forge runs, within the company directory, which is why the company directory and its author are trusted (section 2).
 
 ```json
 {
@@ -114,8 +132,8 @@ The order in which faults are looked for, so that a manifest with two faults is 
 string is plain (no escape) and at most 4096 bytes. It is the operator's, not the manifest's: the manifest says *what* is wanted, this
 file says *which programs and which repositories may be used for it*, the way the arguments of `forge build` and `forge gate` do. It
 **must live outside the company directory** (a path inside it, judged by its text, is `operator-invalid` with a `reason:` line): the
-company directory is the manifest author's, and what the operator grants must not be writable from there. (A symbolic link from
-outside pointing inside is not seen.)
+company directory and the operator file are both the operator's (section 2), and keeping the grants out of the directory a manifest
+edit touches is hygiene, not a boundary. (A symbolic link from outside pointing inside is not seen.)
 
 | key | meaning | needed by |
 |---|---|---|
@@ -187,7 +205,7 @@ decide <dir> retry:<id> approved <reason>`, `line: N`), `accepted: <id>` for eac
 | 11 | blocked: a gate was rejected and nothing else can start (the defensive `step-cycle` shares the code) | `refusal: gate-rejected`, `gate:`, `step:` |
 | 12 | the budget is spent and a model step is held back by it | `refusal: budget-exhausted` |
 | 13 | a check ran and did not pass, or a step is held by an earlier failed check | `refusal: check-failed`, `step:`, `score: a/b` (on the run that scored it) or `held:` + `retry:` (on later runs) |
-| 14 | the check could not be read as a score, did not end, wrote too much, its artifact is unusable, or a need or the contract is not what was accepted or given | `refusal: check-unavailable` or `refusal: artifact-invalid`, `step:`, `reason:` |
+| 14 | the check could not be read as a score, did not end, wrote too much, its artifact is unusable, or a need or the contract is not what was accepted or given | `refusal: check-unavailable`, `refusal: artifact-invalid` or `refusal: usage-invalid`, `step:`, `reason:` |
 | 15 | the step's worker ended without a claim, or a stale build would not stop | `refusal: step-failed`, `step:`, `exit: N` or `reason:` |
 | 16 | a TERM or INT arrived while a build ran: the build was cancelled and its spend recorded | `stopped: signal`, `step:` |
 
@@ -224,7 +242,7 @@ One JSON object per line, framed like every Forge journal (`v`, `seq` from 1 and
 | `company.step.admitted` | the step id | `forge_task` (the step's workspace, `steps/<id>`) |
 | `company.step.accepted` | the step id | `artifact` (path relative to the company directory), `sha256` (computed by Forge) |
 | `company.step.check_failed` | the step id | `score`, `total` |
-| `company.step.check_unavailable` | the step id | `reason` (the printed tag: `check-unavailable` or `artifact-invalid`) |
+| `company.step.check_unavailable` | the step id | `reason` (the printed tag: `check-unavailable`, `artifact-invalid` or `usage-invalid`; a later run names it again) |
 | `company.gate.decided` | the gate name | `gate`, `verdict` (`approved` / `rejected`), `user`, `reason` |
 | `company.spend.recorded` | the step id | `input`, `output`, `cache_write`, `cache_read`, `cost_micro` |
 
@@ -268,6 +286,10 @@ Forge computed. A worker's `done`, a gate's `passed`, a tool's exit 0: none of t
   unreadable one (a sign, text after it, a number of more than 15 digits, `a > b`, `0/0`), a signal, the deadline or the output cap are
   `check-unavailable`: never a pass.
 * The audit's result is **never fed back** to the builder, so a re-run does not learn from it.
+* **For audit authors:** the LAST `TOTAL` line on the check's standard output decides. An audit that runs the artifact must not let the
+  artifact write to the audit's standard output (redirect the artifact's output to a file or `/dev/null`, and print the `TOTAL` line
+  yourself, last): otherwise the program under test can print its own `TOTAL n/n` and pass. The check guard kills the check's whole
+  process group when the check ends, so nothing the audit (or the artifact) leaves in the background survives it.
 
 **Held after a failure; retry through `decide`.** A `check_failed` or `check_unavailable` record **holds** its step. There is no
 Forge-level retry: every later run prints the refusal again (`held: ...` and the `retry:` line), exits 13 or 14, and starts nothing for
@@ -303,9 +325,14 @@ run.
 
 ## 9. Budget
 
-The budget is **derived from recorded tokens, never worker-reported**.
+Forge **derives the cost**; the **token counts are the build tool's own log** (`usage.jsonl`, written by Cancho Code's agent in the
+step's execution directory), trusted as the build tool is trusted (section 2). A build that truncates or deletes that file gets zero
+spend recorded: the budget is a ceiling on an honest build tool, not a control on a hostile one.
 
-* After every build (whatever its ending) Forge reads `steps/<id>/ev/usage.jsonl`, the log Cancho Code's agent writes (one JSON object
+* After every build (whatever its ending) Forge reads `steps/<id>/ev/usage.jsonl` the way it reads an artifact (beneath the execution
+  directory, no link followed, a regular file of at most 16 MiB, a FIFO never opened): a link (to `/dev/zero`, say), a FIFO, a directory,
+  a larger or unreadable file is `usage-invalid` (`reason:` printed), recorded as an unavailable check (the step held, exit 14), no
+  check run, nothing accepted; a file that is not there is no usage. It is the log Cancho Code's agent writes (one JSON object
   per model call with `in`, `out`, `cache_write`, `cache_read`), prices it call by call, subtracts what the journal already holds for the
   step, and appends the difference as `company.spend.recorded` with its `cost_micro`. A line that is not an object of at most 2048
   bytes with four integer token fields from 0 to 10^15 is skipped and counted, never a trap.
@@ -329,7 +356,8 @@ The budget is **derived from recorded tokens, never worker-reported**.
   and before its `spend.recorded` was appended has spent tokens the journal does not hold; the next run's budget check does not see them
   and may admit one more model step, and the delta recorded after that step includes them (the **kill-before-spend window**). (2) The
   delta is `usage.jsonl` now less what was recorded and is never negative: if a tool **rewrites `usage.jsonl` shorter**, the calls in it
-  are lost up to the old total.
+  are lost up to the old total. For an honest tool that is a lag; for a **hostile build it is a budget bypass** (truncate or delete the
+  file and spend is not recorded at all).
 
 ## 10. Kill and resume
 
@@ -379,7 +407,7 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 
 | tag | printed when | exit | reached by |
 |---|---|---|---|
-| `manifest-malformed` | the manifest is not JSON, is over 1 MiB, is the wrong shape, has a name that is not a name, a key twice or escaped; also a manifest file that is not there or unreadable | 1 | unit `test_text_that_is_not_a_manifest_is_malformed`; `check_company.sh` `check: a file that is not there...` |
+| `manifest-malformed` | the manifest is not JSON, is over 1 MiB, is the wrong shape, has a name that is not a name, a step id that is a dot name (`.`, `..`, a leading dot, two dots in a row: it names a directory), a key twice or escaped; also a manifest file that is not there or unreadable | 1 | unit `test_text_that_is_not_a_manifest_is_malformed`; `check_company.sh` `check: a file that is not there...` |
 | `manifest-unknown-field` | a key the closed shape does not have | 1 | unit `test_a_field_the_shape_does_not_have_is_refused` |
 | `step-id-duplicate` | two steps with one id | 1 | unit `test_a_step_id_used_twice_is_refused` |
 | `step-needs-unknown` | a `needs` entry that is no step | 1 | unit `test_a_need_that_is_no_step_is_refused` |
@@ -405,6 +433,7 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 | `budget-exhausted` | a model step is held back by a spent budget | 12 | unit `test_an_exhausted_token_budget_stops_before_any_new_model_step`; run.sh `budget: ...` |
 | `check-failed` | the check scored below its total, or the step is held by an earlier failure | 13 | unit `test_a_score_below_the_total_is_check_failed`; run.sh `lying worker: ...` (second run held, `retry:` frees it) |
 | `check-unavailable` | no readable score, a check that did not end by itself, wrote too much, a missing `check_guard`, or an earlier such hold | 14 | unit `test_a_pass_with_a_failing_exit_is_unavailable_not_a_pass`; run.sh `audit without a score`, `a check that does not end`, `no check_guard in the workers directory` |
+| `usage-invalid` | a build's `usage.jsonl` is a link, a FIFO, a directory, over 16 MiB or unreadable (never followed, never opened when not a regular file); recorded, the step held | 14 | unit `test_a_held_code_names_the_refusal_it_was_recorded_with_and_its_exit`; run.sh `usagelink`, `usagefifo`, `usagebig`, `usagedir` |
 | `artifact-invalid` | the artifact is not a regular file beneath its directory or changed under the check; a need is missing or changed (`needs-missing`, `needs-changed`); the contract is missing, unreadable or changed by the build (`contract-missing`, `contract-unreadable`, `contract-changed`) | 14 | unit `test_every_way_an_artifact_is_refused_has_its_reason`; run.sh `a symlink artifact`, `needs changed`, `contract changed by the build` |
 | `step-failed` | the step's worker ended without a claim (stuck, a refusal, a deadline), or a stale build would not stop | 15 | run.sh `stuck worker: ...`; the stale arm needs an adapter that ignores `cancel` and is **not reached by a test** |
 
@@ -489,6 +518,13 @@ task. The operator's `tool_timeout_ms` is the deadline the run is given (the run
 Everything above is true of the code as built and of the gate's conformance programs. This is the list of what that does **not** show,
 drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-company-layer/progress.md`) and the task reports.
 
+**Trust limits** (section 2)
+
+* Acceptance assumes a builder that writes nothing outside its execution directory: the build *process* is not confined by Forge (only
+  the adapter's arguments are); Cancho Code's own tests running with no `Fs` is the only containment, and it is Cancho Code's.
+* A manifest author who is not the operator is not contained: checks are programs of the company directory Forge runs, `company.journal`
+  is a file of it, an approved gate can be reused on a product step. The budget's token counts are the build tool's log (section 9).
+
 **Not measured at all**
 
 * **No company has been run with a real model.** No Haiku run, no dollar spent, no wall time, no token count from a real
@@ -540,7 +576,7 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
   lock file before it checks the manifest and the gate. The score parser's blank skipping ignores `\r`, and its last-`TOTAL`-line rule is
   strict: a later prose line starting with `TOTAL` makes the score unavailable. The qa and reviewer need cases are only partly tested; the
   cycle check's glue (`has_cycle`) is untested on cyclic input; there is no oversize-manifest oracle case; the early oracle skipped output
-  checks on an empty expectation (fixed in task 5). A held `artifact-invalid` step prints `check-unavailable` again on the next run.
+  checks on an empty expectation (fixed in task 5). (Fixed: a held step now names the refusal it was recorded with, `artifact-invalid` or `usage-invalid`, on every later run.)
   The `event-malformed` tests for the fields of `check_failed`, `admitted` and `gate.decided` records are missing.
 
 **Kill and process gaps** (details in section 10 and [`architecture.md`](architecture.md) 4.4.2)
@@ -560,5 +596,7 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
 **Gate**
 
 `scripts/gate.sh` ends `FAIL` on the machine of this build only because of 3 lines of `scripts/check_procs.sh` (`coreutils: unknown
-program 'forgeprobe...'`: a `pgrep` name longer than 15 characters), identical on the untouched baseline and unrelated to the company
-layer. Everything else passes.
+program 'forgeprobe...'`), identical on the untouched baseline and unrelated to the company layer. *Corrected:* this said the cause was a
+`pgrep` name longer than 15 characters. The measured cause is that on this machine `/usr/bin/sleep` and `timeout` are hard links to
+the uutils multicall binary, which dispatches on `argv[0]`: the helper's copy named `forgeprobe$$` prints `coreutils: unknown program`
+and never runs as a probe. Everything else passes.

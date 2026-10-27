@@ -5,6 +5,7 @@ import std.buffer;
 import std.io;
 import std.json;
 import std.map;
+import forge.company_files;
 import forge.dispatch;
 import forge.gate_run;
 import forge.journal;
@@ -80,45 +81,43 @@ pub fn claim_name(code: int) -> [] &static [byte] {
     return "";
 }
 
-// How the tool ended by the report the runner wrote (read after the evidence was recomputed): 1 exited, 2 signaled, else 0.
-fn claimed[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), execution_dir: &d [byte]) -> [heap, fs_read(""), file_read] int {
-    let path = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), execution_dir), "/report.json");
+// How the tool ended by the report the runner wrote (read after the evidence was recomputed): 1 exited, 2 signaled, else 0. Read
+// like an artifact (`company_files.read_artifact`: beneath the execution directory, no link followed, a regular file of at most
+// 16 MiB, a FIFO never opened); anything else is no claim (0).
+fn claimed[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), execution_dir: &d [byte]) -> [heap, fs_read(""), dir_read, file_read] int {
     var code = 0;
-    borrow path as &pb in {
-        let (data, errno) = journal_io.read_all(heap, fs, buffer.bytes(pb));
-        if errno == 0 {
-            borrow data as &db in {
-                let src = buffer.bytes(db);
-                let tape = box_slice(heap, json.tape_len(src), 0);
-                borrow mut tape as &!t in {
-                    let tp = contents(t);
-                    if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
-                        let e = json.get(src, tp, 0, "ending");
-                        if json.is_string(tp, e) && json.string_equals(src, tp, e, "exited") {
-                            code = 1;
-                        }
-                        if json.is_string(tp, e) && json.string_equals(src, tp, e, "signaled") {
-                            code = 2;
-                        }
+    let (data, why) = company_files.read_artifact(heap, fs, execution_dir, "report.json");
+    if why == 0 {
+        borrow data as &db in {
+            let src = buffer.bytes(db);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            borrow mut tape as &!t in {
+                let tp = contents(t);
+                if json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                    let e = json.get(src, tp, 0, "ending");
+                    if json.is_string(tp, e) && json.string_equals(src, tp, e, "exited") {
+                        code = 1;
+                    }
+                    if json.is_string(tp, e) && json.string_equals(src, tp, e, "signaled") {
+                        code = 2;
                     }
                 }
-                unbox_slice(heap, tape);
             }
+            unbox_slice(heap, tape);
         }
-        buffer.drop(heap, data);
     }
-    buffer.drop(heap, path);
+    buffer.drop(heap, data);
     return code;
 }
 
-fn claimed_of[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), file_read] int {
+fn claimed_of[&h, &f, &d](heap: &!h Heap, fs: &f Fs(""), e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), dir_read, file_read] int {
     if gate_run.succeeded(e) {
         return claimed(heap, fs, execution_dir);
     }
     return 0;
 }
 
-fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write] int {
+fn finish_attempt[&h, &f, &p, &i, &d](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], seq: int, id: &i [byte], e: dispatch.Ending, execution_dir: &d [byte]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write] int {
     if gate_run.succeeded(e) {
         return gate_run.note_execution(heap, fs, path, seq, "execution.finished", id, claim_name(claimed(heap, fs, execution_dir)));
     }

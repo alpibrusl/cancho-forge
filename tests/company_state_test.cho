@@ -642,11 +642,27 @@ fn test_a_failed_check_holds_the_step[&h](heap: &!h Heap) -> [heap] int {
 
 fn test_an_unavailable_check_holds_the_step_and_says_so[&h](heap: &!h Heap) -> [heap] int {
     var j = buffer.empty(heap, 512);
-    j = add(heap, j, company_state.check_unavailable(heap, 1, "b", "artifact-invalid"));
+    j = add(heap, j, company_state.check_unavailable(heap, 1, "b", "check-unavailable"));
     borrow j as &jb in {
         let p = held_probe(heap, buffer.bytes(jb));
         test.assert_eq(p.rule, 0);
         test.assert_eq(p.held, 20);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// The recorded reason is kept, so a later run names the same refusal (fix wave, M1): 3 artifact-invalid, 4 usage-invalid; any other
+// reason text is a plain unavailable check (2).
+fn test_the_reason_of_an_unavailable_check_is_kept_as_its_held_code[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.check_unavailable(heap, 1, "a", "artifact-invalid"));
+    j = add(heap, j, company_state.check_unavailable(heap, 2, "b", "usage-invalid"));
+    j = add(heap, j, company_state.check_unavailable(heap, 3, "c", "something else"));
+    borrow j as &jb in {
+        let p = held_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.held, 3 + 40 + 200);
     }
     buffer.drop(heap, j);
     return 0;

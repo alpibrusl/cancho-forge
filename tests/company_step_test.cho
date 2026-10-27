@@ -494,3 +494,28 @@ fn test_a_missing_guard_is_told_apart_from_every_other_ending() -> [] int {
     test.assert_eq(company_step.check_verdict(process.Ran::Failed(company_step.guard_missing()), "TOTAL 2/2\n"), 2);
     return 0;
 }
+
+// ---- the fix wave: held tags, usage, a busy check lock ------------------------------------------------------------------------
+
+fn test_a_held_code_names_the_refusal_it_was_recorded_with_and_its_exit() -> [] int {
+    test.assert(bytes.equal(company_step.held_tag(1), "check-failed"));
+    test.assert(bytes.equal(company_step.held_tag(2), "check-unavailable"));
+    test.assert(bytes.equal(company_step.held_tag(3), "artifact-invalid"));
+    test.assert(bytes.equal(company_step.held_tag(4), "usage-invalid"));
+    test.assert(bytes.equal(company_step.held_tag(99), "check-unavailable"));
+    test.assert_eq(company_step.held_exit(1), 13);
+    test.assert_eq(company_step.held_exit(2), 14);
+    test.assert_eq(company_step.held_exit(3), 14);
+    test.assert_eq(company_step.held_exit(4), 14);
+    test.assert(bytes.equal(company_step.rule_usage_invalid(), "usage-invalid"));
+    return 0;
+}
+
+fn test_a_busy_check_lock_is_its_own_ending_not_a_bare_failure() -> [] int {
+    test.assert(company_step.is_guard_busy(process.Ran::Failed(company_step.guard_busy())));
+    test.assert(company_step.is_guard_busy(process.Ran::Failed(0 - 2)) == false);
+    test.assert(company_step.is_guard_busy(process.Ran::Code(0)) == false);
+    test.assert(company_step.guard_busy() != company_step.guard_missing());
+    test.assert_eq(company_step.check_verdict(process.Ran::Failed(company_step.guard_busy()), "TOTAL 1/1\n"), 2);
+    return 0;
+}

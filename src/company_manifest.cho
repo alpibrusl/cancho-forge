@@ -33,7 +33,9 @@ import std.json;
 //   9. a step that needs itself, or any cycle                                            step-cycle
 //
 // Names (a step id, a gate, a role) are 1 to 64 bytes of letters, digits, `-`, `_` and `.`, written without an escape: a control
-// character or a space in an id is `manifest-malformed`, a value like any other, never a trap. Text (`mission`, `input`) is a
+// character or a space in an id is `manifest-malformed`, a value like any other, never a trap. A step id is also a directory name
+// of the run (`steps/<id>`), so one that starts with a dot (`.`, `..`, `.x`) or holds two dots in a row is `manifest-malformed`
+// (gates and roles are never paths). Text (`mission`, `input`) is a
 // string of at most 16 KiB that does not spell a NUL (`\u0000`). File names (`check`, `price_table`) are 1 to 128 bytes of
 // letters, digits, `-`, `_` and `.`, not starting with `.`: a name in the company directory, never a path.
 
@@ -254,6 +256,27 @@ fn file_ok[&v](view: &v [byte]) -> [] bool {
 }
 
 // Is node `i` a string written without an escape, whose bytes are a name?
+// A step id names a directory of the run (`steps/<id>`): beyond a name, it does not start with a dot (`.`, `..`, a hidden name) and
+// has no two dots in a row (a path the file capability refuses). Called on a name, so `id` is not empty.
+fn step_id_ok[&v](id: &v [byte]) -> [] bool {
+    if len(id) == 0 {
+        return false;
+    }
+    if int_of(id[0]) == 46 {
+        return false;
+    }
+    var k = 1;
+    while k < len(id) {
+        if int_of(id[k]) == 46 {
+            if int_of(id[k - 1]) == 46 {
+                return false;
+            }
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
 fn is_name[&s, &t](src: &s [byte], tp: &t [int], i: int) -> [] bool {
     return json.string_plain(tp, i) && name_ok(json.string_view(src, tp, i), 64);
 }
@@ -526,6 +549,9 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
     let contract = json.get(src, tp, step, "contract");
     let gate = json.get(src, tp, step, "gate");
     if !is_name(src, tp, json.get(src, tp, step, "id")) || !json.string_plain(tp, role) || !json.string_plain(tp, task_type) {
+        return 1;
+    }
+    if !step_id_ok(json.string_view(src, tp, json.get(src, tp, step, "id"))) {
         return 1;
     }
     if !is_text(src, tp, input) || len(json.string_view(src, tp, input)) == 0 {

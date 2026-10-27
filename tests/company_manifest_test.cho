@@ -81,7 +81,7 @@ fn extra_rule[&h, &g](heap: &!h Heap, extra: &g [byte]) -> [heap] &static [byte]
 }
 
 fn good_text() -> [] &static [byte] {
-    return "{\"id\":\"statuslite\",\"mission\":\"A small status page library.\",\"model\":{\"provider\":\"anthropic\",\"name\":\"claude-haiku-4-5\"},\"budget\":{\"input\":2000000,\"output\":400000,\"cache_write\":200000,\"cache_read\":1000000,\"max_cost\":5000000,\"price_table\":\"prices.json\"},\"human_gates\":[\"product-brief\"],\"roles\":[\"builder\",\"qa\",\"product\"],\"steps\":[{\"id\":\"brief\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"Approve the product brief.\",\"gate\":\"product-brief\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"brief\"],\"input\":\"Build the status library.\",\"check\":\"audit.cho\"},{\"id\":\"gate\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"lib\"],\"input\":\"Run the gate.\"}]}";
+    return "{\"id\":\"statuslite\",\"mission\":\"A small status page library.\",\"model\":{\"provider\":\"anthropic\",\"name\":\"claude-haiku-4-5\"},\"budget\":{\"input\":2000000,\"output\":400000,\"cache_write\":200000,\"cache_read\":1000000,\"max_cost\":5,\"price_table\":\"prices.json\"},\"human_gates\":[\"product-brief\"],\"roles\":[\"builder\",\"qa\",\"product\"],\"steps\":[{\"id\":\"brief\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"Approve the product brief.\",\"gate\":\"product-brief\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"brief\"],\"input\":\"Build the status library.\",\"check\":\"audit.cho\"},{\"id\":\"gate\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"lib\"],\"input\":\"Run the gate.\"}]}";
 }
 
 fn test_the_good_manifest_parses_and_reads_back[&h](heap: &!h Heap) -> [heap] int {
@@ -97,7 +97,7 @@ fn test_the_good_manifest_parses_and_reads_back[&h](heap: &!h Heap) -> [heap] in
                 test.assert(company_manifest.budget_output(mr) == 400000);
                 test.assert(company_manifest.budget_cache_write(mr) == 200000);
                 test.assert(company_manifest.budget_cache_read(mr) == 1000000);
-                test.assert(company_manifest.budget_max_cost(mr) == 5000000);
+                test.assert(company_manifest.budget_max_cost(mr) == 5);
                 let s1 = company_manifest.step_at(mr, 1);
                 test.assert(bytes.equal(company_manifest.step_id(mr, s1), "lib"));
                 test.assert(bytes.equal(company_manifest.step_check(mr, s1), "audit.cho"));
@@ -198,6 +198,18 @@ fn test_a_control_character_in_a_step_id_is_malformed_not_a_trap[&h](heap: &!h H
     test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\nb\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
     test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
     test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    return 0;
+}
+
+// A step id is a directory name of the run (`steps/<id>`): `.`, `..`, one that starts with a dot, or one with two dots in a row
+// would name the steps directory itself, its parent, a hidden name or a path the file capability refuses. manifest-malformed.
+fn test_a_step_id_that_is_a_dot_name_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\".\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"..\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\".hidden\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a..b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"v1.2-lib_x\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"lib.\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), ""));
     return 0;
 }
 

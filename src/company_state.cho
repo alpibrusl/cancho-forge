@@ -109,6 +109,10 @@ pub fn retry_step[&m, &g](m: &m company_manifest.Manifest, gate: &g [byte]) -> [
 
 // ---- the event builders ---------------------------------------------------------------------------------------------------
 
+// Why a copy of `event.record` and not a call: `event.record` closes the object after the four fixed fields and returns a finished
+// line, while every company event adds fields after them, so the builders need the writer still open (`opened`, then `closed`). The
+// four fixed fields and their order are the same, and replay checks them with the task journal's rules.
+
 // The fixed fields, the object still open.
 fn opened[&h, &k, &t](heap: &!h Heap, seq: int, kind: &k [byte], name: &t [byte]) -> [heap] json.Writer {
     var w = json.writer(heap, 192);
@@ -336,10 +340,18 @@ fn apply[&h, &l, &m, &a, &s, &k, &x](heap: &!h Heap, line: &l [byte], expect: in
                         set_held(held, company_graph.index_of(man, id), 1);
                     }
                 } else if bytes.equal(kind, kind_check_unavailable()) {
-                    if named == false || json.is_string(tp, json.get(line, tp, 0, "reason")) == false {
+                    let why = json.get(line, tp, 0, "reason");
+                    if named == false || json.is_string(tp, why) == false {
                         rule = bad;
                     } else {
-                        set_held(held, company_graph.index_of(man, id), 2);
+                        var code = 2;
+                        if json.string_equals(line, tp, why, "artifact-invalid") {
+                            code = 3;
+                        }
+                        if json.string_equals(line, tp, why, "usage-invalid") {
+                            code = 4;
+                        }
+                        set_held(held, company_graph.index_of(man, id), code);
                     }
                 } else if bytes.equal(kind, kind_gate_decided()) {
                     let gate = json.get(line, tp, 0, "gate");
@@ -442,6 +454,10 @@ fn keep_artifact[&h, &x, &s, &t](heap: &!h Heap, arts: buffer.Buffer, art_at: &!
     return a4;
 }
 
+// Why a copy of the loop of `journal.replay_from` and not a call: that loop applies task events to a task table and its refusals
+// are the task journal's (transitions, actors); the company journal shares only the framing (complete lines, `v`, `seq` exactly
+// next, a torn tail not read, `journal.after_last_newline`), which this loop keeps line for line, and applies company kinds instead.
+//
 // Replay `journal_text`, the whole company journal, against manifest `m` (whose steps number the accepted flags). A torn tail is
 // not read and is counted in `report.torn_bytes`; on a refusal the state holds what replayed before the failing line, and
 // `report.rule` / `report.line` say which. End the state with `drop`.
@@ -614,8 +630,9 @@ pub fn step_cost_micro[&s](s: &s CompanyState, i: int) -> [] int {
 }
 
 // Is step number `i` held by its check? 0 no, 1 its last check failed (`check-failed`), 2 its last check could not judge it
-// (`check-unavailable`, or `artifact-invalid`), until a person approves `retry:<id>` after it (or the step is accepted). 0 outside
-// the manifest.
+// (`check-unavailable`), 3 its artifact was refused (`artifact-invalid`), 4 its build's usage log was refused (`usage-invalid`):
+// the recorded reason, so a later run names the same refusal (`company_step.held_tag`). Held until a person approves `retry:<id>`
+// after it (or the step is accepted). 0 outside the manifest.
 pub fn held_by_check[&s](s: &s CompanyState, i: int) -> [] int {
     let hd = contents(s.held);
     if i < 0 {
