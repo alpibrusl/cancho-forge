@@ -8,6 +8,7 @@ import forge.await_run;
 import forge.await_task;
 import forge.build_run;
 import forge.build_task;
+import forge.company_cmd;
 import forge.dispatch;
 import forge.gate_env;
 import forge.gate_run;
@@ -97,7 +98,7 @@ fn show[&i, &h](io: &!i Io, heap: &!h Heap, text: buffer.Buffer) -> [heap, io_wr
 }
 
 fn usage[&i](io: &!i Io) -> [err_write] int {
-    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
+    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n       forge company check <manifest.json> | forge company status <company-dir>\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
     return 2;
 }
 
@@ -890,12 +891,27 @@ fn recover[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(
     return code;
 }
 
+// The company layer's two read-only verbs (src/company_cmd.cho): `forge company check <manifest.json>` and
+// `forge company status <company-dir>`. A sub-verb that is neither, or none, is usage (exit 2). They write nothing and take no lock.
+fn company[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), file_read, io_write, err_write] int {
+    if arg_count(args) == 4 && bytes.equal(arg(args, 2), "check") {
+        return company_cmd.check_cmd(heap, fs, io, args);
+    }
+    if arg_count(args) == 4 && bytes.equal(arg(args, 2), "status") {
+        return company_cmd.status_cmd(heap, fs, io, args);
+    }
+    return usage(io);
+}
+
 fn run[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
     if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "gate") {
         return gate(heap, fs, exec, clock, io, args);
     }
     if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "build") {
         return build(heap, fs, exec, clock, io, args);
+    }
+    if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "company") {
+        return company(heap, fs, io, args);
     }
     if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "recover") {
         return recover(heap, fs, exec, clock, io, args);

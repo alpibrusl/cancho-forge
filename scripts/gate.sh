@@ -7,6 +7,7 @@
 #   forge build          `forge build` end to end against the adapter and a stand-in build tool (scripts/check_build_run.sh)
 #   forge gate           `forge gate` end to end against real git checkouts and a real runner (scripts/check_gate_run.sh)
 #   recover              `forge recover` on journals a crash left, one real crash included (scripts/check_recover.sh)
+#   company              `forge company check` / `status` end to end on the manifest fixtures (scripts/check_company.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
 #   verbs                capabilities, cancel, status and result against the mock worker (every verdict) and the stub LLM and gate runner (capabilities), real child processes
 #   conformance          tests/conformance/*.cho, programs that need an Fs, which
@@ -133,6 +134,10 @@ CANCHO="$C" sh scripts/check_recover.sh "$scratch/recover" || fail=1
 echo "== stub LLM (workers/stub_llm.cho: the contract, and a whole flow per way it can answer, journalled and replayed)"
 mkdir "$scratch/stub-llm" || exit 1
 CANCHO="$C" sh scripts/check_stub_llm.sh "$scratch/stub-llm" || fail=1
+
+echo "== forge company check and status (the manifest fixtures, company directories made here; read-only, no lock)"
+mkdir "$scratch/company" || exit 1
+CANCHO="$C" sh scripts/check_company.sh "$scratch/company" || fail=1
 
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of

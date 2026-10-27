@@ -1,0 +1,320 @@
+edition 9;
+module forge.company_cmd;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_state;
+import forge.journal_io;
+import forge.task;
+
+// The company layer's two read-only verbs (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.4):
+//
+//   forge company check  <manifest.json>   is the manifest valid?
+//   forge company status <company-dir>     where is every step, what was spent, which gates are open
+//
+// Paths are absolute with no `..` (`journal_io.path_ok`, like every other verb). `status` reads <dir>/company.json and
+// <dir>/company.journal (a journal that is not there is a company where nothing happened yet). Neither verb writes a byte or takes
+// the writer lock; the effect rows below are the whole of their authority, and every one is already in the forge binary's report
+// (docs/authority.txt does not change). Everything is printed on standard output: the rows have no `err_write`.
+//
+// Exit status: 0 valid / status shown; 1 refused, the line `refusal: <rule tag>` printed (an unusable manifest is
+// `manifest-malformed`; a journal replay refuses with `journal-corrupt` or `event-malformed`, after the state that replayed before
+// the bad line); 2 bad usage or a path that is not ok (`refusal: path-invalid`); 3 the journal cannot be read (I/O error).
+//
+// The state of a step (a closed set; docs/company.md):
+//   accepted  the journal holds `company.accepted` for it
+//   rejected  its human gate was decided `rejected`
+//   gated     its needs are accepted, its human gate has no decision yet
+//   ready     its needs are accepted and it has no gate or its gate is approved
+//   waiting   a step it needs is not accepted
+// A step with a gate whose needs are not met is `waiting`, whatever its gate says.
+
+// 0 accepted, 1 rejected, 2 gated, 3 ready, 4 waiting.
+fn step_state[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, i: int) -> [] int {
+    if company_state.accepted_at(s, i) {
+        return 0;
+    }
+    let step = company_manifest.step_at(m, i);
+    let k = company_manifest.step_needs_count(m, step);
+    var j = 0;
+    while j < k {
+        let at = company_graph.index_of(m, company_manifest.step_need(m, step, j));
+        if at < 0 || company_state.accepted_at(s, at) == false {
+            return 4;
+        }
+        j = j + 1;
+    }
+    let gate = company_manifest.step_gate(m, step);
+    if len(gate) == 0 {
+        return 3;
+    }
+    let g = company_state.gate_state(s, gate);
+    if g == 2 {
+        return 1;
+    }
+    if g == 1 {
+        return 3;
+    }
+    return 2;
+}
+
+fn state_name(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "accepted";
+    }
+    if code == 1 {
+        return "rejected";
+    }
+    if code == 2 {
+        return "gated";
+    }
+    if code == 3 {
+        return "ready";
+    }
+    return "waiting";
+}
+
+// Is step `i` waiting on a human gate that has no decision? (Not accepted, has a gate, the gate is open.)
+fn awaits_gate[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, i: int) -> [] bool {
+    if company_state.accepted_at(s, i) {
+        return false;
+    }
+    let gate = company_manifest.step_gate(m, company_manifest.step_at(m, i));
+    if len(gate) == 0 {
+        return false;
+    }
+    return company_state.gate_state(s, gate) == 0;
+}
+
+fn put_nat[&h](heap: &!h Heap, out: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    return buffer.push_nat(heap, out, n);
+}
+
+fn put_spend[&h](heap: &!h Heap, out: buffer.Buffer, label: &static [byte], n: int) -> [heap] buffer.Buffer {
+    return put_nat(heap, buffer.append(heap, out, label), n);
+}
+
+// The status of a company, as text: one line `id state` for each step in manifest order, then
+//   spend: input N output N cache_write N cache_read N
+//   open gates: <names in step order, each once> | none
+// and, when the journal ends in a record that was cut off, `torn tail bytes: N`. Pure. On a journal the replay refused, `s` holds
+// what replayed before the bad line and the text shows that; the caller names the refusal.
+pub fn status_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        out = buffer.append(heap, out, company_manifest.step_id(m, company_manifest.step_at(m, i)));
+        out = buffer.append(heap, out, " ");
+        out = buffer.append(heap, out, state_name(step_state(m, s, i)));
+        out = buffer.append(heap, out, "\n");
+        i = i + 1;
+    }
+    out = put_spend(heap, out, "spend: input ", company_state.spend_input(s));
+    out = put_spend(heap, out, " output ", company_state.spend_output(s));
+    out = put_spend(heap, out, " cache_write ", company_state.spend_cache_write(s));
+    out = put_spend(heap, out, " cache_read ", company_state.spend_cache_read(s));
+    out = buffer.append(heap, out, "\nopen gates:");
+    var listed = 0;
+    i = 0;
+    while i < n {
+        if awaits_gate(m, s, i) {
+            let gate = company_manifest.step_gate(m, company_manifest.step_at(m, i));
+            var seen = false;
+            var j = 0;
+            while j < i {
+                if awaits_gate(m, s, j) && bytes.equal(company_manifest.step_gate(m, company_manifest.step_at(m, j)), gate) {
+                    seen = true;
+                }
+                j = j + 1;
+            }
+            if seen == false {
+                out = buffer.append(heap, out, " ");
+                out = buffer.append(heap, out, gate);
+                listed = listed + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if listed == 0 {
+        out = buffer.append(heap, out, " none");
+    }
+    out = buffer.append(heap, out, "\n");
+    let torn = company_state.report_of(s).torn_bytes;
+    if torn > 0 {
+        out = put_spend(heap, out, "torn tail bytes: ", torn);
+        out = buffer.append(heap, out, "\n");
+    }
+    return out;
+}
+
+// ---- reading files --------------------------------------------------------------------------------------------------------
+
+// The file at `path` (an ok path), at most `limit` bytes: the bytes and 0, or an errno, or -3 for a file past the limit.
+fn read_limited[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], limit: int) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
+    let none = buffer.empty(heap, 1);
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            return (none, e);
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var data = none;
+            var errno = 0;
+            borrow mut file as &!x in {
+                let (got, e) = journal_io.drain(heap, x, data, limit);
+                data = got;
+                errno = e;
+            }
+            file_close(file);
+            return (data, errno);
+        }
+    }
+}
+
+fn line[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
+    io.write_all(io, label);
+    io.write_all(io, value);
+    io.newline(io);
+    return 0;
+}
+
+fn refuse[&i, &t](io: &!i Io, tag: &t [byte]) -> [io_write] int {
+    return line(io, "refusal: ", tag);
+}
+
+// `dir` + "/" + `name`.
+fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.append(heap, b, "/");
+    return buffer.append(heap, b, name);
+}
+
+// ---- the verbs ------------------------------------------------------------------------------------------------------------
+
+// `forge company check <manifest.json>`: args are `forge company check <path>`.
+pub fn check_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), file_read, io_write] int {
+    if arg_count(args) != 4 {
+        return 2;
+    }
+    let path = arg(args, 3);
+    if journal_io.path_ok(fs, path) == false {
+        refuse(io, task.rule_name(task.Rule::PathInvalid));
+        return 2;
+    }
+    let (text, errno) = read_limited(heap, fs, path, company_manifest.max_bytes() + 1);
+    var code = 1;
+    if errno != 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(why) => {
+                    refuse(io, company_manifest.rule_name(why));
+                }
+                company_manifest.ManifestResult::Held(held) => {
+                    borrow held as &hm in {
+                        io.write_all(io, "valid: ");
+                        io.write_all(io, company_manifest.id_of(hm));
+                        io.write_all(io, ", ");
+                        var n = put_nat(heap, buffer.empty(heap, 4), company_manifest.step_count(hm));
+                        borrow n as &nb in {
+                            io.write_all(io, buffer.bytes(nb));
+                        }
+                        buffer.drop(heap, n);
+                        io.write_all(io, " steps\n");
+                    }
+                    company_manifest.drop(heap, held);
+                    code = 0;
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// `forge company status <company-dir>`: args are `forge company status <dir>`.
+pub fn status_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), file_read, io_write] int {
+    if arg_count(args) != 4 {
+        return 2;
+    }
+    let dir = arg(args, 3);
+    let mpath = under(heap, dir, "company.json");
+    let jpath = under(heap, dir, "company.journal");
+    var code = 1;
+    borrow mpath as &mp in {
+        borrow jpath as &jp in {
+            if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false {
+                refuse(io, task.rule_name(task.Rule::PathInvalid));
+                code = 2;
+            } else {
+                code = status_of(heap, fs, io, buffer.bytes(mp), buffer.bytes(jp));
+            }
+        }
+    }
+    buffer.drop(heap, mpath);
+    buffer.drop(heap, jpath);
+    return code;
+}
+
+fn status_of[&h, &f, &i, &m, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, mpath: &m [byte], jpath: &j [byte]) -> [heap, fs_read(""), file_read, io_write] int {
+    let (text, errno) = read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
+    var code = 1;
+    if errno != 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(why) => {
+                    refuse(io, company_manifest.rule_name(why));
+                }
+                company_manifest.ManifestResult::Held(held) => {
+                    code = status_with(heap, fs, io, held, jpath);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// Replay the journal at `jpath` against the manifest `held`, print the status. Ends `held`.
+fn status_with[&h, &f, &i, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, held: company_manifest.Manifest, jpath: &j [byte]) -> [heap, fs_read(""), file_read, io_write] int {
+    var code = 0;
+    let (data, errno) = journal_io.read_all(heap, fs, jpath);
+    if errno != 0 {
+        line(io, "error: cannot read company.journal", "");
+        code = 3;
+    } else {
+        borrow held as &hm in {
+            borrow data as &db in {
+                let state = company_state.replay(heap, buffer.bytes(db), hm);
+                borrow state as &sr in {
+                    var text = status_text(heap, hm, sr);
+                    borrow text as &xb in {
+                        buffer.write(io, xb);
+                    }
+                    buffer.drop(heap, text);
+                    let rep = company_state.report_of(sr);
+                    if rep.rule != 0 {
+                        refuse(io, task.rule_code_name(rep.rule));
+                        var n = put_nat(heap, buffer.empty(heap, 4), rep.line);
+                        borrow n as &nb in {
+                            line(io, "line: ", buffer.bytes(nb));
+                        }
+                        buffer.drop(heap, n);
+                        code = 1;
+                    }
+                }
+                company_state.drop(heap, state);
+            }
+        }
+    }
+    buffer.drop(heap, data);
+    company_manifest.drop(heap, held);
+    return code;
+}
