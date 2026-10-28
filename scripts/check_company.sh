@@ -78,6 +78,33 @@ open gates: none" "$F" company status "$ws"
   run "status: a refused manifest names its rule" 1 "refusal: step-cycle" "$F" company status "$scratch/empty-co"
   run "status: a relative directory is path-invalid, exit 2" 2 "refusal: path-invalid" "$F" company status co
   run "status: no directory is usage, exit 2" 2 "" "$F" company status
+  # ---- status format=json: one JSON object on a clean journal; every refusal is the text refusal, with the same exit status
+  jw="$scratch/jco"; mkdir "$jw" || exit 1
+  cp "$fx/good.json" "$jw/company.json"
+  run "status format=json: no journal, one object and nothing else" 0 '{"company":"statuslite","steps":[{"id":"brief","role":"product","state":"gated","held":null,"gate":"product-brief","artifact":null,"failed_check":null},{"id":"lib","role":"builder","state":"waiting","held":null,"gate":null,"artifact":null,"failed_check":null},{"id":"gate","role":"qa","state":"waiting","held":null,"gate":null,"artifact":null,"failed_check":null}],"gates":[{"name":"product-brief","decision":"open"}],"open_gates":["product-brief"],"budget":{"limits":{"input":2000000,"output":400000,"cache_write":200000,"cache_read":1000000},"max_cost_micro":5000000,"spent":{"input":0,"output":0,"cache_write":0,"cache_read":0},"cost_micro":0,"unpriced":{"input":0,"output":0,"cache_write":0,"cache_read":0}},"journal":{"records":0,"torn_tail_bytes":0}}' "$F" company status "$jw" format=json
+  run "status format=text is the text status" 0 "brief gated
+lib waiting
+gate waiting
+spend: input 0 output 0 cache_write 0 cache_read 0
+open gates: product-brief" "$F" company status "$jw" format=text
+  run "status: an unknown format is usage, exit 2, nothing on stdout" 2 "" "$F" company status "$jw" format=xml
+  run "status: a bare word after the directory is usage, exit 2" 2 "" "$F" company status "$jw" json
+  run "status: two formats is usage, exit 2" 2 "" "$F" company status "$jw" format=json format=json
+  JJ="$jw/company.journal"
+  printf '%s\n' '{"v":1,"seq":1,"kind":"company.step.accepted","task":"brief","artifact":"a.txt","sha256":"abc"}' 'garbage' > "$JJ"
+  run "status format=json: a corrupt journal is the text refusal only (no object, no state), exit 1" 1 "refusal: journal-corrupt
+line: 2" "$F" company status "$jw" format=json
+  printf '%s\n' '{"v":1,"seq":1,"kind":"company.step.accepted","task":"brief","artifact":7,"sha256":"abc"}' > "$JJ"
+  run "status format=json: a malformed event is the text refusal only, exit 1" 1 "refusal: event-malformed
+line: 1" "$F" company status "$jw" format=json
+  rm "$JJ"; mkdir "$JJ"
+  run "status format=json: a journal that cannot be read is the text error, exit 3" 3 "error: cannot read company.journal" "$F" company status "$jw" format=json
+  rmdir "$JJ"
+  run "status format=json: no company.json is manifest-malformed as text, exit 1" 1 "refusal: manifest-malformed" "$F" company status "$scratch/dec-none" format=json
+  run "status format=json: a refused manifest names its rule as text, exit 1" 1 "refusal: step-cycle" "$F" company status "$scratch/empty-co" format=json
+  sed 's/"id": *"statuslite"/"id":"st\\"x"/' "$fx/good.json" > "$jw/company.json"
+  run "status format=json: a manifest id with a quote is refused (manifest-malformed), never echoed, exit 1" 1 "refusal: manifest-malformed" "$F" company status "$jw" format=json
+  run "status format=json: a relative directory is path-invalid as text, exit 2" 2 "refusal: path-invalid" "$F" company status co format=json
   # ---- decide: takes the lock, appends company.gate.decided, authenticates nothing (the OS user is USER, "unknown" without it)
   dw="$scratch/dec"; mkdir "$dw" || exit 1
   cp "$fx/good.json" "$dw/company.json"

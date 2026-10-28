@@ -35,7 +35,8 @@ import forge.task;
 // decision of each gate (0 open, 1 approved, 2 rejected; the last record wins), how many times each step id was admitted, and the
 // total tokens spent per class, and the same per step (by step number), which steps are HELD by their check, and the artifact
 // path and SHA-256 each accepted step was accepted with (`artifact_of`, decoded from the record; the last accepted record of a
-// step wins): what `needs` passes to a dependent step (task 8c, src/company_runner.cho). A kind this build does not know is passed
+// step wins): what `needs` passes to a dependent step (task 8c, src/company_runner.cho), and the score and total of the last
+// `check_failed` record of each step (`failed_score`, what `forge company status format=json` shows). A kind this build does not know is passed
 // over, as the task journal does for the kinds it only records, so a later build can add some. A known kind whose fields are not
 // the ones above is `event-malformed`.
 //
@@ -58,6 +59,7 @@ pub res struct CompanyState {
     accepted: Box[[bool]],
     spend: Box[[int]],
     held: Box[[int]],
+    scores: Box[[int]],
     arts: buffer.Buffer,
     art_at: Box[[int]],
     gates: map.Map[int],
@@ -288,7 +290,7 @@ fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -
 }
 
 // Apply one complete line (no newline) that must carry `expect` as its `seq`. Answers the two maps and 0, or a rule code.
-fn apply[&h, &l, &m, &a, &s, &k, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], buffer.Buffer, int) {
+fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], scores: &!c [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], buffer.Buffer, int) {
     var gs = gates;
     var ad = admitted;
     var ar = arts;
@@ -334,10 +336,15 @@ fn apply[&h, &l, &m, &a, &s, &k, &x](heap: &!h Heap, line: &l [byte], expect: in
                         ar = keep_artifact(heap, ar, art_at, at, line, tp, artifact, sha);
                     }
                 } else if bytes.equal(kind, kind_check_failed()) {
-                    if named == false || field(line, tp, 0, "score") < 0 || field(line, tp, 0, "total") < 0 {
+                    let score = field(line, tp, 0, "score");
+                    let total = field(line, tp, 0, "total");
+                    if named == false || score < 0 || total < 0 {
                         rule = bad;
                     } else {
-                        set_held(held, company_graph.index_of(man, id), 1);
+                        let at = company_graph.index_of(man, id);
+                        set_held(held, at, 1);
+                        set_held(scores, 2 * at, score);
+                        set_held(scores, 2 * at + 1, total);
                     }
                 } else if bytes.equal(kind, kind_check_unavailable()) {
                     let why = json.get(line, tp, 0, "reason");
@@ -469,6 +476,7 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     let accepted = box_slice(heap, steps, false);
     let spend = box_slice(heap, step_base(steps), 0);
     let held = box_slice(heap, steps, 0);
+    let scores = box_slice(heap, 2 * steps, 0 - 1);
     let art_at = box_slice(heap, 4 * steps, 0 - 1);
     var arts = buffer.empty(heap, 256);
     var gates = map.empty(heap, 16, 0, 0);
@@ -482,27 +490,30 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     borrow mut accepted as &!aw in {
         borrow mut spend as &!sw in {
             borrow mut held as &!kw in {
-                borrow mut art_at as &!xw in {
-                    let acc = contents(aw);
-                    let sp = contents(sw);
-                    let hd = contents(kw);
-                    let xa = contents(xw);
-                    while k < len(journal_text) && rule == 0 {
-                        if int_of(journal_text[k]) == 10 {
-                            let (g, a, t, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, xa, gates, admitted, arts);
-                            gates = g;
-                            admitted = a;
-                            arts = t;
-                            if r == 0 {
-                                records = records + 1;
-                                good = k + 1;
-                            } else {
-                                rule = r;
-                                bad_line = records + 1;
+                borrow mut scores as &!cw in {
+                    borrow mut art_at as &!xw in {
+                        let acc = contents(aw);
+                        let sp = contents(sw);
+                        let hd = contents(kw);
+                        let sc = contents(cw);
+                        let xa = contents(xw);
+                        while k < len(journal_text) && rule == 0 {
+                            if int_of(journal_text[k]) == 10 {
+                                let (g, a, t, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, sc, xa, gates, admitted, arts);
+                                gates = g;
+                                admitted = a;
+                                arts = t;
+                                if r == 0 {
+                                    records = records + 1;
+                                    good = k + 1;
+                                } else {
+                                    rule = r;
+                                    bad_line = records + 1;
+                                }
+                                start = k + 1;
                             }
-                            start = k + 1;
+                            k = k + 1;
                         }
-                        k = k + 1;
                     }
                 }
             }
@@ -510,14 +521,15 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     }
     let torn = len(journal_text) - journal.after_last_newline(journal_text);
     let report = journal.Report { records: records, valid_bytes: good, total_bytes: len(journal_text), torn_bytes: torn, tasks: 0, rule: rule, line: bad_line };
-    return CompanyState { accepted: accepted, spend: spend, held: held, arts: arts, art_at: art_at, gates: gates, admitted: admitted, report: report };
+    return CompanyState { accepted: accepted, spend: spend, held: held, scores: scores, arts: arts, art_at: art_at, gates: gates, admitted: admitted, report: report };
 }
 
 pub fn drop[&h](heap: &!h Heap, s: CompanyState) -> [heap] int {
-    let CompanyState { accepted, spend, held, arts, art_at, gates, admitted, report } = s;
+    let CompanyState { accepted, spend, held, scores, arts, art_at, gates, admitted, report } = s;
     unbox_slice(heap, accepted);
     unbox_slice(heap, spend);
     unbox_slice(heap, held);
+    unbox_slice(heap, scores);
     buffer.drop(heap, arts);
     unbox_slice(heap, art_at);
     map.drop(heap, gates);
@@ -642,6 +654,34 @@ pub fn held_by_check[&s](s: &s CompanyState, i: int) -> [] int {
         return 0;
     }
     return hd[i];
+}
+
+// The tag of a held code (`held_by_check`): 1 check-failed, 3 artifact-invalid, 4 usage-invalid, anything else check-unavailable.
+// What a later run refuses a held step with (`company_step.held_tag`) and what `forge company status format=json` shows.
+pub fn held_name(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "check-failed";
+    }
+    if code == 3 {
+        return "artifact-invalid";
+    }
+    if code == 4 {
+        return "usage-invalid";
+    }
+    return "check-unavailable";
+}
+
+// The score and total of the last `company.step.check_failed` record of step number `i`, or (-1, -1) when it has none (or `i` is
+// outside the manifest). Not cleared by acceptance or a retry: it is the last failed check, as recorded.
+pub fn failed_score[&s](s: &s CompanyState, i: int) -> [] (int, int) {
+    let sc = contents(s.scores);
+    if i < 0 {
+        return (0 - 1, 0 - 1);
+    }
+    if i >= len(sc) / 2 {
+        return (0 - 1, 0 - 1);
+    }
+    return (sc[2 * i], sc[2 * i + 1]);
 }
 
 // ---- human gates ----------------------------------------------------------------------------------------------------------

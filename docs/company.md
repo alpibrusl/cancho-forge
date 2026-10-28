@@ -159,7 +159,7 @@ nothing and take no lock.
 Validates the manifest. Prints `valid: <id>, <n> steps` (exit 0) or `refusal: <tag>` (exit 1: any manifest refusal, including a file that is
 not there, unreadable or over 1 MiB, which is `manifest-malformed`). Exit 2: usage, or `refusal: path-invalid`.
 
-### `forge company status <company-dir>`
+### `forge company status <company-dir> [format=json]`
 
 Reads `company.json` and `company.journal` (no journal is a company where nothing happened yet). Prints one `<id> <state>` line per step
 (states: section 6), then
@@ -167,8 +167,57 @@ Reads `company.json` and `company.journal` (no journal is a company where nothin
 accepted and whose gate has no decision; `none` when there are none; a step that is still `waiting` on a need counts), and
 `torn tail bytes: N` only when the journal ends in an incomplete line (status does not cut it). Exit 0; 1 for a manifest refusal, or
 when the replay refuses (`journal-corrupt` / `event-malformed` with `line: N`, after the state that replayed before the bad line);
-2 usage or `path-invalid`; 3 `error: cannot read company.journal`. It shows tokens, not cost, and **does not show a held step**: a
-step whose check failed is `ready` here (see "Not done").
+2 usage or `path-invalid`; 3 `error: cannot read company.journal`. The text shows tokens, not cost, and **does not show a held step**: a
+step whose check failed is `ready` in it (`format=json` shows both).
+
+**`format=json`** (a trailing `NAME=value` argument, the style of `forge build`'s options; `format=text` is the default, any other
+trailing argument is usage, exit 2) prints the same facts and a few more as **one JSON object on one line, and nothing else on standard
+output**, for a program to read (a status page) without scraping the text. It is read from the same two files and nothing else (no price
+table, no step directory). Every string is written by Forge's JSON writer (`std.json`'s `put_string`, the one the worker requests use):
+`"`, `\` and every control byte are escaped and a byte that is not UTF-8 is written as `\ufffd`, so no text from either file can make the
+document invalid (pinned by `tests/company_cmd_test.cho` and a hostile journal in `tests/conformance/company_run.sh`). The manifest's
+`mission` and the steps' `input` are **not** shown. Every key is always present (`null` when it does not apply):
+
+```json
+{"company":"demo",
+ "steps":[
+  {"id":"brief","role":"product","state":"accepted","held":null,"gate":"product-brief",
+   "artifact":{"name":"company.json","sha256":"9f2c...e1"},"failed_check":null},
+  {"id":"lib","role":"builder","state":"held","held":"check-failed","gate":null,"artifact":null,
+   "failed_check":{"score":1,"total":2}}],
+ "gates":[{"name":"product-brief","decision":"approved"},{"name":"ship","decision":"open"},
+          {"name":"retry:lib","decision":"rejected"}],
+ "open_gates":["ship"],
+ "budget":{"limits":{"input":2000000,"output":400000,"cache_write":200000,"cache_read":1000000},
+           "max_cost_micro":2000000,
+           "spent":{"input":1100,"output":20,"cache_write":0,"cache_read":0},
+           "cost_micro":1120,
+           "unpriced":{"input":0,"output":0,"cache_write":0,"cache_read":0}},
+ "journal":{"records":9,"torn_tail_bytes":0}}
+```
+
+(Shown on several lines here; Forge prints it on one.)
+
+* `steps`, in manifest order: `state` is the text's state (section 6) except that a step the text shows `ready` and its check holds is
+  **`held`**; `held` is the tag the hold was recorded with (`check-failed`, `check-unavailable`, `artifact-invalid`, `usage-invalid`) for
+  any step not accepted that is held, else `null`; `gate` the step's gate name or `null`; `artifact` the path (relative to the company
+  directory) and SHA-256 of its last `company.step.accepted` record, `null` until it is accepted; `failed_check` the score and total of
+  its **last** `company.step.check_failed` record, kept after a retry or an acceptance (it is a record, not the current verdict), `null`
+  when it has none.
+* `gates`: every name of `human_gates` in manifest order, then each `retry:<id>` that has a decision, in step order; `decision` is
+  `open`, `approved` or `rejected` (the last decision wins). A gate name in the journal that is neither is not shown.
+* `open_gates`: exactly the text's `open gates:` list.
+* `budget`: the manifest's ceilings; `max_cost_micro` is `max_cost` in micro-dollars; `spent` the tokens recorded; `cost_micro` the
+  cost the priced spend records hold (authoritative, section 9); `unpriced` the tokens of spend records written without `cost_micro`,
+  which `status` does **not** price (it does not read the price table; the run prices them conservatively, section 9). So the cost the run
+  compares with `max_cost_micro` is `cost_micro` plus the price of `unpriced`, and is `cost_micro` when `unpriced` is all zero.
+* `journal`: `records` the complete records replayed, `torn_tail_bytes` the bytes after the last newline (not read, not cut).
+
+**Refusals stay text in both formats.** A manifest refusal, a refused replay (`journal-corrupt` / `event-malformed`), `path-invalid` and
+the I/O error print exactly the lines and exit status of the text form; with `format=json` the state that replayed before a refused
+line is **not** printed, so standard output holds a JSON object **exactly when the exit status is 0**. A reader checks the exit status
+first, then parses. (A JSON refusal object was not added: it would be a second encoding of every refusal to keep equal to the text one,
+for a reader that must check the exit status anyway.)
 
 ### `forge company decide <company-dir> <gate> approved|rejected <reason...>`
 
@@ -226,8 +275,8 @@ reads the step's evidence and either fixes the cause or records `retry:<id> appr
 | `ready` | its needs are accepted and it has no gate, or its gate is approved |
 | `waiting` | a step it needs is not accepted (this wins over its gate) |
 
-A step *held* by its check (section 8) is not a state of its own in `status`: it is shown as `ready`. The run, not `status`, reports the
-hold.
+A step *held* by its check (section 8) is not a state of its own in the text `status`: it is shown as `ready`. `status format=json`
+shows it as **`held`**, with the tag it was held with (section 5); the run reports the hold too.
 
 ## 7. The company journal
 
@@ -567,8 +616,8 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
 * **Pre-approved gates.** `decide` records a decision on any gate of the manifest at any time, including before the gated step is
   reachable: the gate is then already approved when the step is, and nobody looks at that step's inputs. (A `retry:<id>` approved *before*
   a failure is recorded but does not count, by design.)
-* **`status` shows a held step as `ready`** and shows no cost, only tokens; the hold, the failed score and the cost are in the run's output
-  and in the journal.
+* **The text `status` shows a held step as `ready`** and shows no cost, only tokens; `status format=json` shows the hold, the last failed
+  score and the recorded cost (section 5), but neither form prices unpriced spend records (they are listed apart, as `unpriced`).
 * **A worker that ends without a claim (exit 15) is not held**: the run goes on with every step that does not need it and is not
   admitted again in that invocation, but the next run admits it again and builds it again, spending again (first, if it is the lowest
   step left). Only a failed or unavailable check holds. A step that fails the same way every time is paid for once per invocation. Also, if a run is killed after a `retry:<id>` approval and before the step records anything new, the

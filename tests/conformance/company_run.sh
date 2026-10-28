@@ -97,6 +97,24 @@ kinds() { # name, kind, step: how many records of that kind for that step (0 wit
 }
 builder() { printf '{"id":"%s","role":"builder","task_type":"project.build","needs":[%s],"input":"%s","check":"%s"}' "$1" "$2" "$3" "$4"; }
 
+# `forge company status <dir> format=json` (docs/company.md, section 5), read with python3's json module as a TEST ORACLE only:
+# stdout is exactly one line holding one JSON object, it exits 0, and every step's state is the text status's (a `held` step is
+# `ready` in the text). `sj <name>` leaves the object in $w/<name>.json; `jq_ok <name> <python expression over d>` asserts on it.
+sj() {
+  "$F" company status "$w/$1" format=json > "$w/$1.json"; r=$?
+  "$F" company status "$w/$1" > "$w/$1.text"
+  [ "$r" = 0 ] && [ "$(wc -l < "$w/$1.json")" -eq 1 ] && [ "$(tail -c 1 "$w/$1.json" | od -An -c | tr -d ' ')" = '\n' ] && python3 -I -c '
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+text = open(sys.argv[2], encoding="utf-8").read().split("\n")
+assert isinstance(d, dict) and len(d["steps"]) > 0
+for k, st in enumerate(d["steps"]):
+    got = "ready" if st["state"] == "held" else st["state"]
+    assert text[k].split(" ") == [st["id"], got], (text[k], st)
+' "$w/$1.json" "$w/$1.text"
+}
+jq_ok() { python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1], encoding="utf-8")); sys.exit(0 if ('"$2"') else 1)' "$w/$1.json"; }
+
 # ---- (1) the lying worker (spec 7): the build says done, the audit scores 1/2
 mkco lie "[$(builder lib '' done audit_half.sh)]" 100000 lib
 run lie 1
@@ -105,6 +123,9 @@ check "lying worker: the worker DID claim done (its own journal holds the claim,
 check "lying worker: company.journal holds NO company.step.accepted, and the check_failed with its score" sh -c "! grep -q 'company.step.accepted' '$w/lie/company.journal' && grep -q '\"kind\":\"company.step.check_failed\",\"task\":\"lib\",\"score\":1,\"total\":2' '$w/lie/company.journal'"
 "$F" company status "$w/lie" > "$w/lie.status"
 check "lying worker: status shows the step not accepted" sh -c "grep -qx 'lib ready' '$w/lie.status'"
+check "status format=json: one object, nothing else on stdout, exit 0, the states of the text status" sj lie
+check "status format=json: the held step is held with its tag and its score, no artifact" jq_ok lie 'd["steps"][0] == {"id": "lib", "role": "builder", "state": "held", "held": "check-failed", "gate": None, "artifact": None, "failed_check": {"score": 1, "total": 2}}'
+check "status format=json: company, gates, budget and the journal's record count" jq_ok lie 'd["company"] == "co" and d["gates"] == [{"name": "ship", "decision": "open"}, {"name": "g", "decision": "open"}] and d["open_gates"] == [] and d["budget"]["limits"]["input"] == 100000 and d["budget"]["max_cost_micro"] == 10000000 and d["journal"] == {"records": '"$(wc -l < "$w/lie/company.journal")"', "torn_tail_bytes": 0}'
 proposed() { grep -c '"kind":"task.proposed"' "$w/$1/steps/$2/journal.jsonl"; } # name, step: builds the step's workspace saw
 run lie 2
 check "lying worker: a second run does NOT build again (no Forge-level retry): exit 13, the step held, admitted once, one build" sh -c "[ '$(rc lie 2)' = 13 ] && grep -qx 'refusal: check-failed' '$w/lie.2.out' && grep -qx 'retry: forge company decide $w/lie retry:lib approved <reason>' '$w/lie.2.out' && [ $(kinds lie company.step.admitted lib) -eq 1 ] && [ $(proposed lie lib) -eq 1 ] && ! grep -q 'company.step.accepted' '$w/lie/company.journal'"
@@ -129,6 +150,8 @@ steps="[$(builder lib '' done audit_pass.sh),{\"id\":\"qa\",\"role\":\"qa\",\"ta
 mkco good "$steps" 100000 lib qa
 run good 1
 check "good path: the first run stops at the open gate, exit 10, naming it" sh -c "[ '$(rc good 1)' = 10 ] && grep -qx 'refusal: gate-open' '$w/good.1.out' && grep -qx 'gate: ship' '$w/good.1.out' && grep -qx 'step: ship' '$w/good.1.out'"
+check "status format=json at the open gate: matching the text" sj good
+check "status format=json at the open gate: ship gated and listed open, lib and qa accepted" jq_ok good '[s["state"] for s in d["steps"]] == ["accepted", "accepted", "gated"] and d["open_gates"] == ["ship"] and d["steps"][2]["gate"] == "ship"'
 check "good path: lib and qa are accepted with the artifact and its sha256, ship is not" sh -c "[ \$(grep -c '\"kind\":\"company.step.accepted\"' '$w/good/company.journal') -eq 2 ] && grep -q '\"kind\":\"company.step.accepted\",\"task\":\"lib\",\"artifact\":\"steps/lib/ev/project.cho\",\"sha256\":\"$(sha256sum "$w/good/steps/lib/ev/project.cho" | cut -c1-64)\"' '$w/good/company.journal' && grep -q '\"task\":\"qa\",\"artifact\":\"steps/qa/ev/report.json\"' '$w/good/company.journal'"
 check "good path: the builder's own task was left in verification, never accepted by the worker" sh -c "! grep -q 'task.accepted' '$w/good/steps/lib/journal.jsonl'"
 "$F" company decide "$w/good" ship approved "looks right" > /dev/null
@@ -139,6 +162,18 @@ run good 3
 check "good path: a third run is done at once and admits nothing" sh -c "[ '$(rc good 3)' = 0 ] && [ \$(grep -c 'company.step.admitted' '$w/good/company.journal') -eq 3 ]"
 "$F" company status "$w/good" > "$w/good.status"
 check "good path: status shows all three accepted" sh -c "grep -qx 'lib accepted' '$w/good.status' && grep -qx 'qa accepted' '$w/good.status' && grep -qx 'ship accepted' '$w/good.status'"
+check "status format=json: all accepted, matching the text" sj good
+check "status format=json: an accepted step names its artifact and the sha256 the journal holds, the gate approved" jq_ok good 'd["steps"][0]["artifact"] == {"name": "steps/lib/ev/project.cho", "sha256": "'"$(sha256sum "$w/good/steps/lib/ev/project.cho" | cut -c1-64)"'"} and d["steps"][2]["artifact"]["name"] == "company.json" and {"name": "ship", "decision": "approved"} in d["gates"] and all(s["held"] is None for s in d["steps"])'
+# A hostile journal: a gate name and an artifact name full of what breaks JSON (quotes, a backslash, braces, a newline, a NUL, a
+# control byte) cannot break the object: the gate is not one the manifest lists and is not shown; the name is escaped and reads back.
+mkdir "$w/hostile" && cp "$w/good/company.json" "$w/good/company.journal" "$w/hostile/" || exit 1
+n=$(wc -l < "$w/hostile/company.journal")
+cat >> "$w/hostile/company.journal" <<EOF
+{"v":1,"seq":$((n + 1)),"kind":"company.gate.decided","task":"x","gate":"\\"}],\\"x\\":{\\n","verdict":"rejected","user":"u\\u0000","reason":"r"}
+{"v":1,"seq":$((n + 2)),"kind":"company.step.accepted","task":"lib","artifact":"a\\"b\\\\c}{\\n\\u0000\\u001f\\u00e9","sha256":"\\"]"}
+EOF
+check "status format=json: a hostile gate and artifact name cannot break the object" sj hostile
+check "status format=json: the hostile gate is not shown, the artifact name reads back byte for byte" jq_ok hostile 'len(d["gates"]) == 2 and d["steps"][0]["artifact"] == {"name": "a\"b\\c}{\n\u0000\u001fé", "sha256": "\"]"} and d["journal"]["records"] == '"$((n + 2))"
 
 # ---- (3) the budget: the input ceiling is 1000; one build spends 1100 (two calls) and the next model step is never started
 mkco budget "[$(builder one '' spend audit_pass.sh),$(builder two '' done audit_pass.sh)]" 1000 one two

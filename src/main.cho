@@ -104,7 +104,7 @@ fn show[&i, &h](io: &!i Io, heap: &!h Heap, text: buffer.Buffer) -> [heap, io_wr
 }
 
 fn usage[&i](io: &!i Io) -> [err_write] int {
-    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n       forge company check <manifest.json> | forge company status <company-dir>\n       forge company decide <company-dir> <gate> approved|rejected <reason...> | forge company run <company-dir> <operator-file>\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
+    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n       forge company check <manifest.json> | forge company status <company-dir> [format=json]\n       forge company decide <company-dir> <gate> approved|rejected <reason...> | forge company run <company-dir> <operator-file>\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
     return 2;
 }
 
@@ -726,7 +726,7 @@ fn company[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g A
     if arg_count(args) == 4 && bytes.equal(arg(args, 2), "check") {
         return company_cmd.check_cmd(heap, fs, io, args);
     }
-    if arg_count(args) == 4 && bytes.equal(arg(args, 2), "status") {
+    if (arg_count(args) == 4 || arg_count(args) == 5) && bytes.equal(arg(args, 2), "status") {
         return company_cmd.status_cmd(heap, fs, io, args);
     }
     return usage(io);

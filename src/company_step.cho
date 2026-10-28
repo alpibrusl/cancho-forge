@@ -526,16 +526,7 @@ pub fn is_guard_busy(ran: process.Ran) -> [] bool {
 // The tag a held step is refused with on every later run, by its held code (`company_state.held_by_check`): the refusal it was
 // recorded with. 1 check-failed, 2 check-unavailable, 3 artifact-invalid, 4 usage-invalid; anything else check-unavailable.
 pub fn held_tag(code: int) -> [] &static [byte] {
-    if code == 1 {
-        return "check-failed";
-    }
-    if code == 3 {
-        return rule_artifact_invalid();
-    }
-    if code == 4 {
-        return rule_usage_invalid();
-    }
-    return "check-unavailable";
+    return company_state.held_name(code);
 }
 
 // The exit status of a held step: 13 for a failed check, 14 for every other hold.

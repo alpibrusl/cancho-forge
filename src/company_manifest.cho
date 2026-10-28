@@ -886,6 +886,19 @@ pub fn has_gate[&m, &n](m: &m Manifest, name: &n [byte]) -> [] bool {
     return false;
 }
 
+// How many names `human_gates` lists.
+pub fn gate_count[&m](m: &m Manifest) -> [] int {
+    return json.count(contents(m.tape), m.gates);
+}
+
+// The `k`th name of `human_gates` (0-based); empty outside the list.
+pub fn gate_at[&m](m: &m Manifest, k: int) -> [] &m [byte] {
+    if k < 0 || k >= gate_count(m) {
+        return buffer.bytes(m.text)[0..0];
+    }
+    return text_at(m, json.at(contents(m.tape), m.gates, k));
+}
+
 pub fn step_count[&m](m: &m Manifest) -> [] int {
     return m.step_count;
 }
