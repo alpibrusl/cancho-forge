@@ -11,7 +11,7 @@ import forge.company_state;
 // Unit tests for src/company_run.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.3 and 10): the
 // pure scheduling step of `forge company run`. Each test replays a journal built with the event builders against a manifest and
 // reads the action `next_action` answers as one number (`code_of`): Start(i) is i, WaitGate(i) 10 + i, Blocked(i) 20 + i,
-// Stop(tag) 30 + tag, Done 40, Held(i) 50 + i. Run with `cancho test`.
+// Stop(tag) 30 + tag, Done 40, Held(i) 50 + i, Failed(i) 60 + i. Run with `cancho test`.
 
 // lib (builder), qa (qa), lib2 (builder, after qa): the budget manifest.
 fn budget_manifest() -> [] &static [byte] {
@@ -57,19 +57,41 @@ fn code_of(a: company_run.Action) -> [] int {
         company_run.Action::Held(i) => {
             return 50 + i;
         }
+        company_run.Action::Failed(i) => {
+            return 60 + i;
+        }
     }
 }
 
-// The code of the action for `manifest` and the journal `text`, with `cost` micro-dollars spent against a ceiling of `max_cost`.
+// The code of the action for `manifest` and the journal `text`, with `cost` micro-dollars spent against a ceiling of `max_cost`, no
+// step having failed in this invocation.
 fn act[&h, &t](heap: &!h Heap, manifest: &static [byte], text: &t [byte], cost: int, max_cost: int) -> [heap] int {
+    return act_past(heap, manifest, text, cost, max_cost, 0 - 1, 0 - 1);
+}
+
+// The same, with steps `f1` and `f2` (-1 for none) marked as having ended without a claim earlier in this invocation.
+fn act_past[&h, &t](heap: &!h Heap, manifest: &static [byte], text: &t [byte], cost: int, max_cost: int, f1: int, f2: int) -> [heap] int {
     var code = 0 - 1;
     match company_manifest.parse(heap, manifest) {
         company_manifest.ManifestResult::Held(m) => {
             borrow m as &mr in {
                 let s = company_state.replay(heap, text, mr);
-                borrow s as &sr in {
-                    code = code_of(company_run.next_action(mr, sr, limits(), cost, max_cost));
+                var failed = box_slice(heap, company_manifest.step_count(mr), false);
+                borrow mut failed as &!fw in {
+                    let marks = contents(fw);
+                    if f1 >= 0 && f1 < len(marks) {
+                        marks[f1] = true;
+                    }
+                    if f2 >= 0 && f2 < len(marks) {
+                        marks[f2] = true;
+                    }
                 }
+                borrow s as &sr in {
+                    borrow failed as &fr in {
+                        code = code_of(company_run.next_action(mr, sr, limits(), cost, max_cost, contents(fr)));
+                    }
+                }
+                unbox_slice(heap, failed);
                 company_state.drop(heap, s);
             }
             company_manifest.drop(heap, m);
@@ -360,4 +382,85 @@ fn test_an_approved_retry_lets_the_held_step_start_again[&h](heap: &!h Heap) -> 
 // lib (builder) alone.
 fn chain_manifest_free() -> [] &static [byte] {
     return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[],\"roles\":[\"builder\"],\"steps\":[{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}]}";
+}
+
+// ---- a step that ended without a claim in this invocation ---------------------------------------------------------------------
+
+// pct (builder), status (builder, no needs), render (builder, needs pct), cli (builder, no needs): the StatusLite shape of the A/B
+// runs B1 and A2, where pct ended without a claim.
+fn no_claim_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\"],\"steps\":[{\"id\":\"pct\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"status\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"render\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"pct\"],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"cli\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}]}";
+}
+
+fn act_failed[&h](heap: &!h Heap, journal: buffer.Buffer, f1: int) -> [heap] int {
+    var code = 0 - 1;
+    borrow journal as &jb in {
+        code = act_past(heap, no_claim_manifest(), buffer.bytes(jb), 0, 1000, f1, 0 - 1);
+    }
+    buffer.drop(heap, journal);
+    return code;
+}
+
+// Without the invocation's list the failed step is started first, as before: a later invocation retries it (no hold).
+fn test_a_step_that_ended_without_a_claim_is_started_first_by_a_new_invocation[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.admitted(heap, 1, "pct", "steps/pct"));
+    test.assert_eq(act_and_drop(heap, no_claim_manifest(), j), 0);
+    return 0;
+}
+
+// In the invocation it failed in, it is passed over: the independent step after it starts, and its dependent is not started.
+fn test_a_step_that_ended_without_a_claim_is_not_started_again_in_the_same_invocation[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.admitted(heap, 1, "pct", "steps/pct"));
+    test.assert_eq(act_failed(heap, j, 0), 1);
+    var k = add(heap, buffer.empty(heap, 256), company_state.admitted(heap, 1, "pct", "steps/pct"));
+    k = accepted_step(heap, k, 2, "status");
+    test.assert_eq(act_failed(heap, k, 0), 3);
+    return 0;
+}
+
+// Once every independent step is accepted, the dependent still waits (never Start(render)) and the answer is Failed(pct).
+fn test_when_nothing_else_can_start_the_answer_is_the_failed_step_and_its_dependent_waits[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.admitted(heap, 1, "pct", "steps/pct"));
+    j = accepted_step(heap, j, 2, "status");
+    j = accepted_step(heap, j, 3, "cli");
+    test.assert_eq(act_failed(heap, j, 0), 60);
+    return 0;
+}
+
+// Two failed steps: the lowest is named; the order among the endings puts Failed before Held (a check that held a step), a
+// waiting gate and a spent budget.
+fn test_failed_outranks_held_wait_and_stop[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "status", 1, 2));
+    test.assert_eq(act_failed(heap, j, 0), 3);
+    var k = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "status", 1, 2));
+    k = accepted_step(heap, k, 2, "cli");
+    test.assert_eq(act_failed(heap, k, 0), 60);
+    let g = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    var code = 0 - 1;
+    borrow g as &gb in {
+        code = act_past(heap, free_model_manifest(), buffer.bytes(gb), 0, 1000, 1, 0 - 1);
+    }
+    buffer.drop(heap, g);
+    test.assert_eq(code, 61);
+    var two = 0 - 1;
+    let e = accepted_step(heap, buffer.empty(heap, 256), 1, "status");
+    borrow e as &eb in {
+        two = act_past(heap, no_claim_manifest(), buffer.bytes(eb), 0, 1000, 3, 0);
+    }
+    buffer.drop(heap, e);
+    test.assert_eq(two, 60);
+    return 0;
+}
+
+// An index outside the manifest in the list (a list longer than the steps cannot come from the run; a shorter one is all false
+// beyond its end) changes nothing.
+fn test_a_failed_list_that_names_no_step_changes_nothing[&h](heap: &!h Heap) -> [heap] int {
+    let e = buffer.empty(heap, 8);
+    var code = 0 - 1;
+    borrow e as &eb in {
+        code = act_past(heap, no_claim_manifest(), buffer.bytes(eb), 0, 1000, 9, 0 - 1);
+    }
+    buffer.drop(heap, e);
+    test.assert_eq(code, 0);
+    return 0;
 }

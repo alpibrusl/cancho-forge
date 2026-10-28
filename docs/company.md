@@ -208,7 +208,7 @@ decide <dir> retry:<id> approved <reason>`, `line: N`), `accepted: <id>` for eac
 | 12 | the budget is spent and a model step is held back by it | `refusal: budget-exhausted` |
 | 13 | a check ran and did not pass, or a step is held by an earlier failed check | `refusal: check-failed`, `step:`, `score: a/b` (on the run that scored it) or `held:` + `retry:` (on later runs) |
 | 14 | the check could not be read as a score, did not end, wrote too much, its artifact is unusable, or a need or the contract is not what was accepted or given | `refusal: check-unavailable`, `refusal: artifact-invalid` or `refusal: usage-invalid`, `step:`, `reason:` |
-| 15 | the step's worker ended without a claim, or a stale build would not stop | `refusal: step-failed`, `step:`, `exit: N` or `reason:` |
+| 15 | a step's worker ended without a claim, or a stale build would not stop; the run went on with every step that does not need it first (section 8, item 6) | when it happens: `refusal: step-failed`, `step:`, `exit: N` or `reason:`, `going on: ...`; at the end: `refusal: step-failed`, one `step: <id>` per such step, `failed: ...` |
 | 16 | a TERM or INT arrived while a build ran: the build was cancelled and its spend recorded | `stopped: signal`, `step:` |
 
 The usual shape of a company, then, is: run (exit 10 at a gate), `decide`, run again, and so on until exit 0; and on 13 or 14, a person
@@ -270,7 +270,15 @@ For a step `Start(i)` the run does, in order (the long form is the header of `sr
    no worker (its artifact is `company.json`).
 5. A build's `usage.jsonl` is priced and `company.spend.recorded` appended, **whatever the build's ending**: tokens spent on a build that
    got stuck are spent.
-6. A worker that ended without a claim stops the run: `step-failed`, exit 15, no check.
+6. A worker that ended without a claim: `step-failed` (`exit: N`), no check, nothing accepted, and **the run goes on**. Within this one
+   invocation the step is not admitted again (the run keeps the list in memory, never in the journal: `company_run.next_action` is given
+   it and answers `Failed` instead of `Start` for it); every other step that is ready still runs, and the steps that need the failed one
+   wait. When nothing else can start the run ends exit 15, `refusal: step-failed` and a `step:` line for each step that ended without a
+   claim in it. It is not a hold: the next invocation starts with an empty list and admits it again, in step order (the lowest step
+   first, so a step listed first is retried first), so a transient provider error heals by re-running. A stale build that would not stop
+   (item 2) is treated the same way. (Until 50d81e9 such a step stopped the run at once, so in the A/B runs B1 and A2 the independent
+   steps behind nothing were never built.) A `Failed` ending outranks a hold by a check, an open gate and a spent budget: the run reports
+   what happened in it.
 7. **The check.** Forge hashes the artifact itself, runs the step's `check` program, and hashes it again.
 
 **Acceptance.** A step is `accepted` only when Forge ran the check and the check printed a score line `TOTAL a/b` (the last such line
@@ -437,7 +445,7 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 | `check-unavailable` | no readable score, a check that did not end by itself, wrote too much, a missing `check_guard`, or an earlier such hold | 14 | unit `test_a_pass_with_a_failing_exit_is_unavailable_not_a_pass`; run.sh `audit without a score`, `a check that does not end`, `no check_guard in the workers directory` |
 | `usage-invalid` | a build's `usage.jsonl` is a link, a FIFO, a directory, over 16 MiB or unreadable (never followed, never opened when not a regular file); recorded, the step held | 14 | unit `test_a_held_code_names_the_refusal_it_was_recorded_with_and_its_exit`; run.sh `usagelink`, `usagefifo`, `usagebig`, `usagedir` |
 | `artifact-invalid` | the artifact is not a regular file beneath its directory or changed under the check; a need is missing or changed (`needs-missing`, `needs-changed`); the contract is missing, unreadable or changed by the build (`contract-missing`, `contract-unreadable`, `contract-changed`) | 14 | unit `test_every_way_an_artifact_is_refused_has_its_reason`; run.sh `a symlink artifact`, `needs changed`, `contract changed by the build` |
-| `step-failed` | the step's worker ended without a claim (stuck, a refusal, a deadline), or a stale build would not stop | 15 | run.sh `stuck worker: ...`; the stale arm needs an adapter that ignores `cancel` and is **not reached by a test** |
+| `step-failed` | the step's worker ended without a claim (stuck, a refusal, a deadline), or a stale build would not stop; printed when it happens and again when nothing else can start (the run goes on with the steps that do not need it first) | 15 | unit `test_a_step_that_ended_without_a_claim_is_not_started_again_in_the_same_invocation`, `test_when_nothing_else_can_start_the_answer_is_the_failed_step_and_its_dependent_waits`; run.sh `stuck worker: ...`, `no claim: ...`; the stale arm needs an adapter that ignores `cancel` and is **not reached by a test** |
 
 Not refusals, so without a tag of their own: `stopped: signal` (exit 16; `kill.sh` `T:` and `E:` cases) and `worker-error: <code>`, the
 tool runner's own code (`input-unusable`, `tool-unusable`, `evidence-unwritable`, `tool-timeout`, `tool-output-overflow`,
@@ -561,8 +569,9 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
   a failure is recorded but does not count, by design.)
 * **`status` shows a held step as `ready`** and shows no cost, only tokens; the hold, the failed score and the cost are in the run's output
   and in the journal.
-* **A worker that ends without a claim (exit 15) is not held**: the next run admits the step and builds it again, spending again. Only a
-  failed or unavailable check holds. Also, if a run is killed after a `retry:<id>` approval and before the step records anything new, the
+* **A worker that ends without a claim (exit 15) is not held**: the run goes on with every step that does not need it and is not
+  admitted again in that invocation, but the next run admits it again and builds it again, spending again (first, if it is the lowest
+  step left). Only a failed or unavailable check holds. A step that fails the same way every time is paid for once per invocation. Also, if a run is killed after a `retry:<id>` approval and before the step records anything new, the
   approval still stands, and the next run rebuilds it: one extra paid try.
 * **Relative paths are refused** everywhere (`path-invalid`), by the rule of every Forge verb. A worker step is also refused
   `path-invalid` when a component of a path it is given starts with `-` (the session scratchpad of some agents, for example); `check`

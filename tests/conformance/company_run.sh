@@ -11,7 +11,7 @@
 # approves, the run again completes (exit 0) and no step was admitted twice; a third run admits nothing; (3) the budget: a build
 # that spends past the ceiling, the next model step is never admitted, `budget-exhausted` (exit 12), the spend record carries the
 # cost Forge derived; (4) a rejected gate blocks its dependents and not an independent step (exit 11); and the other ways a run
-# stops: a worker that ends without a claim (15), an audit with no score (14), an artifact missing, no price table, a step
+# stops: a worker that ends without a claim (15; the steps that do not need it still run in the same invocation), an audit with no score (14), an artifact missing, no price table, a step
 # directory missing, a bad operator file, a corrupt journal, a held lock, bad usage; and resume: a step admitted and never accepted
 # (a run killed mid-step) is admitted again, once. And needs (task 8c): a step that needs another is given a copy of its accepted
 # artifact and needs.json with the recorded sha256; one whose need changed or is gone is refused artifact-invalid and never admitted.
@@ -358,6 +358,19 @@ check "manifest: a contract that is a path, not a file name, is manifest-malform
 mkco stuck "[$(builder lib '' stuck audit_pass.sh)]" 100000 lib
 run stuck 1
 check "stuck worker: step-failed, exit 15, the build's exit printed, nothing accepted" sh -c "[ '$(rc stuck 1)' = 15 ] && grep -qx 'refusal: step-failed' '$w/stuck.1.out' && grep -qx 'exit: 4' '$w/stuck.1.out' && ! grep -q 'company.step.accepted' '$w/stuck/company.journal' && [ $(kinds stuck company.step.admitted lib) -eq 1 ]"
+check "stuck worker: alone in the company, the run ends at once naming it, step-failed, exit 15" sh -c "grep -qx 'step: lib' '$w/stuck.1.out' && grep -qx 'failed: ended without a claim in this run; the next run admits it again' '$w/stuck.1.out' && [ \$(grep -c 'refusal: step-failed' '$w/stuck.1.out') -eq 2 ]"
+# A step that ends without a claim does not stop the steps that do not need it (the A/B runs B1 and A2: pct failed and status,
+# render and cli were never built): pct (stuck), status and cli (independent), render (needs pct). In ONE invocation pct is
+# admitted once, status and cli are built and accepted, render is never admitted, and the run ends step-failed naming pct, exit 15.
+# A second invocation admits pct again, first (the lowest step; no hold, so a transient failure heals by re-running), and nothing
+# accepted is built again.
+mkco nclaim "[$(builder pct '' stuck audit_pass.sh),$(builder status '' done audit_pass.sh),$(builder render '"pct"' done audit_pass.sh),$(builder cli '' done audit_pass.sh)]" 100000 pct status render cli
+run nclaim 1
+check "no claim: the independent steps are built and accepted in the same invocation, the failed step admitted once, its dependent never" sh -c "[ $(kinds nclaim company.step.admitted pct) -eq 1 ] && [ $(kinds nclaim company.step.accepted status) -eq 1 ] && [ $(kinds nclaim company.step.accepted cli) -eq 1 ] && [ $(kinds nclaim company.step.admitted render) -eq 0 ] && [ $(kinds nclaim company.step.accepted pct) -eq 0 ]"
+check "no claim: the run ends step-failed, exit 15, naming the failed step last" sh -c "[ '$(rc nclaim 1)' = 15 ] && [ \"\$(tail -n 3 '$w/nclaim.1.out')\" = \"\$(printf 'refusal: step-failed\\nstep: pct\\nfailed: ended without a claim in this run; the next run admits it again')\" ] && grep -qx 'going on: the steps that do not need it; it is not admitted again in this run' '$w/nclaim.1.out'"
+check "no claim: the failed step was admitted first, then status and cli in step order" sh -c "[ \"\$(grep -o '\"kind\":\"company.step.admitted\",\"task\":\"[a-z]*\"' '$w/nclaim/company.journal' | cut -d'\"' -f8 | tr '\\n' ' ')\" = 'pct status cli ' ]"
+run nclaim 2
+check "no claim: a second invocation admits the failed step again (first, it is the lowest), builds nothing accepted again, exit 15" sh -c "[ '$(rc nclaim 2)' = 15 ] && [ $(kinds nclaim company.step.admitted pct) -eq 2 ] && [ $(kinds nclaim company.step.admitted status) -eq 1 ] && [ $(kinds nclaim company.step.admitted cli) -eq 1 ] && [ $(kinds nclaim company.step.admitted render) -eq 0 ] && [ \"\$(grep -o '\"kind\":\"company.step.admitted\",\"task\":\"[a-z]*\"' '$w/nclaim/company.journal' | tail -n 1 | cut -d'\"' -f8)\" = pct ]"
 
 # ---- an audit with no score: check-unavailable, exit 14, nothing accepted and no check_failed
 mkco none "[$(builder lib '' done audit_none.sh)]" 100000 lib

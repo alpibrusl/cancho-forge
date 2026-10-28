@@ -25,9 +25,14 @@ import forge.company_state;
 //   Held(i)      nothing else can start, and step i (the lowest such) is held by its check: its last check failed or could not
 //                judge it, and no person has approved `retry:<id>` since (`company_state.held_by_check`). The run never starts
 //                it again by itself (section 10: no Forge-level retry)
+//   Failed(i)    nothing else can start, and step i (the lowest such) is one whose worker ended without a claim IN THIS
+//                INVOCATION of the run (`failed`, the run loop's own list, never the journal's): it is not started again in the
+//                same invocation, so the steps that do not need it go on; its dependents wait. Not a hold: the next invocation
+//                starts with an empty list and admits it again, in step order, as before
 //
-// The order of the answers when no step can start (`settle`): Held, then WaitGate, then Stop, then Blocked. A step held by its check
-// comes first: it is the one a person must look at. A step that uses no model and
+// The order of the answers when no step can start: Failed (answered by `next_action` itself), then, by `settle`, Held, then WaitGate, then Stop, then Blocked. A step that
+// failed in this invocation comes first: the run ends `step-failed` (exit 15) as it did when such a step stopped it at once, only
+// later, once every step that could go on has. A step held by its check comes next: it is the one a person must look at. A step that uses no model and
 // waits on a gate outranks the spent budget, because a person approving the gate lets it run (a qa step must not be hidden behind
 // `budget-exhausted`); a gated MODEL step under a spent budget counts as held, because approving its gate would not let it run, so
 // Stop outranks waiting for it. (Before the review of 8a, Stop outranked every WaitGate.) The budget covers model steps only (section
@@ -41,6 +46,7 @@ pub enum Action {
     Stop(int),
     Done,
     Held(int),
+    Failed(int),
 }
 
 // The tag of `Stop` for a spent budget.
@@ -81,9 +87,18 @@ pub fn uses_model(role: company_manifest.Role) -> [] bool {
     }
 }
 
+// Did step `i` end without a claim in this invocation? A list shorter than the manifest says no for the steps it does not reach.
+fn failed_at[&f](failed: &f [bool], i: int) -> [] bool {
+    if i < 0 || i >= len(failed) {
+        return false;
+    }
+    return failed[i];
+}
+
 // The next action. `limits` are the token ceilings of the manifest's budget, `spent_cost_micro` the cost so far and
-// `max_cost_micro` its ceiling, both in micro-dollars (`company_budget.exhausted`).
-pub fn next_action[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, limits: company_budget.Limits, spent_cost_micro: int, max_cost_micro: int) -> [] Action {
+// `max_cost_micro` its ceiling, both in micro-dollars (`company_budget.exhausted`). `failed[i]` is true for a step whose worker
+// ended without a claim earlier in this invocation of the run (all false at its start): such a step is not started again.
+pub fn next_action[&m, &s, &f](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, limits: company_budget.Limits, spent_cost_micro: int, max_cost_micro: int, failed: &f [bool]) -> [] Action {
     let n = company_manifest.step_count(m);
     let flags = company_state.accepted_flags(s);
     let spent = company_budget.usage_of(company_state.spend_input(s), company_state.spend_output(s), company_state.spend_cache_write(s), company_state.spend_cache_read(s));
@@ -94,6 +109,7 @@ pub fn next_action[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.
     var blocked = 0 - 1;
     var checked = 0 - 1;
     var first_left = 0 - 1;
+    var gone = 0 - 1;
     var i = 0;
     while i < n {
         if company_state.accepted_at(s, i) == false {
@@ -101,7 +117,11 @@ pub fn next_action[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.
             if first_left < 0 {
                 first_left = i;
             }
-            if company_state.held_by_check(s, i) != 0 {
+            if failed_at(failed, i) {
+                if gone < 0 {
+                    gone = i;
+                }
+            } else if company_state.held_by_check(s, i) != 0 {
                 if checked < 0 {
                     checked = i;
                 }
@@ -134,6 +154,9 @@ pub fn next_action[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.
             }
         }
         i = i + 1;
+    }
+    if pending > 0 && gone >= 0 {
+        return Action::Failed(gone);
     }
     return settle(pending, held, waiting, checked, blocked, first_left);
 }

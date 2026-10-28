@@ -20,6 +20,7 @@ import forge.company_step;
 fn test_every_way_a_run_stops_has_its_own_exit_status() -> [] int {
     test.assert_eq(company_step.action_exit(company_run.Action::Done), 0);
     test.assert_eq(company_step.action_exit(company_run.Action::Held(0)), 13);
+    test.assert_eq(company_step.action_exit(company_run.Action::Failed(0)), 15);
     test.assert_eq(company_step.action_exit(company_run.Action::Start(3)), 0 - 1);
     test.assert_eq(company_step.action_exit(company_run.Action::WaitGate(1)), 10);
     test.assert_eq(company_step.action_exit(company_run.Action::Blocked(1)), 11);

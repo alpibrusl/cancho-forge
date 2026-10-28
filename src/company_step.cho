@@ -107,6 +107,9 @@ pub fn action_exit(a: company_run.Action) -> [] int {
         company_run.Action::Held(i) => {
             return exit_check_failed();
         }
+        company_run.Action::Failed(i) => {
+            return exit_step_failed();
+        }
     }
 }
 
