@@ -3,7 +3,9 @@ performs
     child_signal
     clock
     dir_read
+    dir_write
     err_write
+    exec_detached
     exec_under
     file_read
     file_write
@@ -14,7 +16,8 @@ performs
     pipe_read
     pipe_write
     poll
+    signals("INT,TERM")
+    signals_read
 never touches
     the network
-    signals
     foreign code

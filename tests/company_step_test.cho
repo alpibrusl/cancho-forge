@@ -1,0 +1,593 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.crypto;
+import std.json;
+import std.process;
+import std.test;
+import forge.company_budget;
+import forge.company_manifest;
+import forge.company_run;
+import forge.company_state;
+import forge.company_step;
+
+// Unit tests for src/company_step.cho: the pure half of `forge company run` (exit status, worker and artifact of a role, the check
+// verdict from how the check program ended, the usage delta, hex of a digest, the operator file). Run with `cancho test`.
+
+// ---- exit status -----------------------------------------------------------------------------------------------------------
+
+fn test_every_way_a_run_stops_has_its_own_exit_status() -> [] int {
+    test.assert_eq(company_step.action_exit(company_run.Action::Done), 0);
+    test.assert_eq(company_step.action_exit(company_run.Action::Held(0)), 13);
+    test.assert_eq(company_step.action_exit(company_run.Action::Failed(0)), 15);
+    test.assert_eq(company_step.action_exit(company_run.Action::Start(3)), 0 - 1);
+    test.assert_eq(company_step.action_exit(company_run.Action::WaitGate(1)), 10);
+    test.assert_eq(company_step.action_exit(company_run.Action::Blocked(1)), 11);
+    test.assert_eq(company_step.action_exit(company_run.Action::Stop(company_run.stop_budget())), 12);
+    test.assert_eq(company_step.verdict_exit(0), 0 - 1);
+    test.assert_eq(company_step.verdict_exit(1), 13);
+    test.assert_eq(company_step.verdict_exit(2), 14);
+    test.assert_eq(company_step.verdict_exit(0 - 7), 14);
+    test.assert_eq(company_step.verdict_exit(99), 14);
+    test.assert_eq(company_step.exit_step_failed(), 15);
+    test.assert_eq(company_step.exit_refused(), 1);
+    test.assert_eq(company_step.exit_usage(), 2);
+    test.assert_eq(company_step.exit_io(), 3);
+    return 0;
+}
+
+// ---- runner and artifact ---------------------------------------------------------------------------------------------------
+
+fn runner_code(r: company_step.Runner) -> [] int {
+    match r {
+        company_step.Runner::Build => {
+            return 1;
+        }
+        company_step.Runner::Gate => {
+            return 2;
+        }
+        company_step.Runner::Person => {
+            return 3;
+        }
+        company_step.Runner::Unsupported => {
+            return 4;
+        }
+        company_step.Runner::Tool => {
+            return 5;
+        }
+    }
+}
+
+fn test_each_role_has_its_runner_and_artifact() -> [] int {
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Builder)), 1);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Writer)), 1);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Qa)), 2);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Reviewer)), 2);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Product)), 3);
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::Analyst)), 5);
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Build), "project.cho"));
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Gate), "report.json"));
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Person), "company.json"));
+    test.assert_eq(len(company_step.artifact_name(company_step.Runner::Unsupported)), 0);
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Tool), "tool.out"));
+    return 0;
+}
+
+// ---- the check verdict -----------------------------------------------------------------------------------------------------
+
+fn test_a_full_score_with_exit_zero_passes() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), "case a ok\nTOTAL 2/2\n"), 0);
+    return 0;
+}
+
+// The lying worker of spec 7: whatever the worker said, an audit that scores 1/2 is check-failed, with exit 0 or 1.
+fn test_a_score_below_the_total_is_check_failed_whatever_the_exit() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), "TOTAL 1/2\n"), 1);
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(1), "TOTAL 1/2\n"), 1);
+    return 0;
+}
+
+fn test_a_pass_with_a_failing_exit_is_unavailable_not_a_pass() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(1), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(255), "TOTAL 2/2\n"), 2);
+    return 0;
+}
+
+fn test_a_check_that_did_not_end_by_itself_is_unavailable_even_with_a_full_score() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Signaled(9), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::TimedOut, "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::TooMuch, "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::Failed(2), "TOTAL 2/2\n"), 2);
+    return 0;
+}
+
+fn test_no_score_is_unavailable() -> [] int {
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), ""), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), "done\n"), 2);
+    test.assert_eq(company_step.check_verdict(process.Ran::Code(0), "TOTAL 0/0\n"), 2);
+    return 0;
+}
+
+fn test_the_score_is_read_back_for_the_journal() -> [] int {
+    let (a, b) = company_step.score_of("x\nTOTAL 1/2\n");
+    test.assert_eq(a, 1);
+    test.assert_eq(b, 2);
+    let (c, d) = company_step.score_of("nothing");
+    test.assert_eq(c, 0 - 1);
+    test.assert_eq(d, 0 - 1);
+    return 0;
+}
+
+// ---- usage delta -----------------------------------------------------------------------------------------------------------
+
+fn test_the_usage_delta_is_what_is_new_per_class_never_negative() -> [] int {
+    let after = company_budget.usage_of(100, 50, 7, 0);
+    let before = company_budget.usage_of(40, 50, 9, 0);
+    let d = company_step.usage_delta(after, before);
+    test.assert_eq(d.input, 60);
+    test.assert_eq(d.output, 0);
+    test.assert_eq(d.cache_write, 0);
+    test.assert_eq(d.cache_read, 0);
+    test.assert(company_step.any_tokens(d));
+    test.assert(company_step.any_tokens(company_step.usage_delta(before, after)));
+    test.assert(company_step.any_tokens(company_step.usage_delta(after, after)) == false);
+    test.assert_eq(company_step.cost_delta(10, 3), 7);
+    test.assert_eq(company_step.cost_delta(3, 10), 0);
+    return 0;
+}
+
+fn test_the_usage_delta_of_extreme_values_never_traps() -> [] int {
+    let big = company_budget.usage_of(9223372036854775807, 0 - 9223372036854775807, 1000000000000000, 0);
+    let d = company_step.usage_delta(big, company_budget.usage_of(0 - 5, 9223372036854775807, 0, 0));
+    test.assert_eq(d.input, 1000000000000000);
+    test.assert_eq(d.output, 0);
+    test.assert_eq(company_step.cost_delta(9223372036854775807, 0 - 9223372036854775807), 1000000000000000);
+    return 0;
+}
+
+// ---- hex -------------------------------------------------------------------------------------------------------------------
+
+fn test_the_digest_is_written_as_lower_case_hex[&h](heap: &!h Heap) -> [heap] int {
+    let digest = box_slice(heap, 32, byte_of(0));
+    borrow mut digest as &!dw in {
+        crypto.sha256("abc", contents(dw));
+    }
+    var out = buffer.empty(heap, 64);
+    borrow digest as &dr in {
+        out = company_step.put_hex(heap, out, contents(dr));
+    }
+    borrow out as &ob in {
+        test.assert(bytes.equal(buffer.bytes(ob), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    }
+    buffer.drop(heap, out);
+    unbox_slice(heap, digest);
+    return 0;
+}
+
+// ---- the operator file -----------------------------------------------------------------------------------------------------
+
+fn operator_is_ok[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] bool {
+    var ok = false;
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(text, tp) > 0 {
+            ok = company_step.operator_ok(text, tp);
+        }
+    }
+    unbox_slice(heap, tape);
+    return ok;
+}
+
+fn good_operator() -> [] &static [byte] {
+    return "{\"workers\":\"/w\",\"tools\":\"/t\",\"checker\":\"/c/cancho\",\"agent\":\"stand-in --x\",\"gates\":{\"qa\":{\"repo\":\"alpibrusl/cancho-hdl\",\"revision\":\"0123456789012345678901234567890123456789\",\"checkout\":\"/co\"}},\"check_timeout_ms\":20000}";
+}
+
+fn test_a_good_operator_file_is_taken_and_read_back[&h](heap: &!h Heap) -> [heap] int {
+    let text = good_operator();
+    test.assert(operator_is_ok(heap, text));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\"}"));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(bytes.equal(company_step.op_text(text, tp, "workers"), "/w"));
+        test.assert(bytes.equal(company_step.op_text(text, tp, "agent"), "stand-in --x"));
+        test.assert(bytes.equal(company_step.op_gate(text, tp, "qa", "checkout"), "/co"));
+        test.assert(bytes.equal(company_step.op_gate(text, tp, "qa", "repo"), "alpibrusl/cancho-hdl"));
+        test.assert_eq(len(company_step.op_gate(text, tp, "nope", "repo")), 0);
+        test.assert_eq(len(company_step.op_text(text, tp, "gates")), 0);
+        test.assert_eq(company_step.op_ms(text, tp, "check_timeout_ms", 5), 20000);
+        test.assert_eq(company_step.op_ms(text, tp, "gate_timeout_ms", 5), 5);
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+fn analyst_operator() -> [] &static [byte] {
+    return "{\"workers\":\"/w\",\"analyst_tools\":\"/t2\",\"granted_tools\":[\"tally\",\"jsonq\"],\"analysts\":{\"an\":{\"tool\":\"tally\",\"argv\":[\"--field\",\"2\"],\"input\":\"checks.log\"}},\"tool_timeout_ms\":30000}";
+}
+
+fn test_an_operator_file_names_each_analyst_steps_tool_argv_and_input[&h](heap: &!h Heap) -> [heap] int {
+    let text = analyst_operator();
+    test.assert(operator_is_ok(heap, text));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(bytes.equal(company_step.op_text(text, tp, "analyst_tools"), "/t2"));
+        test.assert(bytes.equal(company_step.op_analyst(text, tp, "an", "tool"), "tally"));
+        test.assert(bytes.equal(company_step.op_analyst(text, tp, "an", "input"), "checks.log"));
+        test.assert_eq(len(company_step.op_analyst(text, tp, "nope", "tool")), 0);
+        test.assert(json.is_array(tp, company_step.op_analyst_node(text, tp, "an", "argv")));
+        test.assert_eq(json.count(tp, company_step.op_analyst_node(text, tp, "an", "argv")), 2);
+        test.assert(company_step.op_analyst_node(text, tp, "nope", "argv") < 0);
+        test.assert(json.is_array(tp, company_step.op_node(text, tp, "granted_tools")));
+        test.assert(company_step.op_node(text, tp, "nothing") < 0);
+        test.assert_eq(company_step.op_ms(text, tp, "tool_timeout_ms", 5), 30000);
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+fn test_an_analyst_entry_outside_its_shape_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analyst_tools\":\"t\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"granted_tools\":\"tally\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":[]}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":3}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":\"t\",\"argv\":[],\"input\":\"i\",\"x\":1}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":\"t\",\"input\":\"i\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":3,\"argv\":[],\"input\":\"i\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":\"t\",\"argv\":\"--x\",\"input\":\"i\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"analysts\":{\"an\":{\"tool\":\"t\",\"argv\":[],\"input\":7}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"tool_timeout_ms\":9999}") == false);
+    // the strings of argv and the granted list are judged by `tool_task.check` when the step starts, not by the shape
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"granted_tools\":[3],\"analysts\":{\"an\":{\"tool\":\"t\",\"argv\":[1],\"input\":\"i\"}}}"));
+    return 0;
+}
+
+fn test_an_operator_file_outside_the_shape_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(operator_is_ok(heap, "{}") == false);
+    test.assert(operator_is_ok(heap, "[]") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"w\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":3}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"extra\":1}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"workers\":\"/x\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\\n\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"tools\":\"t\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent\":7}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"check_timeout_ms\":9999}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"check_timeout_ms\":86400001}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"check_timeout_ms\":\"20000\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"check_timeout_ms\":99999999999999999999999}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":[]}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":3}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":{\"repo\":\"r\",\"revision\":\"v\",\"checkout\":\"co\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":{\"repo\":\"r\",\"revision\":\"v\",\"checkout\":\"/co\",\"x\":1}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"qa\":{\"repo\":\"r\",\"checkout\":\"/co\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"gates\":{\"q\\u0061\":{\"repo\":\"r\",\"revision\":\"v\",\"checkout\":\"/co\"}}}") == false);
+    return 0;
+}
+
+fn test_an_operator_file_may_name_a_guide_held_to_the_build_path_rule[&h](heap: &!h Heap) -> [heap] int {
+    let text = "{\"workers\":\"/w\",\"guide\":\"/opt/guides/plan.md\"}";
+    test.assert(operator_is_ok(heap, text));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(bytes.equal(company_step.op_text(text, tp, "guide"), "/opt/guides/plan.md"));
+    }
+    unbox_slice(heap, tape);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"guides/plan.md\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":7}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"/\"}") == false);
+    // absolute, but not a path `forge build` would take (`gate_task.path_ok`: a space, a `..`)
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"/opt/my guide.md\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"/opt/../plan.md\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"/g\",\"guide\":\"/h\"}") == false);
+    return 0;
+}
+
+fn test_an_operator_file_may_set_the_build_ceilings_held_to_forge_builds_ranges[&h](heap: &!h Heap) -> [heap] int {
+    let text = "{\"workers\":\"/w\",\"attempts\":2,\"agent_seconds\":240,\"rounds\":5,\"plan_seconds\":1200,\"jobs\":8}";
+    test.assert(operator_is_ok(heap, text));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(company_step.op_int(text, tp, "agent_seconds", 30) == 240);
+        test.assert(company_step.op_int(text, tp, "attempts", 4) == 2);
+        test.assert(company_step.op_int(text, tp, "rounds", 3) == 5);
+        test.assert(company_step.op_int(text, tp, "plan_seconds", 900) == 1200);
+        test.assert(company_step.op_int(text, tp, "jobs", 4) == 8);
+        test.assert(len(company_step.limit_reason(text, tp)) == 0);
+    }
+    unbox_slice(heap, tape);
+    // none named: the defaults of `forge build`
+    let bare = "{\"workers\":\"/w\"}";
+    let tape2 = box_slice(heap, json.tape_len(bare), 0);
+    borrow mut tape2 as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(bare, tp) > 0);
+        test.assert(company_step.op_int(bare, tp, "agent_seconds", 30) == 30);
+    }
+    unbox_slice(heap, tape2);
+    // the ends of each range are taken, one past them refused
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":1}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":3600}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":0}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":3601}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"attempts\":21}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"rounds\":11}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"plan_seconds\":7201}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"jobs\":65}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"jobs\":-1}") == false);
+    // the wrong type: a string, a float, a boolean
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":\"240\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":240.0}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":true}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":240,\"agent_seconds\":240}") == false);
+    // and the reason names the first one wrong
+    let wrong = "{\"workers\":\"/w\",\"rounds\":0,\"agent_seconds\":\"x\"}";
+    let tape3 = box_slice(heap, json.tape_len(wrong), 0);
+    borrow mut tape3 as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(wrong, tp) > 0);
+        test.assert(bytes.equal(company_step.limit_reason(wrong, tp), "agent_seconds is not a whole number from 1 to 3600"));
+    }
+    unbox_slice(heap, tape3);
+    return 0;
+}
+
+// ---- the artifact ----------------------------------------------------------------------------------------------------------
+
+fn test_every_way_an_artifact_is_refused_has_its_reason() -> [] int {
+    test.assert(bytes.equal(company_step.rule_artifact_invalid(), "artifact-invalid"));
+    test.assert(bytes.equal(company_step.artifact_reason(1), "not there"));
+    test.assert(bytes.equal(company_step.artifact_reason(2), "not a regular file (a link, a directory, a FIFO or a device)"));
+    test.assert(bytes.equal(company_step.artifact_reason(3), "over 16 MiB"));
+    test.assert(bytes.equal(company_step.artifact_reason(4), "cannot be read"));
+    test.assert(bytes.equal(company_step.artifact_reason(5), "changed while the check ran"));
+    test.assert(bytes.equal(company_step.artifact_reason(6), "contract-changed"));
+    test.assert_eq(company_step.contract_cap(), 262144);
+    test.assert(bytes.equal(company_step.contract_reason(1), "contract-missing"));
+    test.assert(bytes.equal(company_step.contract_reason(2), "contract-unreadable"));
+    test.assert(bytes.equal(company_step.contract_reason(4), "contract-unreadable"));
+    test.assert(bytes.equal(company_step.contract_reason(0 - 9), "contract-unreadable"));
+    test.assert(bytes.equal(company_step.artifact_reason(0 - 9), "cannot be read"));
+    test.assert(bytes.equal(company_step.retry_hint(), "retry: forge company decide "));
+    return 0;
+}
+
+fn test_an_operator_file_inside_the_company_directory_is_seen_by_its_text() -> [] int {
+    test.assert(company_step.inside("/co", "/co/operator.json"));
+    test.assert(company_step.inside("/co/", "/co/sub/operator.json"));
+    test.assert(company_step.inside("/co", "/cox/operator.json") == false);
+    test.assert(company_step.inside("/co", "/co") == false);
+    test.assert(company_step.inside("/co", "/co/") == false);
+    test.assert(company_step.inside("/co", "/elsewhere/o.json") == false);
+    test.assert(company_step.inside("", "/x") == false);
+    test.assert(company_step.inside("/", "/x") == false);
+    test.assert(company_step.inside("/co", "") == false);
+    return 0;
+}
+
+// ---- needs: what an accepted step passes to the step that needs it (task 8c) -------------------------------------------------
+
+fn test_the_artifact_of_a_step_and_its_delivered_name_follow_its_runner[&h](heap: &!h Heap) -> [heap] int {
+    var r = company_step.artifact_rel(heap, "lib", company_step.Runner::Build);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "steps/lib/ev/project.cho"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.artifact_rel(heap, "qa", company_step.Runner::Gate);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "steps/qa/ev/report.json"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.artifact_rel(heap, "brief", company_step.Runner::Person);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "company.json"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.artifact_rel(heap, "an", company_step.Runner::Tool);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "steps/an/ev/tool.out"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.needs_name(heap, "an", company_step.Runner::Tool);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "needs-an-tool.out"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.artifact_rel(heap, "a", company_step.Runner::Unsupported);
+    borrow r as &rb in {
+        test.assert_eq(buffer.size(rb), 0);
+    }
+    buffer.drop(heap, r);
+    r = company_step.needs_name(heap, "lib", company_step.Runner::Build);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "needs-lib-project.cho"));
+    }
+    buffer.drop(heap, r);
+    r = company_step.needs_name(heap, "brief", company_step.Runner::Person);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "needs-brief-company.json"));
+    }
+    buffer.drop(heap, r);
+    test.assert(bytes.equal(company_step.needs_file(), "needs.json"));
+    test.assert(bytes.equal(company_step.needs_reason(1), "needs-missing"));
+    test.assert(bytes.equal(company_step.needs_reason(2), "needs-changed"));
+    test.assert(bytes.equal(company_step.needs_reason(5), "needs-changed"));
+    test.assert(bytes.equal(company_step.needs_reason(0 - 1), "needs-changed"));
+    return 0;
+}
+
+// a (builder), q (qa), p (product), then b (builder) needs all three and c (builder) needs nothing.
+fn needs_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\",\"product\"],\"steps\":[{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"},{\"id\":\"q\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"},{\"id\":\"p\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"},{\"id\":\"b\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"a\",\"q\",\"p\"],\"input\":\"x\",\"check\":\"c.sh\"},{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"}]}";
+}
+
+// 1 when `needs_text` of step number `k` after replaying `journal` is exactly `want`, else 0.
+fn needs_text_is[&h, &j, &w](heap: &!h Heap, journal: &j [byte], k: int, want: &w [byte]) -> [heap] int {
+    var got = 0 - 1;
+    match company_manifest.parse(heap, needs_manifest()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, journal, mr);
+                borrow s as &sr in {
+                    let t = company_step.needs_text(heap, mr, sr, k);
+                    borrow t as &tb in {
+                        got = 0;
+                        if bytes.equal(buffer.bytes(tb), want) {
+                            got = 1;
+                        }
+                    }
+                    buffer.drop(heap, t);
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return got;
+}
+
+fn add_line[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = journal;
+    borrow record as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return out;
+}
+
+// A product step's need (`p`, run by a person) is not listed: its "artifact" is the manifest, which every run parses and trusts, and
+// there is nothing to give (fix round 1, I1).
+fn test_needs_text_lists_every_need_with_the_path_and_digest_the_journal_recorded[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add_line(heap, j, company_state.accepted(heap, 1, "a", "steps/a/ev/project.cho", "aa11"));
+    j = add_line(heap, j, company_state.accepted(heap, 2, "q", "steps/q/ev/report.json", "bb22"));
+    j = add_line(heap, j, company_state.accepted(heap, 3, "p", "company.json", "cc33"));
+    borrow j as &jb in {
+        let want = "[{\"step\":\"a\",\"artifact\":\"steps/a/ev/project.cho\",\"path\":\"needs-a-project.cho\",\"sha256\":\"aa11\"},{\"step\":\"q\",\"artifact\":\"steps/q/ev/report.json\",\"path\":\"needs-q-report.json\",\"sha256\":\"bb22\"}]\n";
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 3, want), 1);
+        // A step with no needs gets nothing: no needs.json is written for it.
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 4, ""), 1);
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 0, ""), 1);
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 0 - 1, ""), 1);
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 9, ""), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// Only accepted needs are listed (the scheduler starts a step only when all are, so this is the defensive half).
+fn test_needs_text_lists_only_what_is_accepted[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add_line(heap, j, company_state.accepted(heap, 1, "q", "steps/q/ev/report.json", "bb22"));
+    j = add_line(heap, j, company_state.accepted(heap, 2, "p", "company.json", "cc33"));
+    borrow j as &jb in {
+        test.assert_eq(needs_text_is(heap, buffer.bytes(jb), 3, "[{\"step\":\"q\",\"artifact\":\"steps/q/ev/report.json\",\"path\":\"needs-q-report.json\",\"sha256\":\"bb22\"}]\n"), 1);
+    }
+    buffer.drop(heap, j);
+    test.assert_eq(needs_text_is(heap, "", 3, ""), 1);
+    // Only the person's need accepted: nothing to verify, nothing to give.
+    var k = buffer.empty(heap, 128);
+    k = add_line(heap, k, company_state.accepted(heap, 1, "p", "company.json", "cc33"));
+    borrow k as &kb in {
+        test.assert_eq(needs_text_is(heap, buffer.bytes(kb), 3, ""), 1);
+    }
+    buffer.drop(heap, k);
+    return 0;
+}
+
+// A recorded path with a quote and a backslash (a hand-edited journal: the run never writes one) is written escaped, so the file
+// is JSON whatever the journal held, and the run's own check of the path against the step's artifact refuses it.
+fn test_needs_text_escapes_what_it_copies_from_the_journal[&h](heap: &!h Heap) -> [heap] int {
+    let journal = "{\"v\":1,\"seq\":1,\"kind\":\"company.step.accepted\",\"task\":\"a\",\"artifact\":\"steps/a\\\"x\\\\y\",\"sha256\":\"a\\\"b\"}\n";
+    let want = "[{\"step\":\"a\",\"artifact\":\"steps/a\\\"x\\\\y\",\"path\":\"needs-a-project.cho\",\"sha256\":\"a\\\"b\"}]\n";
+    test.assert_eq(needs_text_is(heap, journal, 3, want), 1);
+    return 0;
+}
+
+// ---- the check guard (task 9) ----------------------------------------------------------------------------------------------
+
+fn test_the_guard_says_how_the_check_ended_and_forge_reads_it_back() -> [] int {
+    // the guard's code for each ending
+    test.assert_eq(company_step.guard_code(process.Ran::Code(0), 0), 0);
+    test.assert_eq(company_step.guard_code(process.Ran::Code(1), 0), 1);
+    test.assert_eq(company_step.guard_code(process.Ran::Code(77), 0), 1);
+    test.assert_eq(company_step.guard_code(process.Ran::Signaled(8), 0), 3);
+    test.assert_eq(company_step.guard_code(process.Ran::TimedOut, 0), 4);
+    test.assert_eq(company_step.guard_code(process.Ran::TooMuch, 0), 5);
+    test.assert_eq(company_step.guard_code(process.Ran::Failed(2), 0), 6);
+    // Forge gone wins over however the killed check ended
+    test.assert_eq(company_step.guard_code(process.Ran::Signaled(256), 2), 7);
+    test.assert_eq(company_step.guard_code(process.Ran::Code(0), 2), 7);
+    test.assert_eq(company_step.guard_usage(), 8);
+    // and back: a pass and a failure keep their verdicts, everything else is unavailable
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::Code(0)), "TOTAL 2/2\n"), 0);
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::Code(1)), "TOTAL 1/2\n"), 1);
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::Code(1)), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::Code(0)), "TOTAL 1/2\n"), 1);
+    var k = 3;
+    while k < 300 {
+        test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::Code(k)), "TOTAL 2/2\n"), 2);
+        k = k + 1;
+    }
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::Code(0 - 1)), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::Signaled(256)), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::TimedOut), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::TooMuch), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.check_verdict(company_step.check_ran(process.Ran::Failed(4)), "TOTAL 2/2\n"), 2);
+    test.assert_eq(company_step.exit_stopped(), 16);
+    test.assert(company_step.guard_margin_ms() > 0);
+    return 0;
+}
+
+fn test_a_missing_guard_is_told_apart_from_every_other_ending() -> [] int {
+    test.assert(company_step.is_guard_missing(process.Ran::Failed(company_step.guard_missing())));
+    test.assert(!company_step.is_guard_missing(process.Ran::Failed(0 - 2)));
+    test.assert(!company_step.is_guard_missing(process.Ran::Failed(2)));
+    test.assert(!company_step.is_guard_missing(process.Ran::Code(0 - 3)));
+    test.assert(!company_step.is_guard_missing(process.Ran::Signaled(0 - 3)));
+    test.assert(!company_step.is_guard_missing(process.Ran::TimedOut));
+    test.assert(!company_step.is_guard_missing(process.Ran::TooMuch));
+    // a guard's own ending never maps to it
+    test.assert(!company_step.is_guard_missing(company_step.check_ran(process.Ran::Code(3))));
+    test.assert(!company_step.is_guard_missing(company_step.check_ran(process.Ran::Code(8))));
+    test.assert_eq(company_step.check_verdict(process.Ran::Failed(company_step.guard_missing()), "TOTAL 2/2\n"), 2);
+    return 0;
+}
+
+// ---- the fix wave: held tags, usage, a busy check lock ------------------------------------------------------------------------
+
+fn test_a_held_code_names_the_refusal_it_was_recorded_with_and_its_exit() -> [] int {
+    test.assert(bytes.equal(company_step.held_tag(1), "check-failed"));
+    test.assert(bytes.equal(company_step.held_tag(2), "check-unavailable"));
+    test.assert(bytes.equal(company_step.held_tag(3), "artifact-invalid"));
+    test.assert(bytes.equal(company_step.held_tag(4), "usage-invalid"));
+    test.assert(bytes.equal(company_step.held_tag(99), "check-unavailable"));
+    test.assert_eq(company_step.held_exit(1), 13);
+    test.assert_eq(company_step.held_exit(2), 14);
+    test.assert_eq(company_step.held_exit(3), 14);
+    test.assert_eq(company_step.held_exit(4), 14);
+    test.assert(bytes.equal(company_step.rule_usage_invalid(), "usage-invalid"));
+    return 0;
+}
+
+fn test_a_busy_check_lock_is_its_own_ending_not_a_bare_failure() -> [] int {
+    test.assert(company_step.is_guard_busy(process.Ran::Failed(company_step.guard_busy())));
+    test.assert(company_step.is_guard_busy(process.Ran::Failed(0 - 2)) == false);
+    test.assert(company_step.is_guard_busy(process.Ran::Code(0)) == false);
+    test.assert(company_step.guard_busy() != company_step.guard_missing());
+    test.assert_eq(company_step.check_verdict(process.Ran::Failed(company_step.guard_busy()), "TOTAL 1/1\n"), 2);
+    return 0;
+}

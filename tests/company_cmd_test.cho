@@ -1,0 +1,305 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_manifest;
+import forge.company_state;
+import forge.company_cmd;
+
+// Unit tests for the pure half of src/company_cmd.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section
+// 4.4, `forge company status`): `status_text` over a manifest and a replayed company journal. The two commands that read files are
+// checked from outside by scripts/check_company.sh. Run with `cancho test`.
+
+fn manifest_text() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"g\",\"h\"],\"roles\":[\"qa\",\"product\"],\"steps\":[{\"id\":\"a\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"},{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"b\"],\"input\":\"x\"},{\"id\":\"d\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"},{\"id\":\"e\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"gate\":\"h\"}]}";
+}
+
+// The text `status_text` makes of the journal `text`, for the manifest above.
+fn status_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 16);
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    buffer.drop(heap, out);
+                    out = company_cmd.status_text(heap, mr, sr);
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return out;
+}
+
+fn add[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = journal;
+    borrow record as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return out;
+}
+
+fn want[&h, &t, &w](heap: &!h Heap, journal: &t [byte], wanted: &w [byte]) -> [heap] bool {
+    let got = status_of(heap, journal);
+    var same = false;
+    borrow got as &gb in {
+        same = bytes.equal(buffer.bytes(gb), wanted);
+    }
+    buffer.drop(heap, got);
+    return same;
+}
+
+fn test_nothing_happened_yet_every_step_waits_or_is_gated[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(want(heap, "", "a gated\nb waiting\nc waiting\nd gated\ne gated\nspend: input 0 output 0 cache_write 0 cache_read 0\nopen gates: g h\n"));
+    return 0;
+}
+
+fn test_an_accepted_step_unblocks_the_next_and_spend_is_summed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "out/a.txt", "abc"));
+    j = add(heap, j, company_state.admitted(heap, 3, "b", "t-1"));
+    j = add(heap, j, company_state.spend_recorded(heap, 4, "b", 10, 20, 30, 40));
+    j = add(heap, j, company_state.spend_recorded(heap, 5, "b", 1, 2, 3, 4));
+    borrow j as &jb in {
+        test.assert(want(heap, buffer.bytes(jb), "a accepted\nb ready\nc waiting\nd ready\ne gated\nspend: input 11 output 22 cache_write 33 cache_read 44\nopen gates: h\n"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_rejected_gate_is_not_open_and_its_steps_are_rejected[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "g", "rejected", "u", "no"));
+    borrow j as &jb in {
+        test.assert(want(heap, buffer.bytes(jb), "a rejected\nb waiting\nc waiting\nd rejected\ne gated\nspend: input 0 output 0 cache_write 0 cache_read 0\nopen gates: h\n"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_every_gate_decided_prints_none_open[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "h", "approved", "u", "ok"));
+    borrow j as &jb in {
+        test.assert(want(heap, buffer.bytes(jb), "a ready\nb waiting\nc waiting\nd ready\ne ready\nspend: input 0 output 0 cache_write 0 cache_read 0\nopen gates: none\n"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_torn_tail_is_counted_and_not_read[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "h", "approved", "u", "ok"));
+    j = buffer.append(heap, j, "{\"v\":1,\"se");
+    borrow j as &jb in {
+        test.assert(want(heap, buffer.bytes(jb), "a gated\nb waiting\nc waiting\nd gated\ne ready\nspend: input 0 output 0 cache_write 0 cache_read 0\nopen gates: g\ntorn tail bytes: 10\n"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_refused_journal_shows_what_replayed_before_the_bad_line[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "h", "approved", "u", "ok"));
+    j = buffer.append(heap, j, "garbage\n");
+    j = add(heap, j, company_state.accepted(heap, 3, "a", "out", "abc"));
+    borrow j as &jb in {
+        test.assert(want(heap, buffer.bytes(jb), "a gated\nb waiting\nc waiting\nd gated\ne ready\nspend: input 0 output 0 cache_write 0 cache_read 0\nopen gates: g\n"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// ---- the OS user of a decision --------------------------------------------------------------------------------------------
+
+fn user_of[&t](environ: &t [byte]) -> [] &t [byte] {
+    return company_cmd.user_in_environ(environ);
+}
+
+fn test_the_user_is_the_value_of_user_in_a_nul_separated_environment() -> [] int {
+    test.assert(bytes.equal(user_of("HOME=/home/ana\0USER=ana\0PATH=/bin\0"), "ana"));
+    test.assert(bytes.equal(user_of("USER=ana\0"), "ana"));
+    test.assert(bytes.equal(user_of("USER=ana"), "ana"));
+    return 0;
+}
+
+fn test_a_missing_empty_or_look_alike_user_is_unknown() -> [] int {
+    test.assert(bytes.equal(user_of(""), "unknown"));
+    test.assert(bytes.equal(user_of("HOME=/h\0PATH=/bin\0"), "unknown"));
+    test.assert(bytes.equal(user_of("USER=\0"), "unknown"));
+    test.assert(bytes.equal(user_of("XUSER=bob\0USERNAME=bob\0"), "unknown"));
+    test.assert(bytes.equal(user_of("USER"), "unknown"));
+    return 0;
+}
+
+fn test_a_user_name_that_is_too_long_is_unknown() -> [] int {
+    test.assert(bytes.equal(user_of("USER=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\0"), "unknown"));
+    return 0;
+}
+
+fn test_a_verdict_word_is_approved_or_rejected_and_nothing_else() -> [] int {
+    test.assert_eq(company_cmd.verdict_code("approved"), 1);
+    test.assert_eq(company_cmd.verdict_code("rejected"), 2);
+    test.assert_eq(company_cmd.verdict_code("Approved"), 0);
+    test.assert_eq(company_cmd.verdict_code("open"), 0);
+    test.assert_eq(company_cmd.verdict_code(""), 0);
+    return 0;
+}
+
+// ---- the status as JSON (`format=json`) -----------------------------------------------------------------------------------
+
+fn quoted_is[&h, &t, &w](heap: &!h Heap, text: &t [byte], wanted: &w [byte]) -> [heap] bool {
+    let got = company_cmd.quoted(heap, text);
+    var same = false;
+    borrow got as &gb in {
+        same = bytes.equal(buffer.bytes(gb), wanted);
+    }
+    buffer.drop(heap, got);
+    return same;
+}
+
+fn test_a_json_string_escapes_quotes_and_backslashes[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(quoted_is(heap, "plain", "\"plain\""));
+    test.assert(quoted_is(heap, "a\"b\\c", "\"a\\\"b\\\\c\""));
+    test.assert(quoted_is(heap, "\"}{\"x\":", "\"\\\"}{\\\"x\\\":\""));
+    test.assert(quoted_is(heap, "", "\"\""));
+    return 0;
+}
+
+fn test_a_json_string_escapes_every_control_byte[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(quoted_is(heap, "\n\r\t", "\"\\n\\r\\t\""));
+    var raw = buffer.empty(heap, 8);
+    raw = buffer.push(heap, raw, byte_of(0));
+    raw = buffer.push(heap, raw, byte_of(1));
+    raw = buffer.push(heap, raw, byte_of(31));
+    raw = buffer.push(heap, raw, byte_of(8));
+    raw = buffer.push(heap, raw, byte_of(12));
+    borrow raw as &rb in {
+        test.assert(quoted_is(heap, buffer.bytes(rb), "\"\\u0000\\u0001\\u001f\\b\\f\""));
+    }
+    buffer.drop(heap, raw);
+    return 0;
+}
+
+fn test_a_byte_that_is_not_utf8_is_written_as_the_replacement_character[&h](heap: &!h Heap) -> [heap] int {
+    var raw = buffer.empty(heap, 8);
+    raw = buffer.push(heap, raw, byte_of(255));
+    raw = buffer.push(heap, raw, byte_of(195));
+    raw = buffer.append(heap, raw, "a");
+    raw = buffer.push(heap, raw, byte_of(128));
+    borrow raw as &rb in {
+        test.assert(quoted_is(heap, buffer.bytes(rb), "\"\\ufffd\\ufffda\\ufffd\""));
+    }
+    buffer.drop(heap, raw);
+    var ok = buffer.empty(heap, 8);
+    ok = buffer.push(heap, ok, byte_of(195));
+    ok = buffer.push(heap, ok, byte_of(169));
+    borrow ok as &ob in {
+        var wanted = buffer.append(heap, buffer.empty(heap, 8), "\"");
+        wanted = buffer.append(heap, wanted, buffer.bytes(ob));
+        wanted = buffer.append(heap, wanted, "\"");
+        borrow wanted as &wb in {
+            test.assert(quoted_is(heap, buffer.bytes(ob), buffer.bytes(wb)));
+        }
+        buffer.drop(heap, wanted);
+    }
+    buffer.drop(heap, ok);
+    return 0;
+}
+
+// The JSON `status_json` makes of the journal `text`, for the manifest above.
+fn json_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 16);
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    buffer.drop(heap, out);
+                    out = company_cmd.status_json(heap, mr, sr);
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return out;
+}
+
+fn json_is[&h, &t, &w](heap: &!h Heap, journal: &t [byte], wanted: &w [byte]) -> [heap] bool {
+    let got = json_of(heap, journal);
+    var same = false;
+    borrow got as &gb in {
+        same = bytes.equal(buffer.bytes(gb), wanted);
+    }
+    buffer.drop(heap, got);
+    return same;
+}
+
+fn test_status_json_of_nothing_happened_yet[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(json_is(heap, "", "{\"company\":\"co\",\"steps\":[{\"id\":\"a\",\"role\":\"product\",\"state\":\"gated\",\"held\":null,\"gate\":\"g\",\"artifact\":null,\"failed_check\":null},{\"id\":\"b\",\"role\":\"qa\",\"state\":\"waiting\",\"held\":null,\"gate\":null,\"artifact\":null,\"failed_check\":null},{\"id\":\"c\",\"role\":\"qa\",\"state\":\"waiting\",\"held\":null,\"gate\":null,\"artifact\":null,\"failed_check\":null},{\"id\":\"d\",\"role\":\"product\",\"state\":\"gated\",\"held\":null,\"gate\":\"g\",\"artifact\":null,\"failed_check\":null},{\"id\":\"e\",\"role\":\"product\",\"state\":\"gated\",\"held\":null,\"gate\":\"h\",\"artifact\":null,\"failed_check\":null}],\"gates\":[{\"name\":\"g\",\"decision\":\"open\"},{\"name\":\"h\",\"decision\":\"open\"}],\"open_gates\":[\"g\",\"h\"],\"budget\":{\"limits\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1},\"max_cost_micro\":1000000,\"spent\":{\"input\":0,\"output\":0,\"cache_write\":0,\"cache_read\":0},\"cost_micro\":0,\"unpriced\":{\"input\":0,\"output\":0,\"cache_write\":0,\"cache_read\":0}},\"journal\":{\"records\":0,\"torn_tail_bytes\":0}}\n"));
+    return 0;
+}
+
+// An accepted step's artifact name from the journal is escaped; a held step is `held` with its tag and its score; a retry gate with a
+// decision is listed; a gate name the manifest does not list (here a hostile one) is not shown; priced and unpriced spend are apart.
+fn test_status_json_shows_artifacts_holds_scores_gates_and_spend[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 1024);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "o\"u\\t\n", "ab"));
+    j = add(heap, j, company_state.check_failed(heap, 3, "b", 2, 7));
+    j = add(heap, j, company_state.gate_decided(heap, 4, "\"],\"x\":{", "rejected", "u", "no"));
+    j = add(heap, j, company_state.gate_decided(heap, 5, "retry:c", "rejected", "u", "no"));
+    j = add(heap, j, company_state.spend_priced(heap, 6, "b", 1, 2, 3, 4, 55));
+    j = add(heap, j, company_state.spend_recorded(heap, 7, "b", 10, 20, 30, 40));
+    j = buffer.append(heap, j, "{\"v\":1");
+    borrow j as &jb in {
+        test.assert(json_is(heap, buffer.bytes(jb), "{\"company\":\"co\",\"steps\":[{\"id\":\"a\",\"role\":\"product\",\"state\":\"accepted\",\"held\":null,\"gate\":\"g\",\"artifact\":{\"name\":\"o\\\"u\\\\t\\n\",\"sha256\":\"ab\"},\"failed_check\":null},{\"id\":\"b\",\"role\":\"qa\",\"state\":\"held\",\"held\":\"check-failed\",\"gate\":null,\"artifact\":null,\"failed_check\":{\"score\":2,\"total\":7}},{\"id\":\"c\",\"role\":\"qa\",\"state\":\"waiting\",\"held\":null,\"gate\":null,\"artifact\":null,\"failed_check\":null},{\"id\":\"d\",\"role\":\"product\",\"state\":\"ready\",\"held\":null,\"gate\":\"g\",\"artifact\":null,\"failed_check\":null},{\"id\":\"e\",\"role\":\"product\",\"state\":\"gated\",\"held\":null,\"gate\":\"h\",\"artifact\":null,\"failed_check\":null}],\"gates\":[{\"name\":\"g\",\"decision\":\"approved\"},{\"name\":\"h\",\"decision\":\"open\"},{\"name\":\"retry:c\",\"decision\":\"rejected\"}],\"open_gates\":[\"h\"],\"budget\":{\"limits\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1},\"max_cost_micro\":1000000,\"spent\":{\"input\":11,\"output\":22,\"cache_write\":33,\"cache_read\":44},\"cost_micro\":55,\"unpriced\":{\"input\":10,\"output\":20,\"cache_write\":30,\"cache_read\":40}},\"journal\":{\"records\":7,\"torn_tail_bytes\":6}}\n"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// A retry approved after the failure frees the step: `ready` again, `held` null, the last failed score still shown.
+fn test_status_json_a_retried_step_is_ready_and_keeps_its_last_score[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "x", "y"));
+    j = add(heap, j, company_state.check_unavailable(heap, 3, "b", "artifact-invalid"));
+    var held = buffer.empty(heap, 1);
+    borrow j as &j1 in {
+        buffer.drop(heap, held);
+        held = json_of(heap, buffer.bytes(j1));
+    }
+    borrow held as &hb in {
+        test.assert(bytes.find(buffer.bytes(hb), "{\"id\":\"b\",\"role\":\"qa\",\"state\":\"held\",\"held\":\"artifact-invalid\",\"gate\":null,\"artifact\":null,\"failed_check\":null}") >= 0);
+    }
+    buffer.drop(heap, held);
+    j = add(heap, j, company_state.check_failed(heap, 4, "b", 0, 3));
+    j = add(heap, j, company_state.gate_decided(heap, 5, "retry:b", "approved", "u", "go"));
+    var freed = buffer.empty(heap, 1);
+    borrow j as &j2 in {
+        buffer.drop(heap, freed);
+        freed = json_of(heap, buffer.bytes(j2));
+    }
+    borrow freed as &fb in {
+        test.assert(bytes.find(buffer.bytes(fb), "{\"id\":\"b\",\"role\":\"qa\",\"state\":\"ready\",\"held\":null,\"gate\":null,\"artifact\":null,\"failed_check\":{\"score\":0,\"total\":3}}") >= 0);
+        test.assert(bytes.find(buffer.bytes(fb), "{\"name\":\"retry:b\",\"decision\":\"approved\"}") >= 0);
+    }
+    buffer.drop(heap, freed);
+    buffer.drop(heap, j);
+    return 0;
+}

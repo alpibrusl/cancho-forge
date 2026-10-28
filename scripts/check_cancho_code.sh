@@ -17,7 +17,7 @@ fail=0
 libs=$(ls src/*.cho | grep -v '/main\.cho$')
 cc="$scratch/cc"; mkdir "$cc" "$cc/workers" || exit 1
 tools="$cc/tools"; mkdir "$tools" "$cc/tools_empty" || exit 1
-for e in done stuck stuck0 gate plan provider usage disagree disagree0 badjson nojson unknown link hang noisy sig args env args2 notool big forge; do mkdir "$cc/ev_$e" || exit 1; done
+for e in done stuck stuck0 gate plan provider usage disagree disagree0 badjson nojson unknown link hang noisy sig args env args2 ctr ctr2 notool big forge; do mkdir "$cc/ev_$e" || exit 1; done
 mkdir "$cc/ev_refuse" || exit 1
 # a brief.txt that is a directory: the brief cannot be written, while build.out could be
 mkdir "$cc/ev_briefdir" "$cc/ev_briefdir/brief.txt" || exit 1
@@ -59,6 +59,12 @@ if $C build workers/cancho_code.cho $libs --std -o "$cc/workers/cancho_code" \
   oracle "args: nothing of the brief is in the argument vector" sh -c "! grep -q 'quotes' '$cc/ev_args/args.txt'"
   printf 'A:/opt/cancho/bin/cancho\nA:%s/ev_args2/brief.txt\nA:%s/ev_args2\nA:stand-in-agent --x\nA:--provider\nA:stand\nA:--model\nA:m1\nA:--guide\nA:/opt/guides/plan.md\nA:--attempts\nA:7\nA:--agent-seconds\nA:31\nA:--rounds\nA:2\nA:--plan-seconds\nA:901\nA:--jobs\nA:5\n' "$cc" "$cc" > "$cc/want_args2"
   oracle "args2: the guide and the operator's ceilings are in the vector, in order" cmp -s "$cc/ev_args2/args.txt" "$cc/want_args2"
+  # --- the contract: --contract and its absolute path in the vector, after the model and before the ceilings; nowhere when the task has none
+  for e in ctr ctr2; do
+    printf 'A:/opt/cancho/bin/cancho\nA:%s/ev_%s/brief.txt\nA:%s/ev_%s\nA:stand-in-agent --x\nA:--provider\nA:stand\nA:--model\nA:m1\nA:--contract\nA:%s/ev_%s/contract.txt\nA:--attempts\nA:4\nA:--agent-seconds\nA:30\nA:--rounds\nA:3\nA:--plan-seconds\nA:900\nA:--jobs\nA:4\n' "$cc" "$e" "$cc" "$e" "$cc" "$e" > "$cc/want_$e"
+    oracle "contract: $e: the vector holds --contract and the absolute path beneath the execution directory" cmp -s "$cc/ev_$e/args.txt" "$cc/want_$e"
+  done
+  oracle "contract: a task without one has no --contract in its vector" sh -c "! grep -q -e '--contract' '$cc/ev_args/args.txt'"
   # --- the environment: empty (what `env -i /bin/sh -c env` shows is the baseline; PWD and the shell's own variables are filtered from both)
   env -i /bin/sh -c env | grep -v '^PWD=\|^_=\|^OLDPWD=\|^SHLVL=' | sort > "$cc/want_env"
   grep -v '^PWD=\|^_=\|^OLDPWD=\|^SHLVL=' "$cc/ev_env/env.txt" | sort > "$cc/got_env"
@@ -104,6 +110,13 @@ if $C build workers/cancho_code.cho $libs --std -o "$cc/workers/cancho_code" \
   }
   snap() { (cd "$1" && for f in $(ls -A); do stat -c '%n %s %.9Y' "$f"; done; cksum $(ls -A | grep -v '^forge-build.lock$' | grep -v '^pids.txt$') 2> /dev/null); }
   ms() { date +%s%N | cut -c1-13; }
+  # --- defect 2 of statuslite run arm-a-1 (docs/company.md section 14): a build that ends by itself (done, exit 0) and leaves a
+  # process running in its group (`straggle`: what the real tool's agent is once the driver killed its shell at the agent's deadline).
+  # The adapter kills the build's group on every ending, its own exit included, so nothing is left once the answer is written.
+  mkdir "$cc/strag" || exit 1
+  lreq '"straggle\n76"' "$cc/strag" 60000 > "$cc/strag.req"; run_through "$cc/strag.req" "$cc/strag" "$cc/strag.ans"
+  oracle "straggle: the build ended done and its answer is succeeded" sh -c "grep -q '\"state\":\"succeeded\"' '$cc/strag.ans' && grep -q '\"verdict\":\"done\"' '$cc/strag/build.json'"
+  oracle "straggle: what the build left running in its group (sleep 76) was killed when it ended" sh -c ". scripts/procs.sh; sleep 0.5; ! leftover -f '^sleep 76\$' > /dev/null"
   # the reference: the same brief, alone, in its own directory
   mkdir "$cc/lk_ref" "$cc/lk" || exit 1
   touch "$cc/lk_ref/release"

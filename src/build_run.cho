@@ -5,6 +5,7 @@ import std.buffer;
 import std.bytes;
 import std.json;
 import std.map;
+import std.option;
 import forge.await_run;
 import forge.build_task;
 import forge.dispatch;
@@ -65,6 +66,8 @@ pub struct Finished {
     records: int,
     // How many times the worker was started for the task (0: it never was).
     attempts: int,
+    // A signal the caller claimed asked the run to stop while the build ran: the build was cancelled (task 9).
+    stopped: bool,
 }
 
 // The brief file the operator named, read up to the brief's limit: its bytes and 0, or an errno (the file is not there, a
@@ -144,8 +147,9 @@ pub fn poll_interval_ms() -> [] int {
 // Run the task. `journal_path` is the journal of the workspace (the caller holds the lock); `workers` is the directory
 // holding `cancho_code`; `tools` is the operator's directory holding `cancho-build`; `brief` is the brief's text;
 // `execution_dir` an existing directory for the build (the work directory of the tool, and where the evidence is); the rest
-// is the operator's configuration. `timeout_ms` is Forge's deadline for the run.
-pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], brief: &b [byte], execution_dir: &e [byte], tools_dir: &t [byte], workers_dir: &y [byte], checker: &k [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts_ceiling: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int, timeout_ms: int) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, clock, poll] Finished {
+// is the operator's configuration. `contract` is the task's optional contract file (a path beneath `execution_dir`, `build_task.contract_ok`;
+// empty: none). `timeout_ms` is Forge's deadline for the run.
+pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &q, &p, &m, &a, &s](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], brief: &b [byte], execution_dir: &e [byte], tools_dir: &t [byte], workers_dir: &y [byte], checker: &k [byte], guide: &g [byte], contract: &q [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts_ceiling: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int, timeout_ms: int, stop: &!s option.Option[SignalWatch]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec_under, clock, poll, signals_read] Finished {
     let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
     if report.rule != 0 || recovered.errno != 0 {
         map.drop(heap, existing);
@@ -153,13 +157,14 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a](heap: &!h
         if rule == 0 {
             rule = 0 - 1;
         }
-        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, records: report.records, attempts: 0 };
+        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, records: report.records, attempts: 0, stopped: false };
     }
     let id = build_task.task_id(heap, report.tasks + 1);
     var state = 0;
     var records = report.records;
     var attempts = 0;
     var outcome = Outcome::Journal(0 - 1);
+    var stopped = false;
     borrow id as &ib in {
         let tid = buffer.bytes(ib);
         let fresh = report.records == 0;
@@ -170,6 +175,13 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a](heap: &!h
         tasks = t2;
         seq = s2;
         var checked = build_task.check(build_task.task_type(), brief, execution_dir, tools_dir, timeout_ms);
+        match checked {
+            build_task.Checked::Held => {
+                checked = build_task.contract_checked(len(contract) > 0, contract, execution_dir);
+            }
+            build_task.Checked::Refused(why) => {
+            }
+        }
         match checked {
             build_task.Checked::Held => {
                 checked = build_task.operator_checked(checker, guide, provider, model, agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);
@@ -196,7 +208,7 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a](heap: &!h
                     attempts = attempts + 1;
                     let request_id = gate_run.request_id_of(heap, tid, attempts);
                     borrow request_id as &rb in {
-                        let req = build_task.request(heap, buffer.bytes(rb), attempts, tid, brief, timeout_ms, 1048576, execution_dir, tools_dir, workers_dir, checker, guide, provider, model, agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);
+                        let req = build_task.request(heap, buffer.bytes(rb), attempts, tid, brief, contract, timeout_ms, 1048576, execution_dir, tools_dir, workers_dir, checker, guide, provider, model, agent, attempts_ceiling, agent_seconds, rounds, plan_seconds, jobs);
                         borrow req as &qb in {
                             let began = clock_ms(clock);
                             var ending = worker.execute(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(qb), buffer.bytes(rb), tid, execution_dir, 1048576, timeout_ms, true);
@@ -209,8 +221,16 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a](heap: &!h
                                     if left < 1000 {
                                         left = 1000;
                                     }
-                                    ending = await_run.finish(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(rb), tid, execution_dir, left, poll_interval_ms());
+                                    let (got, asked) = await_run.finish_or_stop(heap, exec, workers, fs, clock, "cancho_code", buffer.bytes(rb), tid, execution_dir, left, poll_interval_ms(), stop);
+                                    ending = got;
+                                    stopped = asked;
                                 }
+                            } else if await_run.stop_asked(stop) {
+                                // A signal the caller claimed came while `execute` ran (only `forge company run` claims one; `forge
+                                // build` passes `None` and never comes here): the supervisor and build it may have started are
+                                // named by no record, so they are cancelled now, before Forge returns (task 9, fix round 1).
+                                await_run.cancel_unaccepted(heap, exec, workers, clock, "cancho_code", buffer.bytes(rb), tid, execution_dir);
+                                stopped = true;
                             }
                             let consequence = dispatch.consequence(ending);
                             let decision = retry.decide(consequence, attempts, false);
@@ -247,5 +267,5 @@ pub fn run[&h, &f, &x, &w, &c, &j, &b, &e, &t, &y, &k, &g, &p, &m, &a](heap: &!h
         records = seq - 1;
     }
     buffer.drop(heap, id);
-    return Finished { outcome: outcome, state: state, number: report.tasks + 1, records: records, attempts: attempts };
+    return Finished { outcome: outcome, state: state, number: report.tasks + 1, records: records, attempts: attempts, stopped: stopped };
 }

@@ -4,14 +4,19 @@
 #   cancho check         every program type-checks, under its declared authority
 #   cancho test          every `fn test_*` passes (pure logic: tasks, journal replay)
 #   cancho code adapter  workers/cancho_code.cho against a stand-in build tool and real child processes (scripts/check_cancho_code.sh)
+#   tool runner          workers/tool_run.cho against stand-in tools and real child processes (scripts/check_tool_run.sh)
 #   forge build          `forge build` end to end against the adapter and a stand-in build tool (scripts/check_build_run.sh)
 #   forge gate           `forge gate` end to end against real git checkouts and a real runner (scripts/check_gate_run.sh)
 #   recover              `forge recover` on journals a crash left, one real crash included (scripts/check_recover.sh)
+#   company              `forge company check` / `status` end to end on the manifest fixtures (scripts/check_company.sh)
+#   company run          `forge company run` end to end, real workers, the lying-worker test (tests/conformance/company_run.sh)
+#   company kill         `forge company run` killed mid-step and run again: nothing left running, each step accepted once (tests/conformance/company_kill.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
 #   verbs                capabilities, cancel, status and result against the mock worker (every verdict) and the stub LLM and gate runner (capabilities), real child processes
 #   conformance          tests/conformance/*.cho, programs that need an Fs, which
 #                        `cancho test` cannot hand a test: built, run against a
 #                        scratch directory made here and removed, exit 0 = held
+#   docs tags            every company rule tag appears in docs/company.md and docs/architecture.md
 #   file budget          no source file over 2,000 lines
 # Usage: CANCHO=path/to/cancho scripts/gate.sh
 set -u
@@ -97,6 +102,15 @@ echo "== worker contract verbs (capabilities, cancel, status, result: every verd
 # workers that answer capabilities and nothing else. They are built into the workers directory of the section above.
 $C check workers/stub_llm.cho $libs --std || fail=1
 $C check workers/gate_runner.cho $libs --std || fail=1
+$C check workers/check_guard.cho $libs --std || fail=1
+# The check guard's authority report is its review artefact (docs/authority-check-guard.txt); a change that widens it changes that
+# file in the same commit and says so in the message.
+$C authority workers/check_guard.cho $libs --std | sed -n '/^performs/,/^provably/p' | sed '$d' > "$scratch/authority-check-guard.txt"
+if cmp -s "$scratch/authority-check-guard.txt" docs/authority-check-guard.txt; then
+  echo "ok   check guard authority: the report is the checked-in one"
+else
+  echo "FAIL check guard authority: differs from docs/authority-check-guard.txt"; diff docs/authority-check-guard.txt "$scratch/authority-check-guard.txt"; fail=1
+fi
 $C check tests/conformance/verbs.cho tests/conformance/support.cho $libs --std || fail=1
 if $C build workers/stub_llm.cho $libs --std -o "$wdir/stub_llm" \
   && $C build workers/gate_runner.cho $libs --std -o "$wdir/gate_runner" \
@@ -118,6 +132,10 @@ echo "== cancho code adapter (workers/cancho_code.cho against a stand-in build t
 mkdir "$scratch/cancho-code" || exit 1
 CANCHO="$C" sh scripts/check_cancho_code.sh "$scratch/cancho-code" || fail=1
 
+echo "== tool runner (workers/tool_run.cho, tool.run: stand-in tools, real child processes, the tool's group killed at its deadline and on TERM)"
+mkdir "$scratch/tool-run" || exit 1
+CANCHO="$C" sh scripts/check_tool_run.sh "$scratch/tool-run" || fail=1
+
 echo "== forge build (issue #34: the operator's configuration, the brief file, the adapter and a stand-in build tool, the journal)"
 mkdir "$scratch/build-run" || exit 1
 CANCHO="$C" sh scripts/check_build_run.sh "$scratch/build-run" || fail=1
@@ -133,6 +151,18 @@ CANCHO="$C" sh scripts/check_recover.sh "$scratch/recover" || fail=1
 echo "== stub LLM (workers/stub_llm.cho: the contract, and a whole flow per way it can answer, journalled and replayed)"
 mkdir "$scratch/stub-llm" || exit 1
 CANCHO="$C" sh scripts/check_stub_llm.sh "$scratch/stub-llm" || fail=1
+
+echo "== forge company check and status (the manifest fixtures, company directories made here; read-only, no lock)"
+mkdir "$scratch/company" || exit 1
+CANCHO="$C" sh scripts/check_company.sh "$scratch/company" || fail=1
+
+echo "== forge company run (real workers and a stand-in build tool; the lying worker, gates, budget, resume: tests/conformance/company_run.sh)"
+mkdir "$scratch/company-run" || exit 1
+CANCHO="$C" sh tests/conformance/company_run.sh "$scratch/company-run" || fail=1
+
+echo "== forge company run killed and resumed (a real run killed with SIGKILL and SIGTERM mid-build and mid-check: tests/conformance/company_kill.sh)"
+mkdir "$scratch/company-kill" || exit 1
+CANCHO="$C" sh tests/conformance/company_kill.sh "$scratch/company-kill" || fail=1
 
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of
@@ -221,6 +251,16 @@ if cmp -s "$scratch/authority.txt" docs/authority.txt; then
 else
   echo "FAIL authority: differs from docs/authority.txt"; diff docs/authority.txt "$scratch/authority.txt"; fail=1
 fi
+
+echo "== docs: every rule tag the company code can print is in docs/company.md and docs/architecture.md"
+# An oracle from outside the program: the tags are the kebab-case string literals of the company files and the tool task (listed; workers/*.cho are left out: their literals include non-tag names).
+company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_check.cho src/company_cmd.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_run.cho src/company_runner.cho src/company_state.cho src/company_step.cho src/step_run.cho src/tool_call.cho src/tool_task.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
+for t in $company_tags; do
+  for d in docs/company.md docs/architecture.md; do
+    if grep -qF "\`$t\`" "$d"; then :; else echo "FAIL docs: tag $t is not in $d"; fail=1; fi
+  done
+done
+echo "ok   docs: $(echo "$company_tags" | wc -l) company tags checked"
 
 echo "== file budget (2000 lines)"
 for f in $(find src tests spike workers -name '*.cho'); do

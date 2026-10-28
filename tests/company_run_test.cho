@@ -1,0 +1,466 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_budget;
+import forge.company_manifest;
+import forge.company_run;
+import forge.company_state;
+
+// Unit tests for src/company_run.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.3 and 10): the
+// pure scheduling step of `forge company run`. Each test replays a journal built with the event builders against a manifest and
+// reads the action `next_action` answers as one number (`code_of`): Start(i) is i, WaitGate(i) 10 + i, Blocked(i) 20 + i,
+// Stop(tag) 30 + tag, Done 40, Held(i) 50 + i, Failed(i) 60 + i. Run with `cancho test`.
+
+// lib (builder), qa (qa), lib2 (builder, after qa): the budget manifest.
+fn budget_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\"],\"steps\":[{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"qa\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"lib2\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"qa\"],\"input\":\"x\",\"check\":\"c.cho\"}]}";
+}
+
+// brief (product, gate g) -> lib (builder) -> qa (qa): a chain behind a gate.
+fn chain_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\",\"product\"],\"steps\":[{\"id\":\"brief\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"brief\"],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"qa\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"lib\"],\"input\":\"x\"}]}";
+}
+
+// brief (product, gate g) -> lib (builder) -> doc (qa), and qa (qa) with no needs: a branch independent of the gate.
+fn branch_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\",\"product\"],\"steps\":[{\"id\":\"brief\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"brief\"],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"doc\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"lib\"],\"input\":\"x\"},{\"id\":\"qa\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}";
+}
+
+// brief (product, gate g) and lib (builder, no needs): a model step that is free while a gate is open.
+fn free_model_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"product\"],\"steps\":[{\"id\":\"brief\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}]}";
+}
+
+fn limits() -> [] company_budget.Limits {
+    return company_budget.Limits { input: 1000, output: 1000, cache_write: 1000, cache_read: 1000 };
+}
+
+fn code_of(a: company_run.Action) -> [] int {
+    match a {
+        company_run.Action::Start(i) => {
+            return i;
+        }
+        company_run.Action::WaitGate(i) => {
+            return 10 + i;
+        }
+        company_run.Action::Blocked(i) => {
+            return 20 + i;
+        }
+        company_run.Action::Stop(tag) => {
+            return 30 + tag;
+        }
+        company_run.Action::Done => {
+            return 40;
+        }
+        company_run.Action::Held(i) => {
+            return 50 + i;
+        }
+        company_run.Action::Failed(i) => {
+            return 60 + i;
+        }
+    }
+}
+
+// The code of the action for `manifest` and the journal `text`, with `cost` micro-dollars spent against a ceiling of `max_cost`, no
+// step having failed in this invocation.
+fn act[&h, &t](heap: &!h Heap, manifest: &static [byte], text: &t [byte], cost: int, max_cost: int) -> [heap] int {
+    return act_past(heap, manifest, text, cost, max_cost, 0 - 1, 0 - 1);
+}
+
+// The same, with steps `f1` and `f2` (-1 for none) marked as having ended without a claim earlier in this invocation.
+fn act_past[&h, &t](heap: &!h Heap, manifest: &static [byte], text: &t [byte], cost: int, max_cost: int, f1: int, f2: int) -> [heap] int {
+    var code = 0 - 1;
+    match company_manifest.parse(heap, manifest) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                var failed = box_slice(heap, company_manifest.step_count(mr), false);
+                borrow mut failed as &!fw in {
+                    let marks = contents(fw);
+                    if f1 >= 0 && f1 < len(marks) {
+                        marks[f1] = true;
+                    }
+                    if f2 >= 0 && f2 < len(marks) {
+                        marks[f2] = true;
+                    }
+                }
+                borrow s as &sr in {
+                    borrow failed as &fr in {
+                        code = code_of(company_run.next_action(mr, sr, limits(), cost, max_cost, contents(fr)));
+                    }
+                }
+                unbox_slice(heap, failed);
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return code;
+}
+
+// `journal` with `record` appended.
+fn add[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = journal;
+    borrow record as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return out;
+}
+
+fn accepted_step[&h](heap: &!h Heap, journal: buffer.Buffer, seq: int, step: &static [byte]) -> [heap] buffer.Buffer {
+    return add(heap, journal, company_state.accepted(heap, seq, step, "out/a.txt", "abc"));
+}
+
+fn code_for[&h](heap: &!h Heap, manifest: &static [byte], journal: buffer.Buffer, cost: int) -> [heap] int {
+    var code = 0 - 1;
+    borrow journal as &jb in {
+        code = act(heap, manifest, buffer.bytes(jb), cost, 1000);
+    }
+    buffer.drop(heap, journal);
+    return code;
+}
+
+// ---- done, start, order ----------------------------------------------------------------------------------------------------
+
+fn test_an_empty_journal_starts_the_first_step[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(code_for(heap, budget_manifest(), buffer.empty(heap, 8), 0), 0);
+    return 0;
+}
+
+fn test_steps_start_lowest_index_first_as_the_needs_are_accepted[&h](heap: &!h Heap) -> [heap] int {
+    var j = accepted_step(heap, buffer.empty(heap, 256), 1, "lib");
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 1);
+    var k = accepted_step(heap, accepted_step(heap, buffer.empty(heap, 256), 1, "lib"), 2, "qa");
+    test.assert_eq(act_and_drop(heap, budget_manifest(), k), 2);
+    return 0;
+}
+
+// Steps 0 and 1 are both free (no needs): the lower one is first even when step 1 was accepted first.
+fn test_a_later_accepted_step_does_not_change_the_order[&h](heap: &!h Heap) -> [heap] int {
+    let j = accepted_step(heap, buffer.empty(heap, 256), 1, "qa");
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 0);
+    return 0;
+}
+
+fn act_and_drop[&h](heap: &!h Heap, manifest: &static [byte], journal: buffer.Buffer) -> [heap] int {
+    return code_for(heap, manifest, journal, 0);
+}
+
+fn test_all_steps_accepted_is_done[&h](heap: &!h Heap) -> [heap] int {
+    var j = accepted_step(heap, buffer.empty(heap, 256), 1, "lib");
+    j = accepted_step(heap, j, 2, "qa");
+    j = accepted_step(heap, j, 3, "lib2");
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 40);
+    return 0;
+}
+
+// Done wins over an exhausted budget: nothing is left to start.
+fn test_all_accepted_is_done_even_when_the_budget_is_spent[&h](heap: &!h Heap) -> [heap] int {
+    var j = accepted_step(heap, buffer.empty(heap, 256), 1, "lib");
+    j = accepted_step(heap, j, 2, "qa");
+    j = accepted_step(heap, j, 3, "lib2");
+    j = add(heap, j, company_state.spend_recorded(heap, 4, "lib", 5000, 0, 0, 0));
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 40);
+    return 0;
+}
+
+// ---- gates -----------------------------------------------------------------------------------------------------------------
+
+fn test_a_step_with_an_open_gate_waits[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(act_and_drop(heap, chain_manifest(), buffer.empty(heap, 8)), 10);
+    return 0;
+}
+
+fn test_an_approved_gate_lets_the_step_start[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.gate_decided(heap, 1, "g", "approved", "ana", "fine"));
+    test.assert_eq(act_and_drop(heap, chain_manifest(), j), 0);
+    return 0;
+}
+
+fn test_a_rejected_gate_blocks_and_nothing_behind_it_starts[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.gate_decided(heap, 1, "g", "rejected", "ana", "no"));
+    test.assert_eq(act_and_drop(heap, chain_manifest(), j), 20);
+    return 0;
+}
+
+fn test_a_later_approval_after_a_rejection_lets_the_step_start[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.gate_decided(heap, 1, "g", "rejected", "ana", "no"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "g", "approved", "ana", "yes"));
+    test.assert_eq(act_and_drop(heap, chain_manifest(), j), 0);
+    return 0;
+}
+
+// An independent step keeps going past an open or a rejected gate; the gate is answered when nothing else can start.
+fn test_an_independent_branch_continues_past_an_open_gate[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(act_and_drop(heap, branch_manifest(), buffer.empty(heap, 8)), 3);
+    let j = accepted_step(heap, buffer.empty(heap, 256), 1, "qa");
+    test.assert_eq(act_and_drop(heap, branch_manifest(), j), 10);
+    return 0;
+}
+
+fn test_an_independent_branch_continues_past_a_blocked_one_and_blocked_comes_last[&h](heap: &!h Heap) -> [heap] int {
+    let r = add(heap, buffer.empty(heap, 256), company_state.gate_decided(heap, 1, "g", "rejected", "ana", "no"));
+    test.assert_eq(act_and_drop(heap, branch_manifest(), r), 3);
+    var j = add(heap, buffer.empty(heap, 256), company_state.gate_decided(heap, 1, "g", "rejected", "ana", "no"));
+    j = accepted_step(heap, j, 2, "qa");
+    test.assert_eq(act_and_drop(heap, branch_manifest(), j), 20);
+    return 0;
+}
+
+// ---- budget ----------------------------------------------------------------------------------------------------------------
+
+fn test_an_unspent_budget_does_not_stop_a_model_step[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 10, 10, 10, 10));
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 0);
+    return 0;
+}
+
+// A model step is not started once a token class is over its limit: with the qa step accepted, only model steps are left.
+fn test_an_exhausted_token_budget_stops_before_any_new_model_step[&h](heap: &!h Heap) -> [heap] int {
+    var j = accepted_step(heap, buffer.empty(heap, 256), 1, "qa");
+    j = add(heap, j, company_state.spend_recorded(heap, 2, "lib", 5000, 0, 0, 0));
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 30 + company_run.stop_budget());
+    return 0;
+}
+
+fn test_an_exhausted_cost_budget_stops_before_any_new_model_step[&h](heap: &!h Heap) -> [heap] int {
+    let j = accepted_step(heap, buffer.empty(heap, 256), 1, "qa");
+    var code = 0 - 1;
+    borrow j as &jb in {
+        code = act(heap, budget_manifest(), buffer.bytes(jb), 2000, 1000);
+    }
+    buffer.drop(heap, j);
+    test.assert_eq(code, 30 + company_run.stop_budget());
+    return 0;
+}
+
+// A qa step uses no model tokens: it still starts when the budget is spent, ahead of a model step with a lower number only if
+// that one is held back (here step 0 is, step 1 starts).
+fn test_a_qa_step_still_starts_when_the_budget_is_exhausted[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 1);
+    return 0;
+}
+
+// A model step held back by the budget does NOT hide a product step waiting on its gate (the product step uses no model, so a
+// person deciding the gate lets it go on): WaitGate(brief). Before the 8b review this answered Stop.
+fn test_a_gated_product_step_waits_although_a_model_step_is_held_by_the_budget[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    test.assert_eq(act_and_drop(heap, free_model_manifest(), j), 10);
+    return 0;
+}
+
+// With the product step accepted, only the held model step is left: Stop.
+fn test_stop_when_only_a_model_step_held_by_the_budget_is_left[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    j = accepted_step(heap, j, 2, "brief");
+    test.assert_eq(act_and_drop(heap, free_model_manifest(), j), 30 + company_run.stop_budget());
+    return 0;
+}
+
+fn test_the_stop_tag_is_named() -> [] int {
+    test.assert(bytes.equal(company_run.stop_name(company_run.stop_budget()), "budget-exhausted"));
+    return 0;
+}
+
+// ---- roles -----------------------------------------------------------------------------------------------------------------
+
+fn test_builder_and_writer_steps_use_the_model_the_others_do_not() -> [] int {
+    test.assert(company_run.uses_model(company_manifest.Role::Builder));
+    test.assert(company_run.uses_model(company_manifest.Role::Writer));
+    test.assert(company_run.uses_model(company_manifest.Role::Qa) == false);
+    test.assert(company_run.uses_model(company_manifest.Role::Analyst) == false);
+    test.assert(company_run.uses_model(company_manifest.Role::Reviewer) == false);
+    test.assert(company_run.uses_model(company_manifest.Role::Product) == false);
+    return 0;
+}
+
+// ---- a spent budget and a gate -----------------------------------------------------------------------------------------------
+
+// lib (builder, no needs) and check (qa, gate g, no needs): a step that uses no model waits on a human while the budget is spent.
+fn gated_qa_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\"],\"steps\":[{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"check\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"gate\":\"g\"}]}";
+}
+
+// write (writer, gate g, no needs) and lib (builder, no needs): only model steps, one of them gated.
+fn gated_writer_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"writer\"],\"steps\":[{\"id\":\"write\",\"role\":\"writer\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"gate\":\"g\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}]}";
+}
+
+// The budget is spent and the model step `lib` is held, but `check` (qa) waits on gate g: a person approving g lets it run, so
+// the answer is WaitGate(check), not Stop (the spec: the budget covers model steps only).
+fn test_a_gated_step_that_uses_no_model_waits_even_when_the_budget_is_spent[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    test.assert_eq(act_and_drop(heap, gated_qa_manifest(), j), 11);
+    return 0;
+}
+
+// And once g is approved, check starts although the budget is spent.
+fn test_the_approved_qa_step_starts_with_the_budget_spent[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "g", "approved", "ana", "go"));
+    test.assert_eq(act_and_drop(heap, gated_qa_manifest(), j), 1);
+    return 0;
+}
+
+// Within budget the free model step starts first and the gate waits after it.
+fn test_within_budget_the_free_builder_starts_before_the_gate_is_asked[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(act_and_drop(heap, gated_qa_manifest(), buffer.empty(heap, 8)), 0);
+    let j = accepted_step(heap, buffer.empty(heap, 256), 1, "lib");
+    test.assert_eq(act_and_drop(heap, gated_qa_manifest(), j), 11);
+    return 0;
+}
+
+// A gated MODEL step under a spent budget: approving it would not let it run, so Stop outranks the wait.
+fn test_a_gated_model_step_under_a_spent_budget_is_stop_not_wait[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    j = accepted_step(heap, j, 2, "lib");
+    test.assert_eq(act_and_drop(heap, gated_writer_manifest(), j), 30 + company_run.stop_budget());
+    return 0;
+}
+
+// ---- the answer when nothing can start (settle) -------------------------------------------------------------------------------
+
+fn test_settle_with_nothing_pending_is_done() -> [] int {
+    test.assert_eq(code_of(company_run.settle(0, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0 - 1)), 40);
+    return 0;
+}
+
+fn test_settle_orders_wait_then_stop_then_blocked() -> [] int {
+    test.assert_eq(code_of(company_run.settle(3, 2, 1, 0 - 1, 0, 0)), 11);
+    test.assert_eq(code_of(company_run.settle(3, 2, 0 - 1, 0 - 1, 0, 0)), 30 + company_run.stop_budget());
+    test.assert_eq(code_of(company_run.settle(3, 0 - 1, 0 - 1, 0 - 1, 1, 0)), 21);
+    // A step held by its check comes first: the person must look at it.
+    test.assert_eq(code_of(company_run.settle(3, 2, 1, 0, 0, 0)), 50);
+    return 0;
+}
+
+// Steps are left and none can start, wait or is blocked by a gate (a need that can never be met, which `parse` refuses): the
+// first step left is Blocked, so the run never loops.
+fn test_settle_falls_back_to_blocking_the_first_step_left() -> [] int {
+    test.assert_eq(code_of(company_run.settle(2, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 1)), 21);
+    test.assert_eq(code_of(company_run.settle(1, 0 - 1, 0 - 1, 0 - 1, 0 - 1, 0)), 20);
+    return 0;
+}
+
+// ---- held by a check ---------------------------------------------------------------------------------------------------------
+
+// A step whose check failed is never started again by the run itself: Held(lib), not Start(lib).
+fn test_a_step_whose_check_failed_is_held_not_started_again[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "lib", 1, 2));
+    test.assert_eq(act_and_drop(heap, chain_manifest_free(), j), 50);
+    return 0;
+}
+
+// An independent step still runs first; the held answer comes when nothing else can start.
+fn test_an_independent_step_runs_before_the_held_one_is_reported[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "lib", 1, 2));
+    test.assert_eq(act_and_drop(heap, budget_manifest(), j), 1);
+    var k = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "lib", 1, 2));
+    k = accepted_step(heap, k, 2, "qa");
+    test.assert_eq(act_and_drop(heap, budget_manifest(), k), 2);
+    var n = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "lib", 1, 2));
+    n = accepted_step(heap, n, 2, "qa");
+    n = accepted_step(heap, n, 3, "lib2");
+    test.assert_eq(act_and_drop(heap, budget_manifest(), n), 50);
+    return 0;
+}
+
+fn test_an_approved_retry_lets_the_held_step_start_again[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.check_unavailable(heap, 1, "lib", "check-unavailable"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "retry:lib", "approved", "ana", "fixed the audit"));
+    test.assert_eq(act_and_drop(heap, chain_manifest_free(), j), 0);
+    return 0;
+}
+
+// lib (builder) alone.
+fn chain_manifest_free() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[],\"roles\":[\"builder\"],\"steps\":[{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}]}";
+}
+
+// ---- a step that ended without a claim in this invocation ---------------------------------------------------------------------
+
+// pct (builder), status (builder, no needs), render (builder, needs pct), cli (builder, no needs): the StatusLite shape of the A/B
+// runs B1 and A2, where pct ended without a claim.
+fn no_claim_manifest() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":1000,\"cache_write\":1000,\"cache_read\":1000,\"max_cost\":1000,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\"],\"steps\":[{\"id\":\"pct\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"status\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"render\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"pct\"],\"input\":\"x\",\"check\":\"c.cho\"},{\"id\":\"cli\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}]}";
+}
+
+fn act_failed[&h](heap: &!h Heap, journal: buffer.Buffer, f1: int) -> [heap] int {
+    var code = 0 - 1;
+    borrow journal as &jb in {
+        code = act_past(heap, no_claim_manifest(), buffer.bytes(jb), 0, 1000, f1, 0 - 1);
+    }
+    buffer.drop(heap, journal);
+    return code;
+}
+
+// Without the invocation's list the failed step is started first, as before: a later invocation retries it (no hold).
+fn test_a_step_that_ended_without_a_claim_is_started_first_by_a_new_invocation[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.admitted(heap, 1, "pct", "steps/pct"));
+    test.assert_eq(act_and_drop(heap, no_claim_manifest(), j), 0);
+    return 0;
+}
+
+// In the invocation it failed in, it is passed over: the independent step after it starts, and its dependent is not started.
+fn test_a_step_that_ended_without_a_claim_is_not_started_again_in_the_same_invocation[&h](heap: &!h Heap) -> [heap] int {
+    let j = add(heap, buffer.empty(heap, 256), company_state.admitted(heap, 1, "pct", "steps/pct"));
+    test.assert_eq(act_failed(heap, j, 0), 1);
+    var k = add(heap, buffer.empty(heap, 256), company_state.admitted(heap, 1, "pct", "steps/pct"));
+    k = accepted_step(heap, k, 2, "status");
+    test.assert_eq(act_failed(heap, k, 0), 3);
+    return 0;
+}
+
+// Once every independent step is accepted, the dependent still waits (never Start(render)) and the answer is Failed(pct).
+fn test_when_nothing_else_can_start_the_answer_is_the_failed_step_and_its_dependent_waits[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.admitted(heap, 1, "pct", "steps/pct"));
+    j = accepted_step(heap, j, 2, "status");
+    j = accepted_step(heap, j, 3, "cli");
+    test.assert_eq(act_failed(heap, j, 0), 60);
+    return 0;
+}
+
+// Two failed steps: the lowest is named; the order among the endings puts Failed before Held (a check that held a step), a
+// waiting gate and a spent budget.
+fn test_failed_outranks_held_wait_and_stop[&h](heap: &!h Heap) -> [heap] int {
+    var j = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "status", 1, 2));
+    test.assert_eq(act_failed(heap, j, 0), 3);
+    var k = add(heap, buffer.empty(heap, 256), company_state.check_failed(heap, 1, "status", 1, 2));
+    k = accepted_step(heap, k, 2, "cli");
+    test.assert_eq(act_failed(heap, k, 0), 60);
+    let g = add(heap, buffer.empty(heap, 256), company_state.spend_recorded(heap, 1, "lib", 5000, 0, 0, 0));
+    var code = 0 - 1;
+    borrow g as &gb in {
+        code = act_past(heap, free_model_manifest(), buffer.bytes(gb), 0, 1000, 1, 0 - 1);
+    }
+    buffer.drop(heap, g);
+    test.assert_eq(code, 61);
+    var two = 0 - 1;
+    let e = accepted_step(heap, buffer.empty(heap, 256), 1, "status");
+    borrow e as &eb in {
+        two = act_past(heap, no_claim_manifest(), buffer.bytes(eb), 0, 1000, 3, 0);
+    }
+    buffer.drop(heap, e);
+    test.assert_eq(two, 60);
+    return 0;
+}
+
+// An index outside the manifest in the list (a list longer than the steps cannot come from the run; a shorter one is all false
+// beyond its end) changes nothing.
+fn test_a_failed_list_that_names_no_step_changes_nothing[&h](heap: &!h Heap) -> [heap] int {
+    let e = buffer.empty(heap, 8);
+    var code = 0 - 1;
+    borrow e as &eb in {
+        code = act_past(heap, no_claim_manifest(), buffer.bytes(eb), 0, 1000, 9, 0 - 1);
+    }
+    buffer.drop(heap, e);
+    test.assert_eq(code, 0);
+    return 0;
+}

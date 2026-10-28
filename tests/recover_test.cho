@@ -509,3 +509,46 @@ fn test_a_task_is_awaiting_only_while_it_is_running_with_no_ending_after_the_acc
     buffer.drop(heap, c);
     return 0;
 }
+
+// task 9: what `forge company run` asks to stop before it starts a step again: a task whose worker may be running, phase 2 (the
+// intent written, nothing after it) or phase 5 (the job accepted), and no other.
+fn test_in_flight_names_the_tasks_whose_worker_may_still_be_running[&h](heap: &!h Heap) -> [heap] int {
+    var j = running(heap, buffer.empty(heap, 512), "t-1");
+    j = push(heap, j, "execution.started", "t-1");
+    j = running(heap, j, "t-2");
+    j = push(heap, j, "execution.started", "t-2");
+    j = with_accepted(heap, j, "t-2", "r-2", "/w/e");
+    j = running(heap, j, "t-3");
+    j = running(heap, j, "t-4");
+    j = push(heap, j, "execution.started", "t-4");
+    j = push(heap, j, "execution.finished", "t-4");
+    j = running(heap, j, "t-5");
+    j = push(heap, j, "execution.started", "t-5");
+    j = with_accepted(heap, j, "t-5", "r-5", "/w/e");
+    j = push(heap, j, "task.cancelled", "t-5");
+    borrow j as &jb in {
+        let ids = recover.in_flight(heap, buffer.bytes(jb));
+        borrow ids as &ib in {
+            let all = buffer.bytes(ib);
+            test.assert(contains(all, "t-1\n"));
+            test.assert(contains(all, "t-2\n"));
+            test.assert(!contains(all, "t-3"));
+            test.assert(!contains(all, "t-4"));
+            test.assert(!contains(all, "t-5"));
+            test.assert_eq(len(all), 8);
+        }
+        buffer.drop(heap, ids);
+        let waiting = recover.awaiting(heap, buffer.bytes(jb));
+        borrow waiting as &wb in {
+            test.assert(bytes.equal(buffer.bytes(wb), "t-2\n"));
+        }
+        buffer.drop(heap, waiting);
+    }
+    buffer.drop(heap, j);
+    let none = recover.in_flight(heap, "");
+    borrow none as &nb in {
+        test.assert_eq(len(buffer.bytes(nb)), 0);
+    }
+    buffer.drop(heap, none);
+    return 0;
+}

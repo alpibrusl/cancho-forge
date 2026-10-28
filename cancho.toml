@@ -91,3 +91,48 @@ std = true
 name = "run_files"
 sources = ["tests/run_files_test.cho", "src/run_files.cho"]
 std = true
+
+[[test]]
+name = "company_manifest"
+sources = ["tests/company_manifest_test.cho", "src/company_manifest.cho"]
+std = true
+
+[[test]]
+name = "company_graph"
+sources = ["tests/company_graph_test.cho", "src/company_graph.cho", "src/company_manifest.cho"]
+std = true
+
+[[test]]
+name = "company_state"
+sources = ["tests/company_state_test.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true
+
+[[test]]
+name = "company_cmd"
+sources = ["tests/company_cmd_test.cho", "src/company_cmd.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/lock.cho", "src/journal_io.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true
+
+[[test]]
+name = "company_budget"
+sources = ["tests/company_budget_test.cho", "src/company_budget.cho"]
+std = true
+
+[[test]]
+name = "company_check"
+sources = ["tests/company_check_test.cho", "src/company_check.cho"]
+std = true
+
+[[test]]
+name = "company_run"
+sources = ["tests/company_run_test.cho", "src/company_run.cho", "src/company_budget.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true
+
+[[test]]
+name = "company_step"
+sources = ["tests/company_step_test.cho", "src/company_step.cho", "src/company_run.cho", "src/company_budget.cho", "src/company_check.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/gate_task.cho", "src/gate_env.cho", "src/build_task.cho"]
+std = true
+
+[[test]]
+name = "tool_task"
+sources = ["tests/tool_task_test.cho", "src/tool_task.cho", "src/build_task.cho", "src/gate_task.cho", "src/gate_env.cho"]
+std = true

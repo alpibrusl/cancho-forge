@@ -1,0 +1,151 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.process;
+import forge.company_step;
+import forge.gate_env;
+import forge.journal_io;
+import forge.supervise;
+import forge.worker;
+
+// The check guard (task 9; src/company_step.cho, "the check guard"): `forge company run` starts this program, in a session of its
+// own, to run a step's check program, so that a check never outlives the Forge that asked for it.
+//
+//   check_guard <company-dir> <check> <artifact> <argdir> <timeout-ms> <live-lock>
+//
+// It starts `<check>` (a name beneath `<company-dir>`, in a session and a process group of its own) with the arguments
+// `<artifact> <argdir>`, `PATH` its whole environment, no input, and waits for it (`forge.supervise.watch`): at most
+// `company_step.check_output_cap()` bytes of output and `<timeout-ms>`, and, every 100 ms, a try at the lock `<live-lock>`, which
+// the Forge that started the guard holds for as long as it waits. A lock the guard can take means that Forge is gone (killed,
+// SIGKILL included: the kernel lets go of a flock however a process ends), and the check's whole group is killed then; so is it at
+// the deadline and past the cap, and when the check exits by itself (final review, I2: `watch`'s `reap_group`), so that nothing the
+// check started in the background outlives it. What the check wrote is written on standard output, and the exit status says how it ended
+// (`company_step.guard_code`; `guard_usage()` for arguments refused).
+//
+// Why a program and not Forge itself: cancho has no kill by pid and no parent-death signal (docs/processes.md 4.7), and a check
+// started in its own group (needed so the deadline reaches what the check starts) is not in Forge's group, so a kill of Forge's
+// group does not reach it. Only a process that outlives Forge and holds the check's `Child` can stop it.
+//
+// Authority (`cancho authority`; the review artefact is docs/authority-check-guard.txt, compared by scripts/gate.sh):
+// `Exec("")` beneath the company directory (`exec_under`, `exec_detached`; the report names no path), `child_signal` to kill the
+// check's group (`child_kill_group`, `child_kill`), `pipe_read` for its output, `Fs("")` to open that directory and to try the lock
+// (`fs_read`, `fs_write`/`file_write`: `forge.lock` opens it to append and writes nothing; `file_read` is `supervise.watch`'s
+// cancel file, never looked at here since the guard passes no cancel path), a clock, polling, the heap, the arguments, standard
+// output. No network, no signals, no foreign code.
+
+// The number written in `text` (1 to 9 digits), or -1.
+fn nat_of[&t](text: &t [byte]) -> [] int {
+    if len(text) < 1 || len(text) > 9 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + (c - 48);
+        k = k + 1;
+    }
+    return n;
+}
+
+fn guard[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    if arg_count(args) != 7 {
+        return company_step.guard_usage();
+    }
+    let dir = arg(args, 1);
+    let check = arg(args, 2);
+    let artifact = arg(args, 3);
+    let argdir = arg(args, 4);
+    let timeout = nat_of(arg(args, 5));
+    let live = arg(args, 6);
+    if journal_io.path_ok(fs, dir) == false || journal_io.path_ok(fs, artifact) == false || journal_io.path_ok(fs, argdir) == false || journal_io.path_ok(fs, live) == false {
+        return company_step.guard_usage();
+    }
+    if timeout <= 0 || worker.name_ok(exec, check) == false {
+        return company_step.guard_usage();
+    }
+    match open_dir(fs, dir) {
+        DirOpened::Failed(e) => {
+            return company_step.guard_code(process.Ran::Failed(e), 0);
+        }
+        DirOpened::Ok(opened) => {
+            var cdir = opened;
+            var list = process.argv(heap, 256);
+            let (l1, e1) = process.add(heap, list, artifact);
+            let (l2, e2) = process.add(heap, l1, argdir);
+            list = l2;
+            var env = buffer.append(heap, buffer.empty(heap, 64), "PATH=");
+            env = buffer.append(heap, env, gate_env.fixed_path());
+            env = buffer.push(heap, env, byte_of(0));
+            var code = company_step.guard_code(process.Ran::Failed(0 - 2), 0);
+            if e1 == 0 && e2 == 0 {
+                match process.channels() {
+                    process.Channels::Failed(e) => {
+                        code = company_step.guard_code(process.Ran::Failed(e), 0);
+                    }
+                    process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+                        borrow cdir as &dw in {
+                            borrow list as &lb in {
+                                borrow env as &vb in {
+                                    match exec_spawn_detached_under(exec, dw, check, process.list(lb), buffer.bytes(vb), Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                                        Spawned::Failed(e) => {
+                                            process.close(to_child, from_child);
+                                            code = company_step.guard_code(process.Ran::Failed(e), 0);
+                                        }
+                                        Spawned::Ok(child) => {
+                                            let (out, ran, how) = supervise.watch(heap, clock, fs, child, to_child, from_child, company_step.check_output_cap(), timeout, "", "", live, true);
+                                            borrow out as &ob in {
+                                                io.write_all(io, buffer.bytes(ob));
+                                            }
+                                            buffer.drop(heap, out);
+                                            code = company_step.guard_code(ran, how);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            process.drop(heap, list);
+            buffer.drop(heap, env);
+            dir_close(cdir);
+            return code;
+        }
+    }
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var code = company_step.guard_usage();
+    borrow fs as &f in {
+        borrow exec as &x in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        borrow args as &g in {
+                            code = guard(h, f, x, c, i, g);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return code;
+}

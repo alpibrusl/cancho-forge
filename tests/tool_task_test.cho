@@ -1,0 +1,335 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.test;
+import forge.tool_task;
+
+// Unit tests for src/tool_task.cho (task 11; docs/worker-contract.md section 12): what a `tool.run` task may say, the refusals and
+// their rule tags, the deadline arithmetic, the authority span of a tool's `introspect`, and the request Forge builds. Run with
+// `cancho test`.
+
+fn refusal(c: tool_task.Checked) -> [] &static [byte] {
+    match c {
+        tool_task.Checked::Held => {
+            return "";
+        }
+        tool_task.Checked::Refused(r) => {
+            return tool_task.rule_name(r);
+        }
+    }
+}
+
+// `doc` is an object with `granted` and `argv`; the rest of the task is given beside it.
+fn checked_with[&h, &d, &k, &e, &t, &n, &i](heap: &!h Heap, doc: &d [byte], kind: &k [byte], exec_dir: &e [byte], tools_dir: &t [byte], timeout_ms: int, tool: &n [byte], input: &i [byte]) -> [heap] &static [byte] {
+    let tape = box_slice(heap, json.tape_len(doc), 0);
+    var out = "unparsed";
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(doc, tp) > 0 {
+            out = refusal(tool_task.check(kind, exec_dir, tools_dir, timeout_ms, doc, tp, json.get(doc, tp, 0, "granted"), tool, json.get(doc, tp, 0, "argv"), input));
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
+
+fn checked[&h, &d, &n, &i](heap: &!h Heap, doc: &d [byte], tool: &n [byte], input: &i [byte]) -> [heap] &static [byte] {
+    return checked_with(heap, doc, "tool.run", "/work/steps/a/ev", "/opt/tools", 60000, tool, input);
+}
+
+fn good_doc() -> [] &static [byte] {
+    return "{\"granted\":[\"tally\",\"jsonq\"],\"argv\":[\"--field\",\"3\",\"--delim\",\" \"]}";
+}
+
+fn test_a_granted_tool_with_an_argv_array_and_an_input_beneath_is_held[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "checks.log"), ""));
+    test.assert(bytes.equal(checked(heap, good_doc(), "jsonq", "data/summary.json"), ""));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "/work/steps/a/ev/checks.log"), ""));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":[]}", "tally", "checks.log"), ""));
+    return 0;
+}
+
+fn test_the_task_type_is_tool_run_and_nothing_else[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(tool_task.task_type(), "tool.run"));
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "repo.gate", "/work/steps/a/ev", "/opt/tools", 60000, "tally", "checks.log"), "task-type-invalid"));
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "", "/work/steps/a/ev", "/opt/tools", 60000, "tally", "checks.log"), "task-type-invalid"));
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "tool.run ", "/work/steps/a/ev", "/opt/tools", 60000, "tally", "checks.log"), "task-type-invalid"));
+    return 0;
+}
+
+fn test_an_unlisted_tool_is_tool_not_granted[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked(heap, good_doc(), "seek", "checks.log"), "tool-not-granted"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "", "checks.log"), "tool-not-granted"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tall", "checks.log"), "tool-not-granted"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tallyx", "checks.log"), "tool-not-granted"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "../tally", "checks.log"), "tool-not-granted"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "/opt/tools/tally", "checks.log"), "tool-not-granted"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[],\"argv\":[]}", "tally", "checks.log"), "tool-not-granted"));
+    return 0;
+}
+
+fn test_a_granted_list_that_is_not_a_list_of_tool_names_is_operator_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked(heap, "{\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":\"tally\",\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\",3],\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"../sh\"],\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"a/b\"],\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\".hidden\"],\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"-x\"],\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"t\\u0061lly\"],\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"\"],\"argv\":[]}", "tally", "checks.log"), "operator-invalid"));
+    return 0;
+}
+
+fn test_a_tool_name_is_a_plain_name() -> [] int {
+    test.assert(tool_task.name_ok("tally"));
+    test.assert(tool_task.name_ok("cancho-tools.jsonq_2"));
+    test.assert(!tool_task.name_ok(""));
+    test.assert(!tool_task.name_ok("a/b"));
+    test.assert(!tool_task.name_ok(".."));
+    test.assert(!tool_task.name_ok(".x"));
+    test.assert(!tool_task.name_ok("-x"));
+    test.assert(!tool_task.name_ok("a b"));
+    test.assert(!tool_task.name_ok("a\0b"));
+    test.assert(tool_task.name_ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    test.assert(!tool_task.name_ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    return 0;
+}
+
+fn test_an_argv_that_is_not_an_array_of_plain_strings_is_argv_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"]}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":\"--field 3\"}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":[\"--top\",10]}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":[[\"x\"]]}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":[null]}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":[\"\"]}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":{\"a\":\"b\"}}", "tally", "checks.log"), "argv-malformed"));
+    return 0;
+}
+
+fn test_an_argv_string_with_an_escape_or_a_control_byte_is_argv_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":[\"a\\u0000b\"]}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":[\"a\\nb\"]}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(bytes.equal(checked(heap, "{\"granted\":[\"tally\"],\"argv\":[\"a\\\"b\"]}", "tally", "checks.log"), "argv-malformed"));
+    test.assert(!tool_task.arg_ok("a\tb"));
+    test.assert(!tool_task.arg_ok("a\rb"));
+    test.assert(!tool_task.arg_ok("a\0b"));
+    test.assert(tool_task.arg_ok("café"));
+    var del = buffer.push(heap, buffer.append(heap, buffer.empty(heap, 4), "a"), byte_of(127));
+    borrow del as &db in {
+        test.assert(!tool_task.arg_ok(buffer.bytes(db)));
+    }
+    buffer.drop(heap, del);
+    test.assert(tool_task.arg_ok("--delim= |;$(rm -rf /)"));
+    return 0;
+}
+
+fn arg_of[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, n + 2);
+    var i = 0;
+    while i < n {
+        b = buffer.push(heap, b, byte_of(120));
+        i = i + 1;
+    }
+    return b;
+}
+
+// `{"granted":["tally"],"argv":[<count> strings of <each> bytes]}`
+fn argv_doc[&h](heap: &!h Heap, count: int, each: int) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 256), "{\"granted\":[\"tally\"],\"argv\":[");
+    var k = 0;
+    while k < count {
+        if k > 0 {
+            b = buffer.append(heap, b, ",");
+        }
+        b = buffer.append(heap, b, "\"");
+        let a = arg_of(heap, each);
+        borrow a as &ab in {
+            b = buffer.append(heap, b, buffer.bytes(ab));
+        }
+        buffer.drop(heap, a);
+        b = buffer.append(heap, b, "\"");
+        k = k + 1;
+    }
+    return buffer.append(heap, b, "]}");
+}
+
+fn argv_rule[&h](heap: &!h Heap, count: int, each: int) -> [heap] &static [byte] {
+    let d = argv_doc(heap, count, each);
+    var out = "";
+    borrow d as &db in {
+        out = checked(heap, buffer.bytes(db), "tally", "checks.log");
+    }
+    buffer.drop(heap, d);
+    return out;
+}
+
+fn test_an_argv_is_at_most_64_arguments_of_at_most_4096_bytes_and_64_kib_in_all[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(tool_task.max_args() == 64);
+    test.assert(tool_task.max_arg_bytes() == 4096);
+    test.assert(tool_task.max_argv_bytes() == 65536);
+    test.assert(bytes.equal(argv_rule(heap, 64, 3), ""));
+    test.assert(bytes.equal(argv_rule(heap, 65, 3), "argv-malformed"));
+    test.assert(bytes.equal(argv_rule(heap, 1, 4096), ""));
+    test.assert(bytes.equal(argv_rule(heap, 1, 4097), "argv-malformed"));
+    test.assert(bytes.equal(argv_rule(heap, 16, 4096), ""));
+    test.assert(bytes.equal(argv_rule(heap, 17, 4096), "argv-malformed"));
+    return 0;
+}
+
+fn test_an_input_that_escapes_the_execution_directory_is_path_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "../checks.log"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "a/../../x"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "/etc/passwd"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "/work/steps/a/ev2/x"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "/work/steps/a/ev"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", ""), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", ".hidden"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "a//b"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "a b"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "a\0b"), "path-invalid"));
+    return 0;
+}
+
+fn test_the_paths_and_the_limits_are_checked_before_the_tool[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "tool.run", "work/ev", "/opt/tools", 60000, "seek", "../x"), "path-invalid"));
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "tool.run", "/work/ev", "/opt/../tools", 60000, "tally", "x"), "path-invalid"));
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "tool.run", "/work/ev", "/opt/tools", 1999, "tally", "x"), "limits-invalid"));
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "tool.run", "/work/ev", "/opt/tools", 2000, "tally", "x"), ""));
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "tool.run", "/work/ev", "/opt/tools", 86400000, "tally", "x"), ""));
+    test.assert(bytes.equal(checked_with(heap, good_doc(), "tool.run", "/work/ev", "/opt/tools", 86400001, "tally", "x"), "limits-invalid"));
+    // the order: type, paths, limits, operator, tool, argv, input
+    test.assert(bytes.equal(checked_with(heap, "{\"granted\":3}", "tool.run", "/work/ev", "/opt/tools", 1, "seek", "../x"), "limits-invalid"));
+    test.assert(bytes.equal(checked_with(heap, "{\"granted\":3}", "tool.run", "/work/ev", "/opt/tools", 60000, "seek", "../x"), "operator-invalid"));
+    test.assert(bytes.equal(checked_with(heap, "{\"granted\":[\"tally\"],\"argv\":3}", "tool.run", "/work/ev", "/opt/tools", 60000, "seek", "../x"), "tool-not-granted"));
+    test.assert(bytes.equal(checked_with(heap, "{\"granted\":[\"tally\"],\"argv\":3}", "tool.run", "/work/ev", "/opt/tools", 60000, "tally", "../x"), "argv-malformed"));
+    return 0;
+}
+
+fn test_every_refusal_has_its_tag() -> [] int {
+    test.assert(bytes.equal(tool_task.rule_name(tool_task.Refusal::TaskTypeInvalid), "task-type-invalid"));
+    test.assert(bytes.equal(tool_task.rule_name(tool_task.Refusal::PathInvalid), "path-invalid"));
+    test.assert(bytes.equal(tool_task.rule_name(tool_task.Refusal::LimitsInvalid), "limits-invalid"));
+    test.assert(bytes.equal(tool_task.rule_name(tool_task.Refusal::OperatorInvalid), "operator-invalid"));
+    test.assert(bytes.equal(tool_task.rule_name(tool_task.Refusal::ToolNotGranted), "tool-not-granted"));
+    test.assert(bytes.equal(tool_task.rule_name(tool_task.Refusal::ArgvMalformed), "argv-malformed"));
+    test.assert(bytes.equal(tool_task.rule_name(tool_task.Refusal::InputUnusable), "input-unusable"));
+    test.assert(bytes.equal(tool_task.rule_name(tool_task.Refusal::ToolUnusable), "tool-unusable"));
+    return 0;
+}
+
+fn test_the_deadlines_are_four_fifths_and_a_tenth_of_that_at_most_ten_seconds() -> [] int {
+    test.assert(tool_task.runner_deadline_ms(60000) == 48000);
+    test.assert(tool_task.runner_deadline_ms(2000) == 1600);
+    test.assert(tool_task.introspect_deadline_ms(48000) == 4800);
+    test.assert(tool_task.introspect_deadline_ms(1600000) == 10000);
+    test.assert(tool_task.introspect_deadline_ms(5) == 1);
+    test.assert(tool_task.out_cap() == 1048576);
+    return 0;
+}
+
+fn span_text[&h, &d](heap: &!h Heap, doc: &d [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.append(heap, buffer.empty(heap, 64), "none");
+    let tape = box_slice(heap, json.tape_len(doc), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(doc, tp) > 0 {
+            let (a, b) = tool_task.authority_span(doc, tp);
+            if a >= 0 {
+                buffer.drop(heap, out);
+                out = buffer.append(heap, buffer.empty(heap, 64), doc[a..b]);
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return out;
+}
+
+fn span_is[&h, &d](heap: &!h Heap, doc: &d [byte], want: &static [byte]) -> [heap] bool {
+    let got = span_text(heap, doc);
+    var same = false;
+    borrow got as &gb in {
+        same = bytes.equal(buffer.bytes(gb), want);
+    }
+    buffer.drop(heap, got);
+    return same;
+}
+
+fn test_the_authority_span_is_the_bytes_of_the_top_level_authority_object[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(span_is(heap, "{\"tool\":\"t\",\"authority\":{\"bounded\":true,\"effects\":[\"heap\"]},\"x\":1}", "{\"bounded\":true,\"effects\":[\"heap\"]}"));
+    test.assert(span_is(heap, "{\"authority\" : { \"a\" : \"}\\\"{\" , \"b\":{}} }", "{ \"a\" : \"}\\\"{\" , \"b\":{}}"));
+    test.assert(span_is(heap, "{\"authority\":{}}", "{}"));
+    test.assert(span_is(heap, "{\"x\":{\"authority\":{\"a\":1}}}", "none"));
+    test.assert(span_is(heap, "{\"authority\":[1]}", "none"));
+    test.assert(span_is(heap, "{\"authority\":\"{}\"}", "none"));
+    test.assert(span_is(heap, "[{\"authority\":{}}]", "none"));
+    test.assert(span_is(heap, "{\"auth\\u006frity\":{}}", "none"));
+    return 0;
+}
+
+fn test_the_task_id_is_tool_and_a_number[&h](heap: &!h Heap) -> [heap] int {
+    let id = tool_task.task_id(heap, 7);
+    borrow id as &ib in {
+        test.assert(bytes.equal(buffer.bytes(ib), "tool-7"));
+    }
+    buffer.drop(heap, id);
+    return 0;
+}
+
+fn test_the_request_carries_the_tool_its_argv_and_the_operator_grants[&h](heap: &!h Heap) -> [heap] int {
+    let doc = "{\"granted\":[\"tally\",\"jsonq\"],\"argv\":[\"--field\",\"3\"]}";
+    let tape = box_slice(heap, json.tape_len(doc), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(doc, tp) > 0);
+        let req = tool_task.request(heap, "r-tool-1", 1, "tool-1", "tally", doc, tp, json.get(doc, tp, 0, "argv"), "checks.log", 60000, 1048576, "/w/ev", "/opt/tools", json.get(doc, tp, 0, "granted"));
+        borrow req as &rb in {
+            test.assert(bytes.equal(buffer.bytes(rb), "{\"contract\":\"forge-worker/1\",\"verb\":\"execute\",\"request_id\":\"r-tool-1\",\"attempt\":1,\"task\":{\"id\":\"tool-1\",\"type\":\"tool.run\",\"input\":{\"tool\":\"tally\",\"argv\":[\"--field\",\"3\"],\"input\":\"checks.log\"}},\"limits\":{\"timeout_ms\":60000,\"max_output_bytes\":1048576},\"grants\":{\"execution_dir\":\"/w/ev\",\"tools_dir\":\"/opt/tools\",\"granted_tools\":[\"tally\",\"jsonq\"]}}"));
+        }
+        buffer.drop(heap, req);
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+fn test_an_input_is_resolved_against_the_execution_directory_and_back[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(tool_task.input_relative("checks.log", "/w/ev"), "checks.log"));
+    test.assert(bytes.equal(tool_task.input_relative("/w/ev/a/checks.log", "/w/ev"), "a/checks.log"));
+    test.assert(bytes.equal(tool_task.input_relative("/w/ev/x", "/w/ev/"), "x"));
+    test.assert_eq(len(tool_task.input_relative("/w/ev", "/w/ev")), 0);
+    let r = tool_task.input_resolved(heap, "checks.log", "/w/ev");
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "/w/ev/checks.log"));
+    }
+    buffer.drop(heap, r);
+    return 0;
+}
+
+fn test_an_input_that_names_one_of_the_runners_own_files_is_path_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "tool.out"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "report.json"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "introspect.json"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "tool.tmp"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "/work/steps/a/ev/tool.out"), "path-invalid"));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "sub/tool.out"), ""));
+    test.assert(bytes.equal(checked(heap, good_doc(), "tally", "tool.output"), ""));
+    return 0;
+}
+
+fn test_a_worker_error_code_is_known_only_when_it_is_one_of_the_runners() -> [] int {
+    test.assert(bytes.equal(tool_task.known_code("input-unusable"), "input-unusable"));
+    test.assert(bytes.equal(tool_task.known_code("tool-unusable"), "tool-unusable"));
+    test.assert(bytes.equal(tool_task.known_code("tool-not-granted"), "tool-not-granted"));
+    test.assert(bytes.equal(tool_task.known_code("argv-malformed"), "argv-malformed"));
+    test.assert(bytes.equal(tool_task.known_code("tool-timeout"), "tool-timeout"));
+    test.assert(bytes.equal(tool_task.known_code("tool-output-overflow"), "tool-output-overflow"));
+    test.assert(bytes.equal(tool_task.known_code("tool-cancelled"), "tool-cancelled"));
+    test.assert(bytes.equal(tool_task.known_code("evidence-unwritable"), "evidence-unwritable"));
+    test.assert(bytes.equal(tool_task.known_code("path-invalid"), "path-invalid"));
+    test.assert_eq(len(tool_task.known_code("rm -rf /")), 0);
+    test.assert_eq(len(tool_task.known_code("")), 0);
+    test.assert_eq(len(tool_task.known_code("input-unusable ")), 0);
+    return 0;
+}

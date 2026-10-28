@@ -1,0 +1,188 @@
+edition 9;
+module forge.company_run;
+
+import std.option;
+import forge.company_budget;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_state;
+
+// The scheduling step of `forge company run` (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.3 and
+// 10): given the manifest and the state replayed from the company journal, what to do next. Pure: it reads, it starts nothing, so the
+// run loop that acts on the answer (replay, ask, run the step, check, journal, repeat) is the only part with authority. The answer is
+// deterministic: the lowest step number first.
+//
+//   Start(i)     run step i now: not accepted, every need accepted, its gate (if any) approved, and, for a model step, the
+//                budget not spent
+//   WaitGate(i)  nothing can start, and step i (the lowest such) is waiting on a human gate that has no decision and would run
+//                if it were approved: a step that uses no model, or any step while the budget is not spent
+//   Blocked(i)   nothing can start, and step i (the lowest such) is behind a gate that was rejected (or waits on a need that can
+//                never be accepted). Returned only when no other step can start or wait: an independent branch keeps running past
+//                a blocked one, and is finished before the run ends `gate-rejected`
+//   Stop(tag)    the budget is spent and a model step is held back by it, behind an open gate or not (`stop_budget`, named
+//                `budget-exhausted`)
+//   Done         every step is accepted
+//   Held(i)      nothing else can start, and step i (the lowest such) is held by its check: its last check failed or could not
+//                judge it, and no person has approved `retry:<id>` since (`company_state.held_by_check`). The run never starts
+//                it again by itself (section 10: no Forge-level retry)
+//   Failed(i)    nothing else can start, and step i (the lowest such) is one whose worker ended without a claim IN THIS
+//                INVOCATION of the run (`failed`, the run loop's own list, never the journal's): it is not started again in the
+//                same invocation, so the steps that do not need it go on; its dependents wait. Not a hold: the next invocation
+//                starts with an empty list and admits it again, in step order, as before
+//
+// The order of the answers when no step can start: Failed (answered by `next_action` itself), then, by `settle`, Held, then WaitGate, then Stop, then Blocked. A step that
+// failed in this invocation comes first: the run ends `step-failed` (exit 15) as it did when such a step stopped it at once, only
+// later, once every step that could go on has. A step held by its check comes next: it is the one a person must look at. A step that uses no model and
+// waits on a gate outranks the spent budget, because a person approving the gate lets it run (a qa step must not be hidden behind
+// `budget-exhausted`); a gated MODEL step under a spent budget counts as held, because approving its gate would not let it run, so
+// Stop outranks waiting for it. (Before the review of 8a, Stop outranked every WaitGate.) The budget covers model steps only (section
+// 10): a builder or a writer step uses model tokens, the others (qa, analyst, reviewer, product) do not and may start with the
+// budget spent. The spent tokens are those the state replayed from `spend.recorded` events; the spent cost is the caller's (it
+// needs the price table).
+pub enum Action {
+    Start(int),
+    WaitGate(int),
+    Blocked(int),
+    Stop(int),
+    Done,
+    Held(int),
+    Failed(int),
+}
+
+// The tag of `Stop` for a spent budget.
+pub fn stop_budget() -> [] int {
+    return 1;
+}
+
+// The rule name of a `Stop` tag; empty for a tag that is not one.
+pub fn stop_name(tag: int) -> [] &static [byte] {
+    if tag == stop_budget() {
+        return "budget-exhausted";
+    }
+    return "";
+}
+
+// Does a step of this role use model tokens (and so count against the budget)? Builder and writer steps do (section 4.2: both are
+// run by the builder adapter).
+pub fn uses_model(role: company_manifest.Role) -> [] bool {
+    match role {
+        company_manifest.Role::Builder => {
+            return true;
+        }
+        company_manifest.Role::Writer => {
+            return true;
+        }
+        company_manifest.Role::Qa => {
+            return false;
+        }
+        company_manifest.Role::Analyst => {
+            return false;
+        }
+        company_manifest.Role::Reviewer => {
+            return false;
+        }
+        company_manifest.Role::Product => {
+            return false;
+        }
+    }
+}
+
+// Did step `i` end without a claim in this invocation? A list shorter than the manifest says no for the steps it does not reach.
+fn failed_at[&f](failed: &f [bool], i: int) -> [] bool {
+    if i < 0 || i >= len(failed) {
+        return false;
+    }
+    return failed[i];
+}
+
+// The next action. `limits` are the token ceilings of the manifest's budget, `spent_cost_micro` the cost so far and
+// `max_cost_micro` its ceiling, both in micro-dollars (`company_budget.exhausted`). `failed[i]` is true for a step whose worker
+// ended without a claim earlier in this invocation of the run (all false at its start): such a step is not started again.
+pub fn next_action[&m, &s, &f](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, limits: company_budget.Limits, spent_cost_micro: int, max_cost_micro: int, failed: &f [bool]) -> [] Action {
+    let n = company_manifest.step_count(m);
+    let flags = company_state.accepted_flags(s);
+    let spent = company_budget.usage_of(company_state.spend_input(s), company_state.spend_output(s), company_state.spend_cache_write(s), company_state.spend_cache_read(s));
+    let broke = company_budget.exhausted(spent, limits, spent_cost_micro, max_cost_micro);
+    var pending = 0;
+    var held = 0 - 1;
+    var waiting = 0 - 1;
+    var blocked = 0 - 1;
+    var checked = 0 - 1;
+    var first_left = 0 - 1;
+    var gone = 0 - 1;
+    var i = 0;
+    while i < n {
+        if company_state.accepted_at(s, i) == false {
+            pending = pending + 1;
+            if first_left < 0 {
+                first_left = i;
+            }
+            if failed_at(failed, i) {
+                if gone < 0 {
+                    gone = i;
+                }
+            } else if company_state.held_by_check(s, i) != 0 {
+                if checked < 0 {
+                    checked = i;
+                }
+            } else if company_graph.needs_met(m, flags, i) {
+                let gate = company_state.step_blocked_by_gate(m, s, i);
+                if gate == 1 {
+                    // A model step under a spent budget would not run if the gate were approved: the budget holds it.
+                    if broke && uses_model(company_manifest.step_at(m, i).role) {
+                        if held < 0 {
+                            held = i;
+                        }
+                    } else if waiting < 0 {
+                        waiting = i;
+                    }
+                }
+                if gate == 2 {
+                    if blocked < 0 {
+                        blocked = i;
+                    }
+                }
+                if gate == 0 {
+                    if broke && uses_model(company_manifest.step_at(m, i).role) {
+                        if held < 0 {
+                            held = i;
+                        }
+                    } else {
+                        return Action::Start(i);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if pending > 0 && gone >= 0 {
+        return Action::Failed(gone);
+    }
+    return settle(pending, held, waiting, checked, blocked, first_left);
+}
+
+// The answer when no step can start: `pending` steps are not accepted; `held` is the lowest model step the spent budget holds back
+// (gated or not), `waiting` the lowest step that waits on an open gate and is not held, `checked` the lowest step held by its check,
+// `blocked` the lowest behind a rejected gate, `first_left` the lowest step not accepted; -1 for none. Done, then Held(checked),
+// then WaitGate, then Stop, then Blocked, then Blocked(first_left).
+pub fn settle(pending: int, held: int, waiting: int, checked: int, blocked: int, first_left: int) -> [] Action {
+    if pending == 0 {
+        return Action::Done;
+    }
+    if checked >= 0 {
+        return Action::Held(checked);
+    }
+    if waiting >= 0 {
+        return Action::WaitGate(waiting);
+    }
+    if held >= 0 {
+        return Action::Stop(stop_budget());
+    }
+    if blocked >= 0 {
+        return Action::Blocked(blocked);
+    }
+    // Steps are left and none can start, wait or is behind a rejected gate: they wait on a need that is not accepted and is itself
+    // not ready (a gate rejected earlier in the chain is `blocked` above; this is a need that names no step, which `parse` refuses,
+    // or a cycle). Blocked, so the run never loops.
+    return Action::Blocked(first_left);
+}

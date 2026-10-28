@@ -1,0 +1,18 @@
+performs
+    args
+    child_signal
+    clock
+    exec_detached
+    exec_under
+    file_read
+    file_write
+    fs_read("")
+    fs_write("")
+    heap
+    io_write
+    pipe_read
+    poll
+never touches
+    the network
+    signals
+    foreign code

@@ -1,0 +1,462 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_manifest;
+
+// Unit tests for src/company_manifest.cho (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, sections 4.1,
+// 4.2 and 4.4): a company manifest is parsed against a closed shape and every fault is a named refusal. The manifests here
+// are built from the pieces below; tests/fixtures/company/*.json holds whole-file forms of the same shapes for the runner.
+// Run with `cancho test`.
+
+fn rule_of[&h, &b](heap: &!h Heap, text: &b [byte]) -> [heap] &static [byte] {
+    match company_manifest.parse(heap, text) {
+        company_manifest.ManifestResult::Held(m) => {
+            company_manifest.drop(heap, m);
+            return "";
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            return company_manifest.rule_name(r);
+        }
+    }
+}
+
+fn model() -> [] &static [byte] {
+    return "\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"}";
+}
+
+fn budget() -> [] &static [byte] {
+    return "\"budget\":{\"input\":1000,\"output\":500,\"cache_write\":10,\"cache_read\":20,\"max_cost\":900,\"price_table\":\"prices.json\"}";
+}
+
+fn step_a() -> [] &static [byte] {
+    return "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"run it\"}";
+}
+
+// A manifest with the given steps array body, `budget` text and `extra` (fields put before `steps`, each ending in a comma).
+fn doc[&h, &s, &g, &e](heap: &!h Heap, steps: &s [byte], budget_text: &g [byte], extra: &e [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"a mission\",");
+    o = buffer.append(heap, o, model());
+    o = buffer.append(heap, o, ",");
+    if len(budget_text) > 0 {
+        o = buffer.append(heap, o, budget_text);
+        o = buffer.append(heap, o, ",");
+    }
+    o = buffer.append(heap, o, "\"human_gates\":[\"product-brief\"],\"roles\":[\"builder\",\"qa\",\"analyst\",\"reviewer\",\"writer\",\"product\"],");
+    o = buffer.append(heap, o, extra);
+    o = buffer.append(heap, o, "\"steps\":[");
+    o = buffer.append(heap, o, steps);
+    return buffer.append(heap, o, "]}");
+}
+
+fn steps_rule[&h, &s](heap: &!h Heap, steps: &s [byte]) -> [heap] &static [byte] {
+    let d = doc(heap, steps, budget(), "");
+    var r = "";
+    borrow d as &db in {
+        r = rule_of(heap, buffer.bytes(db));
+    }
+    buffer.drop(heap, d);
+    return r;
+}
+
+fn budget_rule[&h, &g](heap: &!h Heap, budget_text: &g [byte]) -> [heap] &static [byte] {
+    let d = doc(heap, step_a(), budget_text, "");
+    var r = "";
+    borrow d as &db in {
+        r = rule_of(heap, buffer.bytes(db));
+    }
+    buffer.drop(heap, d);
+    return r;
+}
+
+fn extra_rule[&h, &g](heap: &!h Heap, extra: &g [byte]) -> [heap] &static [byte] {
+    let d = doc(heap, step_a(), budget(), extra);
+    var r = "";
+    borrow d as &db in {
+        r = rule_of(heap, buffer.bytes(db));
+    }
+    buffer.drop(heap, d);
+    return r;
+}
+
+fn good_text() -> [] &static [byte] {
+    return "{\"id\":\"statuslite\",\"mission\":\"A small status page library.\",\"model\":{\"provider\":\"anthropic\",\"name\":\"claude-haiku-4-5\"},\"budget\":{\"input\":2000000,\"output\":400000,\"cache_write\":200000,\"cache_read\":1000000,\"max_cost\":5,\"price_table\":\"prices.json\"},\"human_gates\":[\"product-brief\"],\"roles\":[\"builder\",\"qa\",\"product\"],\"steps\":[{\"id\":\"brief\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"Approve the product brief.\",\"gate\":\"product-brief\"},{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"brief\"],\"input\":\"Build the status library.\",\"check\":\"audit.cho\"},{\"id\":\"gate\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"lib\"],\"input\":\"Run the gate.\"}]}";
+}
+
+fn test_the_good_manifest_parses_and_reads_back[&h](heap: &!h Heap) -> [heap] int {
+    match company_manifest.parse(heap, good_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                test.assert(company_manifest.step_count(mr) == 3);
+                test.assert(bytes.equal(company_manifest.id_of(mr), "statuslite"));
+                test.assert(bytes.equal(company_manifest.provider_of(mr), "anthropic"));
+                test.assert(bytes.equal(company_manifest.model_of(mr), "claude-haiku-4-5"));
+                test.assert(bytes.equal(company_manifest.price_table_of(mr), "prices.json"));
+                test.assert(company_manifest.budget_input(mr) == 2000000);
+                test.assert(company_manifest.budget_output(mr) == 400000);
+                test.assert(company_manifest.budget_cache_write(mr) == 200000);
+                test.assert(company_manifest.budget_cache_read(mr) == 1000000);
+                test.assert(company_manifest.budget_max_cost(mr) == 5);
+                let s1 = company_manifest.step_at(mr, 1);
+                test.assert(bytes.equal(company_manifest.step_id(mr, s1), "lib"));
+                test.assert(bytes.equal(company_manifest.step_check(mr, s1), "audit.cho"));
+                test.assert(bytes.equal(company_manifest.step_input(mr, s1), "Build the status library."));
+                test.assert(company_manifest.step_needs_count(mr, s1) == 1);
+                test.assert(bytes.equal(company_manifest.step_need(mr, s1, 0), "brief"));
+                match s1.role {
+                    company_manifest.Role::Builder => {
+                    }
+                    _ => {
+                        test.assert(false);
+                    }
+                }
+                match s1.task_type {
+                    company_manifest.TaskType::ProjectBuild => {
+                    }
+                    _ => {
+                        test.assert(false);
+                    }
+                }
+                let s0 = company_manifest.step_at(mr, 0);
+                test.assert(bytes.equal(company_manifest.step_gate(mr, s0), "product-brief"));
+                let s2 = company_manifest.step_at(mr, 2);
+                test.assert(bytes.equal(company_manifest.step_gate(mr, s2), ""));
+                test.assert(company_manifest.has_gate(mr, "product-brief"));
+                test.assert(company_manifest.has_gate(mr, "product-brie") == false);
+                test.assert(company_manifest.has_gate(mr, "") == false);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return 0;
+}
+
+fn test_the_refusal_tags_are_the_documented_ones() -> [] int {
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed), "manifest-malformed"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::ManifestUnknownField), "manifest-unknown-field"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::StepIdDuplicate), "step-id-duplicate"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::StepNeedsUnknown), "step-needs-unknown"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::StepCycle), "step-cycle"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RoleUnknown), "role-unknown"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::TaskTypeUnsupported), "task-type-unsupported"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::CheckMissing), "check-missing"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::ContractRoleInvalid), "contract-role-invalid"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::GateUnknown), "gate-unknown"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::BudgetMissing), "budget-missing"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::PriceTableMissing), "price-table-missing"));
+    return 0;
+}
+
+fn test_a_valid_small_manifest_is_held[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, step_a()), ""));
+    return 0;
+}
+
+fn test_text_that_is_not_a_manifest_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "{"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ""), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "[]"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "\"x\""), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "{}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "{\"id\":\"c\"} trailing"), "manifest-malformed"));
+    return 0;
+}
+
+fn test_an_empty_steps_list_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, ""), "manifest-malformed"));
+    return 0;
+}
+
+fn test_a_field_of_the_wrong_type_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":1,\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":\"b\",\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[1],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "[1]"), "manifest-malformed"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":-1,\"output\":500,\"cache_write\":10,\"cache_read\":20,\"max_cost\":900,\"price_table\":\"p.json\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":\"1\",\"output\":500,\"cache_write\":10,\"cache_read\":20,\"max_cost\":900,\"price_table\":\"p.json\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":[]"), "manifest-malformed"));
+    return 0;
+}
+
+fn test_a_control_character_in_a_step_id_is_malformed_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\\u0001b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\\u0000\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\\nb\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    var raw = buffer.append(heap, buffer.empty(heap, 256), "{\"id\":\"a");
+    raw = buffer.push(heap, raw, byte_of(1));
+    raw = buffer.append(heap, raw, "b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}");
+    borrow raw as &rb in {
+        test.assert(bytes.equal(steps_rule(heap, buffer.bytes(rb)), "manifest-malformed"));
+    }
+    buffer.drop(heap, raw);
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\nb\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    return 0;
+}
+
+// A step id is a directory name of the run (`steps/<id>`): `.`, `..`, one that starts with a dot, or one with two dots in a row
+// would name the steps directory itself, its parent, a hidden name or a path the file capability refuses. manifest-malformed.
+fn test_a_step_id_that_is_a_dot_name_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\".\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"..\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\".hidden\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a..b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"v1.2-lib_x\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"lib.\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), ""));
+    return 0;
+}
+
+fn test_a_manifest_over_one_mebibyte_is_malformed_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.append(heap, buffer.empty(heap, 1100000), "{\"id\":\"");
+    var i = 0;
+    while i < 1048576 {
+        b = buffer.push(heap, b, byte_of(97));
+        i = i + 1;
+    }
+    b = buffer.append(heap, b, "\"}");
+    borrow b as &bb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(bb)), "manifest-malformed"));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_very_deep_nesting_is_malformed_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 200100);
+    var i = 0;
+    while i < 100000 {
+        b = buffer.push(heap, b, byte_of(91));
+        i = i + 1;
+    }
+    borrow b as &bb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(bb)), "manifest-malformed"));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_a_field_the_shape_does_not_have_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(extra_rule(heap, "\"colour\":\"red\","), "manifest-unknown-field"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"timeout\":5}"), "manifest-unknown-field"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\",\"extra\":1}"), "manifest-unknown-field"));
+    return 0;
+}
+
+fn test_the_same_key_twice_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(extra_rule(heap, "\"mission\":\"again\","), "manifest-malformed"));
+    return 0;
+}
+
+fn test_a_step_id_used_twice_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"y\"}";
+    test.assert(bytes.equal(steps_rule(heap, s), "step-id-duplicate"));
+    return 0;
+}
+
+fn test_a_need_that_is_no_step_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"ghost\"],\"input\":\"x\"}"), "step-needs-unknown"));
+    return 0;
+}
+
+fn test_a_step_that_needs_itself_is_a_cycle[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"}"), "step-cycle"));
+    return 0;
+}
+
+fn test_two_steps_that_need_each_other_are_a_cycle[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"b\"],\"input\":\"x\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"y\"}";
+    test.assert(bytes.equal(steps_rule(heap, s), "step-cycle"));
+    return 0;
+}
+
+fn test_a_longer_cycle_behind_a_clean_step_is_found[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"s\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"s\",\"c\"],\"input\":\"x\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"y\"},{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"b\"],\"input\":\"z\"}";
+    test.assert(bytes.equal(steps_rule(heap, s), "step-cycle"));
+    return 0;
+}
+
+fn test_a_diamond_is_not_a_cycle[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"},{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"},{\"id\":\"d\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"b\",\"c\"],\"input\":\"x\"}";
+    test.assert(bytes.equal(steps_rule(heap, s), ""));
+    return 0;
+}
+
+fn test_a_role_that_is_not_one_of_the_six_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"cook\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "role-unknown"));
+    test.assert(bytes.equal(extra_rule(heap, ""), ""));
+    return 0;
+}
+
+fn test_a_role_pack_that_names_a_role_that_does_not_exist_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    let d = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"p\",\"name\":\"n\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[],\"roles\":[\"qa\",\"cook\"],\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}");
+    borrow d as &db in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(db)), "role-unknown"));
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_step_whose_role_is_not_in_the_roles_in_use_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    let d = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"p\",\"name\":\"n\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[],\"roles\":[\"builder\"],\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}");
+    borrow d as &db in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(db)), "role-unknown"));
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_task_type_the_role_does_not_offer_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\"}"), "task-type-unsupported"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"deploy.rocket\",\"needs\":[],\"input\":\"x\"}"), "task-type-unsupported"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"product\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "task-type-unsupported"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"analyst\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), "task-type-unsupported"));
+    return 0;
+}
+
+fn test_each_role_with_its_task_type_is_held[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"analyst\",\"task_type\":\"tool.run\",\"needs\":[],\"input\":\"x\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"reviewer\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"writer\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}"), ""));
+    return 0;
+}
+
+fn test_a_builder_step_without_a_check_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\"}"), "check-missing"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"\"}"), "check-missing"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"writer\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\"}"), "check-missing"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"audit.cho\"}"), ""));
+    return 0;
+}
+
+fn test_a_builder_or_writer_step_may_name_a_contract[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"writer\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api-2_v.txt\"}"), ""));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}"), ""));
+    return 0;
+}
+
+fn test_a_contract_is_a_plain_file_name_or_the_manifest_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"../api.txt\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"/etc/passwd\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"d/api.txt\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\".hidden\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":5}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"a b\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"a\\u0062.txt\"}"), "manifest-malformed"));
+    return 0;
+}
+
+fn test_a_contract_on_a_role_that_builds_nothing_is_contract_role_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"contract\":\"api.txt\"}"), "contract-role-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"analyst\",\"task_type\":\"tool.run\",\"needs\":[],\"input\":\"x\",\"contract\":\"api.txt\"}"), "contract-role-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"reviewer\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"contract\":\"api.txt\"}"), "contract-role-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"contract\":\"api.txt\"}"), "contract-role-invalid"));
+    return 0;
+}
+
+fn test_the_contract_of_a_step_reads_back_and_a_step_without_one_has_none[&h](heap: &!h Heap) -> [heap] int {
+    let d = doc(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\"},{\"id\":\"b\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}", budget(), "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert(bytes.equal(company_manifest.step_contract(mr, company_manifest.step_at(mr, 0)), "api.txt"));
+                    test.assert(bytes.equal(company_manifest.step_contract(mr, company_manifest.step_at(mr, 1)), ""));
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_step_key_outside_the_shape_is_still_unknown_beside_a_contract[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"contracts\":\"api.txt\"}"), "manifest-unknown-field"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"Contract\":\"api.txt\"}"), "manifest-unknown-field"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"contract\":\"b.txt\"}"), "manifest-malformed"));
+    return 0;
+}
+
+fn test_a_gate_that_is_not_a_human_gate_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"gate\":\"nope\"}"), "gate-unknown"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"gate\":\"product-brief\"}"), ""));
+    return 0;
+}
+
+fn test_a_missing_budget_or_price_table_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(budget_rule(heap, ""), "budget-missing"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1}"), "price-table-missing"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"price_table\":\"p.json\"}"), "budget-missing"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{}"), "budget-missing"));
+    return 0;
+}
+
+fn test_a_price_table_that_is_not_a_plain_file_name_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"\"}"), "price-table-missing"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"/etc/passwd\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"../p.json\"}"), "manifest-malformed"));
+    test.assert(bytes.equal(budget_rule(heap, "\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":5}"), "manifest-malformed"));
+    return 0;
+}
+
+fn test_a_step_may_need_one_written_after_it[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"b\"],\"input\":\"x\"},{\"id\":\"b\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"y\"}";
+    test.assert(bytes.equal(steps_rule(heap, s), ""));
+    return 0;
+}
+
+// `n` steps named s0, s1, ...; step k needs step k + 1 (the last needs nothing), or, with `ring`, the last needs s0.
+fn chain[&h](heap: &!h Heap, n: int, ring: bool) -> [heap] buffer.Buffer {
+    var o = buffer.empty(heap, 40000);
+    var k = 0;
+    while k < n {
+        if k > 0 {
+            o = buffer.push(heap, o, byte_of(44));
+        }
+        o = buffer.append(heap, o, "{\"id\":\"s");
+        o = buffer.push_nat(heap, o, k);
+        o = buffer.append(heap, o, "\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[");
+        if k + 1 < n {
+            o = buffer.append(heap, o, "\"s");
+            o = buffer.push_nat(heap, o, k + 1);
+            o = buffer.push(heap, o, byte_of(34));
+        } else if ring {
+            o = buffer.append(heap, o, "\"s0\"");
+        }
+        o = buffer.append(heap, o, "],\"input\":\"x\"}");
+        k = k + 1;
+    }
+    return o;
+}
+
+fn test_the_most_steps_in_a_chain_are_held_and_one_more_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    let ok = chain(heap, 256, false);
+    borrow ok as &b in {
+        test.assert(bytes.equal(steps_rule(heap, buffer.bytes(b)), ""));
+    }
+    buffer.drop(heap, ok);
+    let ring = chain(heap, 256, true);
+    borrow ring as &b in {
+        test.assert(bytes.equal(steps_rule(heap, buffer.bytes(b)), "step-cycle"));
+    }
+    buffer.drop(heap, ring);
+    let over = chain(heap, 257, false);
+    borrow over as &b in {
+        test.assert(bytes.equal(steps_rule(heap, buffer.bytes(b)), "manifest-malformed"));
+    }
+    buffer.drop(heap, over);
+    return 0;
+}

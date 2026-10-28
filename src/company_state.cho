@@ -1,0 +1,736 @@
+edition 9;
+module forge.company_state;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.map;
+import std.option;
+import forge.company_budget;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.event;
+import forge.journal;
+import forge.task;
+
+// The company journal (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.3): the events a company run
+// writes, and the replay of them into what the run knows. The file is `company.journal` in the company directory, one JSON object
+// per line, framed by `event.record` (v, seq, kind, task) and read by the task journal's own rules (src/journal.cho): bytes after
+// the last newline are a torn tail, which recovery may cut (`journal.recovery_cut` on `report`) and which replay does not read; a
+// COMPLETE line that is not the next record (not JSON, wrong `v`, `seq` not exactly next) is `journal-corrupt` and replay stops
+// there. Pure: its rows are `[heap]` at most, so it opens no file; the append wrapper is a later task's.
+//
+// The kinds, and what each carries beyond the four fixed fields (`task` is the step id, except for `company.gate.decided`, where
+// it is the gate name):
+//
+//   company.step.admitted       forge_task   the id of the Forge task the step became
+//   company.step.accepted       artifact, sha256   Forge's own check passed against the artifact it hashed
+//   company.step.check_failed   score, total       the check ran and did not pass
+//   company.step.check_unavailable   reason        the check could not judge the step (reason: the rule tag printed)
+//   company.gate.decided        gate, verdict (approved | rejected), user, reason
+//   company.spend.recorded      input, output, cache_write, cache_read   tokens a step used, and (since the run, task 8b)
+//                               cost_micro   what Forge derived they cost, in micro-dollars, when it recorded them
+//
+// Replay keeps: which steps are accepted (by step number in the manifest, the shape `company_graph.ready` reads), the last
+// decision of each gate (0 open, 1 approved, 2 rejected; the last record wins), how many times each step id was admitted, and the
+// total tokens spent per class, and the same per step (by step number), which steps are HELD by their check, and the artifact
+// path and SHA-256 each accepted step was accepted with (`artifact_of`, decoded from the record; the last accepted record of a
+// step wins): what `needs` passes to a dependent step (task 8c, src/company_runner.cho), and the score and total of the last
+// `check_failed` record of each step (`failed_score`, what `forge company status format=json` shows). A kind this build does not know is passed
+// over, as the task journal does for the kinds it only records, so a later build can add some. A known kind whose fields are not
+// the ones above is `event-malformed`.
+//
+// Held (spec section 10: no retry at the Forge level). A `check_failed` or `check_unavailable` record holds its step: the run
+// never starts it again by itself (`company_run.next_action` answers `Held`). A person lets it go by recording a decision on the
+// gate `retry:<step id>` with `forge company decide <dir> retry:<id> approved <reason>`: an `approved` decision recorded AFTER the
+// hold frees the step; a rejection, an approval recorded before the failure, or one for another step does not. A later failure
+// holds it again; `accepted` frees it. Order in the journal is the whole rule, so replay decides it.
+//
+// Cost. `cost_micro` is additive: a spend record that has it is PRICED, and the recorded cost is authoritative (the run prices each
+// step's `usage.jsonl` call by call, with the over-limit tier where a call crossed it, before it records; the totals replayed here
+// have lost the per-call prompt sizes, so re-pricing them would put every call of a tiered model such as Haiku at its higher tier,
+// up to five times over). A record without the field (written before it existed) is UNPRICED: it adds 0 to the recorded cost, and
+// its tokens are kept apart so that `spent_cost_micro` prices them with the caller's prices, conservatively (`company_budget.usage_of`
+// is priced wholly at the over tier when there is one): never under-counted. `cost_micro` present but not a count (not an integer,
+// negative, over the cap of 10^15) is `event-malformed`. Per step only the priced cost is kept: an unpriced record adds 0 to its
+// step's cost, which makes the run's delta for that step larger, never smaller.
+
+pub res struct CompanyState {
+    accepted: Box[[bool]],
+    spend: Box[[int]],
+    held: Box[[int]],
+    scores: Box[[int]],
+    arts: buffer.Buffer,
+    art_at: Box[[int]],
+    gates: map.Map[int],
+    admitted: map.Map[int],
+    report: journal.Report,
+}
+
+pub fn kind_admitted() -> [] &static [byte] {
+    return "company.step.admitted";
+}
+
+pub fn kind_accepted() -> [] &static [byte] {
+    return "company.step.accepted";
+}
+
+pub fn kind_check_failed() -> [] &static [byte] {
+    return "company.step.check_failed";
+}
+
+pub fn kind_gate_decided() -> [] &static [byte] {
+    return "company.gate.decided";
+}
+
+pub fn kind_spend_recorded() -> [] &static [byte] {
+    return "company.spend.recorded";
+}
+
+pub fn kind_check_unavailable() -> [] &static [byte] {
+    return "company.step.check_unavailable";
+}
+
+// The prefix of a retry gate: `retry:<step id>` is a decision a person records with `forge company decide` to let a step whose
+// check failed (or was unavailable) be run again. It is not in `human_gates`; any step id of the manifest makes one.
+pub fn retry_prefix() -> [] &static [byte] {
+    return "retry:";
+}
+
+// The step number a retry gate names (`retry:<id>` with `<id>` a step of the manifest), or -1 for any other name.
+pub fn retry_step[&m, &g](m: &m company_manifest.Manifest, gate: &g [byte]) -> [] int {
+    let p = retry_prefix();
+    if len(gate) <= len(p) {
+        return 0 - 1;
+    }
+    if bytes.equal(gate[0..len(p)], p) == false {
+        return 0 - 1;
+    }
+    return company_graph.index_of(m, gate[len(p)..len(gate)]);
+}
+
+// ---- the event builders ---------------------------------------------------------------------------------------------------
+
+// Why a copy of `event.record` and not a call: `event.record` closes the object after the four fixed fields and returns a finished
+// line, while every company event adds fields after them, so the builders need the writer still open (`opened`, then `closed`). The
+// four fixed fields and their order are the same, and replay checks them with the task journal's rules.
+
+// The fixed fields, the object still open.
+fn opened[&h, &k, &t](heap: &!h Heap, seq: int, kind: &k [byte], name: &t [byte]) -> [heap] json.Writer {
+    var w = json.writer(heap, 192);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "v");
+    w = json.put_int(heap, w, event.schema_version());
+    w = json.put_key(heap, w, "seq");
+    w = json.put_int(heap, w, seq);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, kind);
+    w = json.put_key(heap, w, "task");
+    return json.put_string(heap, w, name);
+}
+
+fn closed[&h](heap: &!h Heap, w: json.Writer) -> [heap] buffer.Buffer {
+    let done = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(done), byte_of(10));
+}
+
+// Step `step` became the Forge task `task_id`.
+pub fn admitted[&h, &s, &t](heap: &!h Heap, seq: int, step: &s [byte], task_id: &t [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_admitted(), step);
+    w = json.put_key(heap, w, "forge_task");
+    w = json.put_string(heap, w, task_id);
+    return closed(heap, w);
+}
+
+// Step `step` passed Forge's check against the artifact at `artifact`, whose SHA-256 Forge computed.
+pub fn accepted[&h, &s, &a, &x](heap: &!h Heap, seq: int, step: &s [byte], artifact: &a [byte], sha256: &x [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_accepted(), step);
+    w = json.put_key(heap, w, "artifact");
+    w = json.put_string(heap, w, artifact);
+    w = json.put_key(heap, w, "sha256");
+    w = json.put_string(heap, w, sha256);
+    return closed(heap, w);
+}
+
+// Step `step`'s check could not judge it (`reason`: the rule tag printed, `check-unavailable` or `artifact-invalid`).
+pub fn check_unavailable[&h, &s, &r](heap: &!h Heap, seq: int, step: &s [byte], reason: &r [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_check_unavailable(), step);
+    w = json.put_key(heap, w, "reason");
+    w = json.put_string(heap, w, reason);
+    return closed(heap, w);
+}
+
+// Step `step`'s check ran and scored `score` of `total`.
+pub fn check_failed[&h, &s](heap: &!h Heap, seq: int, step: &s [byte], score: int, total: int) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_check_failed(), step);
+    w = json.put_key(heap, w, "score");
+    w = json.put_int(heap, w, score);
+    w = json.put_key(heap, w, "total");
+    w = json.put_int(heap, w, total);
+    return closed(heap, w);
+}
+
+// `user` decided `gate`: `verdict` is "approved" or "rejected" (anything else is refused on replay).
+pub fn gate_decided[&h, &g, &v, &u, &r](heap: &!h Heap, seq: int, gate: &g [byte], verdict: &v [byte], user: &u [byte], reason: &r [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_gate_decided(), gate);
+    w = json.put_key(heap, w, "gate");
+    w = json.put_string(heap, w, gate);
+    w = json.put_key(heap, w, "verdict");
+    w = json.put_string(heap, w, verdict);
+    w = json.put_key(heap, w, "user");
+    w = json.put_string(heap, w, user);
+    w = json.put_key(heap, w, "reason");
+    w = json.put_string(heap, w, reason);
+    return closed(heap, w);
+}
+
+// One call of step `step` used these tokens.
+pub fn spend_recorded[&h, &s](heap: &!h Heap, seq: int, step: &s [byte], input: int, output: int, cache_write: int, cache_read: int) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_spend_recorded(), step);
+    w = json.put_key(heap, w, "input");
+    w = json.put_int(heap, w, input);
+    w = json.put_key(heap, w, "output");
+    w = json.put_int(heap, w, output);
+    w = json.put_key(heap, w, "cache_write");
+    w = json.put_int(heap, w, cache_write);
+    w = json.put_key(heap, w, "cache_read");
+    w = json.put_int(heap, w, cache_read);
+    return closed(heap, w);
+}
+
+// The same, priced: the tokens cost `cost_micro` micro-dollars, as Forge derived it from the step's usage when it recorded it.
+pub fn spend_priced[&h, &s](heap: &!h Heap, seq: int, step: &s [byte], input: int, output: int, cache_write: int, cache_read: int, cost_micro: int) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_spend_recorded(), step);
+    w = json.put_key(heap, w, "input");
+    w = json.put_int(heap, w, input);
+    w = json.put_key(heap, w, "output");
+    w = json.put_int(heap, w, output);
+    w = json.put_key(heap, w, "cache_write");
+    w = json.put_int(heap, w, cache_write);
+    w = json.put_key(heap, w, "cache_read");
+    w = json.put_int(heap, w, cache_read);
+    w = json.put_key(heap, w, "cost_micro");
+    w = json.put_int(heap, w, cost_micro);
+    return closed(heap, w);
+}
+
+// ---- replay ---------------------------------------------------------------------------------------------------------------
+
+// The layout of the spend slice: the four token totals, the recorded cost, the four unpriced token totals, then per step number
+// `i` five slots from `step_base(i)`: its four token totals and its recorded cost.
+fn slot_cost() -> [] int {
+    return 4;
+}
+
+fn slot_unpriced() -> [] int {
+    return 5;
+}
+
+fn step_base(i: int) -> [] int {
+    return 9 + 5 * i;
+}
+
+// Has the spend slice the five slots of step number `i`? Answered without computing `step_base(i)` for an `i` that could overflow.
+fn in_steps[&s](sp: &s [int], i: int) -> [] bool {
+    if i < 0 {
+        return false;
+    }
+    return i < (len(sp) - 9) / 5;
+}
+
+// One count never passes this, and a total saturates at it, so no sum of journal numbers can overflow.
+fn cap() -> [] int {
+    return 1000000000000000;
+}
+
+fn spend_ok[&t](tp: &t [int], node: int) -> [] bool {
+    return json.is_int(tp, node);
+}
+
+fn clamp_add(total: int, n: int) -> [] int {
+    if n > cap() - total {
+        return cap();
+    }
+    return total + n;
+}
+
+// Read one spend field: its value, or -1 when it is absent, not an integer, negative or over the cap.
+fn field[&s, &t, &n](src: &s [byte], tp: &t [int], obj: int, name: &n [byte]) -> [] int {
+    let node = json.get(src, tp, obj, name);
+    if node < 0 || spend_ok(tp, node) == false {
+        return 0 - 1;
+    }
+    if json.fits_int(src, tp, node) == false {
+        return 0 - 1;
+    }
+    let n = json.to_int(src, tp, node);
+    if n < 0 || n > cap() {
+        return 0 - 1;
+    }
+    return n;
+}
+
+// Set the held code of step number `at` (ignored outside the slice).
+fn set_held[&k](held: &!k [int], at: int, code: int) -> [] int {
+    if at >= 0 {
+        if at < len(held) {
+            held[at] = code;
+        }
+    }
+    return 0;
+}
+
+// Add four token counts to the four slots of `spend` from `base` (the caller keeps `base + 3` in range).
+fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -> [] int {
+    spend[base] = clamp_add(spend[base], a);
+    spend[base + 1] = clamp_add(spend[base + 1], b);
+    spend[base + 2] = clamp_add(spend[base + 2], c);
+    spend[base + 3] = clamp_add(spend[base + 3], d);
+    return 0;
+}
+
+// Apply one complete line (no newline) that must carry `expect` as its `seq`. Answers the two maps and 0, or a rule code.
+fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], scores: &!c [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], buffer.Buffer, int) {
+    var gs = gates;
+    var ad = admitted;
+    var ar = arts;
+    var rule = 0;
+    let tape = box_slice(heap, json.tape_len(line), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(line, tp) > 0 && json.is_object(tp, 0) {
+            let version = json.get(line, tp, 0, "v");
+            let seqn = json.get(line, tp, 0, "seq");
+            let kindn = json.get(line, tp, 0, "kind");
+            let taskn = json.get(line, tp, 0, "task");
+            let shaped = json.is_int(tp, version) && json.is_int(tp, seqn) && json.is_string(tp, kindn);
+            if shaped == false || json.to_int(line, tp, version) != event.schema_version() || json.to_int(line, tp, seqn) != expect {
+                rule = task.rule_code(task.Rule::JournalCorrupt);
+            } else {
+                let kind = json.string_view(line, tp, kindn);
+                let named = json.is_string(tp, taskn);
+                let id = json.string_view(line, tp, taskn);
+                let bad = task.rule_code(task.Rule::EventMalformed);
+                if bytes.equal(kind, kind_admitted()) {
+                    let forge_task = json.get(line, tp, 0, "forge_task");
+                    if named == false || json.is_string(tp, forge_task) == false {
+                        rule = bad;
+                    } else {
+                        var seen = 0;
+                        borrow ad as &ab in {
+                            seen = map.get(ab, id, 0);
+                        }
+                        ad = map.put(heap, ad, id, seen + 1);
+                    }
+                } else if bytes.equal(kind, kind_accepted()) {
+                    let artifact = json.get(line, tp, 0, "artifact");
+                    let sha = json.get(line, tp, 0, "sha256");
+                    if named == false || json.is_string(tp, artifact) == false || json.is_string(tp, sha) == false {
+                        rule = bad;
+                    } else {
+                        let at = company_graph.index_of(man, id);
+                        if at >= 0 && at < len(accepted) {
+                            accepted[at] = true;
+                        }
+                        set_held(held, at, 0);
+                        ar = keep_artifact(heap, ar, art_at, at, line, tp, artifact, sha);
+                    }
+                } else if bytes.equal(kind, kind_check_failed()) {
+                    let score = field(line, tp, 0, "score");
+                    let total = field(line, tp, 0, "total");
+                    if named == false || score < 0 || total < 0 {
+                        rule = bad;
+                    } else {
+                        let at = company_graph.index_of(man, id);
+                        set_held(held, at, 1);
+                        set_held(scores, 2 * at, score);
+                        set_held(scores, 2 * at + 1, total);
+                    }
+                } else if bytes.equal(kind, kind_check_unavailable()) {
+                    let why = json.get(line, tp, 0, "reason");
+                    if named == false || json.is_string(tp, why) == false {
+                        rule = bad;
+                    } else {
+                        var code = 2;
+                        if json.string_equals(line, tp, why, "artifact-invalid") {
+                            code = 3;
+                        }
+                        if json.string_equals(line, tp, why, "usage-invalid") {
+                            code = 4;
+                        }
+                        set_held(held, company_graph.index_of(man, id), code);
+                    }
+                } else if bytes.equal(kind, kind_gate_decided()) {
+                    let gate = json.get(line, tp, 0, "gate");
+                    let verdict = json.get(line, tp, 0, "verdict");
+                    let user = json.get(line, tp, 0, "user");
+                    let reason = json.get(line, tp, 0, "reason");
+                    let strings = json.is_string(tp, gate) && json.is_string(tp, verdict) && json.is_string(tp, user) && json.is_string(tp, reason);
+                    if strings == false {
+                        rule = bad;
+                    } else if json.string_equals(line, tp, verdict, "approved") {
+                        gs = map.put(heap, gs, json.string_view(line, tp, gate), 1);
+                        set_held(held, retry_step(man, json.string_view(line, tp, gate)), 0);
+                    } else if json.string_equals(line, tp, verdict, "rejected") {
+                        gs = map.put(heap, gs, json.string_view(line, tp, gate), 2);
+                    } else {
+                        rule = bad;
+                    }
+                } else if bytes.equal(kind, kind_spend_recorded()) {
+                    let a = field(line, tp, 0, "input");
+                    let b = field(line, tp, 0, "output");
+                    let c = field(line, tp, 0, "cache_write");
+                    let d = field(line, tp, 0, "cache_read");
+                    let priced = json.get(line, tp, 0, "cost_micro") >= 0;
+                    var cost = 0;
+                    if priced {
+                        cost = field(line, tp, 0, "cost_micro");
+                    }
+                    if named == false || a < 0 || b < 0 || c < 0 || d < 0 || cost < 0 {
+                        rule = bad;
+                    } else {
+                        add_tokens(spend, 0, a, b, c, d);
+                        if priced {
+                            spend[slot_cost()] = clamp_add(spend[slot_cost()], cost);
+                        } else {
+                            add_tokens(spend, slot_unpriced(), a, b, c, d);
+                        }
+                        let at = company_graph.index_of(man, id);
+                        if at >= 0 {
+                            let base = step_base(at);
+                            if base + 4 < len(spend) {
+                                add_tokens(spend, base, a, b, c, d);
+                                spend[base + 4] = clamp_add(spend[base + 4], cost);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            rule = task.rule_code(task.Rule::JournalCorrupt);
+        }
+    }
+    unbox_slice(heap, tape);
+    return (gs, ad, ar, rule);
+}
+
+// `out` with the decoded text of the JSON string at `node` of `src` appended (nothing for a node that is not a string).
+fn put_decoded[&h, &s, &t](heap: &!h Heap, out: buffer.Buffer, src: &s [byte], tp: &t [int], node: int) -> [heap] buffer.Buffer {
+    let n = json.string_length(src, tp, node);
+    if n < 0 {
+        return out;
+    }
+    let room = box_slice(heap, n, byte_of(0));
+    borrow mut room as &!rw in {
+        json.string_into(src, tp, node, contents(rw));
+    }
+    var o = out;
+    borrow room as &rr in {
+        o = buffer.append(heap, o, contents(rr));
+    }
+    unbox_slice(heap, room);
+    return o;
+}
+
+fn size_of(b: buffer.Buffer) -> [] (buffer.Buffer, int) {
+    var n = 0;
+    borrow b as &bb in {
+        n = buffer.size(bb);
+    }
+    return (b, n);
+}
+
+// Keep the artifact path and digest of step number `at` (ignored outside the manifest): both decoded, appended to `arts`, and
+// where they are written in `art_at`'s four slots of the step (path start, path length, digest start, digest length).
+fn keep_artifact[&h, &x, &s, &t](heap: &!h Heap, arts: buffer.Buffer, art_at: &!x [int], at: int, src: &s [byte], tp: &t [int], artifact: int, sha: int) -> [heap] buffer.Buffer {
+    if at < 0 {
+        return arts;
+    }
+    if at >= len(art_at) / 4 {
+        return arts;
+    }
+    let (a0, start) = size_of(arts);
+    let a1 = put_decoded(heap, a0, src, tp, artifact);
+    let (a2, mid) = size_of(a1);
+    let a3 = put_decoded(heap, a2, src, tp, sha);
+    let (a4, end) = size_of(a3);
+    art_at[4 * at] = start;
+    art_at[4 * at + 1] = mid - start;
+    art_at[4 * at + 2] = mid;
+    art_at[4 * at + 3] = end - mid;
+    return a4;
+}
+
+// Why a copy of the loop of `journal.replay_from` and not a call: that loop applies task events to a task table and its refusals
+// are the task journal's (transitions, actors); the company journal shares only the framing (complete lines, `v`, `seq` exactly
+// next, a torn tail not read, `journal.after_last_newline`), which this loop keeps line for line, and applies company kinds instead.
+//
+// Replay `journal_text`, the whole company journal, against manifest `m` (whose steps number the accepted flags). A torn tail is
+// not read and is counted in `report.torn_bytes`; on a refusal the state holds what replayed before the failing line, and
+// `report.rule` / `report.line` say which. End the state with `drop`.
+pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company_manifest.Manifest) -> [heap] CompanyState {
+    var steps = company_manifest.step_count(m);
+    if steps < 1 {
+        steps = 1;
+    }
+    let accepted = box_slice(heap, steps, false);
+    let spend = box_slice(heap, step_base(steps), 0);
+    let held = box_slice(heap, steps, 0);
+    let scores = box_slice(heap, 2 * steps, 0 - 1);
+    let art_at = box_slice(heap, 4 * steps, 0 - 1);
+    var arts = buffer.empty(heap, 256);
+    var gates = map.empty(heap, 16, 0, 0);
+    var admitted = map.empty(heap, 16, 0, 0);
+    var records = 0;
+    var good = 0;
+    var start = 0;
+    var rule = 0;
+    var bad_line = 0;
+    var k = 0;
+    borrow mut accepted as &!aw in {
+        borrow mut spend as &!sw in {
+            borrow mut held as &!kw in {
+                borrow mut scores as &!cw in {
+                    borrow mut art_at as &!xw in {
+                        let acc = contents(aw);
+                        let sp = contents(sw);
+                        let hd = contents(kw);
+                        let sc = contents(cw);
+                        let xa = contents(xw);
+                        while k < len(journal_text) && rule == 0 {
+                            if int_of(journal_text[k]) == 10 {
+                                let (g, a, t, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, sc, xa, gates, admitted, arts);
+                                gates = g;
+                                admitted = a;
+                                arts = t;
+                                if r == 0 {
+                                    records = records + 1;
+                                    good = k + 1;
+                                } else {
+                                    rule = r;
+                                    bad_line = records + 1;
+                                }
+                                start = k + 1;
+                            }
+                            k = k + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let torn = len(journal_text) - journal.after_last_newline(journal_text);
+    let report = journal.Report { records: records, valid_bytes: good, total_bytes: len(journal_text), torn_bytes: torn, tasks: 0, rule: rule, line: bad_line };
+    return CompanyState { accepted: accepted, spend: spend, held: held, scores: scores, arts: arts, art_at: art_at, gates: gates, admitted: admitted, report: report };
+}
+
+pub fn drop[&h](heap: &!h Heap, s: CompanyState) -> [heap] int {
+    let CompanyState { accepted, spend, held, scores, arts, art_at, gates, admitted, report } = s;
+    unbox_slice(heap, accepted);
+    unbox_slice(heap, spend);
+    unbox_slice(heap, held);
+    unbox_slice(heap, scores);
+    buffer.drop(heap, arts);
+    unbox_slice(heap, art_at);
+    map.drop(heap, gates);
+    map.drop(heap, admitted);
+    return 0;
+}
+
+// ---- reading a replayed state ---------------------------------------------------------------------------------------------
+
+// What the replay found of the file itself: records read, bytes valid and torn, and the refusal (`rule`, `line`) if one ended it.
+// `journal.recovery_cut` takes it.
+pub fn report_of[&s](s: &s CompanyState) -> [] journal.Report {
+    return s.report;
+}
+
+// The accepted flags, one per step of the manifest, in step order: what `company_graph.ready` takes.
+pub fn accepted_flags[&s](s: &s CompanyState) -> [] &s [bool] {
+    return contents(s.accepted);
+}
+
+// Is step number `i` accepted? An `i` outside the manifest is not.
+pub fn accepted_at[&s](s: &s CompanyState, i: int) -> [] bool {
+    if i < 0 || i >= len(contents(s.accepted)) {
+        return false;
+    }
+    return contents(s.accepted)[i];
+}
+
+// The artifact step number `i` was accepted with: its path (relative to the company directory) and the SHA-256 Forge computed, as
+// hex, both as the last `company.step.accepted` record of the step wrote them (decoded). Two empty slices for a step that is not
+// accepted or outside the manifest.
+pub fn artifact_of[&s](s: &s CompanyState, i: int) -> [] (&s [byte], &s [byte]) {
+    let at = contents(s.art_at);
+    let text = buffer.bytes(s.arts);
+    if i < 0 {
+        return (text[0..0], text[0..0]);
+    }
+    if i >= len(at) / 4 {
+        return (text[0..0], text[0..0]);
+    }
+    let b = 4 * i;
+    if at[b] < 0 {
+        return (text[0..0], text[0..0]);
+    }
+    return (text[at[b]..at[b] + at[b + 1]], text[at[b + 2]..at[b + 2] + at[b + 3]]);
+}
+
+// 0 the gate is open (no decision), 1 approved, 2 rejected; the last decision wins.
+pub fn gate_state[&g, &s](s: &s CompanyState, gate: &g [byte]) -> [] int {
+    return map.get(s.gates, gate, 0);
+}
+
+// How many times step `step` was admitted (the resume assertion: an accepted step is not admitted again).
+pub fn admitted_count[&i, &s](s: &s CompanyState, step: &i [byte]) -> [] int {
+    return map.get(s.admitted, step, 0);
+}
+
+pub fn spend_input[&s](s: &s CompanyState) -> [] int {
+    return contents(s.spend)[0];
+}
+
+pub fn spend_output[&s](s: &s CompanyState) -> [] int {
+    return contents(s.spend)[1];
+}
+
+pub fn spend_cache_write[&s](s: &s CompanyState) -> [] int {
+    return contents(s.spend)[2];
+}
+
+pub fn spend_cache_read[&s](s: &s CompanyState) -> [] int {
+    return contents(s.spend)[3];
+}
+
+// The cost recorded by priced spend records, in micro-dollars (saturating at 10^15): authoritative, never re-priced.
+pub fn spend_cost_micro[&s](s: &s CompanyState) -> [] int {
+    return contents(s.spend)[slot_cost()];
+}
+
+// The tokens of the unpriced spend records (written without `cost_micro`).
+pub fn unpriced[&s](s: &s CompanyState) -> [] company_budget.Usage {
+    let sp = contents(s.spend);
+    let u = slot_unpriced();
+    return company_budget.usage_of(sp[u], sp[u + 1], sp[u + 2], sp[u + 3]);
+}
+
+// What the company has spent, in micro-dollars: the recorded cost, plus the unpriced records' tokens priced with `prices`
+// (`company_budget.cost_micro` of `unpriced`, the conservative tier), saturating at 10^15. What `next_action` is given.
+pub fn spent_cost_micro[&s](s: &s CompanyState, prices: company_budget.Prices) -> [] int {
+    return clamp_add(spend_cost_micro(s), company_budget.cost_micro(unpriced(s), prices));
+}
+
+// The tokens recorded for step number `i` (zero for a step outside the manifest): what the run subtracts from the step's
+// `usage.jsonl` to find what is new.
+pub fn step_recorded[&s](s: &s CompanyState, i: int) -> [] company_budget.Usage {
+    let sp = contents(s.spend);
+    if in_steps(sp, i) == false {
+        return company_budget.usage_of(0, 0, 0, 0);
+    }
+    let base = step_base(i);
+    return company_budget.usage_of(sp[base], sp[base + 1], sp[base + 2], sp[base + 3]);
+}
+
+// The cost recorded for step number `i` by its priced records (zero outside the manifest).
+pub fn step_cost_micro[&s](s: &s CompanyState, i: int) -> [] int {
+    let sp = contents(s.spend);
+    if in_steps(sp, i) == false {
+        return 0;
+    }
+    return sp[step_base(i) + 4];
+}
+
+// Is step number `i` held by its check? 0 no, 1 its last check failed (`check-failed`), 2 its last check could not judge it
+// (`check-unavailable`), 3 its artifact was refused (`artifact-invalid`), 4 its build's usage log was refused (`usage-invalid`):
+// the recorded reason, so a later run names the same refusal (`company_step.held_tag`). Held until a person approves `retry:<id>`
+// after it (or the step is accepted). 0 outside the manifest.
+pub fn held_by_check[&s](s: &s CompanyState, i: int) -> [] int {
+    let hd = contents(s.held);
+    if i < 0 {
+        return 0;
+    }
+    if i >= len(hd) {
+        return 0;
+    }
+    return hd[i];
+}
+
+// The tag of a held code (`held_by_check`): 1 check-failed, 3 artifact-invalid, 4 usage-invalid, anything else check-unavailable.
+// What a later run refuses a held step with (`company_step.held_tag`) and what `forge company status format=json` shows.
+pub fn held_name(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "check-failed";
+    }
+    if code == 3 {
+        return "artifact-invalid";
+    }
+    if code == 4 {
+        return "usage-invalid";
+    }
+    return "check-unavailable";
+}
+
+// The score and total of the last `company.step.check_failed` record of step number `i`, or (-1, -1) when it has none (or `i` is
+// outside the manifest). Not cleared by acceptance or a retry: it is the last failed check, as recorded.
+pub fn failed_score[&s](s: &s CompanyState, i: int) -> [] (int, int) {
+    let sc = contents(s.scores);
+    if i < 0 {
+        return (0 - 1, 0 - 1);
+    }
+    if i >= len(sc) / 2 {
+        return (0 - 1, 0 - 1);
+    }
+    return (sc[2 * i], sc[2 * i + 1]);
+}
+
+// ---- human gates ----------------------------------------------------------------------------------------------------------
+
+// Does the human gate of step number `step` keep it from running? 0 free (no gate, an approved gate, or a step outside the
+// manifest), 1 the gate is open (`gate-open`, no decision yet), 2 the gate was rejected (`gate-rejected`; the last decision wins).
+// A step that needs a rejected-gated step is not blocked by it directly: it is not ready because that step is not accepted.
+pub fn step_blocked_by_gate[&m, &s](m: &m company_manifest.Manifest, s: &s CompanyState, step: int) -> [] int {
+    if step < 0 || step >= company_manifest.step_count(m) {
+        return 0;
+    }
+    let gate = company_manifest.step_gate(m, company_manifest.step_at(m, step));
+    if len(gate) == 0 {
+        return 0;
+    }
+    let g = gate_state(s, gate);
+    if g == 0 {
+        return 1;
+    }
+    if g == 2 {
+        return 2;
+    }
+    return 0;
+}
+
+// The number of the first step that may run now: not accepted, every need accepted, and not blocked by its gate. A step whose gate is
+// open or rejected is skipped, and so is everything behind it (its dependents are not ready, `company_graph.ready`). None when there
+// is no such step.
+pub fn next_runnable[&m, &s](m: &m company_manifest.Manifest, s: &s CompanyState) -> [] option.Option[int] {
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        if accepted_at(s, i) == false && step_blocked_by_gate(m, s, i) == 0 {
+            let step = company_manifest.step_at(m, i);
+            let k = company_manifest.step_needs_count(m, step);
+            var met = true;
+            var j = 0;
+            while j < k {
+                let at = company_graph.index_of(m, company_manifest.step_need(m, step, j));
+                if at < 0 || accepted_at(s, at) == false {
+                    met = false;
+                }
+                j = j + 1;
+            }
+            if met {
+                return option.Option::Some(i);
+            }
+        }
+        i = i + 1;
+    }
+    return option.Option::None;
+}

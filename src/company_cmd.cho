@@ -1,0 +1,793 @@
+edition 9;
+module forge.company_cmd;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import forge.company_budget;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_state;
+import forge.journal;
+import forge.journal_io;
+import forge.lock;
+import forge.task;
+
+// The company layer's two read-only verbs (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.4):
+//
+//   forge company check  <manifest.json>   is the manifest valid?
+//   forge company status <company-dir> [format=text|format=json]   where is every step, what was spent, which gates are open
+//
+// `format=json` (the trailing `NAME=value` style of `forge build`) prints the same facts and a few more as one JSON object
+// (`status_json`), and nothing else on standard output. A refusal is printed as text in both formats, exactly as without the
+// argument (`refusal: <tag>`, `line: N`, `error: ...`), with the same exit status; in JSON form the state that replayed before a
+// refused line is NOT printed, so standard output is a JSON object exactly when the exit status is 0. Any other trailing argument is
+// bad usage (exit 2).
+//
+// Paths are absolute with no `..` (`journal_io.path_ok`, like every other verb). `status` reads <dir>/company.json and
+// <dir>/company.journal (a journal that is not there is a company where nothing happened yet). Neither verb writes a byte or takes
+// the writer lock; the effect rows below are the whole of their authority, and every one is already in the forge binary's report
+// (docs/authority.txt does not change). Everything is printed on standard output: the rows have no `err_write`.
+//
+// The third verb writes: `forge company decide <company-dir> <gate> approved|rejected <reason...>` (section 10 of the design). It
+// authenticates nothing: it records the OS user (`USER` in the process environment, read from /proc/self/environ through the
+// `fs_read` the verb already holds; "unknown" when there is none) and the reason, and nothing more. It takes the writer lock
+// (`<dir>/lock`), replays the journal and refuses a corrupt one as `status` does, refuses a gate the manifest does not list
+// (`gate-unknown`; besides `human_gates`, every step id makes a retry gate `retry:<id>`, the decision that lets `forge company run`
+// start a step held by its check again, `company_state` header), cuts a torn tail (which replay does not read) and appends `company.gate.decided`. A rejected gate may be
+// approved later: the last decision wins. Its row adds `fs_write` and `file_write` to the verbs above, and no other capability.
+//
+// Exit status: 0 valid / status shown; 1 refused, the line `refusal: <rule tag>` printed (an unusable manifest is
+// `manifest-malformed`; a journal replay refuses with `journal-corrupt` or `event-malformed`, after the state that replayed before
+// the bad line); 2 bad usage or a path that is not ok (`refusal: path-invalid`); 3 the journal cannot be read (I/O error).
+//
+// The state of a step (a closed set; docs/company.md):
+//   accepted  the journal holds `company.step.accepted` for it
+//   rejected  its human gate was decided `rejected`
+//   gated     its needs are accepted, its human gate has no decision yet
+//   ready     its needs are accepted and it has no gate or its gate is approved
+//   waiting   a step it needs is not accepted
+// A step with a gate whose needs are not met is `waiting`, whatever its gate says.
+
+// 0 accepted, 1 rejected, 2 gated, 3 ready, 4 waiting.
+fn step_state[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, i: int) -> [] int {
+    if company_state.accepted_at(s, i) {
+        return 0;
+    }
+    let step = company_manifest.step_at(m, i);
+    let k = company_manifest.step_needs_count(m, step);
+    var j = 0;
+    while j < k {
+        let at = company_graph.index_of(m, company_manifest.step_need(m, step, j));
+        if at < 0 || company_state.accepted_at(s, at) == false {
+            return 4;
+        }
+        j = j + 1;
+    }
+    let gate = company_manifest.step_gate(m, step);
+    if len(gate) == 0 {
+        return 3;
+    }
+    let g = company_state.gate_state(s, gate);
+    if g == 2 {
+        return 1;
+    }
+    if g == 1 {
+        return 3;
+    }
+    return 2;
+}
+
+fn state_name(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "accepted";
+    }
+    if code == 1 {
+        return "rejected";
+    }
+    if code == 2 {
+        return "gated";
+    }
+    if code == 3 {
+        return "ready";
+    }
+    return "waiting";
+}
+
+// Is step `i` waiting on a human gate that has no decision? (Not accepted, has a gate, the gate is open.)
+fn awaits_gate[&m, &s](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, i: int) -> [] bool {
+    if company_state.accepted_at(s, i) {
+        return false;
+    }
+    let gate = company_manifest.step_gate(m, company_manifest.step_at(m, i));
+    if len(gate) == 0 {
+        return false;
+    }
+    return company_state.gate_state(s, gate) == 0;
+}
+
+fn put_nat[&h](heap: &!h Heap, out: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    return buffer.push_nat(heap, out, n);
+}
+
+fn put_spend[&h](heap: &!h Heap, out: buffer.Buffer, label: &static [byte], n: int) -> [heap] buffer.Buffer {
+    return put_nat(heap, buffer.append(heap, out, label), n);
+}
+
+// The status of a company, as text: one line `id state` for each step in manifest order, then
+//   spend: input N output N cache_write N cache_read N
+//   open gates: <names in step order, each once> | none
+// and, when the journal ends in a record that was cut off, `torn tail bytes: N`. Pure. On a journal the replay refused, `s` holds
+// what replayed before the bad line and the text shows that; the caller names the refusal.
+pub fn status_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        out = buffer.append(heap, out, company_manifest.step_id(m, company_manifest.step_at(m, i)));
+        out = buffer.append(heap, out, " ");
+        out = buffer.append(heap, out, state_name(step_state(m, s, i)));
+        out = buffer.append(heap, out, "\n");
+        i = i + 1;
+    }
+    out = put_spend(heap, out, "spend: input ", company_state.spend_input(s));
+    out = put_spend(heap, out, " output ", company_state.spend_output(s));
+    out = put_spend(heap, out, " cache_write ", company_state.spend_cache_write(s));
+    out = put_spend(heap, out, " cache_read ", company_state.spend_cache_read(s));
+    out = buffer.append(heap, out, "\nopen gates:");
+    var listed = 0;
+    i = 0;
+    while i < n {
+        if awaits_gate(m, s, i) {
+            let gate = company_manifest.step_gate(m, company_manifest.step_at(m, i));
+            var seen = false;
+            var j = 0;
+            while j < i {
+                if awaits_gate(m, s, j) && bytes.equal(company_manifest.step_gate(m, company_manifest.step_at(m, j)), gate) {
+                    seen = true;
+                }
+                j = j + 1;
+            }
+            if seen == false {
+                out = buffer.append(heap, out, " ");
+                out = buffer.append(heap, out, gate);
+                listed = listed + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if listed == 0 {
+        out = buffer.append(heap, out, " none");
+    }
+    out = buffer.append(heap, out, "\n");
+    let torn = company_state.report_of(s).torn_bytes;
+    if torn > 0 {
+        out = put_spend(heap, out, "torn tail bytes: ", torn);
+        out = buffer.append(heap, out, "\n");
+    }
+    return out;
+}
+
+// ---- the status as JSON ---------------------------------------------------------------------------------------------------
+//
+// `forge company status <dir> format=json` prints ONE object and a newline (docs/company.md, section 5, has the shape with every
+// key). Every string goes through `json.put_string` (std.json's writer): `"` and `\` are escaped, a control byte is `\n`, `\t`,
+// ... or `\u00XX`, and a byte that is not valid UTF-8 is written as `�`, so no text read from a file can make the document
+// invalid. The structure is this function's own, never a value's, so the writer's traps (an unclosed container, a key out of
+// place) cannot be reached by input. The mission and the step inputs are not shown.
+
+// The name of a role.
+pub fn role_name(r: company_manifest.Role) -> [] &static [byte] {
+    match r {
+        company_manifest.Role::Builder => {
+            return "builder";
+        }
+        company_manifest.Role::Qa => {
+            return "qa";
+        }
+        company_manifest.Role::Analyst => {
+            return "analyst";
+        }
+        company_manifest.Role::Reviewer => {
+            return "reviewer";
+        }
+        company_manifest.Role::Writer => {
+            return "writer";
+        }
+        company_manifest.Role::Product => {
+            return "product";
+        }
+    }
+}
+
+fn decision_name(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "approved";
+    }
+    if code == 2 {
+        return "rejected";
+    }
+    return "open";
+}
+
+fn put_count[&h](heap: &!h Heap, w: json.Writer, key: &static [byte], n: int) -> [heap] json.Writer {
+    let k = json.put_key(heap, w, key);
+    return json.put_int(heap, k, n);
+}
+
+// `text` as one JSON string value, quotes included, by the very call every string of `status_json` is written with
+// (`json.put_string`): what the unit tests pin the escaping of quotes, backslashes, control bytes and bytes that are not UTF-8 on.
+pub fn quoted[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] buffer.Buffer {
+    let w = json.put_string(heap, json.writer(heap, len(text) + 2), text);
+    return json.finish(w);
+}
+
+fn put_text[&h, &t](heap: &!h Heap, w: json.Writer, key: &static [byte], text: &t [byte]) -> [heap] json.Writer {
+    let k = json.put_key(heap, w, key);
+    return json.put_string(heap, k, text);
+}
+
+// The four token classes, as an object.
+fn put_tokens[&h](heap: &!h Heap, w: json.Writer, key: &static [byte], a: int, b: int, c: int, d: int) -> [heap] json.Writer {
+    var o = json.put_key(heap, w, key);
+    o = json.begin_object(heap, o);
+    o = put_count(heap, o, "input", a);
+    o = put_count(heap, o, "output", b);
+    o = put_count(heap, o, "cache_write", c);
+    o = put_count(heap, o, "cache_read", d);
+    return json.end_object(heap, o);
+}
+
+// Step `i` as an object: id, role, state (the text's state, except that a step the text shows `ready` and its check holds is
+// `held`), held (the tag, or null), gate (its gate's name, or null), artifact ({name, sha256} once accepted, or null), failed_check
+// ({score, total} of its last failed check, or null).
+fn put_step[&h, &m, &s](heap: &!h Heap, w: json.Writer, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, i: int) -> [heap] json.Writer {
+    let step = company_manifest.step_at(m, i);
+    let code = step_state(m, s, i);
+    let held = company_state.held_by_check(s, i);
+    var o = json.begin_object(heap, w);
+    o = put_text(heap, o, "id", company_manifest.step_id(m, step));
+    o = put_text(heap, o, "role", role_name(step.role));
+    if code == 3 && held != 0 {
+        o = put_text(heap, o, "state", "held");
+    } else {
+        o = put_text(heap, o, "state", state_name(code));
+    }
+    o = json.put_key(heap, o, "held");
+    if held != 0 && company_state.accepted_at(s, i) == false {
+        o = json.put_string(heap, o, company_state.held_name(held));
+    } else {
+        o = json.put_null(heap, o);
+    }
+    let gate = company_manifest.step_gate(m, step);
+    o = json.put_key(heap, o, "gate");
+    if len(gate) > 0 {
+        o = json.put_string(heap, o, gate);
+    } else {
+        o = json.put_null(heap, o);
+    }
+    o = json.put_key(heap, o, "artifact");
+    if company_state.accepted_at(s, i) {
+        let (name, sha) = company_state.artifact_of(s, i);
+        o = json.begin_object(heap, o);
+        o = put_text(heap, o, "name", name);
+        o = put_text(heap, o, "sha256", sha);
+        o = json.end_object(heap, o);
+    } else {
+        o = json.put_null(heap, o);
+    }
+    let (score, total) = company_state.failed_score(s, i);
+    o = json.put_key(heap, o, "failed_check");
+    if score >= 0 && total >= 0 {
+        o = json.begin_object(heap, o);
+        o = put_count(heap, o, "score", score);
+        o = put_count(heap, o, "total", total);
+        o = json.end_object(heap, o);
+    } else {
+        o = json.put_null(heap, o);
+    }
+    return json.end_object(heap, o);
+}
+
+fn put_gate[&h, &g](heap: &!h Heap, w: json.Writer, name: &g [byte], code: int) -> [heap] json.Writer {
+    var o = json.begin_object(heap, w);
+    o = put_text(heap, o, "name", name);
+    o = put_text(heap, o, "decision", decision_name(code));
+    return json.end_object(heap, o);
+}
+
+// The gates: every name of `human_gates`, in manifest order, then the retry gate `retry:<id>` of each step that has a decision
+// recorded, in step order. A gate name the journal holds that is neither is not shown (the manifest's names are the closed list).
+fn put_gates[&h, &m, &s](heap: &!h Heap, w: json.Writer, m: &m company_manifest.Manifest, s: &s company_state.CompanyState) -> [heap] json.Writer {
+    var o = json.put_key(heap, w, "gates");
+    o = json.begin_array(heap, o);
+    let ng = company_manifest.gate_count(m);
+    var k = 0;
+    while k < ng {
+        let name = company_manifest.gate_at(m, k);
+        o = put_gate(heap, o, name, company_state.gate_state(s, name));
+        k = k + 1;
+    }
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        var retry = buffer.append(heap, buffer.empty(heap, 72), company_state.retry_prefix());
+        retry = buffer.append(heap, retry, company_manifest.step_id(m, company_manifest.step_at(m, i)));
+        borrow retry as &rb in {
+            let g = company_state.gate_state(s, buffer.bytes(rb));
+            if g != 0 {
+                o = put_gate(heap, o, buffer.bytes(rb), g);
+            }
+        }
+        buffer.drop(heap, retry);
+        i = i + 1;
+    }
+    return json.end_array(heap, o);
+}
+
+// The open gates, as the text's `open gates:` line lists them: distinct, in step order.
+fn put_open_gates[&h, &m, &s](heap: &!h Heap, w: json.Writer, m: &m company_manifest.Manifest, s: &s company_state.CompanyState) -> [heap] json.Writer {
+    var o = json.put_key(heap, w, "open_gates");
+    o = json.begin_array(heap, o);
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        if awaits_gate(m, s, i) {
+            let gate = company_manifest.step_gate(m, company_manifest.step_at(m, i));
+            var seen = false;
+            var j = 0;
+            while j < i {
+                if awaits_gate(m, s, j) && bytes.equal(company_manifest.step_gate(m, company_manifest.step_at(m, j)), gate) {
+                    seen = true;
+                }
+                j = j + 1;
+            }
+            if seen == false {
+                o = json.put_string(heap, o, gate);
+            }
+        }
+        i = i + 1;
+    }
+    return json.end_array(heap, o);
+}
+
+// The status of a company as one JSON object and a newline. Pure. Called only on a journal that replayed clean (the verb prints
+// the text refusal otherwise), but on a refused one it shows what replayed before the bad line, as `status_text` does.
+pub fn status_json[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 1024);
+    w = json.begin_object(heap, w);
+    w = put_text(heap, w, "company", company_manifest.id_of(m));
+    w = json.put_key(heap, w, "steps");
+    w = json.begin_array(heap, w);
+    let n = company_manifest.step_count(m);
+    var i = 0;
+    while i < n {
+        w = put_step(heap, w, m, s, i);
+        i = i + 1;
+    }
+    w = json.end_array(heap, w);
+    w = put_gates(heap, w, m, s);
+    w = put_open_gates(heap, w, m, s);
+    w = json.put_key(heap, w, "budget");
+    w = json.begin_object(heap, w);
+    w = put_tokens(heap, w, "limits", company_manifest.budget_input(m), company_manifest.budget_output(m), company_manifest.budget_cache_write(m), company_manifest.budget_cache_read(m));
+    w = put_count(heap, w, "max_cost_micro", company_budget.dollars_to_micro(company_manifest.budget_max_cost(m)));
+    w = put_tokens(heap, w, "spent", company_state.spend_input(s), company_state.spend_output(s), company_state.spend_cache_write(s), company_state.spend_cache_read(s));
+    w = put_count(heap, w, "cost_micro", company_state.spend_cost_micro(s));
+    let u = company_state.unpriced(s);
+    w = put_tokens(heap, w, "unpriced", u.input, u.output, u.cache_write, u.cache_read);
+    w = json.end_object(heap, w);
+    let rep = company_state.report_of(s);
+    w = json.put_key(heap, w, "journal");
+    w = json.begin_object(heap, w);
+    w = put_count(heap, w, "records", rep.records);
+    w = put_count(heap, w, "torn_tail_bytes", rep.torn_bytes);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return buffer.push(heap, json.finish(w), byte_of(10));
+}
+
+// ---- reading files --------------------------------------------------------------------------------------------------------
+
+// The file at `path` (an ok path), at most `limit` bytes: the bytes and 0, or an errno, or -3 for a file past the limit.
+pub fn read_limited[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], limit: int) -> [heap, fs_read(""), file_read] (buffer.Buffer, int) {
+    let none = buffer.empty(heap, 1);
+    match open_read(fs, path) {
+        Opened::Failed(e) => {
+            return (none, e);
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var data = none;
+            var errno = 0;
+            borrow mut file as &!x in {
+                let (got, e) = journal_io.drain(heap, x, data, limit);
+                data = got;
+                errno = e;
+            }
+            file_close(file);
+            return (data, errno);
+        }
+    }
+}
+
+pub fn line[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
+    io.write_all(io, label);
+    io.write_all(io, value);
+    io.newline(io);
+    return 0;
+}
+
+pub fn refuse[&i, &t](io: &!i Io, tag: &t [byte]) -> [io_write] int {
+    return line(io, "refusal: ", tag);
+}
+
+// `dir` + "/" + `name`.
+pub fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.append(heap, b, "/");
+    return buffer.append(heap, b, name);
+}
+
+// ---- the verbs ------------------------------------------------------------------------------------------------------------
+
+// `forge company check <manifest.json>`: args are `forge company check <path>`.
+pub fn check_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), file_read, io_write] int {
+    if arg_count(args) != 4 {
+        return 2;
+    }
+    let path = arg(args, 3);
+    if journal_io.path_ok(fs, path) == false {
+        refuse(io, task.rule_name(task.Rule::PathInvalid));
+        return 2;
+    }
+    let (text, errno) = read_limited(heap, fs, path, company_manifest.max_bytes() + 1);
+    var code = 1;
+    if errno != 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(why) => {
+                    refuse(io, company_manifest.rule_name(why));
+                }
+                company_manifest.ManifestResult::Held(held) => {
+                    borrow held as &hm in {
+                        io.write_all(io, "valid: ");
+                        io.write_all(io, company_manifest.id_of(hm));
+                        io.write_all(io, ", ");
+                        var n = put_nat(heap, buffer.empty(heap, 4), company_manifest.step_count(hm));
+                        borrow n as &nb in {
+                            io.write_all(io, buffer.bytes(nb));
+                        }
+                        buffer.drop(heap, n);
+                        io.write_all(io, " steps\n");
+                    }
+                    company_manifest.drop(heap, held);
+                    code = 0;
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The trailing argument of `status`: 0 text (`format=text`), 1 JSON (`format=json`), -1 anything else.
+pub fn status_format[&a](arg_text: &a [byte]) -> [] int {
+    if bytes.equal(arg_text, "format=text") {
+        return 0;
+    }
+    if bytes.equal(arg_text, "format=json") {
+        return 1;
+    }
+    return 0 - 1;
+}
+
+// `forge company status <company-dir> [format=...]`: args are `forge company status <dir>` and an optional format.
+pub fn status_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), file_read, io_write] int {
+    if arg_count(args) != 4 && arg_count(args) != 5 {
+        return 2;
+    }
+    var as_json = false;
+    if arg_count(args) == 5 {
+        let f = status_format(arg(args, 4));
+        if f < 0 {
+            return 2;
+        }
+        as_json = f == 1;
+    }
+    let dir = arg(args, 3);
+    let mpath = under(heap, dir, "company.json");
+    let jpath = under(heap, dir, "company.journal");
+    var code = 1;
+    borrow mpath as &mp in {
+        borrow jpath as &jp in {
+            if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false {
+                refuse(io, task.rule_name(task.Rule::PathInvalid));
+                code = 2;
+            } else {
+                code = status_of(heap, fs, io, buffer.bytes(mp), buffer.bytes(jp), as_json);
+            }
+        }
+    }
+    buffer.drop(heap, mpath);
+    buffer.drop(heap, jpath);
+    return code;
+}
+
+fn status_of[&h, &f, &i, &m, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, mpath: &m [byte], jpath: &j [byte], as_json: bool) -> [heap, fs_read(""), file_read, io_write] int {
+    let (text, errno) = read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
+    var code = 1;
+    if errno != 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(why) => {
+                    refuse(io, company_manifest.rule_name(why));
+                }
+                company_manifest.ManifestResult::Held(held) => {
+                    code = status_with(heap, fs, io, held, jpath, as_json);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// Replay the journal at `jpath` against the manifest `held`, print the status (as JSON when `as_json`; a refused replay prints no
+// JSON, only the refusal). Ends `held`.
+fn status_with[&h, &f, &i, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, held: company_manifest.Manifest, jpath: &j [byte], as_json: bool) -> [heap, fs_read(""), file_read, io_write] int {
+    var code = 0;
+    let (data, errno) = journal_io.read_all(heap, fs, jpath);
+    if errno != 0 {
+        line(io, "error: cannot read company.journal", "");
+        code = 3;
+    } else {
+        borrow held as &hm in {
+            borrow data as &db in {
+                let state = company_state.replay(heap, buffer.bytes(db), hm);
+                borrow state as &sr in {
+                    let rep = company_state.report_of(sr);
+                    if as_json == false || rep.rule == 0 {
+                        var text = buffer.empty(heap, 1);
+                        buffer.drop(heap, text);
+                        if as_json {
+                            text = status_json(heap, hm, sr);
+                        } else {
+                            text = status_text(heap, hm, sr);
+                        }
+                        borrow text as &xb in {
+                            buffer.write(io, xb);
+                        }
+                        buffer.drop(heap, text);
+                    }
+                    if rep.rule != 0 {
+                        refuse(io, task.rule_code_name(rep.rule));
+                        var n = put_nat(heap, buffer.empty(heap, 4), rep.line);
+                        borrow n as &nb in {
+                            line(io, "line: ", buffer.bytes(nb));
+                        }
+                        buffer.drop(heap, n);
+                        code = 1;
+                    }
+                }
+                company_state.drop(heap, state);
+            }
+        }
+    }
+    buffer.drop(heap, data);
+    company_manifest.drop(heap, held);
+    return code;
+}
+
+// ---- decide ---------------------------------------------------------------------------------------------------------------
+
+// 1 for `approved`, 2 for `rejected`, 0 for any other word.
+pub fn verdict_code[&w](word: &w [byte]) -> [] int {
+    if bytes.equal(word, "approved") {
+        return 1;
+    }
+    if bytes.equal(word, "rejected") {
+        return 2;
+    }
+    return 0;
+}
+
+fn verdict_name(code: int) -> [] &static [byte] {
+    if code == 1 {
+        return "approved";
+    }
+    return "rejected";
+}
+
+// The value of the first `USER=` entry of a process environment (`NAME=value` entries each ended by a NUL), 1 to 64 bytes, or
+// "unknown" when there is none, it is empty or it is longer. Never fails.
+pub fn user_in_environ[&t](environ: &t [byte]) -> [] &t [byte] {
+    var start = 0;
+    var k = 0;
+    while k <= len(environ) {
+        if k == len(environ) || int_of(environ[k]) == 0 {
+            let entry = environ[start..k];
+            if len(entry) >= 5 && bytes.equal(entry[0..5], "USER=") {
+                let value = entry[5..len(entry)];
+                if len(value) >= 1 && len(value) <= 64 {
+                    return value;
+                }
+                return "unknown";
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return "unknown";
+}
+
+// The reasons of arguments `first` to the last, joined by one space.
+fn join_args[&h, &g](heap: &!h Heap, args: &g Args, first: int) -> [args, heap] buffer.Buffer {
+    var out = buffer.empty(heap, 64);
+    var k = first;
+    while k < arg_count(args) {
+        if k > first {
+            out = buffer.append(heap, out, " ");
+        }
+        out = buffer.append(heap, out, arg(args, k));
+        k = k + 1;
+    }
+    return out;
+}
+
+// `forge company decide <company-dir> <gate> approved|rejected <reason...>`: args are `forge company decide <dir> <gate> <verdict> <reason>...`.
+pub fn decide_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    if arg_count(args) < 7 {
+        return 2;
+    }
+    let verdict = verdict_code(arg(args, 5));
+    if verdict == 0 {
+        return 2;
+    }
+    let dir = arg(args, 3);
+    let reason = join_args(heap, args, 6);
+    let mpath = under(heap, dir, "company.json");
+    let jpath = under(heap, dir, "company.journal");
+    let lpath = under(heap, dir, "lock");
+    var code = 1;
+    borrow mpath as &mp in {
+        borrow jpath as &jp in {
+            borrow lpath as &lp in {
+                borrow reason as &rb in {
+                    if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false || journal_io.path_ok(fs, buffer.bytes(lp)) == false {
+                        refuse(io, task.rule_name(task.Rule::PathInvalid));
+                        code = 2;
+                    } else if len(buffer.bytes(rb)) > 1024 {
+                        code = 2;
+                    } else {
+                        match lock.acquire(fs, buffer.bytes(lp)) {
+                            lock.Lock::Refused(rule) => {
+                                refuse(io, task.rule_code_name(rule));
+                                code = 1;
+                            }
+                            lock.Lock::Failed(errno) => {
+                                line(io, "error: cannot take the lock of the company directory", "");
+                                code = 3;
+                            }
+                            lock.Lock::Held(held) => {
+                                code = decide_locked(heap, fs, io, buffer.bytes(mp), buffer.bytes(jp), arg(args, 4), verdict, buffer.bytes(rb));
+                                lock.let_go(held);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, mpath);
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, lpath);
+    buffer.drop(heap, reason);
+    return code;
+}
+
+// The lock is held: read the manifest, then decide against it.
+fn decide_locked[&h, &f, &i, &m, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, mpath: &m [byte], jpath: &j [byte], gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let (text, errno) = read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
+    var code = 1;
+    if errno != 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(why) => {
+                    refuse(io, company_manifest.rule_name(why));
+                }
+                company_manifest.ManifestResult::Held(held) => {
+                    code = decide_with(heap, fs, io, held, jpath, gate, verdict, reason);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The OS user: `USER` of /proc/self/environ, or "unknown". `event` is called with it inside the borrow.
+fn event_for[&h, &f, &g, &r](heap: &!h Heap, fs: &f Fs(""), seq: int, gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), file_read] buffer.Buffer {
+    let (environ, errno) = read_limited(heap, fs, "/proc/self/environ", 65536);
+    var ev = buffer.empty(heap, 1);
+    borrow environ as &eb in {
+        buffer.drop(heap, ev);
+        if errno != 0 {
+            ev = company_state.gate_decided(heap, seq, gate, verdict_name(verdict), "unknown", reason);
+        } else {
+            ev = company_state.gate_decided(heap, seq, gate, verdict_name(verdict), user_in_environ(buffer.bytes(eb)), reason);
+        }
+    }
+    buffer.drop(heap, environ);
+    return ev;
+}
+
+// Replay the journal against `held`, refuse an unknown gate or a refused journal, else append the decision. Ends `held`.
+fn decide_with[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, held: company_manifest.Manifest, jpath: &j [byte], gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var code = 1;
+    borrow held as &hm in {
+        if company_manifest.has_gate(hm, gate) == false && company_state.retry_step(hm, gate) < 0 {
+            refuse(io, company_manifest.rule_name(company_manifest.Refusal::GateUnknown));
+        } else {
+            let existed = journal_io.exists(fs, jpath);
+            let (data, errno) = journal_io.read_all(heap, fs, jpath);
+            if errno != 0 {
+                line(io, "error: cannot read company.journal", "");
+                code = 3;
+            } else {
+                borrow data as &db in {
+                    let state = company_state.replay(heap, buffer.bytes(db), hm);
+                    borrow state as &sr in {
+                        let rep = company_state.report_of(sr);
+                        if rep.rule != 0 {
+                            refuse(io, task.rule_code_name(rep.rule));
+                            var n = put_nat(heap, buffer.empty(heap, 4), rep.line);
+                            borrow n as &nb in {
+                                line(io, "line: ", buffer.bytes(nb));
+                            }
+                            buffer.drop(heap, n);
+                        } else {
+                            code = append_decision(heap, fs, io, jpath, existed, rep, gate, verdict, reason);
+                        }
+                    }
+                    company_state.drop(heap, state);
+                }
+            }
+            buffer.drop(heap, data);
+        }
+    }
+    company_manifest.drop(heap, held);
+    return code;
+}
+
+// The journal replayed clean (`rep`): cut a torn tail, append the decision as record `rep.records + 1`, print the gate's state.
+fn append_decision[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], existed: bool, rep: journal.Report, gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let cut_to = journal.recovery_cut(rep);
+    if cut_to >= 0 {
+        if journal_io.cut_torn_tail(fs, jpath, cut_to) != 0 {
+            line(io, "error: cannot cut the torn tail of company.journal", "");
+            return 3;
+        }
+    }
+    var ev = event_for(heap, fs, rep.records + 1, gate, verdict, reason);
+    var status = 0;
+    borrow ev as &evb in {
+        status = journal_io.append(fs, jpath, buffer.bytes(evb), existed == false);
+    }
+    buffer.drop(heap, ev);
+    if status != 0 {
+        line(io, "error: cannot write company.journal", "");
+        return 3;
+    }
+    io.write_all(io, "gate ");
+    io.write_all(io, gate);
+    line(io, ": ", verdict_name(verdict));
+    return 0;
+}

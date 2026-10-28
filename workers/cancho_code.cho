@@ -1181,6 +1181,9 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                     let kind = text_of(src, tp, json.get(src, tp, task, "type"));
                     let checker = text_of(src, tp, json.get(src, tp, build, "checker"));
                     let guide = text_of(src, tp, json.get(src, tp, build, "guide"));
+                    // `input.contract`: absent is none; present but empty or not a plain string is read as empty and refused
+                    let contract_node = json.get(src, tp, input, "contract");
+                    let contract = text_of(src, tp, contract_node);
                     let provider = text_of(src, tp, json.get(src, tp, build, "provider"));
                     let model = text_of(src, tp, json.get(src, tp, build, "model"));
                     let agent = text_of(src, tp, json.get(src, tp, build, "agent"));
@@ -1191,6 +1194,13 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                     let jobs = int_or(src, tp, json.get(src, tp, build, "jobs"), default_jobs());
                     borrow brief as &bb in {
                         var refusal = build_task.check(kind, buffer.bytes(bb), exec_dir, tools_dir, timeout_ms);
+                        match refusal {
+                            build_task.Checked::Held => {
+                                refusal = build_task.contract_checked(contract_node >= 0, contract, exec_dir);
+                            }
+                            build_task.Checked::Refused(why) => {
+                            }
+                        }
                         match refusal {
                             build_task.Checked::Held => {
                                 refusal = build_task.operator_checked(checker, guide, provider, model, agent, attempts, agent_seconds, rounds, plan_seconds, jobs);
@@ -1215,13 +1225,21 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                                     }
                                 } else {
                                     let brief_path = under(heap, exec_dir, "brief.txt");
-                                    borrow brief_path as &bp in {
-                                        let args = build_task.build_args(heap, checker, buffer.bytes(bp), exec_dir, agent, provider, model, guide, attempts, agent_seconds, rounds, plan_seconds, jobs);
-                                        borrow args as &ab in {
-                                            code = supervise_task(heap, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), buffer.bytes(bb), exec_dir, tools_dir, buffer.bytes(ab), timeout_ms, token);
-                                        }
-                                        buffer.drop(heap, args);
+                                    var contract_path = buffer.empty(heap, 1);
+                                    if contract_node >= 0 {
+                                        buffer.drop(heap, contract_path);
+                                        contract_path = build_task.contract_resolved(heap, contract, exec_dir);
                                     }
+                                    borrow brief_path as &bp in {
+                                        borrow contract_path as &cp in {
+                                            let args = build_task.build_args(heap, checker, buffer.bytes(bp), exec_dir, agent, provider, model, guide, buffer.bytes(cp), attempts, agent_seconds, rounds, plan_seconds, jobs);
+                                            borrow args as &ab in {
+                                                code = supervise_task(heap, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), buffer.bytes(bb), exec_dir, tools_dir, buffer.bytes(ab), timeout_ms, token);
+                                            }
+                                            buffer.drop(heap, args);
+                                        }
+                                    }
+                                    buffer.drop(heap, contract_path);
                                     buffer.drop(heap, brief_path);
                                 }
                             }

@@ -45,6 +45,10 @@ pub enum Refusal {
     // The Cancho Code adapter could not start its supervisor (docs/async-level.md section 4): the workers directory cannot be
     // opened, the supervisor cannot be started, or it ended or stayed silent without taking the directory.
     SupervisorUnavailable,
+    // `input.contract` is present and is not a path beneath the execution directory (empty, not a plain string, an absolute path
+    // elsewhere, a `..` component, a character the shell would treat specially). Decided by `contract_checked`, after the
+    // limits and before the operator's configuration.
+    ContractPathInvalid,
 }
 
 pub enum Checked {
@@ -83,6 +87,9 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         }
         Refusal::SupervisorUnavailable => {
             return "supervisor-unavailable";
+        }
+        Refusal::ContractPathInvalid => {
+            return "contract-path-invalid";
         }
     }
 }
@@ -230,6 +237,86 @@ pub fn check[&y, &b, &e, &t](task_type_text: &y [byte], brief: &b [byte], execut
     return Checked::Held;
 }
 
+// Is `contract` a file beneath the execution directory `execution_dir` (itself already `path_ok`)? Two spellings: an absolute path
+// that begins with the execution directory and a `/` and names something beneath it, or a relative one, resolved against the
+// execution directory by `contract_resolved`. Either way the whole is a path `gate_task.path_ok` would accept: only letters,
+// digits and `._/-`, no two dots in a row (so no `..`), no component starting with a dot or a dash, no empty component, at most
+// 512 bytes once resolved. An empty contract is not one.
+pub fn contract_ok[&c, &e](contract: &c [byte], execution_dir: &e [byte]) -> [] bool {
+    if len(contract) == 0 {
+        return false;
+    }
+    var base = len(execution_dir);
+    while base > 1 && int_of(execution_dir[base - 1]) == 47 {
+        base = base - 1;
+    }
+    if int_of(contract[0]) == 47 {
+        if !gate_task.path_ok(contract) || len(contract) <= base + 1 {
+            return false;
+        }
+        if !bytes.equal(contract[0..base], execution_dir[0..base]) || int_of(contract[base]) != 47 {
+            return false;
+        }
+        return int_of(contract[len(contract) - 1]) != 47 && relative_ok(contract[base + 1..len(contract)]);
+    }
+    if base + 1 + len(contract) > 512 {
+        return false;
+    }
+    return relative_ok(contract);
+}
+
+// A path without a leading slash that `path_ok` would accept after one: letters, digits and `._/-`, no two dots in a row, no
+// component starting with a dot or a dash, no empty component, no trailing slash.
+fn relative_ok[&p](path: &p [byte]) -> [] bool {
+    if len(path) == 0 {
+        return false;
+    }
+    var i = 0;
+    while i < len(path) {
+        let c = int_of(path[i]);
+        let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        let punct = c == 46 || c == 47 || c == 45 || c == 95;
+        if !letter && !digit && !punct {
+            return false;
+        }
+        let start = i == 0 || int_of(path[i - 1]) == 47;
+        if start && (c == 46 || c == 45 || c == 47) {
+            return false;
+        }
+        if c == 46 && i > 0 && int_of(path[i - 1]) == 46 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return int_of(path[len(path) - 1]) != 47;
+}
+
+// The contract of a task, after `check` held: nothing when the task has none (`present` false), else `contract_ok`, else
+// `contract-path-invalid`. `present` is whether `input.contract` exists at all, so that an empty or non-string one is refused
+// instead of being taken for none.
+pub fn contract_checked[&c, &e](present: bool, contract: &c [byte], execution_dir: &e [byte]) -> [] Checked {
+    if present && !contract_ok(contract, execution_dir) {
+        return Checked::Refused(Refusal::ContractPathInvalid);
+    }
+    return Checked::Held;
+}
+
+// The absolute path of a contract that passed `contract_ok`: itself when it is absolute, else the execution directory, a `/` and it.
+pub fn contract_resolved[&h, &c, &e](heap: &!h Heap, contract: &c [byte], execution_dir: &e [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, 64);
+    if len(contract) > 0 && int_of(contract[0]) == 47 {
+        return buffer.append(heap, b, contract);
+    }
+    var base = len(execution_dir);
+    while base > 1 && int_of(execution_dir[base - 1]) == 47 {
+        base = base - 1;
+    }
+    b = buffer.append(heap, b, execution_dir[0..base]);
+    b = buffer.append(heap, b, "/");
+    return buffer.append(heap, b, contract);
+}
+
 // The operator's configuration, after `check` held: the checker (an absolute path of the compiler), the guide (a path, or
 // empty for none), the provider, the model, the agent command and the five ceilings. It is checked last, so a task with
 // two faults is refused for the first of the order type, input, paths, limits, operator; a `grants.build` that is
@@ -271,12 +358,13 @@ fn put_number[&h](heap: &!h Heap, b: buffer.Buffer, name: &static [byte], n: int
 
 // The argument vector of `cancho-build` (docs/cancho-code-audit.md 2.1), each argument ended by a NUL:
 //
-//   <checker> <brief path> <workdir> <agent command> --provider P --model M [--guide G] --attempts N --agent-seconds N
+//   <checker> <brief path> <workdir> <agent command> --provider P --model M [--guide G] [--contract C] --attempts N --agent-seconds N
 //   --rounds N --plan-seconds N --jobs N
 //
+// `contract` is the absolute path `contract_resolved` gave, or empty for none (then `--contract` is not in the vector at all).
 // Every value has passed `check` / `operator_checked`; the agent command is one argument (the tool runs it through the
 // shell itself). Nothing in it comes from the task but the brief, and the brief is in a file.
-pub fn build_args[&h, &c, &b, &w, &a, &p, &m, &g](heap: &!h Heap, checker: &c [byte], brief_path: &b [byte], workdir: &w [byte], agent: &a [byte], provider: &p [byte], model: &m [byte], guide: &g [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [heap] buffer.Buffer {
+pub fn build_args[&h, &c, &b, &w, &a, &p, &m, &g, &q](heap: &!h Heap, checker: &c [byte], brief_path: &b [byte], workdir: &w [byte], agent: &a [byte], provider: &p [byte], model: &m [byte], guide: &g [byte], contract: &q [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [heap] buffer.Buffer {
     var b2 = put_arg(heap, buffer.empty(heap, 256), checker);
     b2 = put_arg(heap, b2, brief_path);
     b2 = put_arg(heap, b2, workdir);
@@ -285,6 +373,9 @@ pub fn build_args[&h, &c, &b, &w, &a, &p, &m, &g](heap: &!h Heap, checker: &c [b
     b2 = put_option(heap, b2, "--model", model);
     if len(guide) > 0 {
         b2 = put_option(heap, b2, "--guide", guide);
+    }
+    if len(contract) > 0 {
+        b2 = put_option(heap, b2, "--contract", contract);
     }
     b2 = put_number(heap, b2, "--attempts", attempts);
     b2 = put_number(heap, b2, "--agent-seconds", agent_seconds);
@@ -552,8 +643,9 @@ pub fn verdict_name(id: int) -> [] &static [byte] {
 // The `execute` request of a `project.build` task, as the adapter reads it: the brief is the task's input (the JSON writer
 // escapes it); the tools directory and the build configuration are the operator's, in `grants`, and no field of `task.input`
 // carries any of them. `workers_dir` is the directory holding the adapter itself, where it finds its supervisor
-// (docs/async-level.md section 4). Every value has passed `check` and `operator_checked`; `guide` is empty for none.
-pub fn request[&h, &r, &t, &b, &e, &u, &z, &c, &g, &p, &m, &a](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &t [byte], brief: &b [byte], timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], tools_dir: &u [byte], workers_dir: &z [byte], checker: &c [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [heap] buffer.Buffer {
+// (docs/async-level.md section 4). Every value has passed `check`, `contract_checked` and `operator_checked`; `guide` and `contract` (a
+// path beneath the execution directory, as `contract_ok` reads it) are empty for none.
+pub fn request[&h, &r, &t, &b, &q, &e, &u, &z, &c, &g, &p, &m, &a](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &t [byte], brief: &b [byte], contract: &q [byte], timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], tools_dir: &u [byte], workers_dir: &z [byte], checker: &c [byte], guide: &g [byte], provider: &p [byte], model: &m [byte], agent: &a [byte], attempts: int, agent_seconds: int, rounds: int, plan_seconds: int, jobs: int) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 512);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "contract");
@@ -574,6 +666,10 @@ pub fn request[&h, &r, &t, &b, &e, &u, &z, &c, &g, &p, &m, &a](heap: &!h Heap, r
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "brief");
     w = json.put_string(heap, w, brief);
+    if len(contract) > 0 {
+        w = json.put_key(heap, w, "contract");
+        w = json.put_string(heap, w, contract);
+    }
     w = json.end_object(heap, w);
     w = json.end_object(heap, w);
     w = json.put_key(heap, w, "limits");
