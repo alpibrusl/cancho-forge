@@ -10,6 +10,7 @@ import forge.company_check;
 import forge.company_graph;
 import forge.company_manifest;
 import forge.company_run;
+import forge.build_task;
 import forge.company_state;
 import forge.gate_task;
 
@@ -692,11 +693,15 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 //     "gates": { "<step id>": { "repo": "<allow-list key>", "revision": "<40 hex>", "checkout": "/abs" } },
 //     "analyst_tools": "/abs", "granted_tools": ["<tool>", ...],
 //     "analysts": { "<step id>": { "tool": "<tool>", "argv": ["<arg>", ...], "input": "<file beneath the step's ev>" } },
-//     "build_timeout_ms": N, "gate_timeout_ms": N, "check_timeout_ms": N, "tool_timeout_ms": N }
+//     "build_timeout_ms": N, "gate_timeout_ms": N, "check_timeout_ms": N, "tool_timeout_ms": N,
+//     "attempts": N, "agent_seconds": N, "rounds": N, "plan_seconds": N, "jobs": N }
 //
 // `workers` is required; `tools`, `checker` and `agent` are required when a step is a build (the run checks it when it starts
 // one); `guide`, optional, is the guide file a build step's tool is given (`--guide`, as `forge build`'s `guide=PATH`), and is
-// held to `gate_task.path_ok` here, the check `build_task.operator_checked` makes of it again; `gates` names, for each qa or reviewer step, the repository, revision and checkout `forge gate` takes; `analysts` names, for
+// held to `gate_task.path_ok` here, the check `build_task.operator_checked` makes of it again; `attempts`, `agent_seconds`,
+// `rounds`, `plan_seconds` and `jobs`, optional, are the tool's ceilings of every build step (`forge build`'s trailing `name=N`),
+// whole numbers held here to the ranges `build_task.operator_checked` holds them to (`build_task.attempts_ok` ...; `limit_reason`
+// names the first one out of range), defaults those of `step_run.build_spec`; `gates` names, for each qa or reviewer step, the repository, revision and checkout `forge gate` takes; `analysts` names, for
 // each analyst step, the tool, its argument vector (a JSON array) and its input, and `analyst_tools` and `granted_tools` the
 // directory of the tools and the only ones that may run (task 11: the manifest names no tool and no argument). The timeouts are
 // optional, 10000 to 86400000 ms. A string is plain (no escape) and at most 4096 bytes; the paths absolute. Anything else (a key
@@ -704,7 +709,7 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 // again by what uses it (`journal_io.path_ok`, `gate_task.check`, `build_task`), so the file grants nothing.
 
 fn root_keys() -> [] &static [byte] {
-    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms ";
+    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs ";
 }
 
 fn analyst_keys() -> [] &static [byte] {
@@ -822,6 +827,9 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
     if guide_ok(src, tp) == false {
         return false;
     }
+    if len(limit_reason(src, tp)) > 0 {
+        return false;
+    }
     if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false {
         return false;
     }
@@ -877,6 +885,62 @@ fn guide_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
         return false;
     }
     return gate_task.path_ok(json.string_view(src, tp, node));
+}
+
+// Is `v` in the range `build_task.operator_checked` holds the build ceiling `name` to?
+fn limit_in_range(name: &static [byte], v: int) -> [] bool {
+    if bytes.equal(name, "attempts") {
+        return build_task.attempts_ok(v);
+    }
+    if bytes.equal(name, "agent_seconds") {
+        return build_task.agent_seconds_ok(v);
+    }
+    if bytes.equal(name, "rounds") {
+        return build_task.rounds_ok(v);
+    }
+    if bytes.equal(name, "plan_seconds") {
+        return build_task.plan_seconds_ok(v);
+    }
+    return build_task.jobs_ok(v);
+}
+
+// The build ceiling `name`, when there: a whole number (`json.fits_int`: not `30.0`, not `"30"`) in its range.
+fn limit_ok[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte]) -> [] bool {
+    let node = json.get(src, tp, 0, name);
+    if node < 0 {
+        return true;
+    }
+    if json.fits_int(src, tp, node) == false {
+        return false;
+    }
+    return limit_in_range(name, json.to_int(src, tp, node));
+}
+
+// Why the build ceilings of the operator file are refused, the first one wrong in a fixed order, or "" when none is (the
+// `reason:` of `operator-invalid`). The ranges are `build_task`'s; the texts name them.
+pub fn limit_reason[&s, &t](src: &s [byte], tp: &t [int]) -> [] &static [byte] {
+    if limit_ok(src, tp, "attempts") == false {
+        return "attempts is not a whole number from 1 to 20";
+    }
+    if limit_ok(src, tp, "agent_seconds") == false {
+        return "agent_seconds is not a whole number from 1 to 3600";
+    }
+    if limit_ok(src, tp, "rounds") == false {
+        return "rounds is not a whole number from 1 to 10";
+    }
+    if limit_ok(src, tp, "plan_seconds") == false {
+        return "plan_seconds is not a whole number from 1 to 7200";
+    }
+    if limit_ok(src, tp, "jobs") == false {
+        return "jobs is not a whole number from 1 to 64";
+    }
+    return "";
+}
+
+// The whole number `name` of the operator file (a build ceiling), or `default` when the file has none (an `operator_ok` file:
+// it is in range).
+pub fn op_int[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte], default: int) -> [] int {
+    return op_ms(src, tp, name, default);
 }
 
 // `analysts`, when there: an object whose every value is an object of exactly `tool` (a plain string), `argv` (an array) and

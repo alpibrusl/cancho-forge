@@ -143,6 +143,7 @@ edit touches is hygiene, not a boundary. (A symbolic link from outside pointing 
 | `gates` | `{"<step id>": {"repo", "revision", "checkout"}}`: what a qa or reviewer step reports the gate of; `repo` must be on the gate runner's allow-list, `revision` a 40-hex commit, `checkout` an absolute path | each qa or reviewer step |
 | `analyst_tools`, `granted_tools`, `analysts`, `tool_timeout_ms` | the analyst's tools, section 13 | each analyst step |
 | `build_timeout_ms`, `gate_timeout_ms`, `check_timeout_ms` | deadlines in ms, 10000 to 86400000; defaults 3600000, 900000, 600000 | optional |
+| `attempts`, `agent_seconds`, `rounds`, `plan_seconds`, `jobs` | `forge build`'s trailing `attempts=N` ... `jobs=N`: the build tool's ceilings for every builder or writer step (`--attempts`, `--agent-seconds`, ... in its argument vector, carried in the worker request). Whole numbers (`json.fits_int`: not `30.0`, not `"30"`) held at parse time to the ranges `build_task.operator_checked` holds them to: attempts 1 to 20, agent_seconds 1 to 3600, rounds 1 to 10, plan_seconds 1 to 7200, jobs 1 to 64; defaults 4, 30, 3, 900, 4 (`step_run.build_spec`). Out of range or of the wrong type is `operator-invalid` with `reason: <key> is not a whole number from <low> to <high>` (the first wrong one, in this order). `agent_seconds` is the deadline of ONE agent call: a model whose calls take longer than it (statuslite run arm-a-1: Haiku 5.5 calls of 64 to 121 s against the fixed 30) cannot finish a unit | optional; one value for every build step of the run |
 
 A key outside this shape, a relative path, a wrong type or a timeout outside its range is `operator-invalid`, and so is a missing key a
 step needs (checked when the step starts, before anything is admitted). These are checks of form only; every value is checked again by
@@ -424,7 +425,7 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 | `journal-corrupt` | a complete line of `company.journal` that is not the next record | 1 | unit `test_a_seq_gap_is_journal_corrupt_and_replay_stops_there`; run.sh `a corrupt journal` |
 | `event-malformed` | a known `company.*` kind with wrong fields (a verdict that is neither word, a count that is not a count, a `cost_micro` that is not a count) | 1 | unit `test_a_known_kind_with_the_wrong_fields_is_event_malformed` |
 | `workspace-locked` | another writer holds `<dir>/lock` (a run, or a `decide` in the middle of writing) | 1 | `check_company.sh` `decide: while another writer holds the lock ...`; run.sh `a company directory locked by another writer` |
-| `operator-invalid` | the operator file is not there, not JSON, outside its shape, inside the company directory, or lacks what a step needs; an analyst with no `analyst_tools` or no entry | 1 | unit `test_an_operator_file_outside_the_shape_is_refused`, `test_an_operator_file_may_name_a_guide_held_to_the_build_path_rule`; run.sh `an operator file inside the company directory`, `guide: a relative guide path is operator-invalid` |
+| `operator-invalid` | the operator file is not there, not JSON, outside its shape (a build ceiling out of range or not a whole number: with `reason:`), inside the company directory, or lacks what a step needs; an analyst with no `analyst_tools` or no entry | 1 | unit `test_an_operator_file_outside_the_shape_is_refused`, `test_an_operator_file_may_name_a_guide_held_to_the_build_path_rule`, `test_an_operator_file_may_set_the_build_ceilings_held_to_forge_builds_ranges`; run.sh `an operator file inside the company directory`, `guide: a relative guide path is operator-invalid`, `limits: an agent_seconds past forge build's range is operator-invalid with its reason ...`, `limits: a jobs that is a string is operator-invalid with its reason ...` |
 | `step-dir-missing` | a worker step's `steps/<id>/ev` is not a directory | 1 | run.sh `a step directory that is not there` |
 | `tool-not-granted` | an analyst step's tool is not in `granted_tools` | 1 | unit `test_an_unlisted_tool_is_tool_not_granted`; run.sh `analyst: a tool the operator did not grant ...` |
 | `argv-malformed` | an analyst's `argv` is not an array of plain strings | 1 | unit `test_an_argv_that_is_not_an_array_of_plain_strings_is_argv_malformed`; run.sh `analyst: an argv with a number ...` |
@@ -532,6 +533,10 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
   `cancho-build`. The builder in every oracle is the real adapter over a stand-in build tool whose `usage.jsonl` lines were written to the
   shape cancho-code's source and tests pin; the price table in the oracle is a toy. Cost figures, the budget's first real overshoot and
   a real model's behaviour under the contract are all unknown.
+  *Corrected (2026-10-28):* one company has since been run with a real model (StatusLite, arm A, run 1, Haiku 5.5; its record is
+  `statuslite/runs/arm-a-1/` in the StatusLite repository): it stopped on two Forge defects, the fixed `--agent-seconds 30` (now the
+  operator file's `agent_seconds`, section 4) and the timed-out agents that outlived their build (below, "Kill and process gaps"). The
+  oracles of this repository still use the stand-in only.
 * **StatusLite does not exist.** Its repository was not created, and the gate runner's allow-list (`alpibrusl/cancho-forge`, `cancho-hdl`,
   `cancho`, `cancho-ui`) does not name it, so no qa step can report its gate yet.
 * **The A/B** (arm A brief only, arm B signatures, arm C semantic contract) has not been run; arm C is not built. The contract path
@@ -585,6 +590,23 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
 * A SIGKILL mid-build leaves the supervisor and the build running until the next `run`; mid-qa leaves the gate and mid-analyst the tool until
   they end by themselves (gap G4: cancho has no kill by pid or parent-death signal); a SIGKILL of the check guard leaves the check.
   The qa and analyst cases and the kill between `execution.started` and `execution.accepted` are **not tested**.
+* **A build's timed-out agents (statuslite run arm-a-1, defect 2).** Measured there: three `cancho-agent` processes still calling the
+  provider 5+ minutes after their build had ended, killed by hand; their late `usage.jsonl` lines were charged to the next build or to
+  none, so `max_cost` did not see that spend. The cause, read from cancho-code's source and reproduced with the stand-in (`straggle`):
+  the tool's driver (`src/driver.cho`) starts the agent with a plain `exec_spawn` of `/bin/sh -c '<agent> <file> 2><file>.agent.err'`,
+  so the shell is in the build's process group and session (`cancho-build` leads both: the adapter starts it with
+  `exec_spawn_detached_under`); dash forks for the redirect, so the agent is the shell's child, not the shell; at the agent's deadline
+  `process.capture` signals the group the shell leads (none: `ESRCH`) and kills the shell's pid alone. The agent, reparented, runs on
+  in the build's group (measured with the stand-in: the left `sleep 76` had `pgid` = `sid` = the build's pid, its parent the
+  session's subreaper, the build itself gone). *Fixed here:* the adapter's `supervise.wait` now kills the build's whole group on
+  every ending, the build's own exit included (`reap_group`, as the check guard), before it reads `usage.jsonl` and answers, so
+  nothing the build left in its group outlives the build, and what it spent until then is in the file Forge reads.
+  Tests: `scripts/check_cancho_code.sh` `straggle: what the build left running in its group (sleep 76) was killed when it ended`;
+  `tests/conformance/company_run.sh` `a build that leaves a process in its group: accepted, and once the run ends nothing it left is
+  running`. **Not fixed (cancho-code's):** while the build still runs, a timed-out agent keeps running and calling the provider beside
+  the driver's next attempt, until the build ends; its usage lines land in the build's `usage.jsonl` and are counted, but late. A
+  descendant that leaves the group (`setsid`) is still not reached. The fix is the driver's: start the agent as a group leader (or
+  `exec` it from the shell) so that the group kill at the agent's deadline reaches it.
 * The `step-failed` arm for a stale build that will not stop needs an adapter that ignores `cancel` and **is not reached by a test**; the
   worst case of cancelling a hung adapter is derived from the code (at most ten asks, each call bounded by a 30 s timeout), not measured.
 * The window between the step's `execution.started` and its `accepted` record, and a signal that arrives between the last look and the

@@ -110,6 +110,13 @@ if $C build workers/cancho_code.cho $libs --std -o "$cc/workers/cancho_code" \
   }
   snap() { (cd "$1" && for f in $(ls -A); do stat -c '%n %s %.9Y' "$f"; done; cksum $(ls -A | grep -v '^forge-build.lock$' | grep -v '^pids.txt$') 2> /dev/null); }
   ms() { date +%s%N | cut -c1-13; }
+  # --- defect 2 of statuslite run arm-a-1 (docs/company.md section 14): a build that ends by itself (done, exit 0) and leaves a
+  # process running in its group (`straggle`: what the real tool's agent is once the driver killed its shell at the agent's deadline).
+  # The adapter kills the build's group on every ending, its own exit included, so nothing is left once the answer is written.
+  mkdir "$cc/strag" || exit 1
+  lreq '"straggle\n76"' "$cc/strag" 60000 > "$cc/strag.req"; run_through "$cc/strag.req" "$cc/strag" "$cc/strag.ans"
+  oracle "straggle: the build ended done and its answer is succeeded" sh -c "grep -q '\"state\":\"succeeded\"' '$cc/strag.ans' && grep -q '\"verdict\":\"done\"' '$cc/strag/build.json'"
+  oracle "straggle: what the build left running in its group (sleep 76) was killed when it ended" sh -c ". scripts/procs.sh; sleep 0.5; ! leftover -f '^sleep 76\$' > /dev/null"
   # the reference: the same brief, alone, in its own directory
   mkdir "$cc/lk_ref" "$cc/lk" || exit 1
   touch "$cc/lk_ref/release"

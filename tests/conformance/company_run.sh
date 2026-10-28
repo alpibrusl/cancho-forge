@@ -285,6 +285,23 @@ mkco gdrel "[$(builder plain '' contract audit_pass.sh)]" 100000 plain
 run_op gdrel 1 "$w/guiderel.json"
 check "guide: a relative guide path is operator-invalid, exit 1, before anything is written" sh -c "[ '$(rc gdrel 1)' = 1 ] && grep -qx 'refusal: operator-invalid' '$w/gdrel.1.out' && [ ! -e '$w/gdrel/company.journal' ] && [ ! -e '$w/gdrel/steps/plain/journal.jsonl' ]"
 
+# the build ceilings: an operator file may set `agent_seconds` (and `attempts`, `rounds`, `plan_seconds`, `jobs`), held to the
+# ranges of `forge build`'s trailing `name=N`; a builder step's worker request then carries them and the build tool is started with
+# them in their place of the argument vector. Out of range, or not a whole number: operator-invalid with a reason, nothing written.
+sed 's|"agent":"stand-in-agent",|"agent":"stand-in-agent","agent_seconds":240,"attempts":2,"rounds":5,"plan_seconds":1200,"jobs":8,|' "$w/operator.json" > "$w/limits.json"
+mkco lim "[$(builder plain '' contract audit_pass.sh)]" 100000 plain
+run_op lim 1 "$w/limits.json"
+printf 'A:/opt/cancho/bin/cancho\nA:%s/lim/steps/plain/ev/brief.txt\nA:%s/lim/steps/plain/ev\nA:stand-in-agent\nA:--provider\nA:stand\nA:--model\nA:m1\nA:--attempts\nA:2\nA:--agent-seconds\nA:240\nA:--rounds\nA:5\nA:--plan-seconds\nA:1200\nA:--jobs\nA:8\n' "$w" "$w" > "$w/lim.want"
+check "limits: the run completes, exit 0, and the build tool got the operator's --agent-seconds 240 (and attempts, rounds, plan-seconds, jobs)" sh -c "[ '$(rc lim 1)' = 0 ] && [ $(kinds lim company.step.accepted plain) -eq 1 ] && cmp -s '$w/lim.want' '$w/lim/steps/plain/ev/args.txt'"
+sed 's|"agent":"stand-in-agent",|"agent":"stand-in-agent","agent_seconds":3601,|' "$w/operator.json" > "$w/limhigh.json"
+mkco limhigh "[$(builder plain '' contract audit_pass.sh)]" 100000 plain
+run_op limhigh 1 "$w/limhigh.json"
+check "limits: an agent_seconds past forge build's range is operator-invalid with its reason, exit 1, before anything is written" sh -c "[ '$(rc limhigh 1)' = 1 ] && grep -qx 'refusal: operator-invalid' '$w/limhigh.1.out' && grep -qx 'reason: agent_seconds is not a whole number from 1 to 3600' '$w/limhigh.1.out' && [ ! -e '$w/limhigh/company.journal' ] && [ ! -e '$w/limhigh/steps/plain/journal.jsonl' ]"
+sed 's|"agent":"stand-in-agent",|"agent":"stand-in-agent","jobs":"8",|' "$w/operator.json" > "$w/limtype.json"
+mkco limtype "[$(builder plain '' contract audit_pass.sh)]" 100000 plain
+run_op limtype 1 "$w/limtype.json"
+check "limits: a jobs that is a string is operator-invalid with its reason, exit 1, before anything is written" sh -c "[ '$(rc limtype 1)' = 1 ] && grep -qx 'refusal: operator-invalid' '$w/limtype.1.out' && grep -qx 'reason: jobs is not a whole number from 1 to 64' '$w/limtype.1.out' && [ ! -e '$w/limtype/company.journal' ]"
+
 # the file is not there: refused before the step is admitted, nothing written; once it is there the step runs
 mkco ctrmiss "[$(cbuilder withc contract api.txt)]" 100000 withc
 run ctrmiss 1
@@ -532,6 +549,13 @@ mkco bgfail "[$(builder lib '' done audit_bgfail.sh)]" 100000 lib
 printf '#!/bin/sh\nsleep 72 &\necho "TOTAL 1/2"\nexit 1\n' > "$w/bgfail/audit_bgfail.sh"; chmod +x "$w/bgfail/audit_bgfail.sh"
 run bgfail 1
 check "a failing check that leaves a sleep behind: check-failed, and no sleep is left" sh -c "[ '$(rc bgfail 1)' = 13 ] && sleep 1 && ! pgrep -f '^sleep 72\$' > /dev/null"
+
+# ---- a build's background children never outlive it (defect 2 of statuslite run arm-a-1, docs/company.md section 14): a build
+# that ends done and leaves a process in its group (`straggle`, a `sleep 76`, what the real tool's timed-out agent is) has nothing
+# left once the step is accepted: the adapter kills the build's group on every ending, its own exit included
+mkco strag "[$(builder lib '' straggle audit_pass.sh)]" 100000 lib
+run strag 1
+check "a build that leaves a process in its group: accepted, and once the run ends nothing it left is running" sh -c "[ '$(rc strag 1)' = 0 ] && [ -s '$w/strag/steps/lib/ev/pids.txt' ] && sleep 0.5 && ! pgrep -f '^sleep 76\$' > /dev/null"
 
 # ---- the check lock is busy (a guard of another run): check-unavailable WITH a reason, recorded, not a silent hold (M2)
 if command -v flock > /dev/null 2>&1; then

@@ -29,7 +29,11 @@ import forge.lock;
 // `reap_group` (final review, I2): when true the child's whole group is killed on EVERY ending, its own exit included, before it is
 // reaped (the group still exists while the exited leader is unreaped, so the kill reaches what it left running in the background).
 // The check guard passes true: a check's background children must not outlive the check. `wait` (the Cancho Code adapter's
-// supervisor) passes false and is unchanged: a build that exited by itself keeps what it left, as `std.process.capture` does.
+// supervisor) passes true as well (defect 2 of statuslite run arm-a-1, docs/company.md section 14): the real build tool's driver
+// starts its agent as `/bin/sh -c '<agent> ... 2>file'` with a plain spawn, so in the build's group; dash forks for the redirect,
+// and at the agent's deadline the driver kills the shell's pid alone, so the agent ran on, calling the provider, after the build
+// had ended and been answered for. A build is a run to its end; nothing it starts is meant to outlive it. (Until the build ends the
+// left-behind agent still runs: that is the tool's to stop, and is not reached from here.)
 
 fn output_token() -> [] int {
     return 1;
@@ -172,7 +176,7 @@ pub fn asks_for_cancel[&h, &f, &p, &r](heap: &!h Heap, fs: &f Fs(""), path: &p [
 }
 
 pub fn wait[&h, &c, &f, &p, &r](heap: &!h Heap, clock: &c Clock, fs: &f Fs(""), child: Child, to_child: Pipe, from_child: Pipe, most: int, timeout: int, cancel_path: &p [byte], request_id: &r [byte]) -> [heap, clock, poll, fs_read(""), fs_write(""), file_read, file_write] (buffer.Buffer, process.Ran, bool) {
-    let (out, ran, why) = watch(heap, clock, fs, child, to_child, from_child, most, timeout, cancel_path, request_id, "", false);
+    let (out, ran, why) = watch(heap, clock, fs, child, to_child, from_child, most, timeout, cancel_path, request_id, "", true);
     return (out, ran, why == 1);
 }
 

@@ -67,6 +67,16 @@ case "$mode" in
              while [ ! -e "$work/release" ]; do sleep 0.1; done
              kill $! 2> /dev/null
              report done 2 done; printf 'product of %s\n' "$tag" > "$work/project.cho"; printf '[BUILD_VERDICT]\tdone %s\n' "$tag"; exit 0 ;;
+  straggle)  # defect 2 of statuslite run arm-a-1 (docs/company.md section 14): the real tool's driver starts its agent as
+             # `/bin/sh -c '<agent> <file> 2><file>.agent.err'` (a plain spawn: in the build's group), dash forks for the redirect,
+             # and at the agent's deadline the driver kills the shell's pid alone; the agent runs on in the build's group after the
+             # build ends. Here: such a shell, its child `sleep 76` (or the seconds on the brief's second line, as `sleep N`), the
+             # shell killed, the build ending done with the child still running.
+             log; report done 2 done; printf 'product\n' > "$work/project.cho"
+             n=$(sed -n 2p "$brief"); [ -n "$n" ] || n=76
+             /bin/sh -c "sleep $n 2>/dev/null" > /dev/null 2>&1 &
+             sh_pid=$!; sleep 0.3; kill -9 "$sh_pid" 2> /dev/null; printf '%s\n' "$sh_pid" > "$work/pids.txt"
+             printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   killable)  # task 9 (tests/conformance/company_kill.sh): a build that is killed in the middle. Unless `fast` is in the work
              # directory it spends one call (a usage.jsonl line), starts a grandchild (`sleep 97`), writes both pids to pids.txt,
              # says it is building (the file `building`) and waits for a `release` that never comes. Then (or at once, with

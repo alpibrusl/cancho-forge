@@ -290,6 +290,57 @@ fn test_an_operator_file_may_name_a_guide_held_to_the_build_path_rule[&h](heap: 
     return 0;
 }
 
+fn test_an_operator_file_may_set_the_build_ceilings_held_to_forge_builds_ranges[&h](heap: &!h Heap) -> [heap] int {
+    let text = "{\"workers\":\"/w\",\"attempts\":2,\"agent_seconds\":240,\"rounds\":5,\"plan_seconds\":1200,\"jobs\":8}";
+    test.assert(operator_is_ok(heap, text));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(company_step.op_int(text, tp, "agent_seconds", 30) == 240);
+        test.assert(company_step.op_int(text, tp, "attempts", 4) == 2);
+        test.assert(company_step.op_int(text, tp, "rounds", 3) == 5);
+        test.assert(company_step.op_int(text, tp, "plan_seconds", 900) == 1200);
+        test.assert(company_step.op_int(text, tp, "jobs", 4) == 8);
+        test.assert(len(company_step.limit_reason(text, tp)) == 0);
+    }
+    unbox_slice(heap, tape);
+    // none named: the defaults of `forge build`
+    let bare = "{\"workers\":\"/w\"}";
+    let tape2 = box_slice(heap, json.tape_len(bare), 0);
+    borrow mut tape2 as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(bare, tp) > 0);
+        test.assert(company_step.op_int(bare, tp, "agent_seconds", 30) == 30);
+    }
+    unbox_slice(heap, tape2);
+    // the ends of each range are taken, one past them refused
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":1}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":3600}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":0}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":3601}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"attempts\":21}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"rounds\":11}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"plan_seconds\":7201}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"jobs\":65}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"jobs\":-1}") == false);
+    // the wrong type: a string, a float, a boolean
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":\"240\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":240.0}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":true}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"agent_seconds\":240,\"agent_seconds\":240}") == false);
+    // and the reason names the first one wrong
+    let wrong = "{\"workers\":\"/w\",\"rounds\":0,\"agent_seconds\":\"x\"}";
+    let tape3 = box_slice(heap, json.tape_len(wrong), 0);
+    borrow mut tape3 as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(wrong, tp) > 0);
+        test.assert(bytes.equal(company_step.limit_reason(wrong, tp), "agent_seconds is not a whole number from 1 to 3600"));
+    }
+    unbox_slice(heap, tape3);
+    return 0;
+}
+
 // ---- the artifact ----------------------------------------------------------------------------------------------------------
 
 fn test_every_way_an_artifact_is_refused_has_its_reason() -> [] int {

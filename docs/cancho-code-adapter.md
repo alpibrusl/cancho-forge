@@ -195,6 +195,11 @@ The harness itself had a defect found at the same time: it called a break INVALI
   request that does not exist yet.
 * **A descendant that leaves the build's group** (`setsid`) is not reached by the group kill (cancho `docs/processes.md`
   section 9; S12). **macOS.**
+* **A build that ends by itself has its group killed too** (since statuslite run arm-a-1, defect 2; docs/company.md section 14):
+  `supervise.wait` passes `reap_group`, so what the build left running in its group (the real tool's timed-out agent, whose shell
+  alone its driver killed) does not outlive the build. Earlier this read "a build that exited by itself keeps what it left": that was
+  the behaviour, not a requirement, and it let agents call the provider after their build was answered for. While the build runs,
+  such an agent still runs (the tool's to stop). Checked by `scripts/check_cancho_code.sh` `straggle: ...`.
 
 ## 9. What building it changed, and what it found
 

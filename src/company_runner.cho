@@ -272,6 +272,10 @@ fn with_operator[&h, &f, &x, &c, &i, &m, &d, &j, &o, &z](heap: &!h Heap, fs: &f 
                     refuse(io, rule_operator_invalid());
                 } else if company_step.operator_ok(src, tp) == false {
                     refuse(io, rule_operator_invalid());
+                    let why = company_step.limit_reason(src, tp);
+                    if len(why) > 0 {
+                        say(io, "reason: ", why);
+                    }
                 } else {
                     code = with_prices(heap, fs, exec, clock, io, hm, dir, jpath, src, tp, sig);
                 }
@@ -868,7 +872,14 @@ fn worker_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &w, &e, &z](heap: &!h 
         }
         var spec = step_run.build_spec();
         let bt = company_step.op_ms(op, tp, "build_timeout_ms", spec.timeout);
-        spec = step_run.BuildSpec { timeout: bt, attempts: spec.attempts, agent_seconds: spec.agent_seconds, rounds: spec.rounds, plan_seconds: spec.plan_seconds, jobs: spec.jobs };
+        // the tool's ceilings: the operator file's where it names them (`company_step.limit_reason` held them to `build_task`'s
+        // ranges when the file was read), `forge build`'s defaults otherwise
+        let attempts = company_step.op_int(op, tp, "attempts", spec.attempts);
+        let agent_seconds = company_step.op_int(op, tp, "agent_seconds", spec.agent_seconds);
+        let rounds = company_step.op_int(op, tp, "rounds", spec.rounds);
+        let plan_seconds = company_step.op_int(op, tp, "plan_seconds", spec.plan_seconds);
+        let jobs = company_step.op_int(op, tp, "jobs", spec.jobs);
+        spec = step_run.BuildSpec { timeout: bt, attempts: attempts, agent_seconds: agent_seconds, rounds: rounds, plan_seconds: plan_seconds, jobs: jobs };
         // TERM and INT are claimed for the build only (task 9): a signal then cancels the build through its worker (the build's
         // group is killed) before Forge exits. Outside the build they are not claimed, so a signal ends Forge the default way;
         // a check's guard then sees Forge gone and kills the check (workers/check_guard.cho).
