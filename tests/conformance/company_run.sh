@@ -271,6 +271,20 @@ check "contract: a step that names none is started without the option and given 
 printf 'A:/opt/cancho/bin/cancho\nA:%s/ctr/steps/plain/ev/brief.txt\nA:%s/ctr/steps/plain/ev\nA:stand-in-agent\nA:--provider\nA:stand\nA:--model\nA:m1\nA:--attempts\nA:4\nA:--agent-seconds\nA:30\nA:--rounds\nA:3\nA:--plan-seconds\nA:900\nA:--jobs\nA:4\n' "$w" "$w" > "$w/ctr.plain.want"
 check "contract: and the whole argument vector of the step without one is the one it always was" sh -c "cmp -s '$w/ctr.plain.want' '$w/ctr/steps/plain/ev/args.txt'"
 
+# the guide: an operator file may name one (`guide`, absolute, held to the rule of `forge build`'s guide=PATH); a builder step's
+# worker request then carries it and the build tool is started with `--guide <path>`, after the model, as `forge build` starts it.
+# The request goes to the adapter on its stdin and is not kept; the adapter builds the vector from the request alone
+# (workers/cancho_code.cho), so the vector the stand-in recorded is what the request said.
+sed 's|"agent":"stand-in-agent",|"agent":"stand-in-agent","guide":"/opt/guides/plan.md",|' "$w/operator.json" > "$w/guide.json"
+mkco gd "[$(builder plain '' contract audit_pass.sh)]" 100000 plain
+run_op gd 1 "$w/guide.json"
+printf 'A:/opt/cancho/bin/cancho\nA:%s/gd/steps/plain/ev/brief.txt\nA:%s/gd/steps/plain/ev\nA:stand-in-agent\nA:--provider\nA:stand\nA:--model\nA:m1\nA:--guide\nA:/opt/guides/plan.md\nA:--attempts\nA:4\nA:--agent-seconds\nA:30\nA:--rounds\nA:3\nA:--plan-seconds\nA:900\nA:--jobs\nA:4\n' "$w" "$w" > "$w/gd.want"
+check "guide: the run completes, exit 0, and the worker request carried it: the build tool got --guide and the operator's path, in forge build's place" sh -c "[ '$(rc gd 1)' = 0 ] && [ $(kinds gd company.step.accepted plain) -eq 1 ] && cmp -s '$w/gd.want' '$w/gd/steps/plain/ev/args.txt'"
+sed 's|"agent":"stand-in-agent",|"agent":"stand-in-agent","guide":"guides/plan.md",|' "$w/operator.json" > "$w/guiderel.json"
+mkco gdrel "[$(builder plain '' contract audit_pass.sh)]" 100000 plain
+run_op gdrel 1 "$w/guiderel.json"
+check "guide: a relative guide path is operator-invalid, exit 1, before anything is written" sh -c "[ '$(rc gdrel 1)' = 1 ] && grep -qx 'refusal: operator-invalid' '$w/gdrel.1.out' && [ ! -e '$w/gdrel/company.journal' ] && [ ! -e '$w/gdrel/steps/plain/journal.jsonl' ]"
+
 # the file is not there: refused before the step is admitted, nothing written; once it is there the step runs
 mkco ctrmiss "[$(cbuilder withc contract api.txt)]" 100000 withc
 run ctrmiss 1

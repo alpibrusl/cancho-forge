@@ -270,6 +270,26 @@ fn test_an_operator_file_outside_the_shape_is_refused[&h](heap: &!h Heap) -> [he
     return 0;
 }
 
+fn test_an_operator_file_may_name_a_guide_held_to_the_build_path_rule[&h](heap: &!h Heap) -> [heap] int {
+    let text = "{\"workers\":\"/w\",\"guide\":\"/opt/guides/plan.md\"}";
+    test.assert(operator_is_ok(heap, text));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(bytes.equal(company_step.op_text(text, tp, "guide"), "/opt/guides/plan.md"));
+    }
+    unbox_slice(heap, tape);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"guides/plan.md\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":7}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"/\"}") == false);
+    // absolute, but not a path `forge build` would take (`gate_task.path_ok`: a space, a `..`)
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"/opt/my guide.md\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"/opt/../plan.md\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"guide\":\"/g\",\"guide\":\"/h\"}") == false);
+    return 0;
+}
+
 // ---- the artifact ----------------------------------------------------------------------------------------------------------
 
 fn test_every_way_an_artifact_is_refused_has_its_reason() -> [] int {

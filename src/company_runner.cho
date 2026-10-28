@@ -894,7 +894,7 @@ fn worker_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &w, &e, &z](heap: &!h 
         }
         borrow brief as &bb in {
             borrow mut stop as &!sp in {
-                let (r, asked) = step_run.run_build(heap, fs, exec, clock, io, spec, stepdir, workers, company_step.op_text(op, tp, "tools"), buffer.bytes(bb), evdir, company_step.op_text(op, tp, "checker"), company_manifest.provider_of(hm), company_manifest.model_of(hm), company_step.op_text(op, tp, "agent"), "", contract, sp);
+                let (r, asked) = step_run.run_build(heap, fs, exec, clock, io, spec, stepdir, workers, company_step.op_text(op, tp, "tools"), buffer.bytes(bb), evdir, company_step.op_text(op, tp, "checker"), company_manifest.provider_of(hm), company_manifest.model_of(hm), company_step.op_text(op, tp, "agent"), company_step.op_text(op, tp, "guide"), contract, sp);
                 ran = r;
                 stopped = asked;
             }

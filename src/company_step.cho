@@ -11,6 +11,7 @@ import forge.company_graph;
 import forge.company_manifest;
 import forge.company_run;
 import forge.company_state;
+import forge.gate_task;
 
 // The pure half of `forge company run` (src/company_runner.cho is the half that acts; docs/superpowers/specs/
 // 2026-10-27-forge-company-layer-design.md, sections 4.3 and 10): which worker runs a step and which file it leaves as the artifact
@@ -687,14 +688,15 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 // What the operator gives a run, in a JSON file named on the command line (never in the company directory: the manifest declares
 // requirements and cannot name a worker, a tool or a checkout, section 4.1). A closed shape:
 //
-//   { "workers": "/abs", "tools": "/abs", "checker": "/abs", "agent": "command line",
+//   { "workers": "/abs", "tools": "/abs", "checker": "/abs", "agent": "command line", "guide": "/abs",
 //     "gates": { "<step id>": { "repo": "<allow-list key>", "revision": "<40 hex>", "checkout": "/abs" } },
 //     "analyst_tools": "/abs", "granted_tools": ["<tool>", ...],
 //     "analysts": { "<step id>": { "tool": "<tool>", "argv": ["<arg>", ...], "input": "<file beneath the step's ev>" } },
 //     "build_timeout_ms": N, "gate_timeout_ms": N, "check_timeout_ms": N, "tool_timeout_ms": N }
 //
 // `workers` is required; `tools`, `checker` and `agent` are required when a step is a build (the run checks it when it starts
-// one); `gates` names, for each qa or reviewer step, the repository, revision and checkout `forge gate` takes; `analysts` names, for
+// one); `guide`, optional, is the guide file a build step's tool is given (`--guide`, as `forge build`'s `guide=PATH`), and is
+// held to `gate_task.path_ok` here, the check `build_task.operator_checked` makes of it again; `gates` names, for each qa or reviewer step, the repository, revision and checkout `forge gate` takes; `analysts` names, for
 // each analyst step, the tool, its argument vector (a JSON array) and its input, and `analyst_tools` and `granted_tools` the
 // directory of the tools and the only ones that may run (task 11: the manifest names no tool and no argument). The timeouts are
 // optional, 10000 to 86400000 ms. A string is plain (no escape) and at most 4096 bytes; the paths absolute. Anything else (a key
@@ -702,7 +704,7 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 // again by what uses it (`journal_io.path_ok`, `gate_task.check`, `build_task`), so the file grants nothing.
 
 fn root_keys() -> [] &static [byte] {
-    return " workers tools checker agent gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms ";
+    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms ";
 }
 
 fn analyst_keys() -> [] &static [byte] {
@@ -817,6 +819,9 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
     if granted >= 0 && json.is_array(tp, granted) == false {
         return false;
     }
+    if guide_ok(src, tp) == false {
+        return false;
+    }
     if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false {
         return false;
     }
@@ -860,6 +865,18 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
         j = j + 1;
     }
     return ok;
+}
+
+// `guide`, when there: an absolute plain string that `gate_task.path_ok` takes (the rule `forge build`'s `guide=PATH` is held to).
+fn guide_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
+    let node = json.get(src, tp, 0, "guide");
+    if node < 0 {
+        return true;
+    }
+    if absolute(src, tp, node) == false {
+        return false;
+    }
+    return gate_task.path_ok(json.string_view(src, tp, node));
 }
 
 // `analysts`, when there: an object whose every value is an object of exactly `tool` (a plain string), `argv` (an array) and
