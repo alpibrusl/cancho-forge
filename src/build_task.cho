@@ -49,6 +49,9 @@ pub enum Refusal {
     // elsewhere, a `..` component, a character the shell would treat specially). Decided by `contract_checked`, after the
     // limits and before the operator's configuration.
     ContractPathInvalid,
+    // `library.txt`, the file Forge writes beside `contract.txt` for a library step, is not a module name (`library_ok`), or the task has
+    // no contract to go with it (`--library` needs one). Decided by the adapter before it starts anything.
+    LibraryInvalid,
 }
 
 pub enum Checked {
@@ -90,6 +93,9 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         }
         Refusal::ContractPathInvalid => {
             return "contract-path-invalid";
+        }
+        Refusal::LibraryInvalid => {
+            return "library-invalid";
         }
     }
 }
@@ -382,6 +388,50 @@ pub fn build_args[&h, &c, &b, &w, &a, &p, &m, &g, &q](heap: &!h Heap, checker: &
     b2 = put_number(heap, b2, "--rounds", rounds);
     b2 = put_number(heap, b2, "--plan-seconds", plan_seconds);
     return put_number(heap, b2, "--jobs", jobs);
+}
+
+// The file of the execution directory that names the module a library step is built as (Forge writes it, as it writes `contract.txt`).
+pub fn library_file() -> [] &static [byte] {
+    return "library.txt";
+}
+
+// Is `name` a module name `cancho-build --library` accepts (cancho-code docs/library.md, tag `library-name`)? Lowercase letters, digits
+// and `_`, not starting with a digit, 1 to 64 bytes, and not `std` or `test`.
+pub fn library_ok[&n](name: &n [byte]) -> [] bool {
+    if len(name) == 0 || len(name) > 64 {
+        return false;
+    }
+    if bytes.equal(name, "std") || bytes.equal(name, "test") {
+        return false;
+    }
+    var i = 0;
+    while i < len(name) {
+        let c = int_of(name[i]);
+        let letter = c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        if !(letter || c == 95 || digit && i > 0) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The library of a task, after `contract_checked` held: nothing when the step has none (`present` false); else a module name
+// (`library_ok`) and a contract (`has_contract`), else `library-invalid`.
+pub fn library_checked[&n](present: bool, name: &n [byte], has_contract: bool) -> [] Checked {
+    if present && (!library_ok(name) || !has_contract) {
+        return Checked::Refused(Refusal::LibraryInvalid);
+    }
+    return Checked::Held;
+}
+
+// `args` (a vector `build_args` made) with `--library NAME` added, each argument ended by a NUL; `args` as it was when there is none.
+pub fn with_library[&h, &n](heap: &!h Heap, args: buffer.Buffer, name: &n [byte]) -> [heap] buffer.Buffer {
+    if len(name) == 0 {
+        return args;
+    }
+    return put_option(heap, args, "--library", name);
 }
 
 // The verdict word of `build.json`, as a number: 1 done, 2 stuck, 3 gate_failed, 4 plan_failed, 5 provider_error, and 0

@@ -487,3 +487,64 @@ fn test_a_workers_directory_is_a_path_like_the_others_and_not_empty() -> [] int 
     test.assert(!build_task.workers_dir_ok("/opt/work;ers"));
     return 0;
 }
+
+fn test_a_library_name_is_a_module_name() -> [] int {
+    test.assert(build_task.library_ok("diff"));
+    test.assert(build_task.library_ok("a"));
+    test.assert(build_task.library_ok("edit_distance2"));
+    test.assert(!build_task.library_ok(""));
+    test.assert(!build_task.library_ok("Diff"));
+    test.assert(!build_task.library_ok("2diff"));
+    test.assert(!build_task.library_ok("a-b"));
+    test.assert(!build_task.library_ok("a b"));
+    test.assert(!build_task.library_ok("a.b"));
+    test.assert(!build_task.library_ok("std"));
+    test.assert(!build_task.library_ok("test"));
+    test.assert(build_task.library_ok("tests"));
+    test.assert(!build_task.library_ok("a\0b"));
+    return 0;
+}
+
+fn test_a_library_name_has_at_most_64_bytes[&h](heap: &!h Heap) -> [heap] int {
+    var b = buffer.empty(heap, 70);
+    var i = 0;
+    while i < 64 {
+        b = buffer.push(heap, b, byte_of(97));
+        i = i + 1;
+    }
+    borrow b as &bb in {
+        test.assert(build_task.library_ok(buffer.bytes(bb)));
+    }
+    b = buffer.push(heap, b, byte_of(97));
+    borrow b as &bc in {
+        test.assert(!build_task.library_ok(buffer.bytes(bc)));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_a_library_needs_a_name_and_a_contract() -> [] int {
+    test.assert(bytes.equal(refusal(build_task.library_checked(false, "", false)), ""));
+    test.assert(bytes.equal(refusal(build_task.library_checked(true, "diff", true)), ""));
+    test.assert(bytes.equal(refusal(build_task.library_checked(true, "diff", false)), "library-invalid"));
+    test.assert(bytes.equal(refusal(build_task.library_checked(true, "Diff", true)), "library-invalid"));
+    test.assert(bytes.equal(refusal(build_task.library_checked(true, "", true)), "library-invalid"));
+    test.assert(bytes.equal(build_task.rule_name(build_task.Refusal::LibraryInvalid), "library-invalid"));
+    return 0;
+}
+
+fn test_a_library_adds_its_option_last_and_only_when_there_is_one[&h](heap: &!h Heap) -> [heap] int {
+    let v = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "a", "p", "m", "", "/w/e/c.txt", 4, 30, 3, 900, 4);
+    let w = build_task.with_library(heap, v, "diff");
+    borrow w as &wb in {
+        test.assert(bytes.equal(buffer.bytes(wb), "/opt/c\0/w/e/brief.txt\0/w/e\0a\0--provider\0p\0--model\0m\0--contract\0/w/e/c.txt\0--attempts\04\0--agent-seconds\030\0--rounds\03\0--plan-seconds\0900\0--jobs\04\0--library\0diff\0"));
+    }
+    buffer.drop(heap, w);
+    let n = build_task.build_args(heap, "/opt/c", "/w/e/brief.txt", "/w/e", "a", "p", "m", "", "", 4, 30, 3, 900, 4);
+    let n2 = build_task.with_library(heap, n, "");
+    borrow n2 as &nb in {
+        test.assert(bytes.equal(buffer.bytes(nb), "/opt/c\0/w/e/brief.txt\0/w/e\0a\0--provider\0p\0--model\0m\0--attempts\04\0--agent-seconds\030\0--rounds\03\0--plan-seconds\0900\0--jobs\04\0"));
+    }
+    buffer.drop(heap, n2);
+    return 0;
+}

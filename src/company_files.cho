@@ -3,6 +3,7 @@ module forge.company_files;
 
 import std.buffer;
 import std.bytes;
+import std.crypto;
 import forge.company_step;
 import forge.journal_io;
 
@@ -212,4 +213,167 @@ pub fn contract_intact[&h, &f, &d, &n, &e](heap: &!h Heap, fs: &f Fs(""), dir: &
     buffer.drop(heap, want);
     buffer.drop(heap, have);
     return same;
+}
+
+// ---- the library of a library step (docs/library-steps.md) -----------------------------------------------------------------
+
+// The file of the execution directory that names the module (the same name `build_task.library_file` gives the adapter).
+pub fn library_name_file() -> [] &static [byte] {
+    return "library.txt";
+}
+
+// Give a library step its module name: written as `library.txt` beneath `evdir`, replacing anything there (a link included), the way
+// `deliver_contract` writes `contract.txt`. 0, or 6 when the execution directory cannot be opened or written.
+pub fn deliver_library[&f, &n, &e](fs: &f Fs(""), name: &n [byte], evdir: &e [byte]) -> [fs_read(""), dir_write, file_write] int {
+    if !journal_io.path_ok(fs, evdir) {
+        return 6;
+    }
+    match open_dir(fs, evdir) {
+        DirOpened::Failed(e2) => {
+            return 6;
+        }
+        DirOpened::Ok(opened) => {
+            var ed = opened;
+            var code = 6;
+            borrow ed as &edr in {
+                if put_beneath(edr, library_name_file(), name) == 0 {
+                    code = 0;
+                }
+            }
+            dir_close(ed);
+            return code;
+        }
+    }
+}
+
+// A step that names no library: a `library.txt` an earlier start left in `evdir` is Forge's and is removed, so a build never meets a
+// library name it was not given. Nothing there is fine.
+pub fn clear_library[&f, &e](fs: &f Fs(""), evdir: &e [byte]) -> [fs_read(""), dir_write] int {
+    if !journal_io.path_ok(fs, evdir) {
+        return 0;
+    }
+    match open_dir(fs, evdir) {
+        DirOpened::Failed(e2) => {
+            return 0;
+        }
+        DirOpened::Ok(opened) => {
+            var ed = opened;
+            var removed = 0;
+            borrow ed as &edr in {
+                match dir_remove(edr, library_name_file()) {
+                    Done::Ok(n) => {
+                        removed = 1;
+                    }
+                    Done::Failed(e3) => {
+                        removed = 0;
+                    }
+                }
+            }
+            dir_close(ed);
+            return removed;
+        }
+    }
+}
+
+// The SHA-256 of `data` as lowercase hex.
+pub fn hex_of[&h, &b](heap: &!h Heap, data: &b [byte]) -> [heap] buffer.Buffer {
+    let digest = box_slice(heap, 32, byte_of(0));
+    borrow mut digest as &!dw in {
+        crypto.sha256(data, contents(dw));
+    }
+    var hex = buffer.empty(heap, 64);
+    borrow digest as &dg in {
+        hex = company_step.put_hex(heap, hex, contents(dg));
+    }
+    unbox_slice(heap, digest);
+    return hex;
+}
+
+// `<dir>/<sub>` as a path.
+fn beneath[&h, &d, &s](heap: &!h Heap, dir: &d [byte], sub: &s [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of(47));
+    return buffer.append(heap, b, sub);
+}
+
+// The hex digest of the file `name` beneath `evdir/sub` (`read_artifact`'s rules: a regular file, no link followed, at most 16 MiB),
+// and 0, or why it is refused (1 not there, 2 not a regular file, 3 too large, 4 unreadable).
+pub fn hash_in[&h, &f, &e, &s, &n](heap: &!h Heap, fs: &f Fs(""), evdir: &e [byte], sub: &s [byte], name: &n [byte]) -> [heap, fs_read(""), dir_read, file_read] (buffer.Buffer, int) {
+    let d = beneath(heap, evdir, sub);
+    var hex = buffer.empty(heap, 1);
+    var why = 4;
+    borrow d as &db in {
+        // A directory that is not there is "not there" (1), as a missing file is: `read_artifact` calls both an unreadable file.
+        var there = journal_io.path_ok(fs, buffer.bytes(db));
+        if there {
+            match open_dir(fs, buffer.bytes(db)) {
+                DirOpened::Failed(e) => {
+                    there = false;
+                    why = 4;
+                    if e == 2 {
+                        why = 1;
+                    }
+                }
+                DirOpened::Ok(opened) => {
+                    dir_close(opened);
+                }
+            }
+        }
+        if there {
+            let (data, w) = read_artifact(heap, fs, buffer.bytes(db), name);
+            why = w;
+            if w == 0 {
+                buffer.drop(heap, hex);
+                borrow data as &dd in {
+                    hex = hex_of(heap, buffer.bytes(dd));
+                }
+            }
+            buffer.drop(heap, data);
+        }
+    }
+    buffer.drop(heap, d);
+    return (hex, why);
+}
+
+// `<name>.cho` and `<name>_test.cho`: the names of a library's two files beneath `src` and `tests` (docs/library.md of cancho-code).
+pub fn library_src_name[&h, &n](heap: &!h Heap, name: &n [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.append(heap, buffer.empty(heap, 32), name), ".cho");
+}
+
+pub fn library_tests_name[&h, &n](heap: &!h Heap, name: &n [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.append(heap, buffer.empty(heap, 32), name), "_test.cho");
+}
+
+// Both files of the library `name` hashed: (source hex, tests hex, why, which). `why` 0 when both are regular files, else the reason
+// (`read_artifact`'s) and `which` 1 for the source file, 2 for the tests file; the hex of a refused file is empty.
+pub fn library_digests[&h, &f, &e, &n](heap: &!h Heap, fs: &f Fs(""), evdir: &e [byte], name: &n [byte]) -> [heap, fs_read(""), dir_read, file_read] (buffer.Buffer, buffer.Buffer, int, int) {
+    let sn = library_src_name(heap, name);
+    let tn = library_tests_name(heap, name);
+    var a = buffer.empty(heap, 1);
+    var b = buffer.empty(heap, 1);
+    var why = 0;
+    var which = 0;
+    borrow sn as &snb in {
+        let (ha, wa) = hash_in(heap, fs, evdir, "src", buffer.bytes(snb));
+        buffer.drop(heap, a);
+        a = ha;
+        if wa != 0 {
+            why = wa;
+            which = 1;
+        }
+    }
+    if why == 0 {
+        borrow tn as &tnb in {
+            let (hb, wb) = hash_in(heap, fs, evdir, "tests", buffer.bytes(tnb));
+            buffer.drop(heap, b);
+            b = hb;
+            if wb != 0 {
+                why = wb;
+                which = 2;
+            }
+        }
+    }
+    buffer.drop(heap, sn);
+    buffer.drop(heap, tn);
+    return (a, b, why, which);
 }

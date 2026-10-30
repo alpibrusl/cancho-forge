@@ -189,7 +189,7 @@ pub fn put_clean[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) ->
     return o;
 }
 
-fn quoted[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buffer.Buffer {
+pub fn quoted[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buffer.Buffer {
     return buffer.push(heap, put_clean(heap, buffer.push(heap, out, byte_of(96)), text), byte_of(96));
 }
 
@@ -256,6 +256,54 @@ fn decisions[&h, &j](heap: &!h Heap, out: buffer.Buffer, journal: &j [byte]) -> 
         pos = e + 1;
     }
     return (o, count);
+}
+
+// ---- the library record, read from the journal text ------------------------------------------------------------------------------
+
+// The digest `field` (`src_sha256` or `tests_sha256`) of the library record (`company.step.library`) that came before the LAST acceptance
+// of step `step`, and `name` must be the library it names; empty when there is none. Only complete lines are read; replay is what
+// refuses a corrupt journal. A later library record of the same step (a rerun that has not been accepted yet) does not count.
+pub fn library_sha[&h, &j, &s, &n, &f](heap: &!h Heap, journal: &j [byte], step: &s [byte], name: &n [byte], field: &f [byte]) -> [heap] buffer.Buffer {
+    var frozen = buffer.empty(heap, 64);
+    var pending = buffer.empty(heap, 64);
+    var pos = 0;
+    while pos < len(journal) {
+        var e = pos;
+        while e < len(journal) && int_of(journal[e]) != 10 {
+            e = e + 1;
+        }
+        if e < len(journal) {
+            let line = journal[pos..e];
+            let tape = box_slice(heap, json.tape_len(line), 0);
+            borrow mut tape as &!tw in {
+                let tp = contents(tw);
+                if json.parse(line, tp) > 0 && json.is_object(tp, 0) {
+                    let kind = json.get(line, tp, 0, "kind");
+                    let task = json.get(line, tp, 0, "task");
+                    if json.is_string(tp, kind) && json.is_string(tp, task) && bytes.equal(json.string_view(line, tp, task), step) {
+                        if bytes.equal(json.string_view(line, tp, kind), company_state.kind_library()) {
+                            let lib = json.get(line, tp, 0, "library");
+                            let value = json.get(line, tp, 0, field);
+                            buffer.drop(heap, pending);
+                            pending = buffer.empty(heap, 64);
+                            if json.is_string(tp, lib) && json.is_string(tp, value) && bytes.equal(json.string_view(line, tp, lib), name) && json.string_plain(tp, value) {
+                                pending = buffer.append(heap, pending, json.string_view(line, tp, value));
+                            }
+                        } else if bytes.equal(json.string_view(line, tp, kind), company_state.kind_accepted()) {
+                            buffer.drop(heap, frozen);
+                            borrow pending as &pb in {
+                                frozen = buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(pb));
+                            }
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+        pos = e + 1;
+    }
+    buffer.drop(heap, pending);
+    return frozen;
 }
 
 // ---- the texts ------------------------------------------------------------------------------------------------------------------
@@ -358,8 +406,17 @@ pub fn pr_text[&h, &m, &s, &d, &x, &b, &k](heap: &!h Heap, m: &m company_manifes
 
 // ---- the request to the worker and its reply ---------------------------------------------------------------------------------------
 
+// The index of the NUL at or after `from` in `text`, or its length.
+fn nul_at[&t](text: &t [byte], from: int) -> [] int {
+    var e = from;
+    while e < len(text) && int_of(text[e]) != 0 {
+        e = e + 1;
+    }
+    return e;
+}
+
 // The JSON request `workers/repo_publish.cho` reads on standard input: every field a string, written escaped.
-pub fn request[&h, &c, &r, &b, &s, &n, &d, &x, &p, &g](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], src_dir: &s [byte], src_name: &n [byte], dest: &d [byte], sha: &x [byte], prov: &p [byte], message: &g [byte]) -> [heap] buffer.Buffer {
+pub fn request[&h, &c, &r, &b, &s, &n, &d, &x, &p, &g, &z](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], src_dir: &s [byte], src_name: &n [byte], dest: &d [byte], sha: &x [byte], prov: &p [byte], message: &g [byte], extras: &z [byte]) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 1024);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "checkout");
@@ -382,6 +439,30 @@ pub fn request[&h, &c, &r, &b, &s, &n, &d, &x, &p, &g](heap: &!h Heap, checkout:
     w = json.put_string(heap, w, prov);
     w = json.put_key(heap, w, "message");
     w = json.put_string(heap, w, message);
+    if len(extras) > 0 {
+        // `extras`: `src_dir NUL src_name NUL dest NUL sha NUL` for each further file of the publish (a library step's second file).
+        w = json.put_key(heap, w, "more");
+        var x = json.begin_array(heap, w);
+        var pos = 0;
+        while pos < len(extras) {
+            let a = nul_at(extras, pos);
+            let b = nul_at(extras, a + 1);
+            let c = nul_at(extras, b + 1);
+            let d = nul_at(extras, c + 1);
+            x = json.begin_object(heap, x);
+            x = json.put_key(heap, x, "src_dir");
+            x = json.put_string(heap, x, extras[pos..a]);
+            x = json.put_key(heap, x, "src_name");
+            x = json.put_string(heap, x, extras[a + 1..b]);
+            x = json.put_key(heap, x, "dest");
+            x = json.put_string(heap, x, extras[b + 1..c]);
+            x = json.put_key(heap, x, "sha256");
+            x = json.put_string(heap, x, extras[c + 1..d]);
+            x = json.end_object(heap, x);
+            pos = d + 1;
+        }
+        w = json.end_array(heap, x);
+    }
     w = json.end_object(heap, w);
     return json.finish(w);
 }

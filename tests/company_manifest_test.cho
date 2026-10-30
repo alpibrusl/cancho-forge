@@ -145,6 +145,9 @@ fn test_the_refusal_tags_are_the_documented_ones() -> [] int {
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::TaskTypeUnsupported), "task-type-unsupported"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::CheckMissing), "check-missing"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::ContractRoleInvalid), "contract-role-invalid"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::LibraryRoleInvalid), "library-role-invalid"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::LibraryNameInvalid), "library-name-invalid"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::LibraryNeedsContract), "library-needs-contract"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::GateUnknown), "gate-unknown"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::BudgetMissing), "budget-missing"));
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::PriceTableMissing), "price-table-missing"));
@@ -458,5 +461,51 @@ fn test_the_most_steps_in_a_chain_are_held_and_one_more_is_malformed[&h](heap: &
         test.assert(bytes.equal(steps_rule(heap, buffer.bytes(b)), "manifest-malformed"));
     }
     buffer.drop(heap, over);
+    return 0;
+}
+
+fn test_a_library_on_a_builder_with_a_contract_is_held_and_reads_back[&h](heap: &!h Heap) -> [heap] int {
+    let d = doc(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":\"diff\"},{\"id\":\"b\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\"}", budget(), "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert(bytes.equal(company_manifest.step_library(mr, company_manifest.step_at(mr, 0)), "diff"));
+                    test.assert_eq(len(company_manifest.step_library(mr, company_manifest.step_at(mr, 1))), 0);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_library_on_a_role_that_builds_nothing_is_library_role_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"library\":\"diff\"}"), "library-role-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\",\"library\":\"diff\"}"), "library-role-invalid"));
+    return 0;
+}
+
+fn test_a_library_that_is_not_a_module_name_is_library_name_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":\"Diff\"}"), "library-name-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":\"\"}"), "library-name-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":\"1diff\"}"), "library-name-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":\"std\"}"), "library-name-invalid"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":\"a-b\"}"), "library-name-invalid"));
+    return 0;
+}
+
+fn test_a_library_without_a_contract_is_library_needs_contract[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"library\":\"diff\"}"), "library-needs-contract"));
+    return 0;
+}
+
+fn test_a_library_that_is_not_a_string_is_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":5}"), "manifest-malformed"));
+    test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":\"d\\u0069ff\"}"), "manifest-malformed"));
     return 0;
 }

@@ -208,3 +208,71 @@ pub fn test_commit_message_has_subject_body_and_trailer[&h](heap: &!h Heap) -> [
     }
     return 0;
 }
+
+// The digests of a library step: the record before the LAST acceptance counts; a record after it (a rerun not yet accepted), another
+// step's, another library's, or none, does not.
+fn lib_sha_of[&h, &j](heap: &!h Heap, journal: &j [byte], step: &static [byte], name: &static [byte], field: &static [byte]) -> [heap] buffer.Buffer {
+    return publish_plan.library_sha(heap, journal, step, name, field);
+}
+
+pub fn test_library_sha_reads_the_record_before_the_last_acceptance[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "lib", "t-1"));
+    j = add(heap, j, company_state.library_files(heap, 2, "lib", "diff", "aaaa", "bbbb"));
+    j = add(heap, j, company_state.accepted(heap, 3, "lib", "steps/lib/ev/project.cho", "abc123"));
+    j = add(heap, j, company_state.library_files(heap, 4, "other", "diff", "cccc", "dddd"));
+    j = add(heap, j, company_state.library_files(heap, 5, "lib", "diff", "eeee", "ffff"));
+    borrow j as &jb in {
+        let a = lib_sha_of(heap, buffer.bytes(jb), "lib", "diff", "src_sha256");
+        borrow a as &ab in {
+            test.assert(bytes.equal(buffer.bytes(ab), "aaaa"));
+        }
+        buffer.drop(heap, a);
+        let t = lib_sha_of(heap, buffer.bytes(jb), "lib", "diff", "tests_sha256");
+        borrow t as &tb in {
+            test.assert(bytes.equal(buffer.bytes(tb), "bbbb"));
+        }
+        buffer.drop(heap, t);
+        let wrong = lib_sha_of(heap, buffer.bytes(jb), "lib", "other_name", "src_sha256");
+        borrow wrong as &wb in {
+            test.assert_eq(len(buffer.bytes(wb)), 0);
+        }
+        buffer.drop(heap, wrong);
+        let unknown = lib_sha_of(heap, buffer.bytes(jb), "nostep", "diff", "src_sha256");
+        borrow unknown as &ub in {
+            test.assert_eq(len(buffer.bytes(ub)), 0);
+        }
+        buffer.drop(heap, unknown);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+pub fn test_library_sha_is_empty_when_no_acceptance_follows_the_record[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.library_files(heap, 1, "lib", "diff", "aaaa", "bbbb"));
+    borrow j as &jb in {
+        let a = lib_sha_of(heap, buffer.bytes(jb), "lib", "diff", "src_sha256");
+        borrow a as &ab in {
+            test.assert_eq(len(buffer.bytes(ab)), 0);
+        }
+        buffer.drop(heap, a);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+pub fn test_the_request_carries_more_files_only_when_there_are_some[&h](heap: &!h Heap) -> [heap] int {
+    let one = publish_plan.request(heap, "/c", "alpibrusl/x", "forge/b", "/s/ev", "project.cho", "src/a.cho", "ab", "p", "m", "");
+    borrow one as &ob in {
+        test.assert_eq(flag(bytes.find(buffer.bytes(ob), "\"more\"") >= 0), 0);
+    }
+    buffer.drop(heap, one);
+    let two = publish_plan.request(heap, "/c", "alpibrusl/x", "forge/b", "/s/ev/src", "diff.cho", "src/diff.cho", "ab", "p", "m", "/s/ev/tests\0diff_test.cho\0tests/diff_test.cho\0cd\0");
+    borrow two as &tb in {
+        let t = buffer.bytes(tb);
+        test.assert_eq(flag(bytes.find(t, "\"more\":[{\"src_dir\":\"/s/ev/tests\",\"src_name\":\"diff_test.cho\",\"dest\":\"tests/diff_test.cho\",\"sha256\":\"cd\"}]") >= 0), 1);
+    }
+    buffer.drop(heap, two);
+    return 0;
+}

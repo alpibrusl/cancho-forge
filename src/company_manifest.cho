@@ -14,7 +14,7 @@ import std.json;
 //     "model":  { "provider", "name" },
 //     "budget": { "input", "output", "cache_write", "cache_read", "max_cost", "price_table" },
 //     "human_gates": [name...], "roles": [role...],
-//     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "contract"?, "gate"? } ... ] }
+//     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "contract"?, "library"?, "gate"? } ... ] }
 //
 // The order the checks run in, so that a manifest with two faults is always refused for the same one:
 //   1. size (over 1 MiB), JSON, the root an object                                       manifest-malformed
@@ -28,6 +28,9 @@ import std.json;
 //      task type (not the one the role offers)                                           task-type-unsupported
 //      check (a builder or writer without one)                                           check-missing
 //      contract (a step that is neither a builder nor a writer names one)                contract-role-invalid
+//      library (a step that is neither a builder nor a writer names one)                 library-role-invalid
+//      library (not a module name: `build_task.library_ok`)                              library-name-invalid
+//      library (a step with a library and no contract)                                   library-needs-contract
 //      gate (not in `human_gates`)                                                       gate-unknown
 //   8. a `needs` entry that is no step id                                                step-needs-unknown
 //   9. a step that needs itself, or any cycle                                            step-cycle
@@ -59,6 +62,13 @@ pub enum Refusal {
     CheckMissing,
     // A `contract` on a step that is neither a builder nor a writer: only a build is given a contract file.
     ContractRoleInvalid,
+    // A `library` on a step that is neither a builder nor a writer: only a build is given a library name.
+    LibraryRoleInvalid,
+    // A `library` that is not a module name (`build_task.library_ok`: lowercase letters, digits and `_`, not starting with a digit, at
+    // most 64 bytes, not `std` or `test`).
+    LibraryNameInvalid,
+    // A `library` on a step with no `contract`: `cancho-build --library` needs the contract to know which functions are public.
+    LibraryNeedsContract,
     // A step's `gate` that is not in `human_gates`.
     GateUnknown,
     // No `budget` object, or one of its five numbers is absent.
@@ -96,6 +106,15 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         Refusal::ContractRoleInvalid => {
             return "contract-role-invalid";
         }
+        Refusal::LibraryRoleInvalid => {
+            return "library-role-invalid";
+        }
+        Refusal::LibraryNameInvalid => {
+            return "library-name-invalid";
+        }
+        Refusal::LibraryNeedsContract => {
+            return "library-needs-contract";
+        }
         Refusal::GateUnknown => {
             return "gate-unknown";
         }
@@ -127,7 +146,7 @@ pub enum TaskType {
 }
 
 // A step, as the nodes of the manifest's tape: read the text of a field with `step_id`, `step_input`, `step_check`, `step_contract`,
-// `step_gate` and `step_need`. `check`, `contract` and `gate` are -1 when the step has none.
+// `step_library`, `step_gate` and `step_need`. `check`, `contract`, `library` and `gate` are -1 when the step has none.
 pub struct Step {
     id: int,
     role: Role,
@@ -136,6 +155,7 @@ pub struct Step {
     input: int,
     check: int,
     contract: int,
+    library: int,
     gate: int,
 }
 
@@ -190,7 +210,7 @@ pub fn max_text() -> [] int {
 
 // ---- the checks -----------------------------------------------------------------------------------------------------------
 // Each answers 0 for held, else a code: 1 malformed, 2 unknown field, 3 duplicate, 4 needs unknown, 5 cycle, 6 role unknown, 7 task
-// type, 8 check missing, 9 gate unknown, 10 budget missing, 11 price table missing, 12 contract on a role that builds nothing.
+// type, 8 check missing, 9 gate unknown, 10 budget missing, 11 price table missing, 12 contract on a role that builds nothing, 13 library on a role that builds nothing, 14 library that is not a module name, 15 library without a contract.
 
 fn refusal_of(code: int) -> [] Refusal {
     if code == 2 {
@@ -225,6 +245,15 @@ fn refusal_of(code: int) -> [] Refusal {
     }
     if code == 12 {
         return Refusal::ContractRoleInvalid;
+    }
+    if code == 13 {
+        return Refusal::LibraryRoleInvalid;
+    }
+    if code == 14 {
+        return Refusal::LibraryNameInvalid;
+    }
+    if code == 15 {
+        return Refusal::LibraryNeedsContract;
     }
     return Refusal::ManifestMalformed;
 }
@@ -538,7 +567,7 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
     if !json.is_object(tp, step) {
         return 1;
     }
-    let keys = keys_code(src, tp, step, "id role task_type needs input check contract gate");
+    let keys = keys_code(src, tp, step, "id role task_type needs input check contract library gate");
     if keys != 0 {
         return keys;
     }
@@ -547,6 +576,7 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
     let input = json.get(src, tp, step, "input");
     let check = json.get(src, tp, step, "check");
     let contract = json.get(src, tp, step, "contract");
+    let library = json.get(src, tp, step, "library");
     let gate = json.get(src, tp, step, "gate");
     if !is_name(src, tp, json.get(src, tp, step, "id")) || !json.string_plain(tp, role) || !json.string_plain(tp, task_type) {
         return 1;
@@ -564,6 +594,9 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
         return 1;
     }
     if contract >= 0 && (!json.string_plain(tp, contract) || !file_ok(json.string_view(src, tp, contract))) {
+        return 1;
+    }
+    if library >= 0 && !json.string_plain(tp, library) {
         return 1;
     }
     if gate >= 0 && !is_name(src, tp, gate) {
@@ -589,6 +622,16 @@ fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, 
     }
     if json.get(src, tp, step, "contract") >= 0 && role != 0 && role != 4 {
         return 12;
+    }
+    let library = json.get(src, tp, step, "library");
+    if library >= 0 && role != 0 && role != 4 {
+        return 13;
+    }
+    if library >= 0 && !library_name_ok(json.string_view(src, tp, library)) {
+        return 14;
+    }
+    if library >= 0 && json.get(src, tp, step, "contract") < 0 {
+        return 15;
     }
     let gate = json.get(src, tp, step, "gate");
     if gate >= 0 && !in_names(src, tp, gates, gate) {
@@ -903,6 +946,29 @@ pub fn step_count[&m](m: &m Manifest) -> [] int {
     return m.step_count;
 }
 
+// Is `name` a module name `cancho-build --library` accepts? The same rule as `build_task.library_ok` (a copy, so that this module imports
+// nothing; tests/company_step_test.cho holds the two to the same answer): lowercase letters, digits and `_`, not starting with a digit,
+// 1 to 64 bytes, and not `std` or `test`.
+pub fn library_name_ok[&n](name: &n [byte]) -> [] bool {
+    if len(name) == 0 || len(name) > 64 {
+        return false;
+    }
+    if bytes.equal(name, "std") || bytes.equal(name, "test") {
+        return false;
+    }
+    var i = 0;
+    while i < len(name) {
+        let c = int_of(name[i]);
+        let letter = c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        if !(letter || c == 95 || digit && i > 0) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
 // Step `i`, 0-based; an `i` outside 0 to `step_count - 1` is the first step.
 pub fn step_at[&m](m: &m Manifest, i: int) -> [] Step {
     let tp = contents(m.tape);
@@ -914,7 +980,7 @@ pub fn step_at[&m](m: &m Manifest, i: int) -> [] Step {
     let node = json.at(tp, m.steps, at);
     let role = role_code(json.string_view(src, tp, json.get(src, tp, node, "role")));
     let tcode = type_code(json.string_view(src, tp, json.get(src, tp, node, "task_type")));
-    return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), contract: json.get(src, tp, node, "contract"), gate: json.get(src, tp, node, "gate") };
+    return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), contract: json.get(src, tp, node, "contract"), library: json.get(src, tp, node, "library"), gate: json.get(src, tp, node, "gate") };
 }
 
 pub fn step_id[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
@@ -934,6 +1000,11 @@ pub fn step_check[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
 // The step's contract file name (a builder's or writer's), empty when it has none.
 pub fn step_contract[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
     return text_at(m, s.contract);
+}
+
+// The step's library name (a builder's or writer's), empty when it has none.
+pub fn step_library[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
+    return text_at(m, s.library);
 }
 
 // The step's gate, empty when it has none.

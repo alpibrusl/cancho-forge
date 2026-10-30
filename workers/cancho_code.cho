@@ -8,6 +8,7 @@ import std.json;
 import std.option;
 import std.process;
 import forge.build_task;
+import forge.company_files;
 import forge.gate_task;
 import forge.journal_io;
 import forge.lock;
@@ -1114,6 +1115,24 @@ fn supervise_task[&h, &f, &c, &x, &r, &k, &b, &e, &t, &a](heap: &!h Heap, fs: &f
     }
 }
 
+// The module name Forge asked for, in `library.txt` beneath the execution directory (Forge writes it for a library step, beside
+// `contract.txt`): its text and whether the file is there. No file (or a directory that cannot be opened) is "no library"; a file that is
+// there but is not a plain small file gives an empty name, which `build_task.library_checked` refuses.
+fn library_of[&h, &f, &e](heap: &!h Heap, fs: &f Fs(""), exec_dir: &e [byte]) -> [heap, fs_read(""), dir_read, file_read] (buffer.Buffer, bool) {
+    let (data, why) = company_files.read_artifact(heap, fs, exec_dir, build_task.library_file());
+    if why == 1 || why == 4 {
+        // Not there, or the execution directory itself cannot be read (which the adapter reports as `workdir-unwritable` when it writes
+        // the brief): no library. A file that is there but is not a plain small file (`read_artifact`'s 2 and 3) is refused below.
+        buffer.drop(heap, data);
+        return (buffer.empty(heap, 1), false);
+    }
+    if why != 0 {
+        buffer.drop(heap, data);
+        return (buffer.empty(heap, 1), true);
+    }
+    return (data, true);
+}
+
 // One call. A request that begins with the line `supervise <token>` is the one `start_supervisor` hands to its supervisor (the
 // token is the start token of that run, the rest of the input is the request of `execute`): this call is the supervisor, it
 // prints nothing, and its exit code is `supervised`'s. Anything else is a call of a verb, and its reply goes to standard
@@ -1184,6 +1203,7 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                     // `input.contract`: absent is none; present but empty or not a plain string is read as empty and refused
                     let contract_node = json.get(src, tp, input, "contract");
                     let contract = text_of(src, tp, contract_node);
+                    let (lib_buf, lib_present) = library_of(heap, fs, exec_dir);
                     let provider = text_of(src, tp, json.get(src, tp, build, "provider"));
                     let model = text_of(src, tp, json.get(src, tp, build, "model"));
                     let agent = text_of(src, tp, json.get(src, tp, build, "agent"));
@@ -1197,6 +1217,15 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                         match refusal {
                             build_task.Checked::Held => {
                                 refusal = build_task.contract_checked(contract_node >= 0, contract, exec_dir);
+                            }
+                            build_task.Checked::Refused(why) => {
+                            }
+                        }
+                        match refusal {
+                            build_task.Checked::Held => {
+                                borrow lib_buf as &lbc in {
+                                    refusal = build_task.library_checked(lib_present, buffer.bytes(lbc), contract_node >= 0);
+                                }
                             }
                             build_task.Checked::Refused(why) => {
                             }
@@ -1232,7 +1261,10 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                                     }
                                     borrow brief_path as &bp in {
                                         borrow contract_path as &cp in {
-                                            let args = build_task.build_args(heap, checker, buffer.bytes(bp), exec_dir, agent, provider, model, guide, buffer.bytes(cp), attempts, agent_seconds, rounds, plan_seconds, jobs);
+                                            var args = build_task.build_args(heap, checker, buffer.bytes(bp), exec_dir, agent, provider, model, guide, buffer.bytes(cp), attempts, agent_seconds, rounds, plan_seconds, jobs);
+                                            borrow lib_buf as &lba in {
+                                                args = build_task.with_library(heap, args, buffer.bytes(lba));
+                                            }
                                             borrow args as &ab in {
                                                 code = supervise_task(heap, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), buffer.bytes(bb), exec_dir, tools_dir, buffer.bytes(ab), timeout_ms, token);
                                             }
@@ -1246,6 +1278,7 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                         }
                     }
                     buffer.drop(heap, brief);
+                    buffer.drop(heap, lib_buf);
                 }
             } else {
                 code = 4;

@@ -91,6 +91,12 @@ pub fn kind_check_unavailable() -> [] &static [byte] {
     return "company.step.check_unavailable";
 }
 
+// A library step's two files, hashed by Forge before its check runs: `src/<library>.cho` and `tests/<library>_test.cho` beneath the
+// execution directory (docs/library-steps.md). Replay checks its shape and nothing else; `forge company publish` reads it.
+pub fn kind_library() -> [] &static [byte] {
+    return "company.step.library";
+}
+
 // The prefix of a retry gate: `retry:<step id>` is a decision a person records with `forge company decide` to let a step whose
 // check failed (or was unavailable) be run again. It is not in `human_gates`; any step id of the manifest makes one.
 pub fn retry_prefix() -> [] &static [byte] {
@@ -149,6 +155,18 @@ pub fn accepted[&h, &s, &a, &x](heap: &!h Heap, seq: int, step: &s [byte], artif
     w = json.put_string(heap, w, artifact);
     w = json.put_key(heap, w, "sha256");
     w = json.put_string(heap, w, sha256);
+    return closed(heap, w);
+}
+
+// Step `step` left the library `name`: its source file hashed `src_sha256` and its test file `tests_sha256`, by Forge, before the check ran.
+pub fn library_files[&h, &s, &n, &a, &b](heap: &!h Heap, seq: int, step: &s [byte], name: &n [byte], src_sha256: &a [byte], tests_sha256: &b [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_library(), step);
+    w = json.put_key(heap, w, "library");
+    w = json.put_string(heap, w, name);
+    w = json.put_key(heap, w, "src_sha256");
+    w = json.put_string(heap, w, src_sha256);
+    w = json.put_key(heap, w, "tests_sha256");
+    w = json.put_string(heap, w, tests_sha256);
     return closed(heap, w);
 }
 
@@ -334,6 +352,11 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                         }
                         set_held(held, at, 0);
                         ar = keep_artifact(heap, ar, art_at, at, line, tp, artifact, sha);
+                    }
+                } else if bytes.equal(kind, kind_library()) {
+                    let strings = json.is_string(tp, json.get(line, tp, 0, "library")) && json.is_string(tp, json.get(line, tp, 0, "src_sha256")) && json.is_string(tp, json.get(line, tp, 0, "tests_sha256"));
+                    if named == false || strings == false {
+                        rule = bad;
                     }
                 } else if bytes.equal(kind, kind_check_failed()) {
                     let score = field(line, tp, 0, "score");

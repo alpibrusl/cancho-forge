@@ -479,3 +479,10 @@ Compiler `972099e`, Linux x86-64, one run each, against the **stand-in** tool (`
 
 What the building changed: the first oracle for the `notool` case listed only `brief.txt`, and now lists the lock file too (the
 adapter takes the lock before the tool is looked up by the spawn). The decision of 11.2 did not change.
+
+## The library file (`library.txt`)
+
+A builder step with a `library` (`docs/library-steps.md`) has a `library.txt` beside `contract.txt` in its execution directory, written by
+Forge. The adapter reads it (a regular file of at most 16 MiB; a directory that cannot be opened is "no library", which the brief-writing step
+then reports as `workdir-unwritable`), refuses it as `library-invalid` when it is not a module name, is not a plain file, or comes with no
+`input.contract`, and otherwise adds `--library NAME` as the last option of the `cancho-build` argument vector. No `library.txt`, no option.
