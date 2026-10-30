@@ -223,6 +223,15 @@ fn dir_of[&d](dest: &d [byte]) -> [] &d [byte] {
     return dest[0..0];
 }
 
+// The end of the line of `text` that starts at `from` (the index of its line feed, or the length).
+fn line_end[&t](text: &t [byte], from: int) -> [] int {
+    var e = from;
+    while e < len(text) && int_of(text[e]) != 10 {
+        e = e + 1;
+    }
+    return e;
+}
+
 fn put[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buffer.Buffer {
     return buffer.append(heap, out, text);
 }
@@ -234,6 +243,21 @@ fn q[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buff
 }
 
 // The part of a script that fails with 16 when a link or a directory is where `path` (relative to the checkout) goes, or on the way.
+// Every name of the newline-separated `names` between single quotes, each followed by a space.
+fn quoted_lines[&h, &t](heap: &!h Heap, out: buffer.Buffer, names: &t [byte]) -> [heap] buffer.Buffer {
+    var s = out;
+    var pos = 0;
+    while pos < len(names) {
+        let e = line_end(names, pos);
+        if e > pos {
+            s = q(heap, s, names[pos..e]);
+            s = put(heap, s, " ");
+        }
+        pos = e + 1;
+    }
+    return s;
+}
+
 fn on_the_way[&h, &t](heap: &!h Heap, out: buffer.Buffer, path: &t [byte]) -> [heap] buffer.Buffer {
     var s = put(heap, out, "p=''\nw=");
     s = q(heap, s, path);
@@ -262,7 +286,14 @@ fn checks_script[&h, &c, &r, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], re
     s = put(heap, s, "if git rev-parse --verify --quiet 'refs/heads/");
     s = put(heap, s, branch);
     s = put(heap, s, "' >/dev/null 2>&1; then exit 15; fi\n");
-    s = on_the_way(heap, s, dest);
+    var at = 0;
+    while at < len(dest) {
+        let e = line_end(dest, at);
+        if e > at {
+            s = on_the_way(heap, s, dest[at..e]);
+        }
+        at = e + 1;
+    }
     s = on_the_way(heap, s, prov);
     s = put(heap, s, "git symbolic-ref -q --short HEAD || git rev-parse HEAD\n");
     return s;
@@ -275,12 +306,17 @@ fn branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], branch
     s = put(heap, s, " || exit 11\ngit checkout -q -b ");
     s = q(heap, s, branch);
     s = put(heap, s, " || exit 18\n");
-    let dd = dir_of(dest);
     let pd = dir_of(prov);
-    if len(dd) > 0 {
-        s = put(heap, s, "mkdir -p ");
-        s = q(heap, s, dd);
-        s = put(heap, s, " || exit 18\n");
+    var at = 0;
+    while at < len(dest) {
+        let e = line_end(dest, at);
+        let dd = dir_of(dest[at..e]);
+        if len(dd) > 0 {
+            s = put(heap, s, "mkdir -p ");
+            s = q(heap, s, dd);
+            s = put(heap, s, " || exit 18\n");
+        }
+        at = e + 1;
     }
     if len(pd) > 0 {
         s = put(heap, s, "mkdir -p ");
@@ -296,8 +332,7 @@ fn commit_script[&h, &c, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], dest: 
     var s = put(heap, buffer.empty(heap, 512), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " || exit 11\ngit add -- ");
-    s = q(heap, s, dest);
-    s = put(heap, s, " ");
+    s = quoted_lines(heap, s, dest);
     s = q(heap, s, prov);
     s = put(heap, s, " || exit 19\ngit -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -q --no-verify -F - || exit 19\ngit rev-parse HEAD || exit 19\ngit checkout -q ");
     s = q(heap, s, orig);
@@ -311,8 +346,7 @@ fn undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], bran
     var s = put(heap, buffer.empty(heap, 512), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " || exit 11\ngit reset -q --hard\nfor f in ");
-    s = q(heap, s, dest);
-    s = put(heap, s, " ");
+    s = quoted_lines(heap, s, dest);
     s = q(heap, s, prov);
     s = put(heap, s, "; do git ls-files --error-unmatch \"$f\" >/dev/null 2>&1 || rm -f \"$f\"; done\ngit checkout -q ");
     s = q(heap, s, orig);
@@ -402,28 +436,82 @@ fn publish[&h, &i, &f, &c, &x, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs("")
     if publish_plan.dest_ok(dest) == false || publish_plan.dest_ok(prov_dest) == false || publish_plan.dest_ok(src_name) == false || bytes.find(src_name, "/") >= 0 || bytes.equal(dest, prov_dest) {
         return answer_failed(heap, io, publish_plan.rule_dest_invalid(), "a destination is not a plain path inside the checkout");
     }
-    let prov_text = decoded_of(heap, src, tp, "provenance");
-    let message_text = decoded_of(heap, src, tp, "message");
-    var code = 0;
-    borrow prov_text as &pv in {
-        borrow message_text as &mg in {
-            code = publish_texts(heap, io, fs, clock, exec, checkout, repo, branch, src_dir, src_name, dest, sha, prov_dest, buffer.bytes(pv), buffer.bytes(mg));
+    // `more`: up to three more artifacts, each with its own directory, source name, destination and digest. Every destination is a
+    // name the checks above would accept, and no two files of this publish go to the same place.
+    var alld = buffer.append(heap, buffer.empty(heap, 128), dest);
+    var extras = buffer.empty(heap, 256);
+    var more_ok = true;
+    let more = json.get(src, tp, 0, "more");
+    if more >= 0 {
+        if json.is_array(tp, more) == false || json.count(tp, more) > 3 {
+            more_ok = false;
+        } else {
+            let n = json.count(tp, more);
+            var j = 0;
+            while j < n && more_ok {
+                let ent = json.at(tp, more, j);
+                if json.is_object(tp, ent) == false {
+                    more_ok = false;
+                } else {
+                    let esd = text_in(src, tp, ent, "src_dir");
+                    let esn = text_in(src, tp, ent, "src_name");
+                    let ede = text_in(src, tp, ent, "dest");
+                    let esh = text_in(src, tp, ent, "sha256");
+                    var seen = false;
+                    borrow alld as &ab in {
+                        seen = has_line(buffer.bytes(ab), ede);
+                    }
+                    if gate_task.path_ok(esd) == false || publish_plan.dest_ok(ede) == false || publish_plan.dest_ok(esn) == false || bytes.find(esn, "/") >= 0 || bytes.equal(ede, prov_dest) || seen || hex64(esh) == false {
+                        more_ok = false;
+                    } else {
+                        alld = buffer.push(heap, alld, byte_of(10));
+                        alld = buffer.append(heap, alld, ede);
+                        extras = buffer.append(heap, extras, esd);
+                        extras = buffer.push(heap, extras, byte_of(0));
+                        extras = buffer.append(heap, extras, esn);
+                        extras = buffer.push(heap, extras, byte_of(0));
+                        extras = buffer.append(heap, extras, ede);
+                        extras = buffer.push(heap, extras, byte_of(0));
+                        extras = buffer.append(heap, extras, esh);
+                        extras = buffer.push(heap, extras, byte_of(0));
+                    }
+                }
+                j = j + 1;
+            }
         }
     }
-    buffer.drop(heap, prov_text);
-    buffer.drop(heap, message_text);
+    var code = 0;
+    if more_ok == false {
+        code = answer_failed(heap, io, publish_plan.rule_dest_invalid(), "an extra file is not a plain accepted artifact with a plain destination");
+    } else {
+        let prov_text = decoded_of(heap, src, tp, "provenance");
+        let message_text = decoded_of(heap, src, tp, "message");
+        borrow prov_text as &pv in {
+            borrow message_text as &mg in {
+                borrow alld as &ab2 in {
+                    borrow extras as &xb in {
+                        code = publish_texts(heap, io, fs, clock, exec, checkout, repo, branch, src_dir, src_name, dest, sha, prov_dest, buffer.bytes(pv), buffer.bytes(mg), buffer.bytes(ab2), buffer.bytes(xb));
+                    }
+                }
+            }
+        }
+        buffer.drop(heap, prov_text);
+        buffer.drop(heap, message_text);
+    }
+    buffer.drop(heap, alld);
+    buffer.drop(heap, extras);
     return code;
 }
 
 // The texts are decoded: the rest of the checks, then the publish.
-fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], repo: &r [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
+fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], repo: &r [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], alld: &a [byte], extras: &t [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
     if hex64(sha) == false || len(prov) > publish_plan.text_cap() || len(message) > publish_plan.text_cap() || len(message) == 0 {
         return answer_failed(heap, io, publish_plan.rule_worker_failed(), "the request is malformed");
     }
     // Step 1: the checkout.
     var orig = buffer.empty(heap, 1);
     var refused = 0;
-    let check = checks_script(heap, checkout, repo, branch, dest, prov_dest);
+    let check = checks_script(heap, checkout, repo, branch, alld, prov_dest);
     borrow check as &cb in {
         let (status, out) = run_sh(heap, exec, clock, buffer.bytes(cb), "");
         refused = status;
@@ -455,15 +543,92 @@ fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m](hea
         if script_name(buffer.bytes(og)) == false {
             code = answer_failed(heap, io, publish_plan.rule_checkout_invalid(), "the checkout is on a branch whose name is not a plain name");
         } else {
-            code = publish_checked(heap, io, fs, clock, exec, checkout, branch, src_dir, src_name, dest, sha, prov_dest, prov, message, buffer.bytes(og));
+            code = publish_checked(heap, io, fs, clock, exec, checkout, branch, src_dir, src_name, dest, sha, prov_dest, prov, message, buffer.bytes(og), alld, extras);
         }
     }
     buffer.drop(heap, orig);
     return code;
 }
 
+// The extra artifacts (`more` of the request), as `src_dir NUL src_name NUL dest NUL sha NUL` for each. Each is read again here, hashed,
+// compared with the digest it was accepted with, and written beneath the checkout. 0; 1 a file is not the one that was accepted; 2 a file
+// could not be written.
+fn write_extras[&h, &f, &k, &t](heap: &!h Heap, fs: &f Fs(""), checkout: &k [byte], extras: &t [byte]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write] int {
+    var pos = 0;
+    while pos < len(extras) {
+        let a = nul_end(extras, pos);
+        let b = nul_end(extras, a + 1);
+        let c = nul_end(extras, b + 1);
+        let d = nul_end(extras, c + 1);
+        let src_dir = extras[pos..a];
+        let src_name = extras[a + 1..b];
+        let dest = extras[b + 1..c];
+        let sha = extras[c + 1..d];
+        pos = d + 1;
+        let (data, why) = company_files.read_artifact(heap, fs, src_dir, src_name);
+        var same = false;
+        if why == 0 {
+            borrow data as &db in {
+                let digest = snapshot.hex_digest(heap, buffer.bytes(db));
+                borrow digest as &gb in {
+                    same = bytes.equal(buffer.bytes(gb), sha);
+                }
+                buffer.drop(heap, digest);
+            }
+        }
+        if same == false {
+            buffer.drop(heap, data);
+            return 1;
+        }
+        var rc = 0 - 1;
+        let path = under(heap, checkout, dest);
+        borrow path as &pb in {
+            borrow data as &db2 in {
+                rc = write_file(fs, buffer.bytes(pb), buffer.bytes(db2));
+            }
+        }
+        buffer.drop(heap, path);
+        buffer.drop(heap, data);
+        if rc != 0 {
+            return 2;
+        }
+    }
+    return 0;
+}
+
+// The index of the NUL at or after `from`, or the length.
+fn nul_end[&t](text: &t [byte], from: int) -> [] int {
+    var e = from;
+    while e < len(text) && int_of(text[e]) != 0 {
+        e = e + 1;
+    }
+    return e;
+}
+
+// Is `name` one of the newline-separated lines of `names`?
+fn has_line[&t, &n](names: &t [byte], name: &n [byte]) -> [] bool {
+    var pos = 0;
+    while pos < len(names) {
+        let e = line_end(names, pos);
+        if bytes.equal(names[pos..e], name) {
+            return true;
+        }
+        pos = e + 1;
+    }
+    return false;
+}
+
+// The string `name` of the object at `node`, when it is written plain, else empty.
+fn text_in[&s, &t](src: &s [byte], tape: &t [int], node: int, name: &static [byte]) -> [] &s [byte] {
+    let v = json.get(src, tape, node, name);
+    if v >= 0 && json.is_string(tape, v) && json.string_plain(tape, v) {
+        return json.string_view(src, tape, v);
+    }
+    return src[0..0];
+}
+
 // The checkout is as it should be: step 2 (the artifact) and step 3 (the branch, the files, the commit).
-fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], orig: &o [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
+fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &a, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], orig: &o [byte], alld: &a [byte], extras: &t [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
     let (data, why) = company_files.read_artifact(heap, fs, src_dir, src_name);
     var same = false;
     if why == 0 {
@@ -480,7 +645,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o](h
         return answer_failed(heap, io, publish_plan.rule_artifact_changed(), "the artifact is not the one that was accepted");
     }
     var status = 0;
-    let made = branch_script(heap, checkout, branch, dest, prov_dest);
+    let made = branch_script(heap, checkout, branch, alld, prov_dest);
     borrow made as &mb in {
         let (st, out) = run_sh(heap, exec, clock, buffer.bytes(mb), "");
         status = st;
@@ -489,7 +654,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o](h
     buffer.drop(heap, made);
     if status != 0 {
         buffer.drop(heap, data);
-        return undo_and_fail(heap, io, exec, clock, checkout, branch, dest, prov_dest, orig, publish_plan.rule_commit_failed(), "the branch or its directories could not be made");
+        return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "the branch or its directories could not be made");
     }
     var rc = 0 - 1;
     let dpath = under(heap, checkout, dest);
@@ -501,6 +666,13 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o](h
     buffer.drop(heap, dpath);
     buffer.drop(heap, data);
     if rc == 0 {
+        let more = write_extras(heap, fs, checkout, extras);
+        if more == 1 {
+            return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_artifact_changed(), "an artifact is not the one that was accepted");
+        }
+        rc = more;
+    }
+    if rc == 0 {
         let ppath = under(heap, checkout, prov_dest);
         borrow ppath as &pp in {
             rc = write_file(fs, buffer.bytes(pp), prov);
@@ -508,9 +680,9 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o](h
         buffer.drop(heap, ppath);
     }
     if rc != 0 {
-        return undo_and_fail(heap, io, exec, clock, checkout, branch, dest, prov_dest, orig, publish_plan.rule_commit_failed(), "a file could not be written in the checkout");
+        return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "a file could not be written in the checkout");
     }
-    let commit = commit_script(heap, checkout, dest, prov_dest, orig);
+    let commit = commit_script(heap, checkout, alld, prov_dest, orig);
     var hash = buffer.empty(heap, 1);
     borrow commit as &cb in {
         let (st, out) = run_sh(heap, exec, clock, buffer.bytes(cb), message);
@@ -527,7 +699,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o](h
         if status == 0 && hex64_40(buffer.bytes(hb)) {
             code = answer_ok(heap, io, buffer.bytes(hb));
         } else {
-            code = undo_and_fail(heap, io, exec, clock, checkout, branch, dest, prov_dest, orig, publish_plan.rule_commit_failed(), "git could not stage or commit (no identity, an ignored path, or a hook)");
+            code = undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "git could not stage or commit (no identity, an ignored path, or a hook)");
         }
     }
     buffer.drop(heap, hash);

@@ -47,6 +47,15 @@ case "$mode" in
              if [ -n "$c" ]; then cat "$c" > "$work/project.cho"; else printf 'nocontract\n' > "$work/project.cho"; fi
              if [ "$mode" = contractmut ] && [ -n "$c" ]; then printf 'tampered\n' >> "$c"; fi
              printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
+  library|libraryliar)
+             # the library step (tests/conformance/company_run.sh, scripts/check_cancho_code.sh): a build that is given `--library NAME` writes,
+             # beside project.cho, `src/NAME.cho` and `tests/NAME_test.cho` as `cancho-build --library` does. It records its argument vector
+             # (args.txt). `libraryliar` says `done` and leaves neither file.
+             log; report done 2 done; for a in "$@"; do printf 'A:%s\n' "$a"; done > "$work/args.txt"
+             printf 'product\n' > "$work/project.cho"
+             n=; prev=; for a in "$@"; do if [ "$prev" = --library ]; then n=$a; fi; prev=$a; done
+             if [ "$mode" = library ] && [ -n "$n" ]; then mkdir -p "$work/src" "$work/tests"; printf 'module %s;\nproduct\n' "$n" > "$work/src/$n.cho"; printf 'tests of %s\n' "$n" > "$work/tests/${n}_test.cho"; fi
+             printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;
   usagelink) log; report done 2 done; printf 'product\n' > "$work/project.cho"; ln -s /dev/zero "$work/usage.jsonl"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # company_run.sh
   usagefifo) log; report done 2 done; printf 'product\n' > "$work/project.cho"; mkfifo "$work/usage.jsonl"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # company_run.sh
   usagebig)  log; report done 2 done; printf 'product\n' > "$work/project.cho"; truncate -s 17000000 "$work/usage.jsonl"; printf '[BUILD_VERDICT]\tdone\n'; exit 0 ;;  # company_run.sh

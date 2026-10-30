@@ -7,6 +7,7 @@ import std.json;
 import std.process;
 import std.test;
 import forge.company_budget;
+import forge.build_task;
 import forge.company_manifest;
 import forge.company_run;
 import forge.company_state;
@@ -628,5 +629,20 @@ fn test_a_publish_entry_of_the_wrong_shape_is_refused[&h](heap: &!h Heap) -> [he
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":[]}") == false);
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"commit_trailer\":\"a\\nb\"}") == false);
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"commit_trailer\":7}") == false);
+    return 0;
+}
+
+fn test_the_manifest_and_the_adapter_agree_on_what_a_module_name_is() -> [] int {
+    test.assert(company_manifest.library_name_ok("diff") == build_task.library_ok("diff"));
+    test.assert(company_manifest.library_name_ok("") == build_task.library_ok(""));
+    test.assert(company_manifest.library_name_ok("Diff") == build_task.library_ok("Diff"));
+    test.assert(company_manifest.library_name_ok("1a") == build_task.library_ok("1a"));
+    test.assert(company_manifest.library_name_ok("a1") == build_task.library_ok("a1"));
+    test.assert(company_manifest.library_name_ok("a_b") == build_task.library_ok("a_b"));
+    test.assert(company_manifest.library_name_ok("a-b") == build_task.library_ok("a-b"));
+    test.assert(company_manifest.library_name_ok("std") == build_task.library_ok("std"));
+    test.assert(company_manifest.library_name_ok("test") == build_task.library_ok("test"));
+    test.assert(company_manifest.library_name_ok("tests") == build_task.library_ok("tests"));
+    test.assert(company_manifest.library_name_ok("a\0b") == build_task.library_ok("a\0b"));
     return 0;
 }

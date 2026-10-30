@@ -11,6 +11,7 @@
 #   company              `forge company check` / `status` end to end on the manifest fixtures (scripts/check_company.sh)
 #   company run          `forge company run` end to end, real workers, the lying-worker test (tests/conformance/company_run.sh)
 #   company kill         `forge company run` killed mid-step and run again: nothing left running, each step accepted once (tests/conformance/company_kill.sh)
+#   company publish lib `forge company publish` of a library step (tests/conformance/repo_publish_library.sh)
 #   company publish     `forge company publish` end to end against throw-away git repositories, the publish worker real: the good path, one case per refusal tag, the hostile cases (tests/conformance/repo_publish.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
 #   verbs                capabilities, cancel, status and result against the mock worker (every verdict) and the stub LLM and gate runner (capabilities), real child processes
@@ -179,6 +180,12 @@ mkdir "$scratch/repo-publish" || exit 1
 CANCHO="$C" sh tests/conformance/repo_publish.sh "$scratch/repo-publish" > "$scratch/repo-publish.out" || fail=1
 cat "$scratch/repo-publish.out"
 if grep -q '^FAIL ' "$scratch/repo-publish.out"; then fail=1; fi
+
+echo "== forge company publish of a library step (two files in one commit, each hashed again; the worker's own refusals: tests/conformance/repo_publish_library.sh)"
+mkdir "$scratch/repo-publish-library" || exit 1
+CANCHO="$C" sh tests/conformance/repo_publish_library.sh "$scratch/repo-publish-library" > "$scratch/repo-publish-library.out" || fail=1
+cat "$scratch/repo-publish-library.out"
+if grep -q '^FAIL ' "$scratch/repo-publish-library.out"; then fail=1; fi
 
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of

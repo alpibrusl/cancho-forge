@@ -924,3 +924,29 @@ fn test_a_malformed_accepted_record_records_no_artifact[&h](heap: &!h Heap) -> [
     test.assert_eq(artifact_is(heap, line, 0, "", ""), 1);
     return 0;
 }
+
+fn test_a_library_record_replays_and_changes_nothing_else[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = add(heap, j, company_state.library_files(heap, 2, "a", "diff", "aaaa", "bbbb"));
+    j = add(heap, j, company_state.accepted(heap, 3, "a", "steps/a/ev/project.cho", "abc"));
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.records, 3);
+        test.assert_eq(p.mask, 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_library_record_without_its_fields_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":2,\"kind\":\"company.step.library\",\"task\":\"a\",\"library\":\"diff\"}\n");
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(jb)), "event-malformed"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}

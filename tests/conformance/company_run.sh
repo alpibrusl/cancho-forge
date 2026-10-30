@@ -381,6 +381,34 @@ printf 'old contract\n' > "$w/ctrstale/steps/plain/ev/contract.txt"
 run ctrstale 1
 check "no contract named: a stale contract.txt is removed, the build gets no --contract and sees nocontract" sh -c "[ '$(rc ctrstale 1)' = 0 ] && ! grep -q -e '--contract' '$w/ctrstale/steps/plain/ev/args.txt' && grep -qx 'nocontract' '$w/ctrstale/steps/plain/ev/project.cho' && [ ! -e '$w/ctrstale/steps/plain/ev/contract.txt' ]"
 
+# ---- the library (docs/library-steps.md): a builder step with a `contract` may name a `library`; Forge writes library.txt beside contract.txt,
+# the build tool is started with `--library NAME` and leaves src/NAME.cho and tests/NAME_test.cho, and Forge hashes both before the check
+# and records them (`company.step.library`). The stand-in's mode `library` does what `cancho-build --library` does; `libraryliar` says `done`
+# and leaves neither file.
+lbuilder() { printf '{"id":"%s","role":"builder","task_type":"project.build","needs":[],"input":"%s","check":"audit_pass.sh","contract":"%s","library":"%s"}' "$1" "$2" "$3" "$4"; }
+mkco lib "[$(lbuilder withl library api.txt diff),$(builder plain '' contract audit_pass.sh)]" 100000 withl plain
+printf 'fn add(a: int, b: int) -> [] int\n' > "$w/lib/api.txt"
+printf 'stale\n' > "$w/lib/steps/plain/ev/library.txt"
+run lib 1
+check "library: the run completes, exit 0, each step admitted once" sh -c "[ '$(rc lib 1)' = 0 ] && [ $(kinds lib company.step.admitted withl) -eq 1 ] && [ $(kinds lib company.step.accepted withl) -eq 1 ]"
+check "library: library.txt is a regular file holding the module name, and the build tool got --library NAME last" sh -c "[ -f '$w/lib/steps/withl/ev/library.txt' ] && [ ! -L '$w/lib/steps/withl/ev/library.txt' ] && [ \"\$(cat '$w/lib/steps/withl/ev/library.txt')\" = diff ] && tail -2 '$w/lib/steps/withl/ev/args.txt' | head -1 | grep -qx 'A:--library' && tail -1 '$w/lib/steps/withl/ev/args.txt' | grep -qx 'A:diff'"
+check "library: Forge recorded both files' digests, once, before the acceptance, and they are the files' sha256" sh -c "[ $(kinds lib company.step.library withl) -eq 1 ] && grep -q '\"kind\":\"company.step.library\",\"task\":\"withl\",\"library\":\"diff\",\"src_sha256\":\"$(sha256sum "$w/lib/steps/withl/ev/src/diff.cho" | cut -c1-64)\",\"tests_sha256\":\"$(sha256sum "$w/lib/steps/withl/ev/tests/diff_test.cho" | cut -c1-64)\"' '$w/lib/company.journal' && [ \$(grep -n 'company.step.library' '$w/lib/company.journal' | cut -d: -f1) -lt \$(grep -n '\"kind\":\"company.step.accepted\",\"task\":\"withl\"' '$w/lib/company.journal' | cut -d: -f1) ]"
+check "library: a step that names none is started without --library, and a stale library.txt is removed" sh -c "! grep -q -e '--library' '$w/lib/steps/plain/ev/args.txt' && [ ! -e '$w/lib/steps/plain/ev/library.txt' ] && [ $(kinds lib company.step.library plain) -eq 0 ]"
+check "library: the journal still replays (status answers, exit 0)" sh -c "'$F' company status '$w/lib' > /dev/null"
+
+# a build that says done and leaves no library file: artifact-invalid, the file named, never accepted, nothing recorded
+mkco liblie "[$(lbuilder withl libraryliar api.txt diff)]" 100000 withl
+printf 'fn add(a: int, b: int) -> [] int\n' > "$w/liblie/api.txt"
+run liblie 1
+check "library liar: artifact-invalid, exit 14, naming src/diff.cho and the reason, never accepted, no library record" sh -c "[ '$(rc liblie 1)' = 14 ] && grep -qx 'refusal: artifact-invalid' '$w/liblie.1.out' && grep -qx 'artifact: steps/withl/ev/src/diff.cho' '$w/liblie.1.out' && grep -qx 'reason: not there' '$w/liblie.1.out' && [ $(kinds liblie company.step.accepted withl) -eq 0 ] && [ $(kinds liblie company.step.library withl) -eq 0 ] && [ $(kinds liblie company.step.check_unavailable withl) -eq 1 ]"
+
+# only the tests file is missing: the second file is named
+mkco libhalf "[$(lbuilder withl library api.txt diff)]" 100000 withl
+printf 'fn add(a: int, b: int) -> [] int\n' > "$w/libhalf/api.txt"
+mkdir -p "$w/libhalf/steps/withl/ev/tests/diff_test.cho"
+run libhalf 1
+check "library: a tests file that is a directory is refused, named, not accepted" sh -c "[ '$(rc libhalf 1)' = 14 ] && grep -qx 'artifact: steps/withl/ev/tests/diff_test.cho' '$w/libhalf.1.out' && grep -q 'reason: not a regular file' '$w/libhalf.1.out' && [ $(kinds libhalf company.step.accepted withl) -eq 0 ]"
+
 # the manifest: a contract on a step that builds nothing, and a bad contract name, are refused by `forge company check`
 printf '{"id":"c","mission":"m","model":{"provider":"p","name":"n"},"budget":{"input":1,"output":1,"cache_write":1,"cache_read":1,"max_cost":1,"price_table":"prices.json"},"human_gates":[],"roles":["qa"],"steps":[{"id":"a","role":"qa","task_type":"repo.gate","needs":[],"input":"x","contract":"api.txt"}]}' > "$w/ctr-qa.json"
 "$F" company check "$w/ctr-qa.json" > "$w/ctr-qa.out" 2>&1; echo $? > "$w/ctr-qa.rc"
@@ -388,6 +416,18 @@ check "manifest: a contract on a qa step is contract-role-invalid, exit 1" sh -c
 sed 's|"role":"qa","task_type":"repo.gate"|"role":"builder","task_type":"project.build","check":"c.sh"|; s|"contract":"api.txt"|"contract":"../api.txt"|; s|"roles":\["qa"\]|"roles":["builder"]|' "$w/ctr-qa.json" > "$w/ctr-bad.json"
 "$F" company check "$w/ctr-bad.json" > "$w/ctr-bad.out" 2>&1; echo $? > "$w/ctr-bad.rc"
 check "manifest: a contract that is a path, not a file name, is manifest-malformed, exit 1" sh -c "[ \$(cat '$w/ctr-bad.rc') = 1 ] && grep -qx 'refusal: manifest-malformed' '$w/ctr-bad.out'"
+
+# the manifest: a library on a step that builds nothing, a name that is not a module name, and a library with no contract
+for t in "qa:library-role-invalid" "name:library-name-invalid" "nocontract:library-needs-contract"; do
+  case "${t%%:*}" in
+    qa) st='{"id":"a","role":"qa","task_type":"repo.gate","needs":[],"input":"x","library":"diff"}'; roles='"qa"' ;;
+    name) st='{"id":"a","role":"builder","task_type":"project.build","needs":[],"input":"x","check":"c.sh","contract":"api.txt","library":"Diff"}'; roles='"builder"' ;;
+    nocontract) st='{"id":"a","role":"builder","task_type":"project.build","needs":[],"input":"x","check":"c.sh","library":"diff"}'; roles='"builder"' ;;
+  esac
+  printf '{"id":"c","mission":"m","model":{"provider":"p","name":"n"},"budget":{"input":1,"output":1,"cache_write":1,"cache_read":1,"max_cost":1,"price_table":"prices.json"},"human_gates":[],"roles":[%s],"steps":[%s]}' "$roles" "$st" > "$w/lib-m.json"
+  "$F" company check "$w/lib-m.json" > "$w/lib-m.out" 2>&1; echo $? > "$w/lib-m.rc"
+  check "manifest: ${t%%:*}: ${t#*:}, exit 1" sh -c "[ \$(cat '$w/lib-m.rc') = 1 ] && grep -qx 'refusal: ${t#*:}' '$w/lib-m.out'"
+done
 
 # ---- a worker that ends without a claim: no accepted, exit 15
 mkco stuck "[$(builder lib '' stuck audit_pass.sh)]" 100000 lib

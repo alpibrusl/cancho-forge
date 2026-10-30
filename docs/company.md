@@ -121,7 +121,10 @@ accepted artifact is published: that is the operator file's `publish` (section 4
   text is decoded and written to `steps/<id>/brief.txt`); `check` the name of a program in the company directory (**required for a builder
   or writer step**, `check-missing`; `forge company run` also requires one for qa, reviewer and analyst steps, and for a product step
   that has no gate); `contract` (optional, **builder or writer only**, `contract-role-invalid` otherwise) the name of a file in the
-  company directory holding required signatures (section 8); `gate` (optional) a name from `human_gates` (`gate-unknown`).
+  company directory holding required signatures (section 8); `library` (optional, **builder or writer only with a `contract`**, `library-role-invalid`,
+  `library-needs-contract`) a module name (`library-name-invalid` unless lowercase letters, digits and `_`, not starting with a digit, at most 64
+  bytes, not `std` or `test`): the build is run as `cancho-build --library NAME` and leaves `src/NAME.cho` and `tests/NAME_test.cho` beside
+  `project.cho` ([`library-steps.md`](library-steps.md)); `gate` (optional) a name from `human_gates` (`gate-unknown`).
 
 The order in which faults are looked for, so that a manifest with two faults is always refused for the same one, is the header of
 `src/company_manifest.cho`.
@@ -488,6 +491,9 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 | `task-type-unsupported` | a `task_type` that is not the one the role offers; in the run, a step no adapter runs (unreachable since task 11) | 1 | unit `test_a_task_type_the_role_does_not_offer_is_refused` |
 | `check-missing` | a builder or writer step without `check` (manifest); in the run also a qa, reviewer or analyst step without one, or a product step with neither gate nor check | 1 | unit `test_a_builder_step_without_a_check_is_refused`; run.sh `a qa step with no check` |
 | `contract-role-invalid` | a step that is neither builder nor writer names a `contract` | 1 | unit `test_a_contract_on_a_role_that_builds_nothing_is_contract_role_invalid`; run.sh `manifest: a contract on a qa step ...` |
+| `library-role-invalid` | a step that is neither builder nor writer names a `library` | 1 | unit `test_a_library_on_a_role_that_builds_nothing_is_library_role_invalid`; run.sh `manifest: qa: library-role-invalid` |
+| `library-name-invalid` | a `library` that is not a module name (`company_manifest.library_name_ok`, the rule of `cancho-build --library`) | 1 | unit `test_a_library_that_is_not_a_module_name_is_library_name_invalid`; run.sh `manifest: name: library-name-invalid` |
+| `library-needs-contract` | a step with a `library` and no `contract` | 1 | unit `test_a_library_without_a_contract_is_library_needs_contract`; run.sh `manifest: nocontract: library-needs-contract` |
 | `gate-unknown` | a step's `gate` not in `human_gates`; `decide` about a gate that is neither listed nor `retry:<step id>` | 1 | unit `test_a_gate_that_is_not_a_human_gate_is_refused`; `check_company.sh` `decide: a gate the manifest does not list is gate-unknown` |
 | `budget-missing` | no `budget`, or one of its five numbers absent | 1 | unit `test_a_missing_budget_or_price_table_is_refused` |
 | `price-table-missing` | `budget.price_table` absent (manifest); in the run, a table that is not there, unreadable, or does not price the manifest's model | 1 | unit `test_a_missing_budget_or_price_table_is_refused`; run.sh `no price table`, `a price table without the model` |
@@ -511,7 +517,7 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 
 | `publish-step-not-accepted` | the step is not in the manifest, is not accepted in the journal, or is not a builder or writer step (a `reason:` line says the last) | 1 | `repo_publish.sh` `a step that is no step`, `a step that is not a builder` |
 | `publish-not-configured` | the operator file has no `publish` entry for the step | 1 | `repo_publish.sh` `no publish entry for the step` |
-| `publish-file-unaccepted` | the entry's `files` names a file besides the step's accepted artifact, or omits it: Forge hashed one file and publishes only that | 1 | `repo_publish.sh` `a file the step did not accept`, `files that omit the artifact` |
+| `publish-file-unaccepted` | the entry's `files` names a file Forge did not hash for the step (the accepted artifact `project.cho`, and for a library step `src/<library>.cho` and `tests/<library>_test.cho`), names one twice, names none, or names a library file for which the journal holds no digest | 1 | `repo_publish.sh` `a file the step did not accept`, `files that omit the artifact` |
 | `publish-dest-invalid` | a destination that is absolute, has `..` or a dot or dash component, an empty component, a character outside `A-Za-z0-9._-/`, is over 256 bytes or is `docs/provenance.md`; or a link or a directory in the checkout where a file goes | 1 | unit `test_dest_refuses_everything_that_leaves_or_hides`; `repo_publish.sh` nine destinations, `a link on the way to the destination` |
 | `publish-repo-not-allowed` | `repo` is not on the gate runner's allow-list (and not `alpibrusl/cancho-diff`), or the checkout's `origin` is not that repository on github.com | 1 | `repo_publish.sh` `a repository that is not on the allow-list`, `a checkout whose origin is another repository`, `...the right name on another host` |
 | `publish-checkout-invalid` | `checkout` is not an absolute plain path, is not a directory, is not the toplevel of a git repository, has no commit, or is on a branch whose name is not a plain name | 1 | `repo_publish.sh` `a checkout that is not a repository`, `a checkout path with ..`, `a checkout that is a directory inside a repository` |
@@ -641,9 +647,12 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
 * **A plan edited by a person is not seen.** The provenance cannot say that an operator changed a worker's plan or output by hand between
   runs, because nothing records it (the cancho-diff run's one such edit was found by reading the plan). The provenance says so in its last
   section. Hashing `plan.json` when a step is admitted and again when it is accepted would let Forge notice.
-* **Only the builder's one accepted artifact is published.** Forge hashes one file per step (`project.cho`); the tests and any other file a
-  build writes are not accepted by anything, so `files` may name only the artifact (`publish-file-unaccepted`). A library's tests, its CI
-  and its README are therefore still not made by this verb.
+* **Only files Forge hashed are published.** For a builder step that is `project.cho`; for a library step (`library-steps.md`) also
+  `src/<library>.cho` and `tests/<library>_test.cho`, hashed before the check and recorded (`company.step.library`). Any other file a build
+  writes is accepted by nothing, so `files` may not name it (`publish-file-unaccepted`). A repository's CI and README are therefore still
+  not made by this verb. The audit judges `project.cho`; the library files are the build tool's own transformation of it, checked by the
+  tool's generated tests (it formats them and runs them), and Forge records their digests but no check of the company judges them.
+  `forge company publish` carries at most three files (the worker refuses a fourth).
 * **The origin check is a name check.** The worker reads `git remote get-url origin`; it does not know that the remote is what it says,
   and it does not look at other remotes or at a `url.<base>.insteadOf` rewrite in the checkout's configuration. The checkout is the
   operator's.
@@ -750,8 +759,12 @@ sections 5 and 6, which asked for this so that nothing a company builds is copie
 1. Checks the request in a fixed order, so two faults are always refused for the same one: the push word, the branch name, the operator
    file's place, the lock, the manifest, the step (accepted, and a builder or writer), the journal, the operator file and its `publish`
    entry for the step, the `files` map, the destination, the repository, the checkout, the trailer.
-2. Hashes the artifact itself, beneath `steps/<id>/ev` with no link followed, and compares it with the digest the journal recorded when
-   it accepted the step (`publish-artifact-changed`). The worker hashes the bytes again when it copies them.
+2. Hashes every file the `files` map names itself, beneath `steps/<id>/ev` with no link followed, and compares it with the digest the
+   journal recorded: `project.cho` with the one of `company.step.accepted`, `src/<library>.cho` and `tests/<library>_test.cho` of a library
+   step with the ones of the `company.step.library` record before the last acceptance (`publish-artifact-changed`; no record is
+   `publish-file-unaccepted`). The first entry of the map is the worker's main file and the others travel as its `more`; the worker hashes
+   every file again when it copies it, and a file that does not match undoes the branch. The provenance lists each file with its digest
+   (a `## Files` section) when there is more than one.
 3. Builds the provenance (`docs/provenance.md`) from the journal: the artifact digest, how many times the step was started, the tokens and
    the cost Forge recorded, the last failed check, every decision a person recorded with the gate, the user and the reason, and a section
    that says what the journal does not record. The same journal gives the same bytes. A recorded reason is written on one line with its

@@ -17,10 +17,12 @@ fail=0
 libs=$(ls src/*.cho | grep -v '/main\.cho$')
 cc="$scratch/cc"; mkdir "$cc" "$cc/workers" || exit 1
 tools="$cc/tools"; mkdir "$tools" "$cc/tools_empty" || exit 1
-for e in done stuck stuck0 gate plan provider usage disagree disagree0 badjson nojson unknown link hang noisy sig args env args2 ctr ctr2 notool big forge; do mkdir "$cc/ev_$e" || exit 1; done
+for e in done stuck stuck0 gate plan provider usage disagree disagree0 badjson nojson unknown link hang noisy sig args env args2 ctr ctr2 lib libnoc libbad libdir notool big forge; do mkdir "$cc/ev_$e" || exit 1; done
 mkdir "$cc/ev_refuse" || exit 1
 # a brief.txt that is a directory: the brief cannot be written, while build.out could be
 mkdir "$cc/ev_briefdir" "$cc/ev_briefdir/brief.txt" || exit 1
+# the library name Forge writes beside contract.txt: a good one, one on a task with no contract, a bad one, and one that cannot be read
+printf 'diff' > "$cc/ev_lib/library.txt"; printf 'diff' > "$cc/ev_libnoc/library.txt"; printf 'Diff' > "$cc/ev_libbad/library.txt"; mkdir "$cc/ev_libdir/library.txt" || exit 1
 
 # The stand-in for `cancho-build`: a fixture shared with scripts/check_build_run.sh (scripts/standin_cancho_build.sh).
 cp scripts/standin_cancho_build.sh "$tools/cancho-build" && chmod +x "$tools/cancho-build" || exit 1
@@ -65,6 +67,11 @@ if $C build workers/cancho_code.cho $libs --std -o "$cc/workers/cancho_code" \
     oracle "contract: $e: the vector holds --contract and the absolute path beneath the execution directory" cmp -s "$cc/ev_$e/args.txt" "$cc/want_$e"
   done
   oracle "contract: a task without one has no --contract in its vector" sh -c "! grep -q -e '--contract' '$cc/ev_args/args.txt'"
+  # --- the library: --library NAME is the last option of the vector, after the ceilings; nowhere when the step has no library.txt
+  printf 'A:/opt/cancho/bin/cancho\nA:%s/ev_lib/brief.txt\nA:%s/ev_lib\nA:stand-in-agent --x\nA:--provider\nA:stand\nA:--model\nA:m1\nA:--contract\nA:%s/ev_lib/contract.txt\nA:--attempts\nA:4\nA:--agent-seconds\nA:30\nA:--rounds\nA:3\nA:--plan-seconds\nA:900\nA:--jobs\nA:4\nA:--library\nA:diff\n' "$cc" "$cc" "$cc" > "$cc/want_lib"
+  oracle "library: the vector ends with --library and the module name Forge wrote" cmp -s "$cc/ev_lib/args.txt" "$cc/want_lib"
+  oracle "library: the stand-in left both files" sh -c "[ -f '$cc/ev_lib/src/diff.cho' ] && [ -f '$cc/ev_lib/tests/diff_test.cho' ]"
+  oracle "library: a task without a library.txt has no --library in its vector" sh -c "! grep -q -e '--library' '$cc/ev_args/args.txt' && ! grep -q -e '--library' '$cc/ev_ctr/args.txt'"
   # --- the environment: empty (what `env -i /bin/sh -c env` shows is the baseline; PWD and the shell's own variables are filtered from both)
   env -i /bin/sh -c env | grep -v '^PWD=\|^_=\|^OLDPWD=\|^SHLVL=' | sort > "$cc/want_env"
   grep -v '^PWD=\|^_=\|^OLDPWD=\|^SHLVL=' "$cc/ev_env/env.txt" | sort > "$cc/got_env"

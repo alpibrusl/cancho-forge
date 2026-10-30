@@ -217,88 +217,287 @@ fn with_entry[&h, &f, &x, &c, &i, &m, &s, &j, &d, &o, &t, &p, &b](heap: &!h Heap
         company_cmd.refuse(io, publish_plan.rule_not_configured());
         return company_step.exit_refused();
     }
+    // The files map names the step's accepted artifacts and nothing else: `project.cho`, and for a library step (a `library` in the
+    // manifest) `src/<library>.cho` and `tests/<library>_test.cho`. `ents` holds one entry for each, in the map's order: a byte for the
+    // kind ('0' the artifact, '1' the library source, '2' the library tests), the destination, a NUL.
+    let library = company_manifest.step_library(hm, company_manifest.step_at(hm, at));
+    var lib_src = buffer.empty(heap, 1);
+    var lib_tests = buffer.empty(heap, 1);
+    if len(library) > 0 {
+        buffer.drop(heap, lib_src);
+        buffer.drop(heap, lib_tests);
+        lib_src = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 32), "src/"), library), ".cho");
+        lib_tests = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 32), "tests/"), library), "_test.cho");
+    }
+    var ents = buffer.empty(heap, 64);
     var dest = src[0..0];
     var extra = false;
+    var dupe = false;
+    var seen = 0;
     let n = json.count(tp, files);
     var k = files + 1;
     var j = 0;
     while j < n {
         let name = json.string_view(src, tp, k);
+        let target = json.string_view(src, tp, k + 1);
+        var kind = 0 - 1;
         if bytes.equal(name, artifact) {
-            dest = json.string_view(src, tp, k + 1);
-        } else {
+            kind = 0;
+        }
+        borrow lib_src as &lsb in {
+            if len(library) > 0 && bytes.equal(name, buffer.bytes(lsb)) {
+                kind = 1;
+            }
+        }
+        borrow lib_tests as &ltb in {
+            if len(library) > 0 && bytes.equal(name, buffer.bytes(ltb)) {
+                kind = 2;
+            }
+        }
+        if kind < 0 {
             extra = true;
+        } else {
+            if seen >> kind & 1 == 1 {
+                extra = true;
+            }
+            seen = seen | 1 << kind;
+            if len(dest) == 0 {
+                dest = target;
+            }
+            borrow ents as &eb in {
+                if publish_plan.dest_ok(target) == false || bytes.equal(target, publish_plan.provenance_dest()) || has_dest(buffer.bytes(eb), target) {
+                    dupe = true;
+                }
+            }
+            ents = buffer.push(heap, ents, byte_of(48 + kind));
+            ents = buffer.append(heap, ents, target);
+            ents = buffer.push(heap, ents, byte_of(0));
         }
         k = json.skip(tp, k + 1);
         j = j + 1;
     }
+    buffer.drop(heap, lib_src);
+    buffer.drop(heap, lib_tests);
     if len(dest) == 0 || extra {
+        buffer.drop(heap, ents);
         company_cmd.refuse(io, publish_plan.rule_file_unaccepted());
-        company_cmd.line(io, "reason: ", "files may name only the step's accepted artifact");
+        company_cmd.line(io, "reason: ", "files may name only the step's accepted artifacts, each once");
         return company_step.exit_refused();
     }
-    if publish_plan.dest_ok(dest) == false || bytes.equal(dest, publish_plan.provenance_dest()) {
+    if dupe {
+        buffer.drop(heap, ents);
         company_cmd.refuse(io, publish_plan.rule_dest_invalid());
         return company_step.exit_refused();
     }
     if publish_plan.repo_ok(repo) == false {
+        buffer.drop(heap, ents);
         company_cmd.refuse(io, publish_plan.rule_repo_not_allowed());
         return company_step.exit_refused();
     }
     if journal_io.path_ok(fs, checkout) == false {
+        buffer.drop(heap, ents);
         company_cmd.refuse(io, publish_plan.rule_checkout_invalid());
         return company_step.exit_refused();
     }
     let workers = company_step.op_text(src, tp, "workers");
     let trailer = company_step.op_text(src, tp, "commit_trailer");
     if publish_plan.trailer_ok(trailer) == false {
+        buffer.drop(heap, ents);
         company_cmd.refuse(io, "operator-invalid");
         return company_step.exit_refused();
     }
-    return with_artifact(heap, fs, exec, clock, io, hm, st, journal, at, dir, workers, step, branch, repo, checkout, dest, trailer);
+    var code = company_step.exit_refused();
+    borrow ents as &entb in {
+        code = with_artifact(heap, fs, exec, clock, io, hm, st, journal, at, dir, workers, step, branch, repo, checkout, dest, trailer, buffer.bytes(entb));
+    }
+    buffer.drop(heap, ents);
+    return code;
 }
 
-// The artifact is hashed again, here, against the digest the journal accepted it with: a file that changed since is
-// `publish-artifact-changed` and nothing else has happened.
-fn with_artifact[&h, &f, &x, &c, &i, &m, &s, &j, &d, &w, &p, &b, &r, &k, &y, &z](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], workers: &w [byte], step: &p [byte], branch: &b [byte], repo: &r [byte], checkout: &k [byte], dest: &y [byte], trailer: &z [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, dir_write, file_read, file_write, io_write] int {
+// Is `target` the destination of an entry already in `ents` (one byte of kind, the destination, a NUL, for each)?
+fn has_dest[&e, &t](ents: &e [byte], target: &t [byte]) -> [] bool {
+    var pos = 0;
+    while pos < len(ents) {
+        var end = pos + 1;
+        while end < len(ents) && int_of(ents[end]) != 0 {
+            end = end + 1;
+        }
+        if bytes.equal(ents[pos + 1..end], target) {
+            return true;
+        }
+        pos = end + 1;
+    }
+    return false;
+}
+
+// Every artifact the `files` map names is hashed again, here, against the digest Forge recorded when it accepted the step (the artifact:
+// `company.step.accepted`; a library step's two files: `company.step.library`, written before the check): a file that changed since is
+// `publish-artifact-changed`, one with no digest on record `publish-file-unaccepted`, and nothing else has happened. The first entry is
+// the worker's main file; the others travel as its `more`.
+fn with_artifact[&h, &f, &x, &c, &i, &m, &s, &j, &d, &w, &p, &b, &r, &k, &y, &z, &u](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], workers: &w [byte], step: &p [byte], branch: &b [byte], repo: &r [byte], checkout: &k [byte], dest: &y [byte], trailer: &z [byte], ents: &u [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, dir_write, file_read, file_write, io_write] int {
     let (rel, sha) = company_state.artifact_of(st, at);
     let expected = company_step.artifact_rel(heap, step, company_step.Runner::Build);
     var code = company_step.exit_refused();
-    var same = false;
+    var rel_same = false;
     borrow expected as &eb in {
-        same = bytes.equal(rel, buffer.bytes(eb));
+        rel_same = bytes.equal(rel, buffer.bytes(eb));
     }
     buffer.drop(heap, expected);
+    let library = company_manifest.step_library(hm, company_manifest.step_at(hm, at));
     let evdir = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/steps/"), step), "/ev");
+    var extras = buffer.empty(heap, 64);
+    var listing = buffer.append(heap, buffer.empty(heap, 128), "\n## Files\n\nEach file below was hashed by Forge again when it was published, and is the one that was accepted.\n\n");
+    var main_dir = buffer.empty(heap, 1);
+    var main_name = buffer.empty(heap, 1);
+    var main_sha = buffer.empty(heap, 1);
+    var unaccepted = false;
+    var changed = false;
+    var first = true;
     borrow evdir as &ed in {
-        if same {
-            let (data, why) = company_files.read_artifact(heap, fs, buffer.bytes(ed), company_step.artifact_name(company_step.Runner::Build));
-            var held = false;
-            if why == 0 {
-                borrow data as &db in {
-                    let hex = hex_of(heap, buffer.bytes(db));
-                    borrow hex as &hb in {
-                        held = bytes.equal(buffer.bytes(hb), sha);
+        var pos = 0;
+        while pos < len(ents) && unaccepted == false && changed == false {
+            let kind = int_of(ents[pos]) - 48;
+            var end = pos + 1;
+            while end < len(ents) && int_of(ents[end]) != 0 {
+                end = end + 1;
+            }
+            let target = ents[pos + 1..end];
+            pos = end + 1;
+            var sub = buffer.empty(heap, 16);
+            var fname = buffer.append(heap, buffer.empty(heap, 32), company_step.artifact_name(company_step.Runner::Build));
+            var want = buffer.append(heap, buffer.empty(heap, 64), sha);
+            if kind == 1 {
+                buffer.drop(heap, sub);
+                buffer.drop(heap, fname);
+                buffer.drop(heap, want);
+                sub = buffer.append(heap, buffer.empty(heap, 16), "src");
+                fname = company_files.library_src_name(heap, library);
+                want = publish_plan.library_sha(heap, journal, step, library, "src_sha256");
+            }
+            if kind == 2 {
+                buffer.drop(heap, sub);
+                buffer.drop(heap, fname);
+                buffer.drop(heap, want);
+                sub = buffer.append(heap, buffer.empty(heap, 16), "tests");
+                fname = company_files.library_tests_name(heap, library);
+                want = publish_plan.library_sha(heap, journal, step, library, "tests_sha256");
+            }
+            var hex = buffer.empty(heap, 1);
+            var why = 0;
+            borrow sub as &sb in {
+                borrow fname as &fb in {
+                    if kind == 0 {
+                        let (data, w2) = company_files.read_artifact(heap, fs, buffer.bytes(ed), buffer.bytes(fb));
+                        why = w2;
+                        if w2 == 0 {
+                            buffer.drop(heap, hex);
+                            borrow data as &dtb in {
+                                hex = company_files.hex_of(heap, buffer.bytes(dtb));
+                            }
+                        }
+                        buffer.drop(heap, data);
+                        if rel_same == false {
+                            why = 5;
+                        }
+                    } else {
+                        let (h2, w3) = company_files.hash_in(heap, fs, buffer.bytes(ed), buffer.bytes(sb), buffer.bytes(fb));
+                        buffer.drop(heap, hex);
+                        hex = h2;
+                        why = w3;
                     }
-                    buffer.drop(heap, hex);
                 }
             }
-            buffer.drop(heap, data);
-            same = held;
-        }
-        if same == false {
-            company_cmd.refuse(io, publish_plan.rule_artifact_changed());
-        } else {
-            code = hand_over(heap, fs, exec, clock, io, hm, st, journal, at, dir, workers, buffer.bytes(ed), step, branch, repo, checkout, dest, sha, trailer);
+            var same = false;
+            var have = false;
+            borrow want as &wb in {
+                have = len(buffer.bytes(wb)) > 0;
+                borrow hex as &xb in {
+                    same = why == 0 && bytes.equal(buffer.bytes(xb), buffer.bytes(wb));
+                }
+            }
+            if have == false {
+                unaccepted = true;
+            } else if same == false {
+                changed = true;
+            } else {
+                borrow sub as &sb2 in {
+                    borrow fname as &fb2 in {
+                        var srcdir = buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(ed));
+                        if len(buffer.bytes(sb2)) > 0 {
+                            srcdir = buffer.push(heap, srcdir, byte_of(47));
+                            srcdir = buffer.append(heap, srcdir, buffer.bytes(sb2));
+                        }
+                        borrow srcdir as &sdb in {
+                            listing = buffer.append(heap, listing, "- ");
+                            listing = publish_plan.quoted(heap, listing, target);
+                            listing = buffer.append(heap, listing, " sha256 ");
+                            borrow want as &wb2 in {
+                                listing = publish_plan.quoted(heap, listing, buffer.bytes(wb2));
+                                if first {
+                                    buffer.drop(heap, main_dir);
+                                    buffer.drop(heap, main_name);
+                                    buffer.drop(heap, main_sha);
+                                    main_dir = buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(sdb));
+                                    main_name = buffer.append(heap, buffer.empty(heap, 32), buffer.bytes(fb2));
+                                    main_sha = buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(wb2));
+                                } else {
+                                    extras = buffer.append(heap, extras, buffer.bytes(sdb));
+                                    extras = buffer.push(heap, extras, byte_of(0));
+                                    extras = buffer.append(heap, extras, buffer.bytes(fb2));
+                                    extras = buffer.push(heap, extras, byte_of(0));
+                                    extras = buffer.append(heap, extras, target);
+                                    extras = buffer.push(heap, extras, byte_of(0));
+                                    extras = buffer.append(heap, extras, buffer.bytes(wb2));
+                                    extras = buffer.push(heap, extras, byte_of(0));
+                                }
+                            }
+                            listing = buffer.append(heap, listing, "\n");
+                        }
+                        first = false;
+                        buffer.drop(heap, srcdir);
+                    }
+                }
+            }
+            buffer.drop(heap, sub);
+            buffer.drop(heap, fname);
+            buffer.drop(heap, want);
+            buffer.drop(heap, hex);
         }
     }
+    if unaccepted {
+        company_cmd.refuse(io, publish_plan.rule_file_unaccepted());
+        company_cmd.line(io, "reason: ", "the journal records no digest for a file named in files");
+    } else if changed {
+        company_cmd.refuse(io, publish_plan.rule_artifact_changed());
+    } else {
+        borrow main_dir as &mdb in {
+            borrow main_name as &mnb in {
+                borrow main_sha as &msb in {
+                    borrow extras as &exb in {
+                        borrow listing as &lsb in {
+                            code = hand_over(heap, fs, exec, clock, io, hm, st, journal, at, dir, workers, buffer.bytes(mdb), buffer.bytes(mnb), step, branch, repo, checkout, dest, buffer.bytes(msb), trailer, buffer.bytes(exb), buffer.bytes(lsb));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, main_dir);
+    buffer.drop(heap, main_name);
+    buffer.drop(heap, main_sha);
+    buffer.drop(heap, extras);
+    buffer.drop(heap, listing);
     buffer.drop(heap, evdir);
     return code;
 }
 
-// Everything is checked on Forge's side: build the texts and ask the worker.
-fn hand_over[&h, &f, &x, &c, &i, &m, &s, &j, &d, &w, &e, &p, &b, &r, &k, &y, &a, &z](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], workers: &w [byte], evdir: &e [byte], step: &p [byte], branch: &b [byte], repo: &r [byte], checkout: &k [byte], dest: &y [byte], sha: &a [byte], trailer: &z [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_write, file_write, io_write] int {
-    let prov = publish_plan.provenance(heap, hm, st, journal, at, sha, dest);
+// Everything is checked on Forge's side: build the texts and ask the worker. `src_dir`/`src_name` are the main file; `extras` the others
+// (`publish_plan.request`); `listing` the section of the provenance that names every file with its digest.
+fn hand_over[&h, &f, &x, &c, &i, &m, &s, &j, &d, &w, &e, &n, &p, &b, &r, &k, &y, &a, &z, &t, &l](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], workers: &w [byte], src_dir: &e [byte], src_name: &n [byte], step: &p [byte], branch: &b [byte], repo: &r [byte], checkout: &k [byte], dest: &y [byte], sha: &a [byte], trailer: &z [byte], extras: &t [byte], listing: &l [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_write, file_write, io_write] int {
+    var prov = publish_plan.provenance(heap, hm, st, journal, at, sha, dest);
+    if len(extras) > 0 {
+        prov = buffer.append(heap, prov, listing);
+    }
     let message = publish_plan.commit_message(heap, hm, step, dest, trailer);
     var code = company_step.exit_refused();
     borrow prov as &pb in {
@@ -307,7 +506,7 @@ fn hand_over[&h, &f, &x, &c, &i, &m, &s, &j, &d, &w, &e, &p, &b, &r, &k, &y, &a,
                 company_cmd.refuse(io, publish_plan.rule_worker_failed());
                 company_cmd.line(io, "reason: ", "the provenance is over its size limit");
             } else {
-                let req = publish_plan.request(heap, checkout, repo, branch, evdir, company_step.artifact_name(company_step.Runner::Build), dest, sha, buffer.bytes(pb), buffer.bytes(mb));
+                let req = publish_plan.request(heap, checkout, repo, branch, src_dir, src_name, dest, sha, buffer.bytes(pb), buffer.bytes(mb), extras);
                 borrow req as &qb in {
                     code = ask_worker(heap, fs, exec, clock, io, hm, st, at, dir, workers, step, branch, dest, sha, buffer.bytes(qb));
                 }
