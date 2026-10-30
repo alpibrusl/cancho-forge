@@ -128,6 +128,11 @@ sources = ["tests/company_run_test.cho", "src/company_run.cho", "src/company_bud
 std = true
 
 [[test]]
+name = "publish_plan"
+sources = ["tests/publish_plan_test.cho", "src/publish_plan.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/gate_task.cho", "src/gate_env.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+std = true
+
+[[test]]
 name = "company_step"
 sources = ["tests/company_step_test.cho", "src/company_step.cho", "src/company_run.cho", "src/company_budget.cho", "src/company_check.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/gate_task.cho", "src/gate_env.cho", "src/build_task.cho"]
 std = true

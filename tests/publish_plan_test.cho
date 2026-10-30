@@ -1,0 +1,210 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_state;
+import forge.publish_plan;
+
+// Unit tests for src/publish_plan.cho (docs/company.md, section 15): what a publish may name, and the texts it writes. The rest of
+// `forge company publish` (the git work, every refusal tag) is tests/conformance/repo_publish.sh. Run with `cancho test`.
+
+fn flag(b: bool) -> [] int {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+pub fn test_dest_accepts_plain_relative_paths() -> [] int {
+    test.assert_eq(flag(publish_plan.dest_ok("src/diff.cho")), 1);
+    test.assert_eq(flag(publish_plan.dest_ok("a")), 1);
+    test.assert_eq(flag(publish_plan.dest_ok("docs/provenance.md")), 1);
+    test.assert_eq(flag(publish_plan.dest_ok("a-b_c.d/e")), 1);
+    return 0;
+}
+
+pub fn test_dest_refuses_everything_that_leaves_or_hides() -> [] int {
+    test.assert_eq(flag(publish_plan.dest_ok("")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("/abs")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("../x")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a/../x")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a/./x")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok(".git/config")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a/.hidden")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a//b")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a/")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("-x")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a/-x")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a b")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a;b")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a'b")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a$b")), 0);
+    test.assert_eq(flag(publish_plan.dest_ok("a\nb")), 0);
+    return 0;
+}
+
+pub fn test_dest_length_is_bounded() -> [] int {
+    let long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    test.assert_eq(flag(publish_plan.dest_ok(long[0..256])), 1);
+    test.assert_eq(flag(publish_plan.dest_ok(long[0..257])), 0);
+    return 0;
+}
+
+pub fn test_branch_accepts_forge_style_names() -> [] int {
+    test.assert_eq(flag(publish_plan.branch_ok("forge/lib")), 1);
+    test.assert_eq(flag(publish_plan.branch_ok("forge/pin-cancho-f4ead824")), 1);
+    test.assert_eq(flag(publish_plan.branch_ok("main")), 1);
+    return 0;
+}
+
+pub fn test_branch_refuses_what_git_or_a_shell_would_read_otherwise() -> [] int {
+    test.assert_eq(flag(publish_plan.branch_ok("")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("-x")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("a..b")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("a.")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("forge/x.lock")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("/a")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("a//b")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("a/.b")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("x;touch pwned")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("a@{1}")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("a~1")), 0);
+    test.assert_eq(flag(publish_plan.branch_ok("a:b")), 0);
+    return 0;
+}
+
+pub fn test_trailer_is_one_line_of_printable_text() -> [] int {
+    test.assert_eq(flag(publish_plan.trailer_ok("")), 1);
+    test.assert_eq(flag(publish_plan.trailer_ok("Co-Authored-By: A <a@example.invalid>")), 1);
+    test.assert_eq(flag(publish_plan.trailer_ok("a\nb")), 0);
+    test.assert_eq(flag(publish_plan.trailer_ok("a\tb")), 0);
+    test.assert_eq(flag(publish_plan.trailer_ok("café")), 0);
+    return 0;
+}
+
+pub fn test_repos_are_the_gates_list_and_cancho_diff() -> [] int {
+    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-forge")), 1);
+    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-diff")), 1);
+    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-tools")), 0);
+    test.assert_eq(flag(publish_plan.repo_ok("")), 0);
+    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-diff ")), 0);
+    return 0;
+}
+
+pub fn test_every_worker_tag_maps_to_itself_and_the_rest_to_worker_failed() -> [] int {
+    test.assert_eq(flag(bytes.equal(publish_plan.worker_tag("publish-checkout-dirty"), "publish-checkout-dirty")), 1);
+    test.assert_eq(flag(bytes.equal(publish_plan.worker_tag("publish-branch-exists"), "publish-branch-exists")), 1);
+    test.assert_eq(flag(bytes.equal(publish_plan.worker_tag("publish-artifact-changed"), "publish-artifact-changed")), 1);
+    test.assert_eq(flag(bytes.equal(publish_plan.worker_tag("publish-commit-failed"), "publish-commit-failed")), 1);
+    test.assert_eq(flag(bytes.equal(publish_plan.worker_tag("rm -rf /"), "publish-worker-failed")), 1);
+    test.assert_eq(flag(bytes.equal(publish_plan.worker_tag(""), "publish-worker-failed")), 1);
+    return 0;
+}
+
+pub fn test_clean_text_cannot_end_a_code_span_or_a_line[&h](heap: &!h Heap) -> [heap] int {
+    let t = publish_plan.put_clean(heap, buffer.empty(heap, 16), "a`b\nc\0d");
+    borrow t as &tb in {
+        test.assert_eq(flag(bytes.equal(buffer.bytes(tb), "a'b c d")), 1);
+    }
+    buffer.drop(heap, t);
+    return 0;
+}
+
+fn manifest_text() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":9,\"output\":9,\"cache_write\":9,\"cache_read\":9,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"ship\"],\"roles\":[\"builder\",\"product\"],\"steps\":[{\"id\":\"lib\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"},{\"id\":\"ship\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[\"lib\"],\"input\":\"x\",\"gate\":\"ship\"}]}";
+}
+
+fn add[&h](heap: &!h Heap, out: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var o = out;
+    borrow record as &rb in {
+        o = buffer.append(heap, o, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return o;
+}
+
+// The provenance of step `lib` of a journal with two builds, tokens, a recorded cost, a failed check and one decision whose reason is
+// written to break a markdown line: as a number per fact the text must contain (1 each), so a test reads one number.
+fn provenance_facts[&h](heap: &!h Heap, reason: &static [byte], forbidden: &static [byte]) -> [heap] int {
+    var facts = 0;
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Refused(why) => {
+            return 0 - 1;
+        }
+        company_manifest.ManifestResult::Held(m) => {
+            var j = buffer.empty(heap, 512);
+            j = add(heap, j, company_state.admitted(heap, 1, "lib", "t-1"));
+            j = add(heap, j, company_state.spend_priced(heap, 2, "lib", 600, 10, 0, 0, 610));
+            j = add(heap, j, company_state.check_failed(heap, 3, "lib", 1, 2));
+            j = add(heap, j, company_state.admitted(heap, 4, "lib", "t-2"));
+            j = add(heap, j, company_state.spend_priced(heap, 5, "lib", 500, 20, 0, 0, 1520));
+            j = add(heap, j, company_state.accepted(heap, 6, "lib", "steps/lib/ev/project.cho", "abc123"));
+            j = add(heap, j, company_state.gate_decided(heap, 7, "ship", "approved", "alfonso", reason));
+            borrow j as &jb in {
+                borrow m as &mr in {
+                    let s = company_state.replay(heap, buffer.bytes(jb), mr);
+                    borrow s as &sr in {
+                        let text = publish_plan.provenance(heap, mr, sr, buffer.bytes(jb), 0, "abc123", "src/diff.cho");
+                        borrow text as &tb in {
+                            let t = buffer.bytes(tb);
+                            facts = facts + flag(bytes.find(t, "# Provenance of `src/diff.cho`") == 0);
+                            facts = facts + 2 * flag(bytes.find(t, "| Artifact sha256 | `abc123` |") > 0);
+                            facts = facts + 4 * flag(bytes.find(t, "| Times the step was started | 2 |") > 0);
+                            facts = facts + 8 * flag(bytes.find(t, "| Tokens | input 1100, output 30, cache write 0, cache read 0 |") > 0);
+                            facts = facts + 16 * flag(bytes.find(t, "| Cost recorded by Forge | $0.002130 |") > 0);
+                            facts = facts + 32 * flag(bytes.find(t, "| Last failed check | 1 of 2 |") > 0);
+                            facts = facts + 64 * flag(bytes.find(t, "- `ship`: approved by `alfonso`: ") > 0);
+                            facts = facts + 128 * flag(bytes.find(t, "## What the journal does not record") > 0);
+                            facts = facts + 256 * flag(bytes.find(t, forbidden) >= 0);
+                        }
+                        buffer.drop(heap, text);
+                    }
+                    company_state.drop(heap, s);
+                }
+            }
+            buffer.drop(heap, j);
+            company_manifest.drop(heap, m);
+        }
+    }
+    return facts;
+}
+
+pub fn test_provenance_states_the_recorded_facts_and_the_gap[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(provenance_facts(heap, "looks right", "ZZZ not there"), 255);
+    return 0;
+}
+
+// A reason written to end a code span, start a heading and add a line cannot do any of it.
+pub fn test_a_hostile_reason_stays_on_one_line_of_the_list[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(provenance_facts(heap, "x`\n# Heading\n- injected", "\n# Heading"), 255);
+    return 0;
+}
+
+pub fn test_commit_message_has_subject_body_and_trailer[&h](heap: &!h Heap) -> [heap] int {
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Refused(why) => {
+            test.assert_eq(1, 0);
+        }
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let with = publish_plan.commit_message(heap, mr, "lib", "src/diff.cho", "Co-Authored-By: A <a@example.invalid>");
+                borrow with as &wb in {
+                    test.assert_eq(flag(bytes.find(buffer.bytes(wb), "Add src/diff.cho, built by Forge\n\nStep lib of the company co") == 0), 1);
+                    test.assert_eq(flag(bytes.find(buffer.bytes(wb), "\n\nCo-Authored-By: A <a@example.invalid>\n") > 0), 1);
+                }
+                buffer.drop(heap, with);
+                let without = publish_plan.commit_message(heap, mr, "lib", "src/diff.cho", "");
+                borrow without as &nb in {
+                    test.assert_eq(flag(bytes.find(buffer.bytes(nb), "Co-Authored-By") < 0), 1);
+                    test.assert_eq(flag(bytes.find(buffer.bytes(nb), "\n\n") > 0), 1);
+                }
+                buffer.drop(heap, without);
+            }
+            company_manifest.drop(heap, m);
+        }
+    }
+    return 0;
+}

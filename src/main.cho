@@ -10,6 +10,7 @@ import forge.await_task;
 import forge.build_run;
 import forge.build_task;
 import forge.company_cmd;
+import forge.company_publish;
 import forge.company_runner;
 import forge.dispatch;
 import forge.gate_env;
@@ -104,7 +105,7 @@ fn show[&i, &h](io: &!i Io, heap: &!h Heap, text: buffer.Buffer) -> [heap, io_wr
 }
 
 fn usage[&i](io: &!i Io) -> [err_write] int {
-    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n       forge company check <manifest.json> | forge company status <company-dir> [format=json]\n       forge company decide <company-dir> <gate> approved|rejected <reason...> | forge company run <company-dir> <operator-file>\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
+    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n       forge company check <manifest.json> | forge company status <company-dir> [format=json]\n       forge company decide <company-dir> <gate> approved|rejected <reason...> | forge company run <company-dir> <operator-file>\n       forge company publish <company-dir> <operator-file> <step-id> <branch>\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
     return 2;
 }
 
@@ -738,6 +739,9 @@ fn run[&h, &f, &x, &c, &i, &g, &z](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(
             return usage(io);
         }
         return company_runner.run_cmd(heap, fs, exec, clock, io, args, sig);
+    }
+    if arg_count(args) >= 3 && bytes.equal(arg(args, 1), "company") && bytes.equal(arg(args, 2), "publish") {
+        return company_publish.publish_cmd(heap, fs, exec, clock, io, args);
     }
     if arg_count(args) >= 2 && bytes.equal(arg(args, 1), "gate") {
         return gate(heap, fs, exec, clock, io, args);
