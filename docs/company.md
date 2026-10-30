@@ -73,7 +73,8 @@ A JSON file of at most 1 MiB, parsed against a **closed** shape: a key the shape
 written twice or with an escape is `manifest-malformed`. It *declares requirements only*; no field grants a capability (design
 4.1). In particular **the manifest cannot name a tool, a worker, a repository, a checkout, a compiler or an agent command**: those are
 the operator's (section 4). It CAN name programs of the company directory as checks, and Forge runs them: so editing `company.json`
-does widen what Forge runs, within the company directory, which is why the company directory and its author are trusted (section 2).
+does widen what Forge runs, within the company directory, which is why the company directory and its author are trusted (section 2). Nor can it name where an
+accepted artifact is published: that is the operator file's `publish` (section 4, section 15).
 
 ```json
 {
@@ -137,11 +138,12 @@ edit touches is hygiene, not a boundary. (A symbolic link from outside pointing 
 
 | key | meaning | needed by |
 |---|---|---|
-| `workers` | directory holding the worker programs `cancho_code`, `gate_runner`, `check_guard` and `tool_run` (built from `workers/*.cho`) | every run (`check_guard` by every check) |
+| `workers` | directory holding the worker programs `cancho_code`, `gate_runner`, `check_guard`, `tool_run` and `repo_publish` (built from `workers/*.cho`) | every run (`check_guard` by every check) |
 | `tools`, `checker`, `agent` | `forge build`'s `<tools>`, `<checker>`, `<agent>`: the directory of `cancho-build`, the compiler it calls, the agent command | every builder or writer step |
 | `guide` | `forge build`'s `guide=PATH`: the plan guide a builder or writer step's `cancho-build` is started with (`--guide <path>`, carried in the worker request). Absolute, and held at parse time to the rule `forge build` holds its guide to (`gate_task.path_ok`: `A-Za-z0-9._/-` only, no `..`, at most 512 bytes); Forge does not open it. Without it the tool is started with no `--guide`, which the real `cancho-build` refuses unless the step's workdir already holds a valid `plan.json` | optional; in practice every builder or writer step |
 | `gates` | `{"<step id>": {"repo", "revision", "checkout"}}`: what a qa or reviewer step reports the gate of; `repo` must be on the gate runner's allow-list, `revision` a 40-hex commit, `checkout` an absolute path | each qa or reviewer step |
 | `analyst_tools`, `granted_tools`, `analysts`, `tool_timeout_ms` | the analyst's tools, section 13 | each analyst step |
+| `publish`, `commit_trailer` | `forge company publish` (section 15): `publish` is `{"<step id>": {"repo": "<allow-list key>", "checkout": "/abs", "files": {"project.cho": "<place in the checkout>"}}}` and `commit_trailer` one printable line (at most 200 bytes) added to the commit message, e.g. a `Co-Authored-By:` line. Form is checked here (`operator-invalid`); the values are checked again by the publish | `forge company publish` only |
 | `build_timeout_ms`, `gate_timeout_ms`, `check_timeout_ms` | deadlines in ms, 10000 to 86400000; defaults 3600000, 900000, 600000 | optional |
 | `attempts`, `agent_seconds`, `rounds`, `plan_seconds`, `jobs` | `forge build`'s trailing `attempts=N` ... `jobs=N`: the build tool's ceilings for every builder or writer step (`--attempts`, `--agent-seconds`, ... in its argument vector, carried in the worker request). Whole numbers (`json.fits_int`: not `30.0`, not `"30"`) held at parse time to the ranges `build_task.operator_checked` holds them to: attempts 1 to 20, agent_seconds 1 to 3600, rounds 1 to 10, plan_seconds 1 to 7200, jobs 1 to 64; defaults 4, 30, 3, 900, 4 (`step_run.build_spec`). Out of range or of the wrong type is `operator-invalid` with `reason: <key> is not a whole number from <low> to <high>` (the first wrong one, in this order). `agent_seconds` is the deadline of ONE agent call: a model whose calls take longer than it (statuslite run arm-a-1: Haiku 5.5 calls of 64 to 121 s against the fixed 30) cannot finish a unit | optional; one value for every build step of the run |
 
@@ -262,6 +264,14 @@ decide <dir> retry:<id> approved <reason>`, `line: N`), `accepted: <id>` for eac
 
 The usual shape of a company, then, is: run (exit 10 at a gate), `decide`, run again, and so on until exit 0; and on 13 or 14, a person
 reads the step's evidence and either fixes the cause or records `retry:<id> approved`.
+
+### `forge company publish <company-dir> <operator-file> <step id> <branch>`
+
+Puts the artifact of an accepted builder step on a fresh branch of a git checkout, with the provenance, committed locally; section 15.
+Takes the company lock, writes `steps/<id>/pr.md` once the commit exists, prints `published: <branch>`, `commit: <40 hex>`, `pr: ...` and
+the pull request's title and body. Exit 0 published; 1 refused (the tags of section 12 beginning `publish-`, and `operator-invalid`,
+`journal-corrupt`, the manifest's and the lock's); 2 usage or `path-invalid`; 3 an I/O error. It never pushes: a seventh word `push` is
+`publish-push-not-granted`.
 
 ## 6. Step states
 
@@ -453,6 +463,9 @@ workers directory has no check_guard`. A race left open: if a next run takes `ch
 | reviewer | `repo.gate` | **the same path as qa**: the gate runner over `gates.<id>`. Nothing compares `cancho authority` to a checked-in ceiling, which was the reviewer's whole point in the design (4.2, 10) | `report.json` | **accepted by the manifest and mapped to the gate runner, but not run by any test and not distinct from qa.** The design's goal 5 asked for a reviewer; it is not met |
 | writer | `project.build` | the builder path (a model step) | `project.cho` | **accepted by the manifest (a `check` is required) and mapped to the builder path, but no writer step has been run by any test.** The design's checks (length, required sections and links) are whatever the step's own `check` program does; Forge adds none, and "a person reads it before the gate opens" is only a `gate` the manifest author puts on the step |
 
+`repo.publish` is not a role and not a scheduled step: it is the verb `forge company publish` (section 15), run by the operator on an accepted
+builder step. A scheduled step needs a new role and a change to the scheduler; that is not built (section 14).
+
 The role pack the design called "a role is a name mapped to a worker, a task type and a default check" is the table above; there is no
 default check, and each step names its own.
 
@@ -495,6 +508,21 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 | `usage-invalid` | a build's `usage.jsonl` is a link, a FIFO, a directory, over 16 MiB or unreadable (never followed, never opened when not a regular file); recorded, the step held | 14 | unit `test_a_held_code_names_the_refusal_it_was_recorded_with_and_its_exit`; run.sh `usagelink`, `usagefifo`, `usagebig`, `usagedir` |
 | `artifact-invalid` | the artifact is not a regular file beneath its directory or changed under the check; a need is missing or changed (`needs-missing`, `needs-changed`); the contract is missing, unreadable or changed by the build (`contract-missing`, `contract-unreadable`, `contract-changed`) | 14 | unit `test_every_way_an_artifact_is_refused_has_its_reason`; run.sh `a symlink artifact`, `needs changed`, `contract changed by the build` |
 | `step-failed` | the step's worker ended without a claim (stuck, a refusal, a deadline), or a stale build would not stop; printed when it happens and again when nothing else can start (the run goes on with the steps that do not need it first) | 15 | unit `test_a_step_that_ended_without_a_claim_is_not_started_again_in_the_same_invocation`, `test_when_nothing_else_can_start_the_answer_is_the_failed_step_and_its_dependent_waits`; run.sh `stuck worker: ...`, `no claim: ...`; the stale arm needs an adapter that ignores `cancel` and is **not reached by a test** |
+
+| `publish-step-not-accepted` | the step is not in the manifest, is not accepted in the journal, or is not a builder or writer step (a `reason:` line says the last) | 1 | `repo_publish.sh` `a step that is no step`, `a step that is not a builder` |
+| `publish-not-configured` | the operator file has no `publish` entry for the step | 1 | `repo_publish.sh` `no publish entry for the step` |
+| `publish-file-unaccepted` | the entry's `files` names a file besides the step's accepted artifact, or omits it: Forge hashed one file and publishes only that | 1 | `repo_publish.sh` `a file the step did not accept`, `files that omit the artifact` |
+| `publish-dest-invalid` | a destination that is absolute, has `..` or a dot or dash component, an empty component, a character outside `A-Za-z0-9._-/`, is over 256 bytes or is `docs/provenance.md`; or a link or a directory in the checkout where a file goes | 1 | unit `test_dest_refuses_everything_that_leaves_or_hides`; `repo_publish.sh` nine destinations, `a link on the way to the destination` |
+| `publish-repo-not-allowed` | `repo` is not on the gate runner's allow-list (and not `alpibrusl/cancho-diff`), or the checkout's `origin` is not that repository on github.com | 1 | `repo_publish.sh` `a repository that is not on the allow-list`, `a checkout whose origin is another repository`, `...the right name on another host` |
+| `publish-checkout-invalid` | `checkout` is not an absolute plain path, is not a directory, is not the toplevel of a git repository, has no commit, or is on a branch whose name is not a plain name | 1 | `repo_publish.sh` `a checkout that is not a repository`, `a checkout path with ..`, `a checkout that is a directory inside a repository` |
+| `publish-checkout-dirty` | the checkout has a modified or an untracked file | 1 | `repo_publish.sh` `a checkout with a modified file`, `...an untracked file` |
+| `publish-branch-invalid` | the branch is not 1 to 100 bytes of `A-Za-z0-9._-/` in components that do not start with a dot or a dash, has `..`, ends in a dot or `.lock` | 1 | unit `test_branch_refuses_what_git_or_a_shell_would_read_otherwise`; `repo_publish.sh` four branches |
+| `publish-branch-exists` | a branch of that name exists in the checkout | 1 | `repo_publish.sh` `a branch that exists` |
+| `publish-artifact-changed` | the artifact is no longer the file the journal accepted: another digest, another path, a link, unreadable | 1 | `repo_publish.sh` `an artifact edited after acceptance`, `an artifact that became a link` |
+| `publish-journal-unreadable` | `company.journal` cannot be read (a corrupt one is `journal-corrupt`) | 1 | `repo_publish.sh` `no journal` |
+| `publish-commit-failed` | git could not make the branch, stage or commit (no identity, an ignored path); the branch and the files are undone | 1 | `repo_publish.sh` `a commit git refuses (no identity), undone`, `an ignored destination ... undone` |
+| `publish-worker-failed` | the publish worker is not there, did not end, or answered what the request did not ask for; or the provenance is over its limit | 1 | `repo_publish.sh` `a workers directory with no repo_publish` |
+| `publish-push-not-granted` | `forge company publish` was given a seventh word (`push`): pushing and opening the pull request are a person's act | 1 | `repo_publish.sh` `push is not granted` |
 
 Not refusals, so without a tag of their own: `stopped: signal` (exit 16; `kill.sh` `T:` and `E:` cases) and `worker-error: <code>`, the
 tool runner's own code (`input-unusable`, `tool-unusable`, `evidence-unwritable`, `tool-timeout`, `tool-output-overflow`,
@@ -604,6 +632,27 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
 
 **Not built**
 
+* **`repo.publish` as a scheduled step.** Publishing is the verb `forge company publish` (section 15), run by the operator on an accepted
+  step. A step of the manifest needs a new role (a seventh), a `Runner` and a change to `next_action`; the verb is the smaller boundary
+  and the part that was needed first. The design's `repo.publish` task type (`autonomy.md` section 5) is therefore only half built.
+* **A publish is not in the company journal.** The record of what was published is `steps/<id>/pr.md` and the branch in the checkout.
+  A `company.step.published` kind would let `status` show it and let a second publish refuse; replay passes over unknown kinds, so it can
+  be added later. Without it a second publish of the same step to another branch is allowed.
+* **A plan edited by a person is not seen.** The provenance cannot say that an operator changed a worker's plan or output by hand between
+  runs, because nothing records it (the cancho-diff run's one such edit was found by reading the plan). The provenance says so in its last
+  section. Hashing `plan.json` when a step is admitted and again when it is accepted would let Forge notice.
+* **Only the builder's one accepted artifact is published.** Forge hashes one file per step (`project.cho`); the tests and any other file a
+  build writes are not accepted by anything, so `files` may name only the artifact (`publish-file-unaccepted`). A library's tests, its CI
+  and its README are therefore still not made by this verb.
+* **The origin check is a name check.** The worker reads `git remote get-url origin`; it does not know that the remote is what it says,
+  and it does not look at other remotes or at a `url.<base>.insteadOf` rewrite in the checkout's configuration. The checkout is the
+  operator's.
+* **Not run against a real repository or a real build.** The conformance uses a stand-in build tool and repositories made in the gate.
+* **`alpibrusl/cancho-diff` is on the publish list and not on the gate runner's**: the gate runner has no row for it (it has no
+  `scripts/gate.sh`). They should be one list (`autonomy.md` section 3, the registry).
+* **Git identity.** The worker has no environment, so the commit uses the checkout's own `user.name` and `user.email`; without them it
+  is `publish-commit-failed`.
+
 * **The reviewer role** is not distinct from qa (section 11): no authority-versus-ceiling comparison exists, so the design's goal 5 (a
   reviewer that is not a coder or a gate-runner) is **not met**; the company layer has qa, analyst and the product gate.
 * **The writer role** has never been run by a test; none of the design's writer checks (length, sections, links) exists.
@@ -689,3 +738,42 @@ program 'forgeprobe...'`), identical on the untouched baseline and unrelated to 
 `pgrep` name longer than 15 characters. The measured cause is that on this machine `/usr/bin/sleep` and `timeout` are hard links to
 the uutils multicall binary, which dispatches on `argv[0]`: the helper's copy named `forgeprobe$$` prints `coreutils: unknown program`
 and never runs as a probe. Everything else passes.
+
+## 15. Publishing an accepted artifact (`forge company publish`)
+
+**Status: built and tested against throw-away git repositories (`tests/conformance/repo_publish.sh`, 100 cases, run by `scripts/gate.sh`).
+Not run against a real repository, not run with a real model's output, and not a scheduled step.** Design: [`autonomy.md`](autonomy.md)
+sections 5 and 6, which asked for this so that nothing a company builds is copied into a repository by hand.
+
+`forge company publish <company-dir> <operator-file> <step id> <branch>` does, for a builder step that is accepted:
+
+1. Checks the request in a fixed order, so two faults are always refused for the same one: the push word, the branch name, the operator
+   file's place, the lock, the manifest, the step (accepted, and a builder or writer), the journal, the operator file and its `publish`
+   entry for the step, the `files` map, the destination, the repository, the checkout, the trailer.
+2. Hashes the artifact itself, beneath `steps/<id>/ev` with no link followed, and compares it with the digest the journal recorded when
+   it accepted the step (`publish-artifact-changed`). The worker hashes the bytes again when it copies them.
+3. Builds the provenance (`docs/provenance.md`) from the journal: the artifact digest, how many times the step was started, the tokens and
+   the cost Forge recorded, the last failed check, every decision a person recorded with the gate, the user and the reason, and a section
+   that says what the journal does not record. The same journal gives the same bytes. A recorded reason is written on one line with its
+   backticks and control bytes replaced.
+4. Starts the worker `repo_publish` beneath the operator's `workers` directory with one JSON request. The worker checks everything again
+   (it trusts no caller), then: the checkout is the toplevel of a git repository with a commit whose `origin` is the allow-listed
+   repository on github.com (`https://github.com/<repo>[.git]` or `git@github.com:<repo>[.git]`), with nothing modified or untracked,
+   without a branch of that name, and with no link or directory where a file goes; it creates the branch, writes the artifact and the
+   provenance, stages exactly those two paths, commits with the message on standard input (hooks off, no signing, so the checkout's hooks
+   never run), and goes back to the branch (or the commit) the checkout was on. A failure after the branch was made is undone: reset, the
+   files this publish added removed, back to the first branch, the new branch deleted. The checkout was clean when it began, so nothing
+   of the operator's is lost.
+5. Writes `steps/<id>/pr.md` (the title on the first line, a blank line, the body) beneath the step's directory without writing through a
+   link, and prints `published:`, `commit:`, `pr:` and the text.
+
+The commit message is a subject line, two lines of body and, when the operator file has `commit_trailer`, a blank line and that line.
+
+**What it does not do.** It does not push and does not open the pull request: both leave the machine, and Forge's rule is that a network
+act is a separately granted, human-gated one. Asked to (`push` as a seventh word) it refuses `publish-push-not-granted`. It does not
+change the company journal: a publish is not recorded in it (see section 14).
+
+**Authority.** The forge binary's report (`docs/authority.txt`) is unchanged: the verb uses rows the binary already held. The worker's is
+`docs/authority-repo-publish.txt`: `Exec` narrowed to `/bin/sh` (git runs through it), the file system for the checkout, the artifact and
+the evidence, a clock, standard input and output; no network, no command line, no signals, no foreign code. `scripts/gate.sh` compares it
+with the checked-in file.

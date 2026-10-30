@@ -1,0 +1,416 @@
+edition 9;
+module forge.publish_plan;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_state;
+import forge.gate_task;
+
+// The pure half of `forge company publish` (docs/company.md, section 15): what may be named, and what is written. Nothing here opens a
+// file or starts a process; `forge.company_publish` reads and asks, `workers/repo_publish.cho` copies and commits.
+//
+// `forge company publish <company-dir> <operator-file> <step id> <branch>` puts the artifact an ACCEPTED builder step left into a fresh
+// branch of a checkout the operator named, writes `docs/provenance.md` from the company journal, commits it locally, and writes the
+// text of a pull request to `steps/<id>/pr.md`. It never pushes and never opens the pull request: a network action stays a separately
+// granted, human-gated act (`publish-push-not-granted`).
+
+// ---- the rule tags (each is documented in docs/company.md section 12 and reached by tests/conformance/repo_publish.sh) ------------------
+
+pub fn rule_not_accepted() -> [] &static [byte] {
+    return "publish-step-not-accepted";
+}
+
+pub fn rule_not_configured() -> [] &static [byte] {
+    return "publish-not-configured";
+}
+
+pub fn rule_repo_not_allowed() -> [] &static [byte] {
+    return "publish-repo-not-allowed";
+}
+
+pub fn rule_checkout_invalid() -> [] &static [byte] {
+    return "publish-checkout-invalid";
+}
+
+pub fn rule_checkout_dirty() -> [] &static [byte] {
+    return "publish-checkout-dirty";
+}
+
+pub fn rule_branch_exists() -> [] &static [byte] {
+    return "publish-branch-exists";
+}
+
+pub fn rule_branch_invalid() -> [] &static [byte] {
+    return "publish-branch-invalid";
+}
+
+pub fn rule_dest_invalid() -> [] &static [byte] {
+    return "publish-dest-invalid";
+}
+
+pub fn rule_file_unaccepted() -> [] &static [byte] {
+    return "publish-file-unaccepted";
+}
+
+pub fn rule_artifact_changed() -> [] &static [byte] {
+    return "publish-artifact-changed";
+}
+
+pub fn rule_journal_unreadable() -> [] &static [byte] {
+    return "publish-journal-unreadable";
+}
+
+pub fn rule_commit_failed() -> [] &static [byte] {
+    return "publish-commit-failed";
+}
+
+pub fn rule_worker_failed() -> [] &static [byte] {
+    return "publish-worker-failed";
+}
+
+pub fn rule_push_not_granted() -> [] &static [byte] {
+    return "publish-push-not-granted";
+}
+
+// Where the provenance goes in the checkout. Fixed: the operator does not choose it.
+pub fn provenance_dest() -> [] &static [byte] {
+    return "docs/provenance.md";
+}
+
+// The most a provenance file, a commit message and a pull request text may be: what the worker reads of its request is 1 MiB.
+pub fn text_cap() -> [] int {
+    return 65536;
+}
+
+// ---- what may be named ---------------------------------------------------------------------------------------------------------
+
+fn name_byte(c: int) -> [] bool {
+    let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+    let digit = c >= 48 && c <= 57;
+    return letter || digit || c == 46 || c == 45 || c == 95;
+}
+
+// Is `path` a place inside a checkout? Relative, 1 to 256 bytes of letters, digits and `._-` in components separated by single
+// slashes; no component empty, starting with a dot (so no `..`, no `.git`, no hidden name) or a dash (an option), and no slash at the
+// end. A path that passes cannot leave the checkout and cannot be taken for an option or a shell word.
+pub fn dest_ok[&p](path: &p [byte]) -> [] bool {
+    if len(path) < 1 || len(path) > 256 {
+        return false;
+    }
+    var start = true;
+    var i = 0;
+    while i < len(path) {
+        let c = int_of(path[i]);
+        if c == 47 {
+            if start {
+                return false;
+            }
+            start = true;
+        } else {
+            if name_byte(c) == false {
+                return false;
+            }
+            if start && (c == 46 || c == 45) {
+                return false;
+            }
+            start = false;
+        }
+        i = i + 1;
+    }
+    return start == false;
+}
+
+// Is `name` a branch name Forge will create? 1 to 100 bytes of letters, digits and `._-`, with single slashes between components,
+// each component not empty and not starting with a dot or a dash, not ending in `.lock`, and the whole not ending in a dot: the shape
+// `dest_ok` takes, plus that.
+pub fn branch_ok[&p](name: &p [byte]) -> [] bool {
+    if len(name) > 100 || dest_ok(name) == false {
+        return false;
+    }
+    if int_of(name[len(name) - 1]) == 46 || bytes.find(name, "..") >= 0 {
+        return false;
+    }
+    var i = 0;
+    var from = 0;
+    while i <= len(name) {
+        if i == len(name) || int_of(name[i]) == 47 {
+            let part = name[from..i];
+            if len(part) >= 5 && bytes.equal(part[len(part) - 5..len(part)], ".lock") {
+                return false;
+            }
+            from = i + 1;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Is `text` a commit trailer line? Empty, or one line of printable ASCII, at most 200 bytes. It goes into a file, never a shell word.
+pub fn trailer_ok[&p](text: &p [byte]) -> [] bool {
+    if len(text) > 200 {
+        return false;
+    }
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 32 || c > 126 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The repositories a publish may write to: the gate runner's allow-list and `alpibrusl/cancho-diff`, which the gate runner has no
+// row for yet (it has no `scripts/gate.sh`). They should be one list (docs/autonomy.md, section 3).
+pub fn repo_ok[&k](key: &k [byte]) -> [] bool {
+    return gate_task.repo_known(key) || bytes.equal(key, "alpibrusl/cancho-diff");
+}
+
+// `text` as a line of markdown: a control byte becomes a space and a backtick an apostrophe, so a recorded reason cannot end a code
+// span, start a heading or break a line. Bytes above 127 are kept (UTF-8).
+pub fn put_clean[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buffer.Buffer {
+    var o = out;
+    var i = 0;
+    while i < len(text) {
+        let c = int_of(text[i]);
+        if c < 32 || c == 127 {
+            o = buffer.push(heap, o, byte_of(32));
+        } else if c == 96 {
+            o = buffer.push(heap, o, byte_of(39));
+        } else {
+            o = buffer.push(heap, o, text[i]);
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+fn quoted[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buffer.Buffer {
+    return buffer.push(heap, put_clean(heap, buffer.push(heap, out, byte_of(96)), text), byte_of(96));
+}
+
+fn put_nat[&h](heap: &!h Heap, out: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    return buffer.push_nat(heap, out, n);
+}
+
+// `micro` micro-dollars as `$W.FFFFFF`.
+fn put_dollars[&h](heap: &!h Heap, out: buffer.Buffer, micro: int) -> [heap] buffer.Buffer {
+    var o = buffer.push(heap, out, byte_of(36));
+    o = put_nat(heap, o, micro / 1000000);
+    o = buffer.push(heap, o, byte_of(46));
+    var frac = micro % 1000000;
+    var div = 100000;
+    while div > 0 {
+        o = buffer.push(heap, o, byte_of(48 + frac / div));
+        frac = frac % div;
+        div = div / 10;
+    }
+    return o;
+}
+
+// ---- the decisions a person recorded, read from the journal text ---------------------------------------------------------------
+
+// One `- <gate>: <verdict> by <user>: <reason>` line for each `company.gate.decided` record of the journal text, in order (a later
+// decision on a gate is another line: the history, not only the last word). A complete line that is not a decision, or not JSON, is
+// passed over: replay (`company_state.replay`) is what refuses a corrupt journal; this only reads. Returns the text and how many.
+fn decisions[&h, &j](heap: &!h Heap, out: buffer.Buffer, journal: &j [byte]) -> [heap] (buffer.Buffer, int) {
+    var o = out;
+    var count = 0;
+    var pos = 0;
+    while pos < len(journal) {
+        var e = pos;
+        while e < len(journal) && int_of(journal[e]) != 10 {
+            e = e + 1;
+        }
+        if e < len(journal) {
+            let line = journal[pos..e];
+            let tape = box_slice(heap, json.tape_len(line), 0);
+            borrow mut tape as &!tw in {
+                let tp = contents(tw);
+                if json.parse(line, tp) > 0 && json.is_object(tp, 0) {
+                    let kind = json.get(line, tp, 0, "kind");
+                    let gate = json.get(line, tp, 0, "gate");
+                    let verdict = json.get(line, tp, 0, "verdict");
+                    let user = json.get(line, tp, 0, "user");
+                    let reason = json.get(line, tp, 0, "reason");
+                    if json.is_string(tp, kind) && bytes.equal(json.string_view(line, tp, kind), company_state.kind_gate_decided()) && json.is_string(tp, gate) && json.is_string(tp, verdict) && json.is_string(tp, user) && json.is_string(tp, reason) {
+                        o = buffer.append(heap, o, "- ");
+                        o = quoted(heap, o, json.string_view(line, tp, gate));
+                        o = buffer.append(heap, o, ": ");
+                        o = put_clean(heap, o, json.string_view(line, tp, verdict));
+                        o = buffer.append(heap, o, " by ");
+                        o = quoted(heap, o, json.string_view(line, tp, user));
+                        o = buffer.append(heap, o, ": ");
+                        o = put_clean(heap, o, json.string_view(line, tp, reason));
+                        o = buffer.push(heap, o, byte_of(10));
+                        count = count + 1;
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+        pos = e + 1;
+    }
+    return (o, count);
+}
+
+// ---- the texts ------------------------------------------------------------------------------------------------------------------
+
+// `docs/provenance.md`: what the journal says about step number `i`, which was accepted with the artifact `sha`, published at `dest`.
+// Only recorded facts, and a section that says what the journal does not record. The same journal and step give the same bytes.
+pub fn provenance[&h, &m, &s, &j, &x, &d](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, journal: &j [byte], i: int, sha: &x [byte], dest: &d [byte]) -> [heap] buffer.Buffer {
+    let step = company_manifest.step_at(m, i);
+    var o = buffer.append(heap, buffer.empty(heap, 1024), "# Provenance of ");
+    o = quoted(heap, o, dest);
+    o = buffer.append(heap, o, "\n\nThis file is generated by `forge company publish` from the company journal; nobody typed it. ");
+    o = quoted(heap, o, dest);
+    o = buffer.append(heap, o, " is the artifact of step ");
+    o = quoted(heap, o, company_manifest.step_id(m, step));
+    o = buffer.append(heap, o, " of the company ");
+    o = quoted(heap, o, company_manifest.id_of(m));
+    o = buffer.append(heap, o, ", built with the model ");
+    o = quoted(heap, o, company_manifest.model_of(m));
+    o = buffer.append(heap, o, " of the provider ");
+    o = quoted(heap, o, company_manifest.provider_of(m));
+    o = buffer.append(heap, o, ".\n\n| | |\n|---|---|\n| Artifact sha256 | ");
+    o = quoted(heap, o, sha);
+    o = buffer.append(heap, o, " |\n| Times the step was started | ");
+    o = put_nat(heap, o, company_state.admitted_count(s, company_manifest.step_id(m, step)));
+    o = buffer.append(heap, o, " |\n");
+    let used = company_state.step_recorded(s, i);
+    o = buffer.append(heap, o, "| Tokens | input ");
+    o = put_nat(heap, o, used.input);
+    o = buffer.append(heap, o, ", output ");
+    o = put_nat(heap, o, used.output);
+    o = buffer.append(heap, o, ", cache write ");
+    o = put_nat(heap, o, used.cache_write);
+    o = buffer.append(heap, o, ", cache read ");
+    o = put_nat(heap, o, used.cache_read);
+    o = buffer.append(heap, o, " |\n| Cost recorded by Forge | ");
+    o = put_dollars(heap, o, company_state.step_cost_micro(s, i));
+    o = buffer.append(heap, o, " |\n| Last failed check | ");
+    let (got, total) = company_state.failed_score(s, i);
+    if got < 0 {
+        o = buffer.append(heap, o, "none");
+    } else {
+        o = put_nat(heap, o, got);
+        o = buffer.append(heap, o, " of ");
+        o = put_nat(heap, o, total);
+    }
+    o = buffer.append(heap, o, " |\n\n## Decisions a person recorded\n\n");
+    let (listed, count) = decisions(heap, buffer.empty(heap, 256), journal);
+    if count == 0 {
+        o = buffer.append(heap, o, "None.\n");
+    } else {
+        borrow listed as &lb in {
+            o = buffer.append(heap, o, buffer.bytes(lb));
+        }
+    }
+    buffer.drop(heap, listed);
+    o = buffer.append(heap, o, "\n## What the journal does not record\n\nA time of day; a change a person made by hand to a worker's plan or output between runs; whether a file besides the artifact was touched. This file cannot list such a change. If one was made, the pull request must say so.\n");
+    return o;
+}
+
+// The commit message: a subject line, a body of two lines, and the operator's trailer line when it has one.
+pub fn commit_message[&h, &m, &i, &d, &t](heap: &!h Heap, m: &m company_manifest.Manifest, step_id: &i [byte], dest: &d [byte], trailer: &t [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 512), "Add ");
+    o = put_clean(heap, o, dest);
+    o = buffer.append(heap, o, ", built by Forge\n\nStep ");
+    o = put_clean(heap, o, step_id);
+    o = buffer.append(heap, o, " of the company ");
+    o = put_clean(heap, o, company_manifest.id_of(m));
+    o = buffer.append(heap, o, " was accepted by its check; ");
+    o = put_clean(heap, o, provenance_dest());
+    o = buffer.append(heap, o, " says how.\n");
+    if len(trailer) > 0 {
+        o = buffer.push(heap, o, byte_of(10));
+        o = buffer.append(heap, o, trailer);
+        o = buffer.push(heap, o, byte_of(10));
+    }
+    return o;
+}
+
+// `steps/<id>/pr.md`: the title on the first line, a blank line, the body. The body repeats the facts of the provenance that a reviewer
+// needs, names the branch, and says what was not done: nothing was pushed.
+pub fn pr_text[&h, &m, &s, &d, &x, &b, &k](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, i: int, sha: &x [byte], dest: &d [byte], branch: &b [byte], commit: &k [byte]) -> [heap] buffer.Buffer {
+    let step = company_manifest.step_at(m, i);
+    var o = buffer.append(heap, buffer.empty(heap, 1024), "Add ");
+    o = put_clean(heap, o, dest);
+    o = buffer.append(heap, o, " (step ");
+    o = put_clean(heap, o, company_manifest.step_id(m, step));
+    o = buffer.append(heap, o, " of the company ");
+    o = put_clean(heap, o, company_manifest.id_of(m));
+    o = buffer.append(heap, o, ")\n\nThe artifact of an accepted step, put on the branch ");
+    o = quoted(heap, o, branch);
+    o = buffer.append(heap, o, " (commit ");
+    o = quoted(heap, o, commit);
+    o = buffer.append(heap, o, ") by `forge company publish`. Its sha256 is ");
+    o = quoted(heap, o, sha);
+    o = buffer.append(heap, o, ". ");
+    o = quoted(heap, o, provenance_dest());
+    o = buffer.append(heap, o, " has the tokens, the cost and the decisions a person recorded.\n\nNot done: the branch was not pushed and this pull request was not opened; both are a person's act. If anyone changed the artifact or the plan by hand, say so here before opening it.\n");
+    return o;
+}
+
+// ---- the request to the worker and its reply ---------------------------------------------------------------------------------------
+
+// The JSON request `workers/repo_publish.cho` reads on standard input: every field a string, written escaped.
+pub fn request[&h, &c, &r, &b, &s, &n, &d, &x, &p, &g](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], src_dir: &s [byte], src_name: &n [byte], dest: &d [byte], sha: &x [byte], prov: &p [byte], message: &g [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 1024);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "checkout");
+    w = json.put_string(heap, w, checkout);
+    w = json.put_key(heap, w, "repo");
+    w = json.put_string(heap, w, repo);
+    w = json.put_key(heap, w, "branch");
+    w = json.put_string(heap, w, branch);
+    w = json.put_key(heap, w, "src_dir");
+    w = json.put_string(heap, w, src_dir);
+    w = json.put_key(heap, w, "src_name");
+    w = json.put_string(heap, w, src_name);
+    w = json.put_key(heap, w, "dest");
+    w = json.put_string(heap, w, dest);
+    w = json.put_key(heap, w, "sha256");
+    w = json.put_string(heap, w, sha);
+    w = json.put_key(heap, w, "provenance_dest");
+    w = json.put_string(heap, w, provenance_dest());
+    w = json.put_key(heap, w, "provenance");
+    w = json.put_string(heap, w, prov);
+    w = json.put_key(heap, w, "message");
+    w = json.put_string(heap, w, message);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The tag the worker's `rule` stands for: one of this module's it may answer with, else `publish-worker-failed`.
+pub fn worker_tag[&t](tag: &t [byte]) -> [] &static [byte] {
+    if bytes.equal(tag, rule_repo_not_allowed()) {
+        return rule_repo_not_allowed();
+    }
+    if bytes.equal(tag, rule_checkout_invalid()) {
+        return rule_checkout_invalid();
+    }
+    if bytes.equal(tag, rule_checkout_dirty()) {
+        return rule_checkout_dirty();
+    }
+    if bytes.equal(tag, rule_branch_exists()) {
+        return rule_branch_exists();
+    }
+    if bytes.equal(tag, rule_branch_invalid()) {
+        return rule_branch_invalid();
+    }
+    if bytes.equal(tag, rule_dest_invalid()) {
+        return rule_dest_invalid();
+    }
+    if bytes.equal(tag, rule_artifact_changed()) {
+        return rule_artifact_changed();
+    }
+    if bytes.equal(tag, rule_commit_failed()) {
+        return rule_commit_failed();
+    }
+    return rule_worker_failed();
+}

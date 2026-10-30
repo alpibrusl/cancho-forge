@@ -591,3 +591,42 @@ fn test_a_busy_check_lock_is_its_own_ending_not_a_bare_failure() -> [] int {
     test.assert_eq(company_step.check_verdict(process.Ran::Failed(company_step.guard_busy()), "TOTAL 1/1\n"), 2);
     return 0;
 }
+
+// ---- the operator file's `publish` and `commit_trailer` (docs/company.md section 15)
+
+fn publish_operator() -> [] &static [byte] {
+    return "{\"workers\":\"/w\",\"publish\":{\"lib\":{\"repo\":\"alpibrusl/cancho-diff\",\"checkout\":\"/co\",\"files\":{\"project.cho\":\"src/diff.cho\"}}},\"commit_trailer\":\"Co-Authored-By: A <a@example.invalid>\"}";
+}
+
+fn test_a_publish_entry_is_read_back_by_step[&h](heap: &!h Heap) -> [heap] int {
+    let text = publish_operator();
+    test.assert(operator_is_ok(heap, text));
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert(bytes.equal(company_step.op_publish(text, tp, "lib", "repo"), "alpibrusl/cancho-diff"));
+        test.assert(bytes.equal(company_step.op_publish(text, tp, "lib", "checkout"), "/co"));
+        test.assert_eq(len(company_step.op_publish(text, tp, "other", "repo")), 0);
+        test.assert(company_step.op_publish_files(text, tp, "lib") >= 0);
+        test.assert(company_step.op_publish_files(text, tp, "other") < 0);
+        test.assert(bytes.equal(company_step.op_text(text, tp, "commit_trailer"), "Co-Authored-By: A <a@example.invalid>"));
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+fn test_a_publish_entry_of_the_wrong_shape_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":{}}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"commit_trailer\":\"\"}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":{\"lib\":{\"repo\":\"r\",\"checkout\":\"/co\",\"files\":{\"a\":\"b\"}}}}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":{\"lib\":{\"repo\":\"r\",\"checkout\":\"co\",\"files\":{\"a\":\"b\"}}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":{\"lib\":{\"repo\":\"r\",\"checkout\":\"/co\",\"files\":{}}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":{\"lib\":{\"repo\":\"r\",\"checkout\":\"/co\",\"files\":{\"a\":1}}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":{\"lib\":{\"repo\":\"r\",\"checkout\":\"/co\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":{\"lib\":{\"repo\":\"r\",\"checkout\":\"/co\",\"files\":{\"a\":\"b\"},\"push\":\"yes\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"publish\":[]}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"commit_trailer\":\"a\\nb\"}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"commit_trailer\":7}") == false);
+    return 0;
+}

@@ -687,6 +687,8 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 //     "gates": { "<step id>": { "repo": "<allow-list key>", "revision": "<40 hex>", "checkout": "/abs" } },
 //     "analyst_tools": "/abs", "granted_tools": ["<tool>", ...],
 //     "analysts": { "<step id>": { "tool": "<tool>", "argv": ["<arg>", ...], "input": "<file beneath the step's ev>" } },
+//     "publish": { "<step id>": { "repo": "<allow-list key>", "checkout": "/abs", "files": { "<artifact name>": "<path in the checkout>" } } },
+//     "commit_trailer": "<one line>",
 //     "build_timeout_ms": N, "gate_timeout_ms": N, "check_timeout_ms": N, "tool_timeout_ms": N,
 //     "attempts": N, "agent_seconds": N, "rounds": N, "plan_seconds": N, "jobs": N }
 //
@@ -703,7 +705,7 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 // again by what uses it (`journal_io.path_ok`, `gate_task.check`, `build_task`), so the file grants nothing.
 
 fn root_keys() -> [] &static [byte] {
-    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs ";
+    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs publish commit_trailer ";
 }
 
 fn analyst_keys() -> [] &static [byte] {
@@ -712,6 +714,10 @@ fn analyst_keys() -> [] &static [byte] {
 
 fn gate_keys() -> [] &static [byte] {
     return " repo revision checkout ";
+}
+
+fn publish_keys() -> [] &static [byte] {
+    return " repo checkout files ";
 }
 
 // Is `key` one of the space-separated words of `words`?
@@ -824,7 +830,7 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
     if len(limit_reason(src, tp)) > 0 {
         return false;
     }
-    if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false {
+    if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false || publish_ok(src, tp) == false {
         return false;
     }
     let agent = json.get(src, tp, 0, "agent");
@@ -966,6 +972,65 @@ fn analysts_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
     return ok;
 }
 
+// `publish` and `commit_trailer`, when there (`forge company publish`, docs/company.md section 15): `publish` is an object whose every
+// value is an object of exactly `repo` (a plain string), `checkout` (an absolute plain string) and `files` (an object of one to eight
+// plain strings, the artifact's name to its place in the checkout), and `commit_trailer` a plain string of at most 200 bytes. These
+// are checks of form only: `publish_plan` and the worker check every value again when a publish uses it.
+fn publish_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
+    let trailer = json.get(src, tp, 0, "commit_trailer");
+    if trailer >= 0 {
+        if plain_string(tp, trailer) == false || len(json.string_view(src, tp, trailer)) > 200 {
+            return false;
+        }
+    }
+    let all = json.get(src, tp, 0, "publish");
+    if all < 0 {
+        return true;
+    }
+    if json.is_object(tp, all) == false || keys_plain(tp, all) == false {
+        return false;
+    }
+    let n = json.count(tp, all);
+    var k = all + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        let v = k + 1;
+        if json.is_object(tp, v) == false {
+            ok = false;
+        } else if keys_ok(src, tp, v, publish_keys()) == false || json.count(tp, v) != 3 {
+            ok = false;
+        } else if plain_string(tp, json.get(src, tp, v, "repo")) == false || absolute(src, tp, json.get(src, tp, v, "checkout")) == false || files_ok(src, tp, json.get(src, tp, v, "files")) == false {
+            ok = false;
+        }
+        k = json.skip(tp, v);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// `files` of a publish entry: an object of one to eight entries, every value a plain string.
+fn files_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if node < 0 || json.is_object(tp, node) == false || keys_plain(tp, node) == false {
+        return false;
+    }
+    let n = json.count(tp, node);
+    if n < 1 || n > 8 {
+        return false;
+    }
+    var k = node + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if plain_string(tp, k + 1) == false {
+            ok = false;
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    return ok;
+}
+
 // Are the keys of the object at `obj` written plain? (A step id is a name, so an escaped key could never match one.)
 fn keys_plain[&t](tp: &t [int], obj: int) -> [] bool {
     let n = json.count(tp, obj);
@@ -1032,4 +1097,22 @@ pub fn op_analyst_node[&s, &t, &i](src: &s [byte], tp: &t [int], step: &i [byte]
 // The node of the top-level `name` of the operator file (granted_tools), or -1.
 pub fn op_node[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte]) -> [] int {
     return json.get(src, tp, 0, name);
+}
+
+// The `field` (repo, checkout) of the publish entry for step `step`, or "" when there is none.
+pub fn op_publish[&s, &t, &i](src: &s [byte], tp: &t [int], step: &i [byte], field: &static [byte]) -> [] &s [byte] {
+    let all = json.get(src, tp, 0, "publish");
+    let entry = json.get(src, tp, all, step);
+    let node = json.get(src, tp, entry, field);
+    if json.is_string(tp, node) == false {
+        return src[0..0];
+    }
+    return json.string_view(src, tp, node);
+}
+
+// The node of `files` of the publish entry for step `step`, or -1.
+pub fn op_publish_files[&s, &t, &i](src: &s [byte], tp: &t [int], step: &i [byte]) -> [] int {
+    let all = json.get(src, tp, 0, "publish");
+    let entry = json.get(src, tp, all, step);
+    return json.get(src, tp, entry, "files");
 }

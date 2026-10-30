@@ -1,0 +1,20 @@
+performs
+    child_signal
+    clock
+    dir_read
+    exec("/bin/sh")
+    file_read
+    file_write
+    fs_read("")
+    fs_write("")
+    heap
+    io_read
+    io_write
+    pipe_read
+    pipe_write
+    poll
+never touches
+    the network
+    the command line
+    signals
+    foreign code

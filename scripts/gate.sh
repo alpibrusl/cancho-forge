@@ -11,6 +11,7 @@
 #   company              `forge company check` / `status` end to end on the manifest fixtures (scripts/check_company.sh)
 #   company run          `forge company run` end to end, real workers, the lying-worker test (tests/conformance/company_run.sh)
 #   company kill         `forge company run` killed mid-step and run again: nothing left running, each step accepted once (tests/conformance/company_kill.sh)
+#   company publish     `forge company publish` end to end against throw-away git repositories, the publish worker real: the good path, one case per refusal tag, the hostile cases (tests/conformance/repo_publish.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
 #   verbs                capabilities, cancel, status and result against the mock worker (every verdict) and the stub LLM and gate runner (capabilities), real child processes
 #   conformance          tests/conformance/*.cho, programs that need an Fs, which
@@ -164,6 +165,21 @@ echo "== forge company run killed and resumed (a real run killed with SIGKILL an
 mkdir "$scratch/company-kill" || exit 1
 CANCHO="$C" sh tests/conformance/company_kill.sh "$scratch/company-kill" || fail=1
 
+echo "== forge company publish (workers/repo_publish.cho: the artifact of an accepted step on a fresh branch of a git checkout with its provenance, committed, never pushed; every refusal; tests/conformance/repo_publish.sh)"
+$C check workers/repo_publish.cho $libs --std || fail=1
+# The publish worker's authority report is its review artefact (docs/authority-repo-publish.txt): `/bin/sh` for git, the file system for the
+# checkout and the artifact, a clock, no network. A change that widens it changes that file in the same commit and says so in the message.
+$C authority workers/repo_publish.cho $libs --std | sed -n '/^performs/,/^provably/p' | sed '$d' > "$scratch/authority-repo-publish.txt"
+if cmp -s "$scratch/authority-repo-publish.txt" docs/authority-repo-publish.txt; then
+  echo "ok   repo publish authority: the report is the checked-in one"
+else
+  echo "FAIL repo publish authority: differs from docs/authority-repo-publish.txt"; diff docs/authority-repo-publish.txt "$scratch/authority-repo-publish.txt"; fail=1
+fi
+mkdir "$scratch/repo-publish" || exit 1
+CANCHO="$C" sh tests/conformance/repo_publish.sh "$scratch/repo-publish" > "$scratch/repo-publish.out" || fail=1
+cat "$scratch/repo-publish.out"
+if grep -q '^FAIL ' "$scratch/repo-publish.out"; then fail=1; fi
+
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of
 # append, sync, snapshot and rename. `narrow` takes only a literal (cancho
@@ -254,7 +270,7 @@ fi
 
 echo "== docs: every rule tag the company code can print is in docs/company.md and docs/architecture.md"
 # An oracle from outside the program: the tags are the kebab-case string literals of the company files and the tool task (listed; workers/*.cho are left out: their literals include non-tag names).
-company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_check.cho src/company_cmd.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_run.cho src/company_runner.cho src/company_state.cho src/company_step.cho src/step_run.cho src/tool_call.cho src/tool_task.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
+company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_check.cho src/company_cmd.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_run.cho src/company_runner.cho src/company_state.cho src/company_step.cho src/company_publish.cho src/publish_plan.cho src/step_run.cho src/tool_call.cho src/tool_task.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
 for t in $company_tags; do
   for d in docs/company.md docs/architecture.md; do
     if grep -qF "\`$t\`" "$d"; then :; else echo "FAIL docs: tag $t is not in $d"; fail=1; fi
