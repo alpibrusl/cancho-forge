@@ -509,3 +509,144 @@ fn test_a_library_that_is_not_a_string_is_malformed[&h](heap: &!h Heap) -> [heap
     test.assert(bytes.equal(steps_rule(heap, "{\"id\":\"a\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"c.cho\",\"contract\":\"api.txt\",\"library\":\"d\\u0069ff\"}"), "manifest-malformed"));
     return 0;
 }
+
+// ---- repos and the repo.change step (docs/company-lifecycle.md sections 2.1 and 8.1) ---------------------------------------
+
+fn repos_rule[&h, &r, &s](heap: &!h Heap, repos: &r [byte], steps: &s [byte]) -> [heap] &static [byte] {
+    var extra = buffer.append(heap, buffer.empty(heap, 128), "\"repos\":");
+    extra = buffer.append(heap, extra, repos);
+    extra = buffer.append(heap, extra, ",");
+    var r2 = "";
+    borrow extra as &eb in {
+        let d = doc(heap, steps, budget(), buffer.bytes(eb));
+        borrow d as &db in {
+            r2 = rule_of(heap, buffer.bytes(db));
+        }
+        buffer.drop(heap, d);
+    }
+    buffer.drop(heap, extra);
+    return r2;
+}
+
+fn test_a_manifest_with_no_repos_is_valid_and_unchanged[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, good_manifest_text()), ""));
+    match company_manifest.parse(heap, good_manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                test.assert(company_manifest.repo_count(mr) == 0);
+                test.assert(company_manifest.repo_index(mr, "diff") == 0 - 1);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return 0;
+}
+
+fn good_manifest_text() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"prices.json\"},\"human_gates\":[],\"roles\":[\"builder\",\"qa\"],\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"run it\"},{\"id\":\"b\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[\"a\"],\"input\":\"x\",\"check\":\"c.sh\"}]}";
+}
+
+fn test_a_repos_row_with_a_kind_outside_the_three_is_repo_kind_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"site\"}]", step_a()), "repo-kind-invalid"));
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"Library\"}]", step_a()), "repo-kind-invalid"));
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"library\"},{\"id\":\"api\",\"kind\":\"service\"},{\"id\":\"cli\",\"kind\":\"program\"}]", step_a()), ""));
+    return 0;
+}
+
+fn test_two_repos_with_one_id_are_repo_duplicate[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"library\"},{\"id\":\"diff\",\"kind\":\"service\"}]", step_a()), "repo-duplicate"));
+    return 0;
+}
+
+fn test_a_repos_entry_outside_the_shape_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"library\",\"checkout\":\"/x\"}]", step_a()), "manifest-unknown-field"));
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\"}]", step_a()), "manifest-malformed"));
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"..\",\"kind\":\"library\"}]", step_a()), "manifest-malformed"));
+    test.assert(bytes.equal(repos_rule(heap, "{\"id\":\"diff\"}", step_a()), "manifest-malformed"));
+    test.assert(bytes.equal(repos_rule(heap, "[\"diff\"]", step_a()), "manifest-malformed"));
+    return 0;
+}
+
+fn test_a_step_naming_a_repo_the_manifest_does_not_list_is_repo_unknown[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"nope\"}";
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"library\"}]", s), "repo-unknown"));
+    test.assert(bytes.equal(steps_rule(heap, s), "repo-unknown"));
+    return 0;
+}
+
+fn test_a_repo_change_step_without_a_repo_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\"}";
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"library\"}]", s), "repo-required"));
+    return 0;
+}
+
+fn test_a_repo_change_step_with_a_repo_is_held_and_reads_back[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\",\"change_kind\":\"bug\"}";
+    var extra = "\"repos\":[{\"id\":\"diff\",\"kind\":\"service\"}],";
+    let d = doc(heap, s, budget(), extra);
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    let st = company_manifest.step_at(mr, 0);
+                    test.assert(company_manifest.is_repo_change(st));
+                    test.assert(bytes.equal(company_manifest.step_repo(mr, st), "diff"));
+                    test.assert(bytes.equal(company_manifest.step_change_kind(mr, st), "bug"));
+                    test.assert(company_manifest.repo_count(mr) == 1);
+                    test.assert(bytes.equal(company_manifest.repo_id_at(mr, 0), "diff"));
+                    test.assert(bytes.equal(company_manifest.repo_kind_name(company_manifest.repo_kind_at(mr, 0)), "service"));
+                    test.assert(company_manifest.repo_index(mr, "diff") == 0);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_repo_on_another_task_type_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    let repos = "[{\"id\":\"diff\",\"kind\":\"library\"}]";
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\"}"), "repo-task-invalid"));
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"repo\":\"diff\"}"), "repo-task-invalid"));
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"project.build\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"change_kind\":\"bug\"}"), "repo-task-invalid"));
+    return 0;
+}
+
+fn test_a_contract_or_library_on_a_repo_change_step_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    let repos = "[{\"id\":\"diff\",\"kind\":\"library\"}]";
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\",\"contract\":\"k.txt\"}"), "repo-task-invalid"));
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\",\"library\":\"diff\"}"), "repo-task-invalid"));
+    return 0;
+}
+
+fn test_only_the_builder_offers_repo_change[&h](heap: &!h Heap) -> [heap] int {
+    let repos = "[{\"id\":\"diff\",\"kind\":\"library\"}]";
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"writer\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\"}"), "task-type-unsupported"));
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"qa\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"repo\":\"diff\"}"), "task-type-unsupported"));
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"repo\":\"diff\"}"), "check-missing"));
+    return 0;
+}
+
+fn test_a_change_kind_outside_the_four_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    let repos = "[{\"id\":\"diff\",\"kind\":\"library\"}]";
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\",\"change_kind\":\"chore\"}"), "repo-change-kind-invalid"));
+    test.assert(bytes.equal(repos_rule(heap, repos, "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\",\"change_kind\":\"rename\"}"), ""));
+    return 0;
+}
+
+fn test_the_repo_refusal_tags_are_the_documented_ones() -> [] int {
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RepoKindInvalid), "repo-kind-invalid"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RepoDuplicate), "repo-duplicate"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RepoUnknown), "repo-unknown"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RepoRequired), "repo-required"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RepoTaskInvalid), "repo-task-invalid"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RepoChangeKindInvalid), "repo-change-kind-invalid"));
+    return 0;
+}

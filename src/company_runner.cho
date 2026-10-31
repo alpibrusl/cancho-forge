@@ -26,6 +26,7 @@ import forge.journal_io;
 import forge.lock;
 import forge.recover;
 import forge.recover_io;
+import forge.repo_row;
 import forge.step_run;
 import forge.task;
 import forge.tool_call;
@@ -273,7 +274,10 @@ fn with_operator[&h, &f, &x, &c, &i, &m, &d, &j, &o, &z](heap: &!h Heap, fs: &f 
                     refuse(io, rule_operator_invalid());
                 } else if company_step.operator_ok(src, tp) == false {
                     refuse(io, rule_operator_invalid());
-                    let why = company_step.limit_reason(src, tp);
+                    var why = company_step.limit_reason(src, tp);
+                    if len(why) == 0 {
+                        why = repo_row.rows_reason(src, tp);
+                    }
                     if len(why) > 0 {
                         say(io, "reason: ", why);
                     }

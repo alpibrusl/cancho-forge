@@ -646,3 +646,12 @@ fn test_the_manifest_and_the_adapter_agree_on_what_a_module_name_is() -> [] int 
     test.assert(company_manifest.library_name_ok("a\0b") == build_task.library_ok("a\0b"));
     return 0;
 }
+
+// ---- the operator file's repos ---------------------------------------------------------------------------------------------
+
+fn test_an_operator_file_with_a_good_repos_row_is_taken_and_a_bad_one_is_not[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"repos\":{\"diff\":{\"kind\":\"library\",\"checkout\":\"/co/diff\",\"compiler_rev\":\"f4ead824f33b291a0ad7620a34a0c1346a7abe4f\",\"publish_allow\":[\"src/**\"],\"max_patch_files\":20,\"max_patch_lines\":800}}}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"repos\":{\"diff\":{\"kind\":\"library\",\"checkout\":\"/co/diff\",\"compiler_rev\":\"f4ead82\",\"publish_allow\":[\"src/**\"],\"max_patch_files\":20,\"max_patch_lines\":800}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"repos\":[]}") == false);
+    return 0;
+}

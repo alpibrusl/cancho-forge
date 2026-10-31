@@ -1,0 +1,572 @@
+edition 9;
+module forge.repo_row;
+
+import std.bytes;
+import std.json;
+import forge.gate_task;
+
+// The operator file's `repos` (docs/company-lifecycle.md sections 2.1 and 8.1, docs/company.md section 16): one row per repository the
+// manifest's `repos` lists, saying where its checkout is, which compiler revision it is built with and which paths and how much a
+// change may touch. This module is pure: it reads a parsed operator file (`src` and its tape `tp`) and opens nothing.
+//
+//   "repos": { "<id>": { "kind", "checkout", "compiler_rev", "publish_allow", "max_patch_files", "max_patch_lines",
+//                        "slug"?, "branch"?, "pins"?, "publish_deny"? } ... }
+//
+// The slice reads the rows it needs and rejects every other key of the autonomy registry (`gate`, `policy`: docs/autonomy.md section 3)
+// as `operator-invalid`, with the `reason:` that `rows_reason` gives. The values are checked again where they are used (the patch
+// bounds by `patch_check`, the paths by `repo_task`, the pin by the change worker), so a row grants nothing a user of it does not allow.
+
+fn row_keys() -> [] &static [byte] {
+    return " slug branch checkout kind compiler_rev pins publish_allow publish_deny max_patch_files max_patch_lines ";
+}
+
+// The most rows, patterns in a list, and bytes of a pattern.
+pub fn max_rows() -> [] int {
+    return 64;
+}
+
+pub fn max_patterns() -> [] int {
+    return 32;
+}
+
+pub fn max_pattern_bytes() -> [] int {
+    return 128;
+}
+
+// The bounds on what a row may allow: a change touches 1 to 64 files and adds 1 to 100000 lines.
+pub fn files_cap() -> [] int {
+    return 64;
+}
+
+pub fn lines_cap() -> [] int {
+    return 100000;
+}
+
+fn listed[&k](words: &static [byte], key: &k [byte]) -> [] bool {
+    if len(key) == 0 {
+        return false;
+    }
+    var start = 0;
+    var k = 0;
+    while k < len(words) {
+        if int_of(words[k]) == 32 {
+            if k - start == len(key) {
+                if bytes.equal(words[start..k], key) {
+                    return true;
+                }
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+fn plain[&t](tp: &t [int], node: int) -> [] bool {
+    return json.is_string(tp, node) && json.string_plain(tp, node);
+}
+
+// Are the keys of the object at `obj` plain strings, each once, each in `words`? (`json.get` finds the first of a key twice, so a key
+// twice is a key whose value is not the node after it.)
+fn keys_ok[&s, &t](src: &s [byte], tp: &t [int], obj: int, words: &static [byte]) -> [] bool {
+    let n = json.count(tp, obj);
+    var k = obj + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if !plain(tp, k) {
+            ok = false;
+        } else {
+            let name = json.string_view(src, tp, k);
+            if !listed(words, name) {
+                ok = false;
+            } else if json.get(src, tp, obj, name) != k + 1 {
+                ok = false;
+            }
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    return ok;
+}
+
+fn keys_plain[&t](tp: &t [int], obj: int) -> [] bool {
+    let n = json.count(tp, obj);
+    var k = obj + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if !plain(tp, k) {
+            ok = false;
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// 40 digits of `0-9a-f`.
+pub fn rev_ok[&r](rev: &r [byte]) -> [] bool {
+    return gate_task.revision_ok(rev);
+}
+
+fn name_char(c: int) -> [] bool {
+    let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+    let digit = c >= 48 && c <= 57;
+    return letter || digit || c == 45 || c == 95 || c == 46;
+}
+
+// A branch name of the row: 1 to 64 bytes of letters, digits, `-`, `_`, `.`, `/`, not starting with `-` or `.`, no `..`, no `//`, not
+// ending in `/`. It is compared with the checkout's branch by the worker, never put in a command.
+pub fn branch_ok[&b](name: &b [byte]) -> [] bool {
+    if len(name) < 1 || len(name) > 64 {
+        return false;
+    }
+    var i = 0;
+    while i < len(name) {
+        let c = int_of(name[i]);
+        if !name_char(c) && c != 47 {
+            return false;
+        }
+        if i == 0 && (c == 45 || c == 46) {
+            return false;
+        }
+        if i > 0 && c == 46 && int_of(name[i - 1]) == 46 {
+            return false;
+        }
+        if i > 0 && c == 47 && int_of(name[i - 1]) == 47 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return int_of(name[len(name) - 1]) != 47;
+}
+
+// The slug of the row (`owner/name`): 3 to 128 bytes of letters, digits, `-`, `_`, `.` and exactly one `/` not at either end. A name
+// for the person reading the journal; nothing is looked up by it in this slice.
+pub fn slug_ok[&b](slug: &b [byte]) -> [] bool {
+    if len(slug) < 3 || len(slug) > 128 {
+        return false;
+    }
+    var slashes = 0;
+    var i = 0;
+    while i < len(slug) {
+        let c = int_of(slug[i]);
+        if c == 47 {
+            slashes = slashes + 1;
+            if i == 0 || i == len(slug) - 1 {
+                return false;
+            }
+        } else if !name_char(c) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return slashes == 1;
+}
+
+// A path pattern of `publish_allow` and `publish_deny`: 1 to 128 bytes of letters, digits, `_`, `-`, `.`, `/` and `*`, relative (no leading
+// `/`), no empty component (`//`, a trailing `/`), no `..` anywhere, and `**` only as a whole component. A component is matched with `*`
+// standing for any run of bytes but `/`; the component `**` stands for any number of components, none included.
+pub fn pattern_ok[&p](pattern: &p [byte]) -> [] bool {
+    if len(pattern) < 1 || len(pattern) > max_pattern_bytes() || int_of(pattern[0]) == 47 {
+        return false;
+    }
+    var i = 0;
+    var start = 0;
+    while i <= len(pattern) {
+        if i == len(pattern) || int_of(pattern[i]) == 47 {
+            let comp = pattern[start..i];
+            if len(comp) == 0 {
+                return false;
+            }
+            if bytes.equal(comp, ".") || bytes.equal(comp, "..") {
+                return false;
+            }
+            var stars = 0;
+            var j = 0;
+            while j < len(comp) {
+                if int_of(comp[j]) == 42 {
+                    stars = stars + 1;
+                }
+                j = j + 1;
+            }
+            if stars > 1 && !bytes.equal(comp, "**") {
+                return false;
+            }
+            start = i + 1;
+        } else {
+            let c = int_of(pattern[i]);
+            if !name_char(c) && c != 42 {
+                return false;
+            }
+            if c == 46 && i > 0 && int_of(pattern[i - 1]) == 46 {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Does `q` match the single-component pattern `p` (`*` any run of bytes)?
+fn seg_match[&a, &b](p: &a [byte], q: &b [byte]) -> [] bool {
+    var pi = 0;
+    var qi = 0;
+    var star = 0 - 1;
+    var mark = 0;
+    while qi < len(q) {
+        if pi < len(p) && int_of(p[pi]) == 42 {
+            star = pi;
+            mark = qi;
+            pi = pi + 1;
+        } else if pi < len(p) && int_of(p[pi]) == int_of(q[qi]) {
+            pi = pi + 1;
+            qi = qi + 1;
+        } else if star >= 0 {
+            mark = mark + 1;
+            qi = mark;
+            pi = star + 1;
+        } else {
+            return false;
+        }
+    }
+    while pi < len(p) && int_of(p[pi]) == 42 {
+        pi = pi + 1;
+    }
+    return pi == len(p);
+}
+
+// The end of the component of `s` that starts at `from`: the index of the next `/`, or the length.
+fn comp_end[&s](s: &s [byte], from: int) -> [] int {
+    var i = from;
+    while i < len(s) && int_of(s[i]) != 47 {
+        i = i + 1;
+    }
+    return i;
+}
+
+// Does `path` match the pattern `pattern` (one `pattern_ok` held for)? Components are matched left to right; `**` is given the components
+// it can take by trying the shortest first, and a failure after it moves it one component on (one backtrack point: at most
+// `len(pattern) * len(path)` steps).
+pub fn glob_match[&a, &b](pattern: &a [byte], path: &b [byte]) -> [] bool {
+    var pi = 0;
+    var qi = 0;
+    var star_p = 0 - 1;
+    var star_q = 0;
+    while qi < len(path) {
+        var pend = len(pattern);
+        if pi < len(pattern) {
+            pend = comp_end(pattern, pi);
+        }
+        let qend = comp_end(path, qi);
+        if pi < len(pattern) && bytes.equal(pattern[pi..pend], "**") {
+            star_p = pend + 1;
+            star_q = qi;
+            pi = pend + 1;
+        } else if pi < len(pattern) && seg_match(pattern[pi..pend], path[qi..qend]) {
+            pi = pend + 1;
+            qi = qend + 1;
+        } else if star_p >= 0 {
+            star_q = comp_end(path, star_q) + 1;
+            qi = star_q;
+            pi = star_p;
+        } else {
+            return false;
+        }
+    }
+    // the path is spent: what is left of the pattern must be only `**`
+    while pi < len(pattern) {
+        let pend = comp_end(pattern, pi);
+        if !bytes.equal(pattern[pi..pend], "**") {
+            return false;
+        }
+        pi = pend + 1;
+    }
+    return true;
+}
+
+// Does the array at `node` (-1: none) hold a pattern that matches `path`? Strings that are not plain are skipped.
+fn any_match[&s, &t, &p](src: &s [byte], tp: &t [int], node: int, path: &p [byte]) -> [] bool {
+    if node < 0 || !json.is_array(tp, node) {
+        return false;
+    }
+    let n = json.count(tp, node);
+    var k = node + 1;
+    var j = 0;
+    var hit = false;
+    while j < n {
+        if plain(tp, k) {
+            let pattern = json.string_view(src, tp, k);
+            if pattern_ok(pattern) && glob_match(pattern, path) {
+                hit = true;
+            }
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return hit;
+}
+
+// May a change touch `path`? It must match a pattern of `allow` and none of `deny` (`deny` wins). `allow` and `deny` are nodes of `src`
+// (`deny` may be -1). A path that is not made of letters, digits, `_`, `-`, `.`, `/` (relative, no empty component, no `.` or `..`) is never
+// allowed.
+pub fn path_allowed[&s, &t, &p](src: &s [byte], tp: &t [int], allow: int, deny: int, path: &p [byte]) -> [] bool {
+    if !pattern_ok(path) {
+        return false;
+    }
+    var i = 0;
+    while i < len(path) {
+        if int_of(path[i]) == 42 {
+            return false;
+        }
+        i = i + 1;
+    }
+    if any_match(src, tp, deny, path) {
+        return false;
+    }
+    return any_match(src, tp, allow, path);
+}
+
+// Is the node an array of `lo` to `hi` patterns, each `pattern_ok`?
+fn patterns_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, lo: int, hi: int) -> [] bool {
+    if !json.is_array(tp, node) {
+        return false;
+    }
+    let n = json.count(tp, node);
+    if n < lo || n > hi {
+        return false;
+    }
+    var k = node + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if !plain(tp, k) || !pattern_ok(json.string_view(src, tp, k)) {
+            ok = false;
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// The pin files a row may name.
+pub fn pin_name_ok[&n](name: &n [byte]) -> [] bool {
+    return bytes.equal(name, ".cancho-rev") || bytes.equal(name, "cancho.toml");
+}
+
+fn pins_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if !json.is_array(tp, node) {
+        return false;
+    }
+    let n = json.count(tp, node);
+    if n < 1 || n > 4 {
+        return false;
+    }
+    var k = node + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if !plain(tp, k) || !pin_name_ok(json.string_view(src, tp, k)) {
+            ok = false;
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return ok;
+}
+
+fn count_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, hi: int) -> [] bool {
+    if !json.is_int(tp, node) || !json.fits_int(src, tp, node) {
+        return false;
+    }
+    let v = json.to_int(src, tp, node);
+    return v >= 1 && v <= hi;
+}
+
+pub fn kind_ok[&k](kind: &k [byte]) -> [] bool {
+    return bytes.equal(kind, "library") || bytes.equal(kind, "program") || bytes.equal(kind, "service");
+}
+
+// Why the row at node `row` is refused, or "" (the first fault, in this order: keys, kind, checkout, compiler_rev, publish_allow,
+// publish_deny, the two bounds, pins, slug, branch).
+fn row_reason[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] &static [byte] {
+    if !json.is_object(tp, row) || !keys_ok(src, tp, row, row_keys()) {
+        return "repos: a row is not an object of the keys kind, checkout, compiler_rev, publish_allow, max_patch_files, max_patch_lines and optionally slug, branch, pins, publish_deny";
+    }
+    let kind = json.get(src, tp, row, "kind");
+    if !plain(tp, kind) || !kind_ok(json.string_view(src, tp, kind)) {
+        return "repos: kind is not library, program or service";
+    }
+    let checkout = json.get(src, tp, row, "checkout");
+    if !plain(tp, checkout) || !gate_task.path_ok(json.string_view(src, tp, checkout)) {
+        return "repos: checkout is not an absolute path of letters, digits and ._/- with no .. and no hidden component";
+    }
+    let rev = json.get(src, tp, row, "compiler_rev");
+    if !plain(tp, rev) || !rev_ok(json.string_view(src, tp, rev)) {
+        return "repos: compiler_rev is not 40 lower-case hexadecimal digits";
+    }
+    if !patterns_ok(src, tp, json.get(src, tp, row, "publish_allow"), 1, max_patterns()) {
+        return "repos: publish_allow is not 1 to 32 relative path patterns of letters, digits and _-./* with no ..";
+    }
+    let deny = json.get(src, tp, row, "publish_deny");
+    if deny >= 0 && !patterns_ok(src, tp, deny, 0, max_patterns()) {
+        return "repos: publish_deny is not 0 to 32 relative path patterns of letters, digits and _-./* with no ..";
+    }
+    if !count_ok(src, tp, json.get(src, tp, row, "max_patch_files"), files_cap()) {
+        return "repos: max_patch_files is not a whole number from 1 to 64";
+    }
+    if !count_ok(src, tp, json.get(src, tp, row, "max_patch_lines"), lines_cap()) {
+        return "repos: max_patch_lines is not a whole number from 1 to 100000";
+    }
+    let pins = json.get(src, tp, row, "pins");
+    if pins >= 0 && !pins_ok(src, tp, pins) {
+        return "repos: pins is not 1 to 4 of .cancho-rev, cancho.toml";
+    }
+    let slug = json.get(src, tp, row, "slug");
+    if slug >= 0 && (!plain(tp, slug) || !slug_ok(json.string_view(src, tp, slug))) {
+        return "repos: slug is not owner/name";
+    }
+    let branch = json.get(src, tp, row, "branch");
+    if branch >= 0 && (!plain(tp, branch) || !branch_ok(json.string_view(src, tp, branch))) {
+        return "repos: branch is not a branch name";
+    }
+    return "";
+}
+
+// Why the operator file's `repos` is refused (the `reason:` of `operator-invalid`), or "" when it is absent or of the shape. The first row
+// in file order that is wrong gives the reason.
+pub fn rows_reason[&s, &t](src: &s [byte], tp: &t [int]) -> [] &static [byte] {
+    let all = json.get(src, tp, 0, "repos");
+    if all < 0 {
+        return "";
+    }
+    if !json.is_object(tp, all) || json.count(tp, all) > max_rows() || !keys_plain(tp, all) {
+        return "repos: not an object of at most 64 rows keyed by repository id";
+    }
+    let n = json.count(tp, all);
+    var k = all + 1;
+    var j = 0;
+    while j < n {
+        let id = json.string_view(src, tp, k);
+        if len(id) < 1 || len(id) > 64 {
+            return "repos: a repository id is not 1 to 64 bytes";
+        }
+        let why = row_reason(src, tp, k + 1);
+        if len(why) > 0 {
+            return why;
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    return "";
+}
+
+// The node of the row of repository `id`, or -1.
+pub fn row_of[&s, &t, &i](src: &s [byte], tp: &t [int], id: &i [byte]) -> [] int {
+    let all = json.get(src, tp, 0, "repos");
+    if all < 0 {
+        return 0 - 1;
+    }
+    return json.get(src, tp, all, id);
+}
+
+// How a manifest's repository and the operator's row relate: 0 they agree, 1 the operator file has no row for it
+// (`repo-unconfigured`), 2 the row's `kind` is not the manifest's (`repo-kind-mismatch`).
+pub fn resolve[&s, &t, &i, &k](src: &s [byte], tp: &t [int], id: &i [byte], manifest_kind: &k [byte]) -> [] int {
+    let row = row_of(src, tp, id);
+    if row < 0 {
+        return 1;
+    }
+    let kind = json.get(src, tp, row, "kind");
+    if !plain(tp, kind) || !bytes.equal(json.string_view(src, tp, kind), manifest_kind) {
+        return 2;
+    }
+    return 0;
+}
+
+// The text of field `name` of the row at `row`, or "" when it is not a plain string.
+pub fn field_text[&s, &t](src: &s [byte], tp: &t [int], row: int, name: &static [byte]) -> [] &s [byte] {
+    let node = json.get(src, tp, row, name);
+    if node < 0 || !plain(tp, node) {
+        return src[0..0];
+    }
+    return json.string_view(src, tp, node);
+}
+
+// The whole number `name` of the row at `row`, or 0.
+pub fn field_int[&s, &t](src: &s [byte], tp: &t [int], row: int, name: &static [byte]) -> [] int {
+    let node = json.get(src, tp, row, name);
+    if node < 0 || !json.is_int(tp, node) || !json.fits_int(src, tp, node) {
+        return 0;
+    }
+    return json.to_int(src, tp, node);
+}
+
+// ---- the pin -----------------------------------------------------------------------------------------------------------------
+
+fn space(c: int) -> [] bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+// Does the text of the pin file `name` (as the checkout holds it at its base commit) pin the compiler to `rev`? `.cancho-rev` holds the
+// revision and nothing else but white space; `cancho.toml` holds a line `cancho = "<40 hex>"` (the first such line decides). Any other
+// name pins nothing.
+pub fn pin_matches[&n, &x, &r](name: &n [byte], text: &x [byte], rev: &r [byte]) -> [] bool {
+    if !rev_ok(rev) {
+        return false;
+    }
+    if bytes.equal(name, ".cancho-rev") {
+        var a = 0;
+        var b = len(text);
+        while a < b && space(int_of(text[a])) {
+            a = a + 1;
+        }
+        while b > a && space(int_of(text[b - 1])) {
+            b = b - 1;
+        }
+        return bytes.equal(text[a..b], rev);
+    }
+    if bytes.equal(name, "cancho.toml") {
+        var start = 0;
+        while start < len(text) {
+            var end = start;
+            while end < len(text) && int_of(text[end]) != 10 {
+                end = end + 1;
+            }
+            let found = toml_pin(text[start..end]);
+            if found.0 {
+                return bytes.equal(found.1, rev);
+            }
+            start = end + 1;
+        }
+        return false;
+    }
+    return false;
+}
+
+// `cancho = "<40 hex>"` on one line: whether it is one, and the 40 bytes.
+fn toml_pin[&l](line: &l [byte]) -> [] (bool, &l [byte]) {
+    var i = 0;
+    while i < len(line) && space(int_of(line[i])) {
+        i = i + 1;
+    }
+    if len(line) < i + 6 || !bytes.equal(line[i..i + 6], "cancho") {
+        return (false, line[0..0]);
+    }
+    i = i + 6;
+    while i < len(line) && space(int_of(line[i])) {
+        i = i + 1;
+    }
+    if i >= len(line) || int_of(line[i]) != 61 {
+        return (false, line[0..0]);
+    }
+    i = i + 1;
+    while i < len(line) && space(int_of(line[i])) {
+        i = i + 1;
+    }
+    if len(line) < i + 42 || int_of(line[i]) != 34 || int_of(line[i + 41]) != 34 {
+        return (false, line[0..0]);
+    }
+    return (true, line[i + 1..i + 41]);
+}

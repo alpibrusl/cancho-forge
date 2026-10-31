@@ -1,0 +1,204 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.test;
+import forge.repo_row;
+
+// Unit tests for src/repo_row.cho: the operator file's `repos` rows (docs/company-lifecycle.md section 2.1), the path patterns, and the
+// compiler pin. Run with `cancho test`.
+
+fn flag(b: bool) -> [] int {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+// The reason `rows_reason` gives for the operator file `text`; "parse" when it is not JSON.
+fn reason_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] &static [byte] {
+    var why = "parse";
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(text, tp) > 0 {
+            why = repo_row.rows_reason(text, tp);
+        }
+    }
+    unbox_slice(heap, tape);
+    return why;
+}
+
+fn good_row() -> [] &static [byte] {
+    return "\"kind\":\"library\",\"checkout\":\"/abs/work/diff\",\"compiler_rev\":\"f4ead824f33b291a0ad7620a34a0c1346a7abe4f\",\"publish_allow\":[\"src/**\",\"tests/**\"],\"max_patch_files\":20,\"max_patch_lines\":800";
+}
+
+fn with_row[&h, &r](heap: &!h Heap, body: &r [byte]) -> [heap] &static [byte] {
+    var o = buffer.append(heap, buffer.empty(heap, 256), "{\"workers\":\"/w\",\"repos\":{\"diff\":{");
+    o = buffer.append(heap, o, body);
+    o = buffer.append(heap, o, "}}}");
+    var why = "";
+    borrow o as &ob in {
+        why = reason_of(heap, buffer.bytes(ob));
+    }
+    buffer.drop(heap, o);
+    return why;
+}
+
+fn replaced[&h](heap: &!h Heap, from: &static [byte], to: &static [byte]) -> [heap] &static [byte] {
+    // the good row with `from` (a whole key:value text) replaced by `to`
+    let g = good_row();
+    var at = 0;
+    while at + len(from) <= len(g) && !bytes.equal(g[at..at + len(from)], from) {
+        at = at + 1;
+    }
+    var o = buffer.append(heap, buffer.empty(heap, 256), g[0..at]);
+    o = buffer.append(heap, o, to);
+    o = buffer.append(heap, o, g[at + len(from)..len(g)]);
+    var why = "";
+    borrow o as &ob in {
+        why = with_row(heap, buffer.bytes(ob));
+    }
+    buffer.drop(heap, o);
+    return why;
+}
+
+fn test_an_operator_file_with_no_repos_has_no_repo_reason[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(len(reason_of(heap, "{\"workers\":\"/w\"}")), 0);
+    test.assert_eq(len(with_row(heap, good_row())), 0);
+    return 0;
+}
+
+fn test_an_operator_repo_row_without_a_40_hex_compiler_rev_is_operator_invalid[&h](heap: &!h Heap) -> [heap] int {
+    let from = "\"compiler_rev\":\"f4ead824f33b291a0ad7620a34a0c1346a7abe4f\"";
+    test.assert(len(replaced(heap, from, "\"compiler_rev\":\"f4ead82\"")) > 0);
+    test.assert(len(replaced(heap, from, "\"compiler_rev\":\"F4EAD824F33B291A0AD7620A34A0C1346A7ABE4F\"")) > 0);
+    test.assert(len(replaced(heap, from, "\"compiler_rev\":7")) > 0);
+    test.assert(len(replaced(heap, from, "\"x\":1")) > 0);
+    test.assert(bytes.equal(replaced(heap, from, "\"compiler_rev\":\"f4ead82\""), "repos: compiler_rev is not 40 lower-case hexadecimal digits"));
+    return 0;
+}
+
+fn test_an_operator_repo_row_with_a_dotdot_in_publish_allow_is_operator_invalid[&h](heap: &!h Heap) -> [heap] int {
+    let from = "\"publish_allow\":[\"src/**\",\"tests/**\"]";
+    test.assert(len(replaced(heap, from, "\"publish_allow\":[\"src/../.git/**\"]")) > 0);
+    test.assert(len(replaced(heap, from, "\"publish_allow\":[\"/etc/**\"]")) > 0);
+    test.assert(len(replaced(heap, from, "\"publish_allow\":[]")) > 0);
+    test.assert(len(replaced(heap, from, "\"publish_allow\":[\"a b\"]")) > 0);
+    test.assert(len(replaced(heap, from, "\"publish_allow\":[\"s**c/x\"]")) > 0);
+    test.assert(len(replaced(heap, from, "\"publish_allow\":[\"src/**\"],\"publish_deny\":[\"../x\"]")) > 0);
+    test.assert_eq(len(replaced(heap, from, "\"publish_allow\":[\"src/**\"],\"publish_deny\":[\".github/**\"]")), 0);
+    return 0;
+}
+
+fn test_an_operator_repo_row_outside_the_shape_is_operator_invalid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(len(replaced(heap, "\"kind\":\"library\"", "\"kind\":\"site\"")) > 0);
+    test.assert(len(replaced(heap, "\"kind\":\"library\"", "\"kind\":\"library\",\"gate\":\"scripts/gate.sh\"")) > 0);
+    test.assert(len(replaced(heap, "\"checkout\":\"/abs/work/diff\"", "\"checkout\":\"rel/diff\"")) > 0);
+    test.assert(len(replaced(heap, "\"checkout\":\"/abs/work/diff\"", "\"checkout\":\"/abs/../diff\"")) > 0);
+    test.assert(len(replaced(heap, "\"max_patch_files\":20", "\"max_patch_files\":0")) > 0);
+    test.assert(len(replaced(heap, "\"max_patch_files\":20", "\"max_patch_files\":65")) > 0);
+    test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":100001")) > 0);
+    test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":\"800\"")) > 0);
+    test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"pins\":[\"Makefile\"]")) > 0);
+    test.assert_eq(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"pins\":[\".cancho-rev\",\"cancho.toml\"],\"slug\":\"a/b\",\"branch\":\"main\"")), 0);
+    test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"slug\":\"nope\"")) > 0);
+    test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"branch\":\"-x\"")) > 0);
+    test.assert(len(reason_of(heap, "{\"repos\":[]}")) > 0);
+    test.assert(len(reason_of(heap, "{\"repos\":{\"a\":5}}")) > 0);
+    return 0;
+}
+
+fn test_deny_wins_over_allow[&h](heap: &!h Heap) -> [heap] int {
+    let text = "{\"allow\":[\"src/**\",\"tests/**\",\"README.md\"],\"deny\":[\"src/secret/**\",\"tests/*.golden\"]}";
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        let a = json.get(text, tp, 0, "allow");
+        let d = json.get(text, tp, 0, "deny");
+        test.assert(repo_row.path_allowed(text, tp, a, d, "src/diff.cho"));
+        test.assert(repo_row.path_allowed(text, tp, a, d, "src/deep/er/x.cho"));
+        test.assert(repo_row.path_allowed(text, tp, a, d, "README.md"));
+        test.assert(repo_row.path_allowed(text, tp, a, d, "tests/a_test.cho"));
+        test.assert(repo_row.path_allowed(text, tp, a, d, "src/secret/k.cho") == false);
+        test.assert(repo_row.path_allowed(text, tp, a, d, "tests/x.golden") == false);
+        test.assert(repo_row.path_allowed(text, tp, a, d, "tests/sub/x.golden"));
+        test.assert(repo_row.path_allowed(text, tp, a, d, "docs/x.md") == false);
+        test.assert(repo_row.path_allowed(text, tp, a, d, ".github/workflows/ci.yml") == false);
+        test.assert(repo_row.path_allowed(text, tp, a, d, "src/../.git/config") == false);
+        test.assert(repo_row.path_allowed(text, tp, a, d, "/src/x") == false);
+        test.assert(repo_row.path_allowed(text, tp, a, d, "src/*") == false);
+        test.assert(repo_row.path_allowed(text, tp, a, d, "") == false);
+        test.assert(repo_row.path_allowed(text, tp, a, 0 - 1, "src/secret/k.cho"));
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+fn test_glob_components_and_double_star() -> [] int {
+    test.assert_eq(flag(repo_row.glob_match("src/**", "src/a.cho")), 1);
+    test.assert_eq(flag(repo_row.glob_match("src/**", "src/a/b/c.cho")), 1);
+    test.assert_eq(flag(repo_row.glob_match("src/**", "srcx/a.cho")), 0);
+    test.assert_eq(flag(repo_row.glob_match("**/x.cho", "a/b/x.cho")), 1);
+    test.assert_eq(flag(repo_row.glob_match("**/x.cho", "x.cho")), 1);
+    test.assert_eq(flag(repo_row.glob_match("a/**/z", "a/z")), 1);
+    test.assert_eq(flag(repo_row.glob_match("a/**/z", "a/b/c/z")), 1);
+    test.assert_eq(flag(repo_row.glob_match("a/**/z", "a/b/c/y")), 0);
+    test.assert_eq(flag(repo_row.glob_match("*.md", "README.md")), 1);
+    test.assert_eq(flag(repo_row.glob_match("*.md", "docs/README.md")), 0);
+    test.assert_eq(flag(repo_row.glob_match("a*b*c", "aXXbYYc")), 1);
+    test.assert_eq(flag(repo_row.glob_match("a*b*c", "aXXbYY")), 0);
+    test.assert_eq(flag(repo_row.glob_match("README.md", "README.md")), 1);
+    test.assert_eq(flag(repo_row.glob_match("README.md", "README.mdx")), 0);
+    return 0;
+}
+
+fn test_pattern_shapes() -> [] int {
+    test.assert_eq(flag(repo_row.pattern_ok("src/**")), 1);
+    test.assert_eq(flag(repo_row.pattern_ok(".github/**")), 1);
+    test.assert_eq(flag(repo_row.pattern_ok("docs/provenance/**")), 1);
+    test.assert_eq(flag(repo_row.pattern_ok("")), 0);
+    test.assert_eq(flag(repo_row.pattern_ok("/x")), 0);
+    test.assert_eq(flag(repo_row.pattern_ok("a//b")), 0);
+    test.assert_eq(flag(repo_row.pattern_ok("a/")), 0);
+    test.assert_eq(flag(repo_row.pattern_ok("a/./b")), 0);
+    test.assert_eq(flag(repo_row.pattern_ok("a/../b")), 0);
+    test.assert_eq(flag(repo_row.pattern_ok("a..b")), 0);
+    test.assert_eq(flag(repo_row.pattern_ok("a**b")), 0);
+    test.assert_eq(flag(repo_row.pattern_ok("a;b")), 0);
+    return 0;
+}
+
+fn test_a_row_is_resolved_against_the_manifest_kind[&h](heap: &!h Heap) -> [heap] int {
+    let text = "{\"repos\":{\"diff\":{\"kind\":\"library\"}}}";
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        test.assert_eq(repo_row.resolve(text, tp, "diff", "library"), 0);
+        test.assert_eq(repo_row.resolve(text, tp, "diff", "service"), 2);
+        test.assert_eq(repo_row.resolve(text, tp, "other", "library"), 1);
+    }
+    unbox_slice(heap, tape);
+    test.assert_eq(flag(repo_row.kind_ok("program")), 1);
+    test.assert_eq(flag(repo_row.kind_ok("site")), 0);
+    return 0;
+}
+
+fn test_the_pin_files_are_read_the_way_the_repositories_write_them() -> [] int {
+    let rev = "f4ead824f33b291a0ad7620a34a0c1346a7abe4f";
+    test.assert_eq(flag(repo_row.pin_matches(".cancho-rev", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f\n", rev)), 1);
+    test.assert_eq(flag(repo_row.pin_matches(".cancho-rev", "  f4ead824f33b291a0ad7620a34a0c1346a7abe4f \r\n", rev)), 1);
+    test.assert_eq(flag(repo_row.pin_matches(".cancho-rev", "0000000000000000000000000000000000000000\n", rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches(".cancho-rev", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f extra\n", rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches(".cancho-rev", "", rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml", "[package]\nname = \"x\"\ncancho = \"f4ead824f33b291a0ad7620a34a0c1346a7abe4f\"\n\n[[bin]]\n", rev)), 1);
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml", "[package]\ncancho=\"f4ead824f33b291a0ad7620a34a0c1346a7abe4f\"", rev)), 1);
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml", "[package]\ncancho = \"1111111111111111111111111111111111111111\"\n", rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml", "[package]\nname = \"x\"\n", rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches("Makefile", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches(".cancho-rev", "f4ead82", "f4ead82")), 0);
+    return 0;
+}

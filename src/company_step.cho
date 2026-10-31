@@ -13,6 +13,7 @@ import forge.company_run;
 import forge.build_task;
 import forge.company_state;
 import forge.gate_task;
+import forge.repo_row;
 
 // The pure half of `forge company run` (src/company_runner.cho is the half that acts; docs/superpowers/specs/
 // 2026-10-27-forge-company-layer-design.md, sections 4.3 and 10): which worker runs a step and which file it leaves as the artifact
@@ -705,7 +706,7 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 // again by what uses it (`journal_io.path_ok`, `gate_task.check`, `build_task`), so the file grants nothing.
 
 fn root_keys() -> [] &static [byte] {
-    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs publish commit_trailer ";
+    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs publish commit_trailer repos ";
 }
 
 fn analyst_keys() -> [] &static [byte] {
@@ -827,7 +828,7 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
     if guide_ok(src, tp) == false {
         return false;
     }
-    if len(limit_reason(src, tp)) > 0 {
+    if len(limit_reason(src, tp)) > 0 || len(repo_row.rows_reason(src, tp)) > 0 {
         return false;
     }
     if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false || publish_ok(src, tp) == false {
