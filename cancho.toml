@@ -118,6 +118,11 @@ sources = ["tests/company_derive_test.cho", "src/company_derive.cho", "src/compa
 std = true
 
 [[test]]
+name = "patch_apply"
+sources = ["tests/patch_apply_test.cho", "src/patch_apply.cho"]
+std = true
+
+[[test]]
 name = "company_state"
 sources = ["tests/company_state_test.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
 std = true
@@ -164,7 +169,7 @@ std = true
 
 [[test]]
 name = "patch_check"
-sources = ["tests/patch_check_test.cho", "src/patch_check.cho", "src/repo_row.cho", "src/gate_task.cho", "src/gate_env.cho"]
+sources = ["tests/patch_check_test.cho", "src/patch_check.cho", "src/repo_row.cho", "src/gate_task.cho", "src/gate_env.cho", "src/patch_apply.cho"]
 std = true
 
 [[test]]

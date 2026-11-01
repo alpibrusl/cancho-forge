@@ -1,5 +1,6 @@
 edition 9;
 
+import std.buffer;
 import std.bytes;
 import std.json;
 import std.test;
@@ -124,5 +125,24 @@ fn test_the_patch_rule_tags_are_the_documented_ones() -> [] int {
     test.assert(bytes.equal(patch_check.rule_name(2), "patch-path-denied"));
     test.assert(bytes.equal(patch_check.rule_name(3), "patch-too-large"));
     test.assert_eq(len(patch_check.rule_name(0)), 0);
+    return 0;
+}
+
+fn test_the_paths_of_a_patch_are_listed_once_each_in_order[&h](heap: &!h Heap) -> [heap] int {
+    let patch = "--- base/src/b.cho\n+++ tree/src/b.cho\n@@ -1 +1 @@\n-a\n+b\n--- base/src/a.cho\n+++ tree/src/a.cho\n@@ -0,0 +1 @@\n+new\n--- base/src/b.cho\n+++ tree/src/b.cho\n@@ -1 +1 @@\n-b\n+c\n";
+    let paths = patch_check.paths(heap, patch);
+    borrow paths as &pb in {
+        test.assert(bytes.equal(buffer.bytes(pb), "src/b.cho\nsrc/a.cho"));
+    }
+    buffer.drop(heap, paths);
+    return 0;
+}
+
+fn test_a_patch_with_no_files_has_no_paths[&h](heap: &!h Heap) -> [heap] int {
+    let paths = patch_check.paths(heap, "nothing");
+    borrow paths as &pb in {
+        test.assert_eq(len(buffer.bytes(pb)), 0);
+    }
+    buffer.drop(heap, paths);
     return 0;
 }

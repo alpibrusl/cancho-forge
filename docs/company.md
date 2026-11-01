@@ -1025,3 +1025,37 @@ checks again. A directory it made stays when the step fails or is killed, and is
 design choice for that slice", and this document's author had found no `mkdir` in the language. Edition 9 of the compiler has `dir_mkdir`
 (cancho #595), already in the pinned revision, so the provisioner uses it: a strictly smaller authority (no program started, no `Exec` row) for the
 same effect. The `Exec` option is not taken and `docs/authority.txt` is not touched.
+
+## 21. Publishing an accepted patch (slice 2, part C, of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status: built and tested** (`tests/conformance/company_change.sh`, the `publish:` cases; unit tests `tests/patch_apply_test.cho`, `tests/patch_check_test.cho`),
+with the stand-in build tool and throw-away git repositories. Not run against a real repository or with a model.
+
+`forge company publish <company-dir> <operator-file> <step id> <branch>` takes a **`repo.change` step** that is accepted (it used to refuse one with
+`publish-step-not-accepted`). Nothing about the command line changes. The step's repository is the manifest's; the operator file's **`repos.<id>` row**
+says where it goes: `checkout` and a **`slug`** (new, required for a publish: the `owner/name` the checkout's `origin` must be on github.com; without it
+`publish-not-configured`). The row's `publish_allow`, `publish_deny` and bounds are applied to the patch **again** (`patch-kind-invalid`,
+`patch-path-denied`, `patch-too-large`), and the patch is read and hashed again against the digest the journal accepted it with
+(`publish-artifact-changed`). Forge then lists the files the patch touches, takes the **base commit** from the step's `company.step.change` record, writes
+a provenance (the ordinary one plus a `## Change` section with the repository, the base commit, the patch's digest and the files) and a commit message,
+and asks the same worker as a file publish (`workers/repo_publish.cho`) with a request that carries `patch_base`.
+
+**The worker** (patch mode, when the request has `patch_base`): checks the checkout as for a file publish and, besides, that `HEAD` **is** the base commit
+(`patch-base-stale`); makes the branch `<branch>`; **applies the patch itself, in cancho** (`src/patch_apply.cho`, no `patch` and no other program):
+for each file of the patch, which must be one of the files Forge named and each of those must be in the patch, it reads the file beneath the checkout
+with no link followed, applies the hunks strictly (exactly where the header says, every context and removed line byte for byte; a creation only over an
+empty or absent file) and writes it back; then it writes the provenance to `docs/provenance/<step id>.md` (one file per step, the file publish's
+`docs/provenance.md` is left alone), stages exactly the patch's files and the provenance, commits with hooks off and no signing, goes back to the branch
+the checkout was on, and answers with the commit. A hunk that does not apply, a file the request did not name, or a patch that deletes a file is
+`patch-not-applicable`, and everything is undone as for a file publish (reset, the files this publish added removed, the branch deleted). `steps/<id>/pr.md`
+is written as ever; nothing is pushed (`publish-push-not-granted`).
+
+**What external programs remain.** `git`, through `/bin/sh`, for the checkout's checks, the branch, the commit and the undo: unchanged from the file publish.
+The patch itself is applied in cancho, so this part added **no** program to the worker and `docs/authority-repo-publish.txt` and `docs/authority.txt` are
+unchanged.
+
+**Where the design and the code differ.** (1) Design section 4.2: a base that moved is re-derived once (`patch-base-stale` brings the change back to
+`building`) and the gate and audit run again on the current tip. Here a moved base is the refusal `patch-base-stale` and nothing more: no re-derivation, no
+re-run, and the person decides (the change goes back to `building` by a `retry:` as any held step does). (2) The provenance is one file per **step**
+(`docs/provenance/<step id>.md`; a derived step's id starts with its change id), not per change. (3) Publication is by the existing verb and the branch
+name the person gives, not `forge/<change id>` by rule. (4) A patch that deletes a file is not published.

@@ -71,6 +71,14 @@ pub fn rule_worker_failed() -> [] &static [byte] {
     return "publish-worker-failed";
 }
 
+pub fn rule_patch_base_stale() -> [] &static [byte] {
+    return "patch-base-stale";
+}
+
+pub fn rule_patch_not_applicable() -> [] &static [byte] {
+    return "patch-not-applicable";
+}
+
 pub fn rule_push_not_granted() -> [] &static [byte] {
     return "publish-push-not-granted";
 }
@@ -404,6 +412,58 @@ pub fn pr_text[&h, &m, &s, &d, &x, &b, &k](heap: &!h Heap, m: &m company_manifes
     return o;
 }
 
+// ---- a patch publish (docs/company.md section 21) ------------------------------------------------------------------------------------
+
+// The name a patch publish stands for where a file publish has a destination: the artifact is `change.patch`, and what lands in the repository is the
+// files it touches.
+pub fn patch_dest() -> [] &static [byte] {
+    return "change.patch";
+}
+
+// Where the provenance of the step's change is written: `docs/provenance/<step id>.md`, one file per step (the file publish's `docs/provenance.md`
+// is left alone). The step id is a name, so this is a plain path.
+pub fn patch_prov_dest[&h, &i](heap: &!h Heap, step_id: &i [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 64), "docs/provenance/");
+    o = buffer.append(heap, o, step_id);
+    return buffer.append(heap, o, ".md");
+}
+
+pub fn patch_commit_message[&h, &m, &i, &t](heap: &!h Heap, m: &m company_manifest.Manifest, step_id: &i [byte], trailer: &t [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 512), "Apply the change of step ");
+    o = put_clean(heap, o, step_id);
+    o = buffer.append(heap, o, ", built by Forge\n\nStep ");
+    o = put_clean(heap, o, step_id);
+    o = buffer.append(heap, o, " of the company ");
+    o = put_clean(heap, o, company_manifest.id_of(m));
+    o = buffer.append(heap, o, " was accepted by its check; docs/provenance/");
+    o = put_clean(heap, o, step_id);
+    o = buffer.append(heap, o, ".md says how.\n");
+    if len(trailer) > 0 {
+        o = buffer.push(heap, o, byte_of(10));
+        o = buffer.append(heap, o, trailer);
+        o = buffer.push(heap, o, byte_of(10));
+    }
+    return o;
+}
+
+pub fn patch_pr_text[&h, &m, &s, &x, &b, &k](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, i: int, sha: &x [byte], branch: &b [byte], commit: &k [byte]) -> [heap] buffer.Buffer {
+    let step = company_manifest.step_at(m, i);
+    var o = buffer.append(heap, buffer.empty(heap, 1024), "Apply the change of step ");
+    o = put_clean(heap, o, company_manifest.step_id(m, step));
+    o = buffer.append(heap, o, " (company ");
+    o = put_clean(heap, o, company_manifest.id_of(m));
+    o = buffer.append(heap, o, ")\n\nThe patch of an accepted step, applied to the files of the repository at the commit it was made against and put on the branch ");
+    o = quoted(heap, o, branch);
+    o = buffer.append(heap, o, " (commit ");
+    o = quoted(heap, o, commit);
+    o = buffer.append(heap, o, ") by `forge company publish`. The patch's sha256 is ");
+    o = quoted(heap, o, sha);
+    o = buffer.append(heap, o, ". docs/provenance/");
+    o = put_clean(heap, o, company_manifest.step_id(m, step));
+    o = buffer.append(heap, o, ".md has the base commit, the files, the tokens, the cost and the decisions a person recorded.\n\nNot done: the branch was not pushed and this pull request was not opened; both are a person's act. If anyone changed the patch after it was accepted, Forge would have refused to publish it.\n");
+    return o;
+}
+
 // ---- the request to the worker and its reply ---------------------------------------------------------------------------------------
 
 // The index of the NUL at or after `from` in `text`, or its length.
@@ -467,6 +527,38 @@ pub fn request[&h, &c, &r, &b, &s, &n, &d, &x, &p, &g, &z](heap: &!h Heap, check
     return json.finish(w);
 }
 
+// The request for a PATCH publish (docs/company.md section 21): the artifact is `src_name` beneath `src_dir`, accepted with `sha`; `dests` are the
+// files the patch touches (one per line); `base` is the commit the patch was made against (40 hex); the provenance goes to `prov_dest`. The worker
+// applies the patch itself, in cancho, to the checkout at `base`.
+pub fn request_patch[&h, &c, &r, &b, &s, &n, &d, &x, &y, &q, &p, &g](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], src_dir: &s [byte], src_name: &n [byte], dests: &d [byte], sha: &x [byte], base: &y [byte], prov_dest: &q [byte], prov: &p [byte], message: &g [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 1024);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "checkout");
+    w = json.put_string(heap, w, checkout);
+    w = json.put_key(heap, w, "repo");
+    w = json.put_string(heap, w, repo);
+    w = json.put_key(heap, w, "branch");
+    w = json.put_string(heap, w, branch);
+    w = json.put_key(heap, w, "src_dir");
+    w = json.put_string(heap, w, src_dir);
+    w = json.put_key(heap, w, "src_name");
+    w = json.put_string(heap, w, src_name);
+    w = json.put_key(heap, w, "dest");
+    w = json.put_string(heap, w, dests);
+    w = json.put_key(heap, w, "sha256");
+    w = json.put_string(heap, w, sha);
+    w = json.put_key(heap, w, "patch_base");
+    w = json.put_string(heap, w, base);
+    w = json.put_key(heap, w, "provenance_dest");
+    w = json.put_string(heap, w, prov_dest);
+    w = json.put_key(heap, w, "provenance");
+    w = json.put_string(heap, w, prov);
+    w = json.put_key(heap, w, "message");
+    w = json.put_string(heap, w, message);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
 // The tag the worker's `rule` stands for: one of this module's it may answer with, else `publish-worker-failed`.
 pub fn worker_tag[&t](tag: &t [byte]) -> [] &static [byte] {
     if bytes.equal(tag, rule_repo_not_allowed()) {
@@ -492,6 +584,12 @@ pub fn worker_tag[&t](tag: &t [byte]) -> [] &static [byte] {
     }
     if bytes.equal(tag, rule_commit_failed()) {
         return rule_commit_failed();
+    }
+    if bytes.equal(tag, rule_patch_base_stale()) {
+        return rule_patch_base_stale();
+    }
+    if bytes.equal(tag, rule_patch_not_applicable()) {
+        return rule_patch_not_applicable();
     }
     return rule_worker_failed();
 }

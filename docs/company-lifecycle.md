@@ -813,8 +813,8 @@ must be reported that way, as `company.md` reports every number.
 
 > **Slice 2, parts A, B1, B2 and B3 built** (change records, `forge company change add` and the `admit:` gate: [`company.md`](company.md) section 17;
 > flows: section 18; derived steps and the runner: section 19; the provisioner: section 20, which uses `dir_mkdir` and not the `Exec /bin/mkdir` this
-> document proposed in section 3). **Not built from slice 2:** issue intake from files, the patch publish on `forge/<change id>` with per-change
-> provenance, `change-duplicate`, `change-rate-limited`, `base` and `at` on the change record.
+> document proposed in section 3; the patch publish: section 21, the patch applied in cancho and not by `patch`). **Not built from slice 2:** issue
+> intake from files, the re-derivation of a stale base, `change-duplicate`, `change-rate-limited`, `base` and `at` on the change record.
 
 ### 8.2 The order of the rest
 

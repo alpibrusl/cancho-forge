@@ -2,6 +2,8 @@ edition 9;
 module forge.patch_check;
 
 import std.bytes;
+import std.buffer;
+import forge.patch_apply;
 import forge.repo_row;
 
 // The bounds Forge puts on a patch a `repo.change` worker leaves (docs/company-lifecycle.md section 4.2 item 3, docs/company.md section 16).
@@ -221,4 +223,44 @@ pub fn check[&p, &s, &t](patch: &p [byte], src: &s [byte], tp: &t [int], allow: 
         code = too_large();
     }
     return Verdict { code: code, files: files, added: added };
+}
+
+// The files a patch that `check` accepted touches, one path per line, in order, each once (a path the patch names twice is named once). The same
+// walk the publish worker applies the patch by (`patch_apply.next_section`).
+pub fn paths[&h, &p](heap: &!h Heap, patch: &p [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 128);
+    var pos = 0;
+    while pos < len(patch) {
+        let s = patch_apply.next_section(patch, pos);
+        if s.found == false {
+            pos = len(patch);
+        } else {
+            let path = patch[s.path_at..s.path_at + s.path_len];
+            var seen = false;
+            var filled = false;
+            borrow out as &ob in {
+                filled = buffer.size(ob) > 0;
+                var at = 0;
+                let all = buffer.bytes(ob);
+                while at < len(all) {
+                    var e = at;
+                    while e < len(all) && int_of(all[e]) != 10 {
+                        e = e + 1;
+                    }
+                    if bytes.equal(all[at..e], path) {
+                        seen = true;
+                    }
+                    at = e + 1;
+                }
+            }
+            if seen == false {
+                if filled {
+                    out = buffer.push(heap, out, byte_of(10));
+                }
+                out = buffer.append(heap, out, path);
+            }
+            pos = s.end;
+        }
+    }
+    return out;
 }

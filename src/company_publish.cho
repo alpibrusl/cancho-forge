@@ -16,7 +16,9 @@ import forge.company_state;
 import forge.company_step;
 import forge.journal_io;
 import forge.lock;
+import forge.patch_check;
 import forge.publish_plan;
+import forge.repo_row;
 import forge.snapshot;
 import forge.task;
 import forge.worker;
@@ -54,6 +56,29 @@ fn is_build(r: company_step.Runner) -> [] bool {
             return false;
         }
         company_step.Runner::Change => {
+            return false;
+        }
+    }
+}
+
+fn is_change(r: company_step.Runner) -> [] bool {
+    match r {
+        company_step.Runner::Change => {
+            return true;
+        }
+        company_step.Runner::Build => {
+            return false;
+        }
+        company_step.Runner::Gate => {
+            return false;
+        }
+        company_step.Runner::Person => {
+            return false;
+        }
+        company_step.Runner::Unsupported => {
+            return false;
+        }
+        company_step.Runner::Tool => {
             return false;
         }
     }
@@ -166,9 +191,11 @@ fn with_journal[&h, &f, &x, &c, &i, &m, &d, &j, &o, &s, &b](heap: &!h Heap, fs: 
                     company_cmd.line(io, "reason: ", "the company journal is refused; publish reads only a journal that replays");
                 } else if at < 0 || company_state.accepted_at(st, at) == false {
                     company_cmd.refuse(io, publish_plan.rule_not_accepted());
+                } else if is_change(company_step.runner_for(company_manifest.step_at(hm, at))) {
+                    code = patch_publish(heap, fs, exec, clock, io, hm, st, buffer.bytes(jb), at, dir, opath, step, branch);
                 } else if is_build(company_step.runner_for(company_manifest.step_at(hm, at))) == false {
                     company_cmd.refuse(io, publish_plan.rule_not_accepted());
-                    company_cmd.line(io, "reason: ", "only a builder or writer step leaves an artifact to publish");
+                    company_cmd.line(io, "reason: ", "only a builder, writer or repo.change step leaves an artifact to publish");
                 } else {
                     code = with_operator(heap, fs, exec, clock, io, hm, st, buffer.bytes(jb), at, dir, opath, step, branch);
                 }
@@ -617,7 +644,13 @@ fn settle[&h, &f, &i, &m, &s, &d, &p, &b, &y, &a, &o](heap: &!h Heap, fs: &f Fs(
 // The commit exists: write `steps/<id>/pr.md` beneath the step's directory (the name replaced, never written through a link) and print
 // the branch, the commit and the text.
 fn written[&h, &f, &i, &m, &s, &d, &p, &b, &y, &a, &k](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, at: int, dir: &d [byte], step: &p [byte], branch: &b [byte], dest: &y [byte], sha: &a [byte], commit: &k [byte]) -> [heap, fs_read(""), dir_write, file_write, io_write] int {
-    let text = publish_plan.pr_text(heap, hm, st, at, sha, dest, branch, commit);
+    var text = buffer.empty(heap, 1);
+    buffer.drop(heap, text);
+    if bytes.equal(dest, publish_plan.patch_dest()) {
+        text = publish_plan.patch_pr_text(heap, hm, st, at, sha, branch, commit);
+    } else {
+        text = publish_plan.pr_text(heap, hm, st, at, sha, dest, branch, commit);
+    }
     let sdir = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/steps/"), step);
     var code = company_step.exit_io();
     var rc = 0 - 1;
@@ -652,5 +685,207 @@ fn written[&h, &f, &i, &m, &s, &d, &p, &b, &y, &a, &k](heap: &!h Heap, fs: &f Fs
         io.write_all(io, buffer.bytes(tb));
     }
     buffer.drop(heap, text);
+    return code;
+}
+
+// ---- a patch publish (docs/company.md section 21) --------------------------------------------------------------------------------------
+
+// The base commit the change worker recorded for `step` (the last `company.step.change` record): 40 characters, or empty.
+fn change_base[&h, &j, &s](heap: &!h Heap, journal: &j [byte], step: &s [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 48);
+    var pos = 0;
+    while pos < len(journal) {
+        var e = pos;
+        while e < len(journal) && int_of(journal[e]) != 10 {
+            e = e + 1;
+        }
+        let line = journal[pos..e];
+        if bytes.find(line, "company.step.change") >= 0 {
+            let tape = box_slice(heap, json.tape_len(line), 0);
+            borrow mut tape as &!tw in {
+                if json.parse(line, contents(tw)) > 0 {
+                    let tp = contents(tw);
+                    let kind = json.get(line, tp, 0, "kind");
+                    let task = json.get(line, tp, 0, "task");
+                    let base = json.get(line, tp, 0, "base");
+                    if json.is_string(tp, kind) && json.is_string(tp, task) && json.is_string(tp, base) && bytes.equal(json.string_view(line, tp, kind), company_state.kind_change()) && bytes.equal(json.string_view(line, tp, task), step) && len(json.string_view(line, tp, base)) == 40 {
+                        buffer.drop(heap, out);
+                        out = buffer.append(heap, buffer.empty(heap, 48), json.string_view(line, tp, base));
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+        pos = e + 1;
+    }
+    return out;
+}
+
+// The operator file, then the repository's row in it: a `repo.change` step is published to the checkout of its repository, which is the row's.
+fn patch_publish[&h, &f, &x, &c, &i, &m, &s, &j, &d, &o, &p, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], opath: &o [byte], step: &p [byte], branch: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, dir_write, file_read, file_write, io_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, opath, 65536);
+    var code = company_step.exit_refused();
+    if errno != 0 {
+        company_cmd.refuse(io, "operator-invalid");
+    } else {
+        borrow text as &tb in {
+            let src = buffer.bytes(tb);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            var parsed = false;
+            borrow mut tape as &!tw in {
+                parsed = json.parse(src, contents(tw)) > 0;
+            }
+            borrow tape as &tr in {
+                let tp = contents(tr);
+                if parsed == false || company_step.operator_ok(src, tp) == false {
+                    company_cmd.refuse(io, "operator-invalid");
+                } else {
+                    code = patch_row(heap, fs, exec, clock, io, hm, st, journal, at, dir, src, tp, step, branch);
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The row of the step's repository: its slug (the origin the worker holds the checkout to), its checkout, its patterns and bounds. The patch is read,
+// hashed again against the journal and bounded again against the row, as at acceptance: the worker is not the only one who looks.
+fn patch_row[&h, &f, &x, &c, &i, &m, &s, &j, &d, &o, &t, &p, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], src: &o [byte], tp: &t [int], step: &p [byte], branch: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_read, dir_write, file_read, file_write, io_write] int {
+    let repo_id = company_manifest.step_repo(hm, company_manifest.step_at(hm, at));
+    let row = repo_row.row_of(src, tp, repo_id);
+    if row < 0 {
+        company_cmd.refuse(io, publish_plan.rule_not_configured());
+        company_cmd.line(io, "reason: ", "the operator file has no repos row for the step's repository");
+        return company_step.exit_refused();
+    }
+    let slug = repo_row.field_text(src, tp, row, "slug");
+    let checkout = repo_row.field_text(src, tp, row, "checkout");
+    if len(slug) == 0 {
+        company_cmd.refuse(io, publish_plan.rule_not_configured());
+        company_cmd.line(io, "reason: ", "the repos row has no slug: a publish holds the checkout's origin to it");
+        return company_step.exit_refused();
+    }
+    if publish_plan.repo_ok(slug) == false {
+        company_cmd.refuse(io, publish_plan.rule_repo_not_allowed());
+        return company_step.exit_refused();
+    }
+    if journal_io.path_ok(fs, checkout) == false {
+        company_cmd.refuse(io, publish_plan.rule_checkout_invalid());
+        return company_step.exit_refused();
+    }
+    let trailer = company_step.op_text(src, tp, "commit_trailer");
+    if publish_plan.trailer_ok(trailer) == false {
+        company_cmd.refuse(io, "operator-invalid");
+        return company_step.exit_refused();
+    }
+    let evdir = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/steps/"), step), "/ev");
+    var code = company_step.exit_refused();
+    borrow evdir as &ed in {
+        let (patch, why) = company_files.read_artifact(heap, fs, buffer.bytes(ed), "change.patch");
+        let (rel, want) = company_state.artifact_of(st, at);
+        let expected = company_step.artifact_rel(heap, step, company_step.Runner::Change);
+        var rel_same = false;
+        borrow expected as &eb in {
+            rel_same = bytes.equal(rel, buffer.bytes(eb));
+        }
+        buffer.drop(heap, expected);
+        var hex = buffer.empty(heap, 1);
+        if why == 0 {
+            buffer.drop(heap, hex);
+            borrow patch as &pb in {
+                hex = company_files.hex_of(heap, buffer.bytes(pb));
+            }
+        }
+        var same = false;
+        borrow hex as &xb in {
+            same = why == 0 && rel_same && bytes.equal(buffer.bytes(xb), want);
+        }
+        buffer.drop(heap, hex);
+        if same == false {
+            company_cmd.refuse(io, publish_plan.rule_artifact_changed());
+        } else {
+            borrow patch as &pb in {
+                let verdict = patch_check.check(buffer.bytes(pb), src, tp, json.get(src, tp, row, "publish_allow"), json.get(src, tp, row, "publish_deny"), repo_row.field_int(src, tp, row, "max_patch_files"), repo_row.field_int(src, tp, row, "max_patch_lines"));
+                if verdict.code != 0 {
+                    company_cmd.refuse(io, patch_check.rule_name(verdict.code));
+                } else {
+                    code = patch_hand_over(heap, fs, exec, clock, io, hm, st, journal, at, dir, buffer.bytes(ed), buffer.bytes(pb), want, slug, checkout, trailer, company_step.op_text(src, tp, "workers"), step, branch);
+                }
+            }
+        }
+        buffer.drop(heap, patch);
+    }
+    buffer.drop(heap, evdir);
+    return code;
+}
+
+// Everything is checked on Forge's side: the files the patch touches, the base commit, the provenance and the commit message; then the worker.
+fn patch_hand_over[&h, &f, &x, &c, &i, &m, &s, &j, &d, &e, &p, &w, &g, &k, &t, &u, &n, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], evdir: &e [byte], patch: &p [byte], sha: &w [byte], slug: &g [byte], checkout: &k [byte], trailer: &t [byte], workers: &u [byte], step: &n [byte], branch: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), dir_write, file_write, io_write] int {
+    let base = change_base(heap, journal, step);
+    var code = company_step.exit_refused();
+    var have = false;
+    borrow base as &bb in {
+        have = len(buffer.bytes(bb)) == 40;
+    }
+    if have == false {
+        company_cmd.refuse(io, publish_plan.rule_not_accepted());
+        company_cmd.line(io, "reason: ", "the journal records no base commit for the step's change");
+        buffer.drop(heap, base);
+        return code;
+    }
+    let files = patch_check.paths(heap, patch);
+    let prov_dest = publish_plan.patch_prov_dest(heap, step);
+    var prov = publish_plan.provenance(heap, hm, st, journal, at, sha, publish_plan.patch_dest());
+    prov = buffer.append(heap, prov, "\n## Change\n\nThe patch was applied by `forge company publish` to the files of the repository at the commit below; nothing else of the repository was written.\n\n- repository ");
+    prov = publish_plan.quoted(heap, prov, slug);
+    prov = buffer.append(heap, prov, "\n- base commit ");
+    borrow base as &bb2 in {
+        prov = publish_plan.quoted(heap, prov, buffer.bytes(bb2));
+    }
+    prov = buffer.append(heap, prov, "\n- patch sha256 ");
+    prov = publish_plan.quoted(heap, prov, sha);
+    prov = buffer.append(heap, prov, "\n- files\n");
+    borrow files as &fb in {
+        var at2 = 0;
+        let all = buffer.bytes(fb);
+        while at2 < len(all) {
+            var e2 = at2;
+            while e2 < len(all) && int_of(all[e2]) != 10 {
+                e2 = e2 + 1;
+            }
+            prov = buffer.append(heap, prov, "  - ");
+            prov = publish_plan.quoted(heap, prov, all[at2..e2]);
+            prov = buffer.push(heap, prov, byte_of(10));
+            at2 = e2 + 1;
+        }
+    }
+    let message = publish_plan.patch_commit_message(heap, hm, step, trailer);
+    borrow prov as &pb in {
+        borrow prov_dest as &db in {
+            borrow message as &mb in {
+                borrow files as &fb2 in {
+                    borrow base as &bb3 in {
+                        if len(buffer.bytes(pb)) > publish_plan.text_cap() {
+                            company_cmd.refuse(io, publish_plan.rule_worker_failed());
+                            company_cmd.line(io, "reason: ", "the provenance is over its size limit");
+                        } else {
+                            let req = publish_plan.request_patch(heap, checkout, slug, branch, evdir, "change.patch", buffer.bytes(fb2), sha, buffer.bytes(bb3), buffer.bytes(db), buffer.bytes(pb), buffer.bytes(mb));
+                            borrow req as &qb in {
+                                code = ask_worker(heap, fs, exec, clock, io, hm, st, at, dir, workers, step, branch, publish_plan.patch_dest(), sha, buffer.bytes(qb));
+                            }
+                            buffer.drop(heap, req);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, prov);
+    buffer.drop(heap, prov_dest);
+    buffer.drop(heap, message);
+    buffer.drop(heap, files);
+    buffer.drop(heap, base);
     return code;
 }

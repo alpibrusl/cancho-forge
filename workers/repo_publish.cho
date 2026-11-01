@@ -8,6 +8,7 @@ import std.process;
 import forge.company_files;
 import forge.gate_task;
 import forge.journal_io;
+import forge.patch_apply;
 import forge.publish_plan;
 import forge.snapshot;
 
@@ -270,7 +271,7 @@ fn on_the_way[&h, &t](heap: &!h Heap, out: buffer.Buffer, path: &t [byte]) -> [h
 // Step 1, as a script. Exits: 11 the checkout is not a directory, not the toplevel of a repository, or has no commit; 13 `origin` is not
 // the allow-listed repository on github.com; 14 something is modified or untracked; 15 the branch exists; 16 a link or a directory is where a
 // file goes. On success it prints the branch the checkout is on (or, detached, the commit).
-fn checks_script[&h, &c, &r, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte]) -> [heap] buffer.Buffer {
+fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte]) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 1024), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " 2>/dev/null || exit 11\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 11\nhere=$(pwd -P)\n[ \"$root\" = \"$here\" ] || exit 11\n");
@@ -282,7 +283,13 @@ fn checks_script[&h, &c, &r, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], re
     s = put(heap, s, repo);
     s = put(heap, s, "'|'git@github.com:");
     s = put(heap, s, repo);
-    s = put(heap, s, ".git') ;;\n  *) exit 13 ;;\nesac\nmod=$(git status --porcelain --untracked-files=all 2>/dev/null) || exit 11\n[ -z \"$mod\" ] || exit 14\n");
+    s = put(heap, s, ".git') ;;\n  *) exit 13 ;;\nesac\n");
+    if len(base) > 0 {
+        s = put(heap, s, "[ \"$(git rev-parse HEAD 2>/dev/null)\" = '");
+        s = put(heap, s, base);
+        s = put(heap, s, "' ] || exit 23\n");
+    }
+    s = put(heap, s, "mod=$(git status --porcelain --untracked-files=all 2>/dev/null) || exit 11\n[ -z \"$mod\" ] || exit 14\n");
     s = put(heap, s, "if git rev-parse --verify --quiet 'refs/heads/");
     s = put(heap, s, branch);
     s = put(heap, s, "' >/dev/null 2>&1; then exit 15; fi\n");
@@ -433,7 +440,12 @@ fn publish[&h, &i, &f, &c, &x, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs("")
     if publish_plan.branch_ok(branch) == false {
         return answer_failed(heap, io, publish_plan.rule_branch_invalid(), "the branch name is not one Forge creates");
     }
-    if publish_plan.dest_ok(dest) == false || publish_plan.dest_ok(prov_dest) == false || publish_plan.dest_ok(src_name) == false || bytes.find(src_name, "/") >= 0 || bytes.equal(dest, prov_dest) {
+    let patch_base = text_of(src, tp, "patch_base");
+    let patching = json.get(src, tp, 0, "patch_base") >= 0;
+    if patching && (hex64_40(patch_base) == false || json.get(src, tp, 0, "more") >= 0 || patch_dests_ok(dest, prov_dest) == false) {
+        return answer_failed(heap, io, publish_plan.rule_dest_invalid(), "a patch publish names its base commit and the plain files the patch touches, and no other file");
+    }
+    if publish_plan.dest_ok(prov_dest) == false || publish_plan.dest_ok(src_name) == false || bytes.find(src_name, "/") >= 0 || bytes.equal(dest, prov_dest) || patching == false && publish_plan.dest_ok(dest) == false {
         return answer_failed(heap, io, publish_plan.rule_dest_invalid(), "a destination is not a plain path inside the checkout");
     }
     // `more`: up to three more artifacts, each with its own directory, source name, destination and digest. Every destination is a
@@ -490,7 +502,7 @@ fn publish[&h, &i, &f, &c, &x, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs("")
             borrow message_text as &mg in {
                 borrow alld as &ab2 in {
                     borrow extras as &xb in {
-                        code = publish_texts(heap, io, fs, clock, exec, checkout, repo, branch, src_dir, src_name, dest, sha, prov_dest, buffer.bytes(pv), buffer.bytes(mg), buffer.bytes(ab2), buffer.bytes(xb));
+                        code = publish_texts(heap, io, fs, clock, exec, checkout, repo, branch, src_dir, src_name, dest, sha, prov_dest, buffer.bytes(pv), buffer.bytes(mg), buffer.bytes(ab2), buffer.bytes(xb), patch_base);
                     }
                 }
             }
@@ -504,14 +516,14 @@ fn publish[&h, &i, &f, &c, &x, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs("")
 }
 
 // The texts are decoded: the rest of the checks, then the publish.
-fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], repo: &r [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], alld: &a [byte], extras: &t [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
+fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a, &t, &u](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], repo: &r [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], alld: &a [byte], extras: &t [byte], base: &u [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
     if hex64(sha) == false || len(prov) > publish_plan.text_cap() || len(message) > publish_plan.text_cap() || len(message) == 0 {
         return answer_failed(heap, io, publish_plan.rule_worker_failed(), "the request is malformed");
     }
     // Step 1: the checkout.
     var orig = buffer.empty(heap, 1);
     var refused = 0;
-    let check = checks_script(heap, checkout, repo, branch, alld, prov_dest);
+    let check = checks_script(heap, checkout, repo, branch, alld, prov_dest, base);
     borrow check as &cb in {
         let (status, out) = run_sh(heap, exec, clock, buffer.bytes(cb), "");
         refused = status;
@@ -536,6 +548,9 @@ fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a,
         if refused == 16 {
             return answer_failed(heap, io, publish_plan.rule_dest_invalid(), "a link or a directory is where a file goes");
         }
+        if refused == 23 {
+            return answer_failed(heap, io, publish_plan.rule_patch_base_stale(), "the checkout is not at the commit the patch was made against");
+        }
         return answer_failed(heap, io, publish_plan.rule_checkout_invalid(), "the checkout is not the toplevel of a git repository with a commit");
     }
     var code = 0;
@@ -543,7 +558,7 @@ fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a,
         if script_name(buffer.bytes(og)) == false {
             code = answer_failed(heap, io, publish_plan.rule_checkout_invalid(), "the checkout is on a branch whose name is not a plain name");
         } else {
-            code = publish_checked(heap, io, fs, clock, exec, checkout, branch, src_dir, src_name, dest, sha, prov_dest, prov, message, buffer.bytes(og), alld, extras);
+            code = publish_checked(heap, io, fs, clock, exec, checkout, branch, src_dir, src_name, dest, sha, prov_dest, prov, message, buffer.bytes(og), alld, extras, base);
         }
     }
     buffer.drop(heap, orig);
@@ -553,6 +568,117 @@ fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a,
 // The extra artifacts (`more` of the request), as `src_dir NUL src_name NUL dest NUL sha NUL` for each. Each is read again here, hashed,
 // compared with the digest it was accepted with, and written beneath the checkout. 0; 1 a file is not the one that was accepted; 2 a file
 // could not be written.
+// The files of a patch publish (`dest`: one per line): 1 to 64 plain paths, each once, none the provenance file's.
+fn patch_dests_ok[&d, &p](dest: &d [byte], prov_dest: &p [byte]) -> [] bool {
+    var at = 0;
+    var n = 0;
+    while at < len(dest) {
+        let e = line_end(dest, at);
+        let one = dest[at..e];
+        if publish_plan.dest_ok(one) == false || bytes.equal(one, prov_dest) || n >= 64 {
+            return false;
+        }
+        var seen = 0;
+        var back = 0;
+        while back < at {
+            let be = line_end(dest, back);
+            if bytes.equal(dest[back..be], one) {
+                seen = 1;
+            }
+            back = be + 1;
+        }
+        if seen == 1 {
+            return false;
+        }
+        n = n + 1;
+        at = e + 1;
+    }
+    return n >= 1;
+}
+
+// The file name after the last slash of `path`.
+fn name_of[&d](path: &d [byte]) -> [] &d [byte] {
+    var k = len(path);
+    while k > 0 {
+        if int_of(path[k - 1]) == 47 {
+            return path[k..len(path)];
+        }
+        k = k - 1;
+    }
+    return path;
+}
+
+// Apply `patch` to the files of the checkout, in cancho (src/patch_apply.cho): every file of the patch must be one of `dests` (and each of `dests` must
+// be in the patch), each is read beneath the checkout with no link followed, patched strictly, and written back. 0 applied; 1 a hunk does not apply
+// (or a creation over a file that is there); 2 a file could not be written; 3 the patch's files are not the request's, or it deletes one.
+fn apply_patch[&h, &f, &k, &p, &d](heap: &!h Heap, fs: &f Fs(""), checkout: &k [byte], patch: &p [byte], dests: &d [byte]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write] int {
+    var pos = 0;
+    var files = 0;
+    var wanted = 0;
+    var at = 0;
+    while at < len(dests) {
+        wanted = wanted + 1;
+        at = line_end(dests, at) + 1;
+    }
+    while pos < len(patch) {
+        let sec = patch_apply.next_section(patch, pos);
+        if sec.found == false {
+            pos = len(patch);
+        } else {
+            let path = patch[sec.path_at..sec.path_at + sec.path_len];
+            if has_line(dests, path) == false {
+                return 3;
+            }
+            files = files + 1;
+            let hunks = patch[sec.body..sec.end];
+            var folder = under(heap, checkout, dir_of(path));
+            if len(dir_of(path)) == 0 {
+                buffer.drop(heap, folder);
+                folder = buffer.append(heap, buffer.empty(heap, 64), checkout);
+            }
+            var rc = 0;
+            borrow folder as &fb in {
+                let (original, why) = company_files.read_artifact(heap, fs, buffer.bytes(fb), name_of(path));
+                var empty = false;
+                borrow original as &ob in {
+                    empty = why != 0 || len(buffer.bytes(ob)) == 0;
+                    if why != 0 && patch_apply.creates(hunks) == false || why == 0 && len(buffer.bytes(ob)) > 0 && patch_apply.creates(hunks) {
+                        rc = 1;
+                    } else {
+                        let (result, code) = patch_apply.apply_section(heap, hunks, buffer.bytes(ob));
+                        if code == 3 {
+                            rc = 3;
+                        } else if code != 0 {
+                            rc = 1;
+                        } else {
+                            let full = under(heap, checkout, path);
+                            borrow full as &fp in {
+                                borrow result as &rb in {
+                                    if write_file(fs, buffer.bytes(fp), buffer.bytes(rb)) != 0 {
+                                        rc = 2;
+                                    }
+                                }
+                            }
+                            buffer.drop(heap, full);
+                        }
+                        buffer.drop(heap, result);
+                    }
+                }
+                buffer.drop(heap, original);
+            }
+            buffer.drop(heap, folder);
+            if rc != 0 {
+                return rc;
+            }
+            pos = sec.end;
+        }
+    }
+    if files != wanted {
+        return 3;
+    }
+    return 0;
+}
+
 fn write_extras[&h, &f, &k, &t](heap: &!h Heap, fs: &f Fs(""), checkout: &k [byte], extras: &t [byte]) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write] int {
     var pos = 0;
     while pos < len(extras) {
@@ -628,7 +754,7 @@ fn text_in[&s, &t](src: &s [byte], tape: &t [int], node: int, name: &static [byt
 }
 
 // The checkout is as it should be: step 2 (the artifact) and step 3 (the branch, the files, the commit).
-fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &a, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], orig: &o [byte], alld: &a [byte], extras: &t [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
+fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &a, &t, &u](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], orig: &o [byte], alld: &a [byte], extras: &t [byte], base: &u [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
     let (data, why) = company_files.read_artifact(heap, fs, src_dir, src_name);
     var same = false;
     if why == 0 {
@@ -657,15 +783,31 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
         return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "the branch or its directories could not be made");
     }
     var rc = 0 - 1;
-    let dpath = under(heap, checkout, dest);
-    borrow dpath as &dp in {
+    if len(base) > 0 {
+        // A patch publish: the artifact is a patch, applied here, in cancho, to the files of the checkout (no `patch`).
+        var applied = 0;
         borrow data as &db in {
-            rc = write_file(fs, buffer.bytes(dp), buffer.bytes(db));
+            applied = apply_patch(heap, fs, checkout, buffer.bytes(db), dest);
         }
+        buffer.drop(heap, data);
+        if applied == 1 {
+            return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_patch_not_applicable(), "the patch does not apply to the files of the checkout");
+        }
+        if applied == 3 {
+            return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_patch_not_applicable(), "the patch touches files other than the ones the request names, or deletes one");
+        }
+        rc = applied;
+    } else {
+        let dpath = under(heap, checkout, dest);
+        borrow dpath as &dp in {
+            borrow data as &db in {
+                rc = write_file(fs, buffer.bytes(dp), buffer.bytes(db));
+            }
+        }
+        buffer.drop(heap, dpath);
+        buffer.drop(heap, data);
     }
-    buffer.drop(heap, dpath);
-    buffer.drop(heap, data);
-    if rc == 0 {
+    if rc == 0 && len(base) == 0 {
         let more = write_extras(heap, fs, checkout, extras);
         if more == 1 {
             return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_artifact_changed(), "an artifact is not the one that was accepted");

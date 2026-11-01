@@ -1,0 +1,327 @@
+edition 9;
+module forge.patch_apply;
+
+import std.buffer;
+import std.bytes;
+
+// Apply a `repo.change` patch to the files of a checkout, in cancho, without `patch` (docs/company.md section 21). Pure: bytes in, bytes out.
+//
+// The patch is the one `patch_check` already judged: `diff -ruN base tree`, per file a `--- base/<path>` line, a `+++ tree/<path>` line and hunks
+// `@@ -a[,b] +c[,d] @@` (a context line starts with a space, a removed one with `-`, an added one with `+`, and `\ No newline at end of file` says the line
+// before it has no line end). It is applied STRICTLY: a hunk goes exactly where its header says (no offset, no fuzz), and every context and
+// removed line must be the file's line there, byte for byte. A patch made against another file than the one given is `1`, never a guess.
+//
+//   next_section(patch, pos)   the next file of the patch at or after `pos`: where its path is, where its hunks start and end
+//   apply_section(heap, hunks, original)   the file after its hunks: the bytes and 0, or empty bytes and a code
+//
+// Codes of `apply_section`: 1 a context or removed line is not the file's (or the hunk is past its end); 2 the hunks are not well formed; 3 the patch
+// deletes the file (every line removed and nothing added: not applied, the caller decides).
+
+pub struct Section {
+    found: bool,
+    path_at: int,
+    path_len: int,
+    body: int,
+    end: int,
+}
+
+fn starts[&l, &p](line: &l [byte], prefix: &p [byte]) -> [] bool {
+    return len(line) >= len(prefix) && bytes.equal(line[0..len(prefix)], prefix);
+}
+
+// The end of the line that starts at `from` (the index of its newline, or the length of `text`).
+fn line_end[&t](text: &t [byte], from: int) -> [] int {
+    var e = from;
+    while e < len(text) && int_of(text[e]) != 10 {
+        e = e + 1;
+    }
+    return e;
+}
+
+// The number at `at` in `line` and the index after it, or -1 for none.
+fn number[&l](line: &l [byte], at: int) -> [] (int, int) {
+    var n = 0;
+    var i = at;
+    while i < len(line) && int_of(line[i]) >= 48 && int_of(line[i]) <= 57 {
+        if n > 100000000 {
+            return (0, 0 - 1);
+        }
+        n = n * 10 + int_of(line[i]) - 48;
+        i = i + 1;
+    }
+    if i == at {
+        return (0, 0 - 1);
+    }
+    return (n, i);
+}
+
+// `@@ -a[,b] +c[,d] @@`: a, b, c, d (b and d are 1 when written without), and whether the line is one. a and c are 0 only for an empty side.
+pub struct Header {
+    ok: bool,
+    old_start: int,
+    old_count: int,
+    new_start: int,
+    new_count: int,
+}
+
+fn header[&l](line: &l [byte]) -> [] Header {
+    let bad = Header { ok: false, old_start: 0, old_count: 0, new_start: 0, new_count: 0 };
+    if !starts(line, "@@ -") {
+        return bad;
+    }
+    let a = number(line, 4);
+    if a.1 < 0 {
+        return bad;
+    }
+    var i = a.1;
+    var b = 1;
+    if i < len(line) && int_of(line[i]) == 44 {
+        let t = number(line, i + 1);
+        if t.1 < 0 {
+            return bad;
+        }
+        b = t.0;
+        i = t.1;
+    }
+    if i + 2 > len(line) || !bytes.equal(line[i..i + 2], " +") {
+        return bad;
+    }
+    let c = number(line, i + 2);
+    if c.1 < 0 {
+        return bad;
+    }
+    i = c.1;
+    var d = 1;
+    if i < len(line) && int_of(line[i]) == 44 {
+        let t = number(line, i + 1);
+        if t.1 < 0 {
+            return bad;
+        }
+        d = t.0;
+        i = t.1;
+    }
+    if i + 3 > len(line) || !bytes.equal(line[i..i + 3], " @@") {
+        return bad;
+    }
+    return Header { ok: true, old_start: a.0, old_count: b, new_start: c.0, new_count: d };
+}
+
+// The index after the hunk whose header line starts at `at` (the body lines its counts say, and a `\` line after any of them), or -1 when the patch
+// ends inside it or a body line is none of the four kinds.
+fn skip_hunk[&p](patch: &p [byte], at: int) -> [] int {
+    let he = line_end(patch, at);
+    let h = header(patch[at..he]);
+    if !h.ok {
+        return 0 - 1;
+    }
+    var old = h.old_count;
+    var new = h.new_count;
+    var pos = he + 1;
+    while old > 0 || new > 0 {
+        if pos >= len(patch) {
+            return 0 - 1;
+        }
+        let e = line_end(patch, pos);
+        var first = 32;
+        if e > pos {
+            first = int_of(patch[pos]);
+        }
+        if first == 32 {
+            old = old - 1;
+            new = new - 1;
+        } else if first == 45 {
+            old = old - 1;
+        } else if first == 43 {
+            new = new - 1;
+        } else {
+            return 0 - 1;
+        }
+        if old < 0 || new < 0 {
+            return 0 - 1;
+        }
+        pos = e + 1;
+        if pos < len(patch) && int_of(patch[pos]) == 92 {
+            pos = line_end(patch, pos) + 1;
+        }
+    }
+    return pos;
+}
+
+// The next file of `patch` at or after byte `pos`: a `--- base/` line, a `+++ tree/` line and every hunk after them. `found` is false when there is
+// none or the section is not well formed; `end` is where the next section would start.
+pub fn next_section[&p](patch: &p [byte], pos: int) -> [] Section {
+    let none = Section { found: false, path_at: 0, path_len: 0, body: 0, end: len(patch) };
+    var at = pos;
+    while at < len(patch) {
+        let e = line_end(patch, at);
+        let line = patch[at..e];
+        if starts(line, "--- base/") {
+            var pe = at + 9;
+            while pe < e && int_of(patch[pe]) != 9 {
+                pe = pe + 1;
+            }
+            let next = e + 1;
+            if next >= len(patch) {
+                return none;
+            }
+            let ne = line_end(patch, next);
+            if !starts(patch[next..ne], "+++ tree/") {
+                return none;
+            }
+            var ps = next + 9;
+            var qe = ps;
+            while qe < ne && int_of(patch[qe]) != 9 {
+                qe = qe + 1;
+            }
+            if !bytes.equal(patch[ps..qe], patch[at + 9..pe]) {
+                return none;
+            }
+            let body = ne + 1;
+            var cur = body;
+            while cur < len(patch) && starts(patch[cur..line_end(patch, cur)], "@@") {
+                let after = skip_hunk(patch, cur);
+                if after < 0 {
+                    return none;
+                }
+                cur = after;
+            }
+            if cur == body {
+                return none;
+            }
+            return Section { found: true, path_at: at + 9, path_len: pe - (at + 9), body: body, end: cur };
+        }
+        at = e + 1;
+    }
+    return none;
+}
+
+// Does the first hunk of `hunks` start from an empty file (`@@ -0,0 ...`)? A creation: the original must be empty or absent.
+pub fn creates[&p](hunks: &p [byte]) -> [] bool {
+    let h = header(hunks[0..line_end(hunks, 0)]);
+    return h.ok && h.old_start == 0 && h.old_count == 0;
+}
+
+// Copy `original` lines from byte `from` up to (not including) line number `upto` (1-based; lines before `line` are already copied): the new byte
+// offset and line number. Stops at the end of the file.
+fn copy_lines[&h, &o](heap: &!h Heap, out: buffer.Buffer, original: &o [byte], from: int, line: int, upto: int) -> [heap] (buffer.Buffer, int, int) {
+    var o = out;
+    var pos = from;
+    var ln = line;
+    while ln < upto && pos < len(original) {
+        let e = line_end(original, pos);
+        var stop = e + 1;
+        if stop > len(original) {
+            stop = len(original);
+        }
+        o = buffer.append(heap, o, original[pos..stop]);
+        pos = stop;
+        ln = ln + 1;
+    }
+    return (o, pos, ln);
+}
+
+// The file `original` after the hunks in `hunks` (the bytes between a section's `body` and `end`). See the codes in the header.
+pub fn apply_section[&h, &p, &o](heap: &!h Heap, hunks: &p [byte], original: &o [byte]) -> [heap] (buffer.Buffer, int) {
+    var out = buffer.empty(heap, len(original) + 64);
+    var pos = 0;
+    var opos = 0;
+    var ln = 1;
+    var removed = 0;
+    var added = 0;
+    var kept = 0;
+    var last_end = 0 - 1;
+    while pos < len(hunks) {
+        let he = line_end(hunks, pos);
+        let h = header(hunks[pos..he]);
+        if !h.ok {
+            return (out, 2);
+        }
+        var upto = h.old_start;
+        if h.old_count == 0 {
+            upto = h.old_start + 1;
+        }
+        if upto < ln {
+            return (out, 1);
+        }
+        let (o2, p2, l2) = copy_lines(heap, out, original, opos, ln, upto);
+        out = o2;
+        opos = p2;
+        ln = l2;
+        if ln != upto {
+            return (out, 1);
+        }
+        var old = h.old_count;
+        var new = h.new_count;
+        pos = he + 1;
+        while old > 0 || new > 0 {
+            if pos >= len(hunks) {
+                return (out, 2);
+            }
+            let e = line_end(hunks, pos);
+            var first = 32;
+            if e > pos {
+                first = int_of(hunks[pos]);
+            }
+            var text = hunks[pos..pos];
+            if e > pos {
+                text = hunks[pos + 1..e];
+            }
+            pos = e + 1;
+            var no_end = false;
+            if pos < len(hunks) && int_of(hunks[pos]) == 92 {
+                no_end = true;
+                pos = line_end(hunks, pos) + 1;
+            }
+            if first == 32 || first == 45 {
+                if opos >= len(original) {
+                    return (out, 1);
+                }
+                let oe = line_end(original, opos);
+                if !bytes.equal(original[opos..oe], text) {
+                    return (out, 1);
+                }
+                let had_end = oe < len(original);
+                if had_end == no_end {
+                    return (out, 1);
+                }
+                opos = oe + 1;
+                if opos > len(original) {
+                    opos = len(original);
+                }
+                ln = ln + 1;
+                old = old - 1;
+                if first == 32 {
+                    out = buffer.append(heap, out, text);
+                    if no_end == false {
+                        out = buffer.push(heap, out, byte_of(10));
+                    }
+                    new = new - 1;
+                    kept = kept + 1;
+                } else {
+                    removed = removed + 1;
+                }
+            } else if first == 43 {
+                out = buffer.append(heap, out, text);
+                if no_end == false {
+                    out = buffer.push(heap, out, byte_of(10));
+                }
+                new = new - 1;
+                added = added + 1;
+            } else {
+                return (out, 2);
+            }
+            if old < 0 || new < 0 {
+                return (out, 2);
+            }
+        }
+        last_end = pos;
+    }
+    if last_end < 0 {
+        return (out, 2);
+    }
+    if removed > 0 && added == 0 && kept == 0 && opos >= len(original) {
+        return (out, 3);
+    }
+    let (o3, p3, l3) = copy_lines(heap, out, original, opos, ln, 100000000);
+    return (o3, 0);
+}
