@@ -14,7 +14,9 @@ import std.json;
 //     "model":  { "provider", "name" },
 //     "budget": { "input", "output", "cache_write", "cache_read", "max_cost", "price_table" },
 //     "human_gates": [name...], "roles": [role...],
-//     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "contract"?, "library"?, "gate"? } ... ] }
+//     "repos": [ { "id", "kind": "library" | "program" | "service" } ... ]?,
+//     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "contract"?, "library"?, "gate"?,
+//                  "repo"?, "change_kind"? } ... ] }
 //
 // The order the checks run in, so that a manifest with two faults is always refused for the same one:
 //   1. size (over 1 MiB), JSON, the root an object                                       manifest-malformed
@@ -23,10 +25,16 @@ import std.json;
 //   3. the shape and types of everything but the budget's presence                       manifest-malformed
 //   4. `budget` missing, a budget number missing / `price_table` missing                 budget-missing / price-table-missing
 //   5. `roles` names a role outside the six                                               role-unknown
+//   5b. `repos`: a kind outside library, program, service                                 repo-kind-invalid
+//       a repository id twice                                                            repo-duplicate
 //   6. step ids twice                                                                    step-id-duplicate
 //   7. per step, in order: role (not one of the six, or not in `roles`)                  role-unknown
 //      task type (not the one the role offers)                                           task-type-unsupported
 //      check (a builder or writer without one)                                           check-missing
+//      repo (a `repo.change` step without one)                                           repo-required
+//      repo / change_kind on another task type, contract / library on `repo.change`      repo-task-invalid
+//      repo (names no entry of `repos`)                                                  repo-unknown
+//      change_kind (not bug, feature, refactor or rename)                                repo-change-kind-invalid
 //      contract (a step that is neither a builder nor a writer names one)                contract-role-invalid
 //      library (a step that is neither a builder nor a writer names one)                 library-role-invalid
 //      library (not a module name: `build_task.library_ok`)                              library-name-invalid
@@ -71,6 +79,18 @@ pub enum Refusal {
     LibraryNeedsContract,
     // A step's `gate` that is not in `human_gates`.
     GateUnknown,
+    // A `repos` entry whose `kind` is not `library`, `program` or `service` (docs/company-lifecycle.md section 2.1).
+    RepoKindInvalid,
+    // Two `repos` entries with the same `id`.
+    RepoDuplicate,
+    // A step's `repo` that no `repos` entry has.
+    RepoUnknown,
+    // A `repo.change` step with no `repo`.
+    RepoRequired,
+    // A `repo` or `change_kind` on a step whose task type is not `repo.change`, or a `contract` or `library` on one that is.
+    RepoTaskInvalid,
+    // A step's `change_kind` that is not `bug`, `feature`, `refactor` or `rename` (the kinds of `cancho-build --kind`).
+    RepoChangeKindInvalid,
     // No `budget` object, or one of its five numbers is absent.
     BudgetMissing,
     // No `budget.price_table`, or an empty one.
@@ -118,6 +138,24 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         Refusal::GateUnknown => {
             return "gate-unknown";
         }
+        Refusal::RepoKindInvalid => {
+            return "repo-kind-invalid";
+        }
+        Refusal::RepoDuplicate => {
+            return "repo-duplicate";
+        }
+        Refusal::RepoUnknown => {
+            return "repo-unknown";
+        }
+        Refusal::RepoRequired => {
+            return "repo-required";
+        }
+        Refusal::RepoTaskInvalid => {
+            return "repo-task-invalid";
+        }
+        Refusal::RepoChangeKindInvalid => {
+            return "repo-change-kind-invalid";
+        }
         Refusal::BudgetMissing => {
             return "budget-missing";
         }
@@ -143,6 +181,15 @@ pub enum TaskType {
     RepoGate,
     ToolRun,
     None,
+    RepoChange,
+}
+
+// The kind of a repository (docs/company-lifecycle.md section 2.1): a closed set. `Library` is a module other programs import, `Program` an
+// executable, `Service` a program that runs somewhere and answers. Slice 1 uses the kind to hold the operator's row to the manifest's.
+pub enum RepoKind {
+    Library,
+    Program,
+    Service,
 }
 
 // A step, as the nodes of the manifest's tape: read the text of a field with `step_id`, `step_input`, `step_check`, `step_contract`,
@@ -157,6 +204,8 @@ pub struct Step {
     contract: int,
     library: int,
     gate: int,
+    repo: int,
+    change_kind: int,
 }
 
 // A manifest that passed every check. It owns its text and the tape over it, so it is `res`: end it with `drop`.
@@ -168,6 +217,7 @@ pub res struct Manifest {
     price_table: int,
     steps: int,
     gates: int,
+    repos: int,
     step_count: int,
     input: int,
     output: int,
@@ -208,9 +258,15 @@ pub fn max_text() -> [] int {
     return 16384;
 }
 
+// The most `repos` entries.
+pub fn max_repos() -> [] int {
+    return 64;
+}
+
 // ---- the checks -----------------------------------------------------------------------------------------------------------
 // Each answers 0 for held, else a code: 1 malformed, 2 unknown field, 3 duplicate, 4 needs unknown, 5 cycle, 6 role unknown, 7 task
-// type, 8 check missing, 9 gate unknown, 10 budget missing, 11 price table missing, 12 contract on a role that builds nothing, 13 library on a role that builds nothing, 14 library that is not a module name, 15 library without a contract.
+// type, 8 check missing, 9 gate unknown, 10 budget missing, 11 price table missing, 12 contract on a role that builds nothing, 13 library on a role that builds nothing, 14 library that is not a module name, 15 library without a contract,
+// 16 repo kind, 17 repo duplicate, 18 repo unknown, 19 repo required, 20 repo on the wrong task type, 21 change kind.
 
 fn refusal_of(code: int) -> [] Refusal {
     if code == 2 {
@@ -254,6 +310,24 @@ fn refusal_of(code: int) -> [] Refusal {
     }
     if code == 15 {
         return Refusal::LibraryNeedsContract;
+    }
+    if code == 16 {
+        return Refusal::RepoKindInvalid;
+    }
+    if code == 17 {
+        return Refusal::RepoDuplicate;
+    }
+    if code == 18 {
+        return Refusal::RepoUnknown;
+    }
+    if code == 19 {
+        return Refusal::RepoRequired;
+    }
+    if code == 20 {
+        return Refusal::RepoTaskInvalid;
+    }
+    if code == 21 {
+        return Refusal::RepoChangeKindInvalid;
     }
     return Refusal::ManifestMalformed;
 }
@@ -408,7 +482,7 @@ fn role_code[&v](name: &v [byte]) -> [] int {
     return 0 - 1;
 }
 
-// A task type name as a number 0 to 3, or -1.
+// A task type name as a number 0 to 4, or -1.
 fn type_code[&v](name: &v [byte]) -> [] int {
     if bytes.equal(name, "project.build") {
         return 0;
@@ -421,6 +495,9 @@ fn type_code[&v](name: &v [byte]) -> [] int {
     }
     if bytes.equal(name, "none") {
         return 3;
+    }
+    if bytes.equal(name, "repo.change") {
+        return 4;
     }
     return 0 - 1;
 }
@@ -460,6 +537,9 @@ fn role_of(code: int) -> [] Role {
 }
 
 fn type_of(code: int) -> [] TaskType {
+    if code == 4 {
+        return TaskType::RepoChange;
+    }
     if code == 0 {
         return TaskType::ProjectBuild;
     }
@@ -567,7 +647,7 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
     if !json.is_object(tp, step) {
         return 1;
     }
-    let keys = keys_code(src, tp, step, "id role task_type needs input check contract library gate");
+    let keys = keys_code(src, tp, step, "id role task_type needs input check contract library gate repo change_kind");
     if keys != 0 {
         return keys;
     }
@@ -578,6 +658,8 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
     let contract = json.get(src, tp, step, "contract");
     let library = json.get(src, tp, step, "library");
     let gate = json.get(src, tp, step, "gate");
+    let repo = json.get(src, tp, step, "repo");
+    let change_kind = json.get(src, tp, step, "change_kind");
     if !is_name(src, tp, json.get(src, tp, step, "id")) || !json.string_plain(tp, role) || !json.string_plain(tp, task_type) {
         return 1;
     }
@@ -602,23 +684,145 @@ fn step_shape_code[&s, &t](src: &s [byte], tp: &t [int], step: int) -> [] int {
     if gate >= 0 && !is_name(src, tp, gate) {
         return 1;
     }
+    if repo >= 0 && !is_name(src, tp, repo) {
+        return 1;
+    }
+    if change_kind >= 0 && !json.string_plain(tp, change_kind) {
+        return 1;
+    }
+    return 0;
+}
+
+// The kinds of `cancho-build --kind`, which a `repo.change` step's `change_kind` names.
+fn change_kind_ok[&v](name: &v [byte]) -> [] bool {
+    return bytes.equal(name, "bug") || bytes.equal(name, "feature") || bytes.equal(name, "refactor") || bytes.equal(name, "rename");
+}
+
+// Is `name` the `id` of an entry of the `repos` array at node `repos` (-1: none)?
+fn repo_listed[&s, &t, &n](src: &s [byte], tp: &t [int], repos: int, name: &n [byte]) -> [] bool {
+    if repos < 0 {
+        return false;
+    }
+    var k = 0;
+    while k < json.count(tp, repos) {
+        let id = json.get(src, tp, json.at(tp, repos, k), "id");
+        if bytes.equal(json.string_view(src, tp, id), name) {
+            return true;
+        }
+        k = k + 1;
+    }
+    return false;
+}
+
+// The `repo` and `change_kind` of one step (docs/company-lifecycle.md section 8.1): a `repo.change` step names a repository of `repos`
+// (19 without one, 18 for one that is not listed), may name a `change_kind`, and takes no `contract` or `library`; any other task type
+// names neither (20).
+fn repo_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, tcode: int, repos: int) -> [] int {
+    let repo = json.get(src, tp, step, "repo");
+    let kind = json.get(src, tp, step, "change_kind");
+    if tcode != 4 {
+        if repo >= 0 || kind >= 0 {
+            return 20;
+        }
+        return 0;
+    }
+    if json.get(src, tp, step, "contract") >= 0 || json.get(src, tp, step, "library") >= 0 {
+        return 20;
+    }
+    if repo < 0 {
+        return 19;
+    }
+    if !repo_listed(src, tp, repos, json.string_view(src, tp, repo)) {
+        return 18;
+    }
+    if kind >= 0 && !change_kind_ok(json.string_view(src, tp, kind)) {
+        return 21;
+    }
+    return 0;
+}
+
+// The shape of `repos`: an array of at most 64 objects of exactly `id` (a name, as a step id is) and `kind` (a plain string).
+fn repos_shape_code[&s, &t](src: &s [byte], tp: &t [int], repos: int) -> [] int {
+    if !json.is_array(tp, repos) || json.count(tp, repos) > max_repos() {
+        return 1;
+    }
+    var k = 0;
+    while k < json.count(tp, repos) {
+        let entry = json.at(tp, repos, k);
+        if !json.is_object(tp, entry) {
+            return 1;
+        }
+        let keys = keys_code(src, tp, entry, "id kind");
+        if keys != 0 {
+            return keys;
+        }
+        let id = json.get(src, tp, entry, "id");
+        let kind = json.get(src, tp, entry, "kind");
+        if !is_name(src, tp, id) || !step_id_ok(json.string_view(src, tp, id)) || !json.string_plain(tp, kind) {
+            return 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// A repository kind name as a number 0 to 2, or -1.
+fn repo_kind_code[&v](name: &v [byte]) -> [] int {
+    if bytes.equal(name, "library") {
+        return 0;
+    }
+    if bytes.equal(name, "program") {
+        return 1;
+    }
+    if bytes.equal(name, "service") {
+        return 2;
+    }
+    return 0 - 1;
+}
+
+// The rules of `repos` once its shape held: a kind outside the three (16), then an id twice (17).
+fn repos_rules_code[&s, &t](src: &s [byte], tp: &t [int], repos: int) -> [] int {
+    var k = 0;
+    while k < json.count(tp, repos) {
+        let entry = json.at(tp, repos, k);
+        if repo_kind_code(json.string_view(src, tp, json.get(src, tp, entry, "kind"))) < 0 {
+            return 16;
+        }
+        k = k + 1;
+    }
+    k = 0;
+    while k < json.count(tp, repos) {
+        let a = json.string_view(src, tp, json.get(src, tp, json.at(tp, repos, k), "id"));
+        var j = k + 1;
+        while j < json.count(tp, repos) {
+            if bytes.equal(a, json.string_view(src, tp, json.get(src, tp, json.at(tp, repos, j), "id"))) {
+                return 17;
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
     return 0;
 }
 
 // Role, task type, check and gate of one step, against the roles in use and the human gates.
-fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, gates: int) -> [] int {
+fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, gates: int, repos: int) -> [] int {
     let role_node = json.get(src, tp, step, "role");
     let role = role_code(json.string_view(src, tp, role_node));
     if role < 0 || !in_names(src, tp, roles, role_node) {
         return 6;
     }
     let tcode = type_code(json.string_view(src, tp, json.get(src, tp, step, "task_type")));
-    if tcode < 0 || tcode != type_of_role(role) {
+    if tcode < 0 || tcode != type_of_role(role) && !(tcode == 4 && role == 0) {
         return 7;
     }
     let check = json.get(src, tp, step, "check");
     if (role == 0 || role == 4) && (check < 0 || len(json.string_view(src, tp, check)) == 0) {
         return 8;
+    }
+    let repo_code = repo_rules_code(src, tp, step, tcode, repos);
+    if repo_code != 0 {
+        return repo_code;
     }
     if json.get(src, tp, step, "contract") >= 0 && role != 0 && role != 4 {
         return 12;
@@ -746,7 +950,7 @@ fn graph_code[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], steps: i
 
 // Everything but the size and the JSON: the root object `0` of the tape over `src`.
 fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] int {
-    let keys = keys_code(src, tp, 0, "id mission model budget human_gates roles steps");
+    let keys = keys_code(src, tp, 0, "id mission model budget human_gates roles repos steps");
     if keys != 0 {
         return keys;
     }
@@ -755,6 +959,7 @@ fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] 
     let gates = json.get(src, tp, 0, "human_gates");
     let roles = json.get(src, tp, 0, "roles");
     let steps = json.get(src, tp, 0, "steps");
+    let repos = json.get(src, tp, 0, "repos");
     if !is_name(src, tp, json.get(src, tp, 0, "id")) || !is_text(src, tp, json.get(src, tp, 0, "mission")) {
         return 1;
     }
@@ -773,6 +978,12 @@ fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] 
     }
     if !json.is_array(tp, steps) || json.count(tp, steps) < 1 || json.count(tp, steps) > max_steps() {
         return 1;
+    }
+    if repos >= 0 {
+        let r = repos_shape_code(src, tp, repos);
+        if r != 0 {
+            return r;
+        }
     }
     var i = 0;
     while i < json.count(tp, steps) {
@@ -793,13 +1004,19 @@ fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] 
         }
         i = i + 1;
     }
+    if repos >= 0 {
+        let r = repos_rules_code(src, tp, repos);
+        if r != 0 {
+            return r;
+        }
+    }
     let dup = duplicate_code(src, tp, steps);
     if dup != 0 {
         return dup;
     }
     i = 0;
     while i < json.count(tp, steps) {
-        let c = step_rules_code(src, tp, json.at(tp, steps, i), roles, gates);
+        let c = step_rules_code(src, tp, json.at(tp, steps, i), roles, gates, repos);
         if c != 0 {
             return c;
         }
@@ -834,6 +1051,7 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
     var price_table = 0 - 1;
     var steps = 0 - 1;
     var gates = 0 - 1;
+    var repos = 0 - 1;
     var count = 0;
     var input = 0;
     var output = 0;
@@ -848,6 +1066,7 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
         price_table = json.get(text, tp, budget, "price_table");
         steps = json.get(text, tp, 0, "steps");
         gates = json.get(text, tp, 0, "human_gates");
+        repos = json.get(text, tp, 0, "repos");
         count = json.count(tp, steps);
         input = json.to_int(text, tp, json.get(text, tp, budget, "input"));
         output = json.to_int(text, tp, json.get(text, tp, budget, "output"));
@@ -855,11 +1074,11 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
         cache_read = json.to_int(text, tp, json.get(text, tp, budget, "cache_read"));
         max_cost = json.to_int(text, tp, json.get(text, tp, budget, "max_cost"));
     }
-    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
+    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
 }
 
 pub fn drop[&h](heap: &!h Heap, m: Manifest) -> [heap] int {
-    let Manifest { text, tape, id, provider, price_table, steps, gates, step_count, input, output, cache_write, cache_read, max_cost } = m;
+    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, step_count, input, output, cache_write, cache_read, max_cost } = m;
     buffer.drop(heap, text);
     unbox_slice(heap, tape);
     return 0;
@@ -980,7 +1199,7 @@ pub fn step_at[&m](m: &m Manifest, i: int) -> [] Step {
     let node = json.at(tp, m.steps, at);
     let role = role_code(json.string_view(src, tp, json.get(src, tp, node, "role")));
     let tcode = type_code(json.string_view(src, tp, json.get(src, tp, node, "task_type")));
-    return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), contract: json.get(src, tp, node, "contract"), library: json.get(src, tp, node, "library"), gate: json.get(src, tp, node, "gate") };
+    return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), contract: json.get(src, tp, node, "contract"), library: json.get(src, tp, node, "library"), gate: json.get(src, tp, node, "gate"), repo: json.get(src, tp, node, "repo"), change_kind: json.get(src, tp, node, "change_kind") };
 }
 
 pub fn step_id[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
@@ -1019,4 +1238,96 @@ pub fn step_needs_count[&m](m: &m Manifest, s: Step) -> [] int {
 // The id of what the step needs, `k`th (0-based); empty outside the list.
 pub fn step_need[&m](m: &m Manifest, s: Step, k: int) -> [] &m [byte] {
     return text_at(m, json.at(contents(m.tape), s.needs, k));
+}
+
+// The step's repository id (a `repo.change` step's), empty when it has none.
+pub fn step_repo[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
+    return text_at(m, s.repo);
+}
+
+// The step's `change_kind` as written, empty when it has none (`cancho-build`'s default, `feature`, is then used).
+pub fn step_change_kind[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
+    return text_at(m, s.change_kind);
+}
+
+// Does the step run as a `repo.change` task?
+pub fn is_repo_change(s: Step) -> [] bool {
+    match s.task_type {
+        TaskType::RepoChange => {
+            return true;
+        }
+        TaskType::ProjectBuild => {
+            return false;
+        }
+        TaskType::RepoGate => {
+            return false;
+        }
+        TaskType::ToolRun => {
+            return false;
+        }
+        TaskType::None => {
+            return false;
+        }
+    }
+}
+
+// How many entries `repos` lists (0 for a manifest without one).
+pub fn repo_count[&m](m: &m Manifest) -> [] int {
+    if m.repos < 0 {
+        return 0;
+    }
+    return json.count(contents(m.tape), m.repos);
+}
+
+// The `id` of the `k`th `repos` entry (0-based); empty outside the list.
+pub fn repo_id_at[&m](m: &m Manifest, k: int) -> [] &m [byte] {
+    if k < 0 || k >= repo_count(m) {
+        return buffer.bytes(m.text)[0..0];
+    }
+    let tp = contents(m.tape);
+    return text_at(m, json.get(buffer.bytes(m.text), tp, json.at(tp, m.repos, k), "id"));
+}
+
+// The `kind` of the `k`th `repos` entry (a held manifest: one of the three); `Library` outside the list.
+pub fn repo_kind_at[&m](m: &m Manifest, k: int) -> [] RepoKind {
+    if k < 0 || k >= repo_count(m) {
+        return RepoKind::Library;
+    }
+    let tp = contents(m.tape);
+    let src = buffer.bytes(m.text);
+    let code = repo_kind_code(json.string_view(src, tp, json.get(src, tp, json.at(tp, m.repos, k), "kind")));
+    if code == 1 {
+        return RepoKind::Program;
+    }
+    if code == 2 {
+        return RepoKind::Service;
+    }
+    return RepoKind::Library;
+}
+
+// The index in `repos` of the repository `name`, or -1.
+pub fn repo_index[&m, &n](m: &m Manifest, name: &n [byte]) -> [] int {
+    var k = 0;
+    while k < repo_count(m) {
+        if bytes.equal(repo_id_at(m, k), name) {
+            return k;
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// The kind's name as the manifest and the operator file spell it.
+pub fn repo_kind_name(k: RepoKind) -> [] &static [byte] {
+    match k {
+        RepoKind::Library => {
+            return "library";
+        }
+        RepoKind::Program => {
+            return "program";
+        }
+        RepoKind::Service => {
+            return "service";
+        }
+    }
 }

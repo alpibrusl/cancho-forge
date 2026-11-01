@@ -124,7 +124,9 @@ accepted artifact is published: that is the operator file's `publish` (section 4
   company directory holding required signatures (section 8); `library` (optional, **builder or writer only with a `contract`**, `library-role-invalid`,
   `library-needs-contract`) a module name (`library-name-invalid` unless lowercase letters, digits and `_`, not starting with a digit, at most 64
   bytes, not `std` or `test`): the build is run as `cancho-build --library NAME` and leaves `src/NAME.cho` and `tests/NAME_test.cho` beside
-  `project.cho` ([`library-steps.md`](library-steps.md)); `gate` (optional) a name from `human_gates` (`gate-unknown`).
+  `project.cho` ([`library-steps.md`](library-steps.md)); `gate` (optional) a name from `human_gates` (`gate-unknown`); `repo` and `change_kind` (optional,
+  **only on a builder's `repo.change` step**, section 16).
+* `repos` (optional, root): a closed array of 0 to 64 `{id, kind}` (section 16). A manifest without it is read exactly as before.
 
 The order in which faults are looked for, so that a manifest with two faults is always refused for the same one, is the header of
 `src/company_manifest.cho`.
@@ -147,6 +149,7 @@ edit touches is hygiene, not a boundary. (A symbolic link from outside pointing 
 | `gates` | `{"<step id>": {"repo", "revision", "checkout"}}`: what a qa or reviewer step reports the gate of; `repo` must be on the gate runner's allow-list, `revision` a 40-hex commit, `checkout` an absolute path | each qa or reviewer step |
 | `analyst_tools`, `granted_tools`, `analysts`, `tool_timeout_ms` | the analyst's tools, section 13 | each analyst step |
 | `publish`, `commit_trailer` | `forge company publish` (section 15): `publish` is `{"<step id>": {"repo": "<allow-list key>", "checkout": "/abs", "files": {"project.cho": "<place in the checkout>"}}}` and `commit_trailer` one printable line (at most 200 bytes) added to the commit message, e.g. a `Co-Authored-By:` line. Form is checked here (`operator-invalid`); the values are checked again by the publish | `forge company publish` only |
+| `repos` | `{"<repository id>": {"kind", "checkout", "compiler_rev", "publish_allow", "max_patch_files", "max_patch_lines", optionally "slug", "branch", "pins", "publish_deny"}}`: the repositories a `repo.change` step may work on (section 16). Form is checked here (`operator-invalid` with a `reason:`); the values are checked again by what uses them | each `repo.change` step |
 | `build_timeout_ms`, `gate_timeout_ms`, `check_timeout_ms` | deadlines in ms, 10000 to 86400000; defaults 3600000, 900000, 600000 | optional |
 | `attempts`, `agent_seconds`, `rounds`, `plan_seconds`, `jobs` | `forge build`'s trailing `attempts=N` ... `jobs=N`: the build tool's ceilings for every builder or writer step (`--attempts`, `--agent-seconds`, ... in its argument vector, carried in the worker request). Whole numbers (`json.fits_int`: not `30.0`, not `"30"`) held at parse time to the ranges `build_task.operator_checked` holds them to: attempts 1 to 20, agent_seconds 1 to 3600, rounds 1 to 10, plan_seconds 1 to 7200, jobs 1 to 64; defaults 4, 30, 3, 900, 4 (`step_run.build_spec`). Out of range or of the wrong type is `operator-invalid` with `reason: <key> is not a whole number from <low> to <high>` (the first wrong one, in this order). `agent_seconds` is the deadline of ONE agent call: a model whose calls take longer than it (statuslite run arm-a-1: Haiku 5.5 calls of 64 to 121 s against the fixed 30) cannot finish a unit | optional; one value for every build step of the run |
 
@@ -494,6 +497,15 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 | `library-role-invalid` | a step that is neither builder nor writer names a `library` | 1 | unit `test_a_library_on_a_role_that_builds_nothing_is_library_role_invalid`; run.sh `manifest: qa: library-role-invalid` |
 | `library-name-invalid` | a `library` that is not a module name (`company_manifest.library_name_ok`, the rule of `cancho-build --library`) | 1 | unit `test_a_library_that_is_not_a_module_name_is_library_name_invalid`; run.sh `manifest: name: library-name-invalid` |
 | `library-needs-contract` | a step with a `library` and no `contract` | 1 | unit `test_a_library_without_a_contract_is_library_needs_contract`; run.sh `manifest: nocontract: library-needs-contract` |
+| `repo-kind-invalid` | a manifest `repos` entry whose `kind` is not `library`, `program` or `service` | 1 | unit `test_a_repos_row_with_a_kind_outside_the_three_is_repo_kind_invalid` |
+| `repo-duplicate` | two `repos` entries with one `id` | 1 | unit `test_two_repos_with_one_id_are_repo_duplicate` |
+| `repo-unknown` | a step's `repo` that no `repos` entry has | 1 | unit `test_a_step_naming_a_repo_the_manifest_does_not_list_is_repo_unknown` |
+| `repo-required` | a `repo.change` step with no `repo` | 1 | unit `test_a_repo_change_step_without_a_repo_is_refused` |
+| `repo-task-invalid` | a `repo` or `change_kind` on a step that is not `repo.change`, or a `contract` or `library` on one that is | 1 | unit `test_a_repo_on_another_task_type_is_refused`, `test_a_contract_or_library_on_a_repo_change_step_is_refused` |
+| `repo-change-kind-invalid` | a `change_kind` that is not `bug`, `feature`, `refactor` or `rename` | 1 | unit `test_a_change_kind_outside_the_four_is_refused` |
+| `patch-kind-invalid` | a `repo.change` patch that is empty, truncated, has other prefixes than `base/` and `tree/`, or holds a rename, a mode change or a binary hunk | 14 | unit `test_a_patch_with_a_rename_is_patch_kind_invalid` and the two after it |
+| `patch-path-denied` | a path of the patch that the operator row's `publish_allow` does not allow, `publish_deny` denies, or that is not a plain relative path | 14 | unit `test_a_patch_outside_publish_allow_is_patch_path_denied`, `test_a_patch_inside_publish_deny_is_patch_path_denied` |
+| `patch-too-large` | more files than `max_patch_files` or more added lines than `max_patch_lines` | 14 | unit `test_a_patch_over_max_patch_lines_or_files_is_patch_too_large` |
 | `gate-unknown` | a step's `gate` not in `human_gates`; `decide` about a gate that is neither listed nor `retry:<step id>` | 1 | unit `test_a_gate_that_is_not_a_human_gate_is_refused`; `check_company.sh` `decide: a gate the manifest does not list is gate-unknown` |
 | `budget-missing` | no `budget`, or one of its five numbers absent | 1 | unit `test_a_missing_budget_or_price_table_is_refused` |
 | `price-table-missing` | `budget.price_table` absent (manifest); in the run, a table that is not there, unreadable, or does not price the manifest's model | 1 | unit `test_a_missing_budget_or_price_table_is_refused`; run.sh `no price table`, `a price table without the model` |
@@ -790,3 +802,31 @@ change the company journal: a publish is not recorded in it (see section 14).
 `docs/authority-repo-publish.txt`: `Exec` narrowed to `/bin/sh` (git runs through it), the file system for the checkout, the artifact and
 the evidence, a clock, standard input and output; no network, no command line, no signals, no foreign code. `scripts/gate.sh` compares it
 with the checked-in file.
+
+## 16. `repo.change`: a change request on an existing repository (slice 1 of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status.** The manifest and operator-file side and the patch bounds are built and unit-tested (this section, part A). The worker and
+the runner (part B) are described in the next paragraphs only once they exist. Nothing here has run with a real model or a real
+`cancho-build --repo`.
+
+**Manifest.** Root `repos`: an optional array of at most 64 closed objects `{"id", "kind"}`. `id` is a name as a step id is (no dot
+name); `kind` is `library`, `program` or `service` (`repo-kind-invalid`); an id twice is `repo-duplicate`. A step may carry two more
+optional keys. `repo` (an id of `repos`, `repo-unknown`) and `change_kind` (`bug`, `feature`, `refactor`, `rename`: the values of
+`cancho-build --kind`; `repo-change-kind-invalid`). The builder role offers a second task type, `repo.change`; the step's `input` is the
+change-request text. A `repo.change` step needs a `repo` (`repo-required`) and a `check` (`check-missing`, as any builder step), and
+takes no `contract` or `library`; `repo` and `change_kind` on any other task type are `repo-task-invalid`. A manifest with no `repos`
+is valid and read exactly as before.
+
+**Operator file.** `repos.<id>` = `{kind, checkout, compiler_rev, publish_allow, max_patch_files, max_patch_lines}` and optionally
+`slug`, `branch`, `pins` (`.cancho-rev` and/or `cancho.toml`; default `.cancho-rev`) and `publish_deny`. `checkout` is an absolute path
+by `gate_task.path_ok`'s rule, `compiler_rev` 40 lower-case hex, the patterns relative paths of letters, digits and `_-./*` with no `..`
+(`*` any run inside a component, a whole component `**` any number of components), `max_patch_files` 1 to 64, `max_patch_lines` 1 to
+100000. Any other key (the autonomy registry's `gate` and `policy` included) is `operator-invalid`, with a `reason:` line.
+
+**Patch bounds** (`src/patch_check.cho`, pure): Forge reads `change.patch` itself and answers `patch-kind-invalid`, then
+`patch-path-denied`, then `patch-too-large`. The patch is `diff -ruN base tree` (`--- base/<path>`, `+++ tree/<path>`); hunk bodies are
+counted by their headers so a header-looking line inside a hunk is data.
+
+**Decisions where the design document and the code differ.** (1) `change_kind` is a new optional step key: the design names no source
+for `--kind`, and the tool's default (`feature`) would force a test on a bug fix the operator may not want. (2) The tags `repo-required`,
+`repo-task-invalid` and `repo-change-kind-invalid` are new; the design gives the two manifest-shape tests no tag.
