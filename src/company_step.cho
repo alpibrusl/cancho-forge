@@ -139,6 +139,16 @@ pub enum Runner {
     Person,
     Unsupported,
     Tool,
+    // A builder's `repo.change` step (docs/company.md section 16): the change worker, its artifact the patch `change.patch`.
+    Change,
+}
+
+// The runner of a step: `Change` for a `repo.change` step, else the role's (`runner_of`).
+pub fn runner_for(step: company_manifest.Step) -> [] Runner {
+    if company_manifest.is_repo_change(step) {
+        return Runner::Change;
+    }
+    return runner_of(step.role);
 }
 
 pub fn runner_of(role: company_manifest.Role) -> [] Runner {
@@ -184,6 +194,9 @@ pub fn artifact_name(r: Runner) -> [] &static [byte] {
         Runner::Tool => {
             return "tool.out";
         }
+        Runner::Change => {
+            return "change.patch";
+        }
     }
 }
 
@@ -206,6 +219,9 @@ pub fn artifact_rel[&h, &i](heap: &!h Heap, id: &i [byte], r: Runner) -> [heap] 
             out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
         }
         Runner::Tool => {
+            out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
+        }
+        Runner::Change => {
             out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
         }
     }
@@ -239,6 +255,9 @@ fn is_person(r: Runner) -> [] bool {
             return false;
         }
         Runner::Tool => {
+            return false;
+        }
+        Runner::Change => {
             return false;
         }
     }
@@ -285,9 +304,9 @@ pub fn needs_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, s
     while j < n {
         let id = company_manifest.step_need(m, step, j);
         let at = company_graph.index_of(m, id);
-        if company_state.accepted_at(s, at) && is_person(runner_of(company_manifest.step_at(m, at).role)) == false {
+        if company_state.accepted_at(s, at) && is_person(runner_for(company_manifest.step_at(m, at))) == false {
             let (path, sha) = company_state.artifact_of(s, at);
-            let name = needs_name(heap, id, runner_of(company_manifest.step_at(m, at).role));
+            let name = needs_name(heap, id, runner_for(company_manifest.step_at(m, at)));
             w = json.begin_object(heap, w);
             w = json.put_key(heap, w, "step");
             w = json.put_string(heap, w, id);
@@ -525,7 +544,8 @@ pub fn is_guard_busy(ran: process.Ran) -> [] bool {
 }
 
 // The tag a held step is refused with on every later run, by its held code (`company_state.held_by_check`): the refusal it was
-// recorded with. 1 check-failed, 2 check-unavailable, 3 artifact-invalid, 4 usage-invalid; anything else check-unavailable.
+// recorded with. 1 check-failed, 2 check-unavailable, 3 artifact-invalid, 4 usage-invalid, 5 change-refused (a `repo.change` step's
+// repository or patch refusal: the specific tag is printed when it happens); anything else check-unavailable.
 pub fn held_tag(code: int) -> [] &static [byte] {
     return company_state.held_name(code);
 }

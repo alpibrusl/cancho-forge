@@ -151,3 +151,8 @@ std = true
 name = "patch_check"
 sources = ["tests/patch_check_test.cho", "src/patch_check.cho", "src/repo_row.cho", "src/gate_task.cho", "src/gate_env.cho"]
 std = true
+
+[[test]]
+name = "repo_task"
+sources = ["tests/repo_task_test.cho", "src/repo_task.cho", "src/repo_row.cho", "src/build_task.cho", "src/gate_task.cho", "src/gate_env.cho"]
+std = true
