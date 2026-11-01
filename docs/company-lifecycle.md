@@ -811,8 +811,10 @@ new `tests/conformance/company_change.sh` run by `scripts/gate.sh`; every refusa
 The slice is **done** when those are green with the stand-in. It says nothing about whether a model can write such a patch (M-1) and
 must be reported that way, as `company.md` reports every number.
 
-> **Slice 2, part A built** (change records, `forge company change add`, the `admit:` gate): [`company.md`](company.md) section 17. Flows,
-> the provisioner, issue intake and the patch publish are the rest of slice 2 and are not built.
+> **Slice 2, parts A, B1, B2 and B3 built** (change records, `forge company change add` and the `admit:` gate: [`company.md`](company.md) section 17;
+> flows: section 18; derived steps and the runner: section 19; the provisioner: section 20, which uses `dir_mkdir` and not the `Exec /bin/mkdir` this
+> document proposed in section 3). **Not built from slice 2:** issue intake from files, the patch publish on `forge/<change id>` with per-change
+> provenance, `change-duplicate`, `change-rate-limited`, `base` and `at` on the change record.
 
 ### 8.2 The order of the rest
 

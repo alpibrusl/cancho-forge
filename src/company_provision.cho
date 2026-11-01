@@ -1,0 +1,76 @@
+edition 9;
+module forge.company_provision;
+
+import std.dirs;
+
+// The provisioner (docs/company-lifecycle.md section 3, docs/company.md section 20): a step that did not exist when the operator prepared the company
+// has no `steps/<id>/ev`, and a worker step needs it. For a DERIVED step (src/company_derive.cho) Forge makes it: `steps/<id>` and `steps/<id>/ev`
+// beneath the company directory, one `mkdirat` each (`dir_mkdir`, edition 9), mode 0755 under the umask, never through a link and never replacing
+// anything (a name that exists is `EEXIST`, which is fine for a directory that is already there and is checked after).
+//
+// What it holds: `dir_write` beneath the `steps` directory the operator made (`steps/` itself is the operator's: Forge does not make the directory
+// the company's work lives in, and a company directory without it is `step-dir-missing` as before), and nothing else: the design proposed a narrowed
+// `Exec /bin/mkdir`, and this language has the one-component `mkdirat` instead, so `docs/authority.txt` does not change. The step id is a name of a
+// manifest (letters, digits, `-`, `_`, `.`, no leading dot, no `..`), one component, which `dir_mkdir` checks again.
+
+// 493 is 0o755.
+fn mode() -> [] int {
+    return 493;
+}
+
+// Is `path` a directory?
+fn present[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] bool {
+    match open_dir(fs, path) {
+        DirOpened::Failed(e) => {
+            return false;
+        }
+        DirOpened::Ok(d) => {
+            dir_close(d);
+            return true;
+        }
+    }
+}
+
+// Make `name` beneath `d`: true when it is a directory afterwards (made, or already there as one is checked by the caller's walk).
+fn make_in[&d, &n](d: &d Dir, name: &n [byte]) -> [dir_write] bool {
+    match dir_mkdir(d, name, mode()) {
+        Done::Ok(n) => {
+            return true;
+        }
+        Done::Failed(e) => {
+            return e == 17;
+        }
+    }
+}
+
+// `steps/<id>/ev` beneath the company directory `dir`, made if missing. `steps` is the path of the operator's `steps` directory. True when the step's
+// `ev` directory is there afterwards.
+pub fn make_ev[&f, &s, &i](fs: &f Fs(""), steps: &s [byte], id: &i [byte]) -> [fs_read(""), dir_read, dir_write] bool {
+    var ok = false;
+    match open_dir(fs, steps) {
+        DirOpened::Failed(e) => {
+            ok = false;
+        }
+        DirOpened::Ok(held) => {
+            var sd = held;
+            borrow sd as &sr in {
+                if make_in(sr, id) {
+                    match dir_enter(sr, id) {
+                        DirOpened::Failed(e) => {
+                            ok = false;
+                        }
+                        DirOpened::Ok(inner) => {
+                            var step_dir = inner;
+                            borrow step_dir as &ir in {
+                                ok = make_in(ir, "ev");
+                            }
+                            dir_close(step_dir);
+                        }
+                    }
+                }
+            }
+            dir_close(sd);
+        }
+    }
+    return ok;
+}

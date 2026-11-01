@@ -949,7 +949,7 @@ own field. Not measured: nothing about a model.
 
 **Status: manifest shape and accessors built and tested; nothing runs a flow yet.** Unit tests `tests/company_flow_test.cho`; `flow-unknown` in
 `tests/conformance/company_change_add.sh`. Derived steps (`<change id>.<template id>`, a pure function of manifest and journal), the runner for
-them and the provisioner that makes their `steps/<id>/ev` are the next parts and are not built: a change in this part still turns into no work.
+them and the provisioner that makes their `steps/<id>/ev` are sections 19 and 20; in this part alone a change turns into no work.
 
 **Manifest.** Root `flows`: an optional object of at most 16 flows, each a name (as a step id is) and an array of 1 to 16 steps in the shape of
 `steps` (an empty array, a name that is not a name or an array that is not an array is `manifest-malformed`). A flow step is held to the rules of a
@@ -970,8 +970,7 @@ kinds its changes will have, so the check is made when a change is taken, and on
 
 **Status: built and tested, no model.** Unit tests `tests/company_derive_test.cho`, `tests/company_change_test.cho`; `tests/conformance/company_derive.sh`
 (`status` and `decide`); a derived `repo.change` step run by the real change worker with the stand-in build tool in `tests/conformance/company_change.sh`
-(`derived:` cases). **Not built:** the provisioner. The operator still makes `steps/<derived id>/ev` by hand (`step-dir-missing` otherwise), so a change
-still needs a person to make one directory per derived step before `forge company run` can start it. Not measured: anything about a model.
+(`derived:` cases). The directory a derived step needs is made by the provisioner (section 20). Not measured: anything about a model.
 
 **What is derived.** For every change the journal holds in the state *admitted* (never a proposed or rejected one), the steps of the flow named after its
 kind, if the manifest has one (a manifest that has none for that kind derives nothing for it; `change add` refuses such a change when the manifest declares
@@ -1007,3 +1006,22 @@ file changes the next derivation, as editing `company.json` changes the steps. T
 check that the file is the one proposed is open (it is the retention work of design section 4.4). (2) A change whose flow has been removed derives no
 step instead of being refused. (3) The company ends when every step, derived included, is accepted; a change admitted later reopens a company that
 said `done`.
+
+## 20. The provisioner (slice 2, part B3, of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status: built and tested, no model** (`derived:` cases of `tests/conformance/company_change.sh`). A worker step needs `steps/<id>/ev` (`step-dir-missing`
+otherwise, section 14), and the operator cannot have made it for a step that did not exist when they prepared the company. So when `forge company run`
+is about to start a **derived** step and its `ev` directory is not there, Forge makes `steps/<id>` and `steps/<id>/ev` (`src/company_provision.cho`):
+one `mkdirat` per directory (`dir_mkdir`, mode 0755 under the umask), beneath the `steps/` directory the operator made, never through a link and
+never replacing anything. A step of the manifest's own is never provisioned: its absence is `step-dir-missing` as before. `steps/` itself is the
+operator's too; without it there is no work directory to make anything in.
+
+**What it can and cannot do.** It holds `dir_write` and nothing else (forge already holds `dir_write`: `docs/authority.txt` is **unchanged**). A name
+at `steps/<id>` that is a file or a link is left as it is and the step is `step-dir-missing`: Forge neither replaces nor follows it. The step id is a
+name the manifest and the derivation checked (letters, digits, `-`, `_`, `.`, no leading dot, no `..`), one path component, which `dir_mkdir`
+checks again. A directory it made stays when the step fails or is killed, and is reused by the next run (`EEXIST` on a directory is fine).
+
+**Where the design and the code differ.** The design (section 3) proposed `Exec /bin/mkdir` narrowed to one program, "whether that is acceptable is a
+design choice for that slice", and this document's author had found no `mkdir` in the language. Edition 9 of the compiler has `dir_mkdir`
+(cancho #595), already in the pinned revision, so the provisioner uses it: a strictly smaller authority (no program started, no `Exec` row) for the
+same effect. The `Exec` option is not taken and `docs/authority.txt` is not touched.
