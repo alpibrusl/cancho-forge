@@ -18,6 +18,7 @@ import forge.company_files;
 import forge.company_graph;
 import forge.company_manifest;
 import forge.company_needs;
+import forge.company_provision;
 import forge.company_run;
 import forge.company_state;
 import forge.company_step;
@@ -567,6 +568,24 @@ fn record_buffer[&h, &f, &i, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpat
 }
 
 // Is there a directory at `path`?
+// Is the step's `ev` directory there? A DERIVED step's is made when it is not (`company_provision`: the operator could not have made it); a step of the
+// manifest's own never is, and its absence is `step-dir-missing` as ever.
+fn ev_ready[&h, &f, &d, &i, &e](heap: &!h Heap, fs: &f Fs(""), dir: &d [byte], id: &i [byte], derived: bool, evdir: &e [byte]) -> [heap, fs_read(""), dir_read, dir_write] bool {
+    if dir_present(fs, evdir) {
+        return true;
+    }
+    if derived == false {
+        return false;
+    }
+    var made = false;
+    let steps = company_cmd.under(heap, dir, "steps");
+    borrow steps as &sb in {
+        made = company_provision.make_ev(fs, buffer.bytes(sb), id);
+    }
+    buffer.drop(heap, steps);
+    return made && dir_present(fs, evdir);
+}
+
 fn dir_present[&f, &p](fs: &f Fs(""), path: &p [byte]) -> [fs_read("")] bool {
     if journal_io.path_ok(fs, path) == false {
         return false;
@@ -671,7 +690,7 @@ fn tool_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n](heap: &!h Heap, fs: &f 
         borrow stepdir as &sb in {
             let evdir = glue(heap, buffer.bytes(sb), "/ev");
             borrow evdir as &eb in {
-                if dir_present(fs, buffer.bytes(eb)) == false {
+                if ev_ready(heap, fs, dir, id, k >= company_manifest.own_step_count(hm), buffer.bytes(eb)) == false {
                     refuse(io, rule_step_dir_missing());
                     say(io, "step: ", id);
                     code = company_step.exit_refused();
@@ -773,7 +792,7 @@ fn change_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n](heap: &!h Heap, fs: &
         borrow stepdir as &sb in {
             let evdir = glue(heap, buffer.bytes(sb), "/ev");
             borrow evdir as &eb in {
-                if dir_present(fs, buffer.bytes(eb)) == false {
+                if ev_ready(heap, fs, dir, id, k >= company_manifest.own_step_count(hm), buffer.bytes(eb)) == false {
                     refuse(io, rule_step_dir_missing());
                     say(io, "step: ", id);
                     code = company_step.exit_refused();
@@ -985,7 +1004,7 @@ fn worker_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n, &z](heap: &!h Heap, f
         borrow stepdir as &sb in {
             let evdir = glue(heap, buffer.bytes(sb), "/ev");
             borrow evdir as &eb in {
-                if dir_present(fs, buffer.bytes(eb)) == false {
+                if ev_ready(heap, fs, dir, id, k >= company_manifest.own_step_count(hm), buffer.bytes(eb)) == false {
                     refuse(io, rule_step_dir_missing());
                     say(io, "step: ", id);
                     code = company_step.exit_refused();
