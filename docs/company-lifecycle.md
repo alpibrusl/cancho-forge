@@ -758,6 +758,13 @@ Forge cannot tell them apart from a good deploy. This document does not claim ot
 
 ### 8.1 Slice 1: `repos` and a `repo.change` step on an existing checkout, no deploy
 
+> **Built (PRs part A and part B), tested with a stand-in build tool only.** What was built, where it differs from the text below, and what
+> was left out are in [`company.md`](company.md) section 16. In short: `repos`, the step keys `repo` and `change_kind`, the operator rows, the
+> change worker `workers/repo_change.cho` over cancho-code's `build --repo` (merged: `docs/repo-patch.md` there), Forge's own bounds on the
+> patch, and the conformance cases named below as `company_change.sh`. **Not built from this list:** `audit never shrinks` (slice 3),
+> `scope.txt`, a supervisor for a Forge killed mid-change. Names changed: the two manifest-shape tests are `repo-required` and
+> `repo-task-invalid`; the patch has `base/` and `tree/` prefixes; `repo-unconfigured` and `repo-kind-mismatch` are found when the step starts.
+
 The smallest unit that proves the thing the maintainer asked first: **the same company, a second piece of work, on a repository that
 already exists.** Nothing else of this document is needed for it: no change records, no flows, no clock, no deploy.
 

@@ -53,6 +53,9 @@ fn is_build(r: company_step.Runner) -> [] bool {
         company_step.Runner::Tool => {
             return false;
         }
+        company_step.Runner::Change => {
+            return false;
+        }
     }
 }
 
@@ -163,7 +166,7 @@ fn with_journal[&h, &f, &x, &c, &i, &m, &d, &j, &o, &s, &b](heap: &!h Heap, fs: 
                     company_cmd.line(io, "reason: ", "the company journal is refused; publish reads only a journal that replays");
                 } else if at < 0 || company_state.accepted_at(st, at) == false {
                     company_cmd.refuse(io, publish_plan.rule_not_accepted());
-                } else if is_build(company_step.runner_of(company_manifest.step_at(hm, at).role)) == false {
+                } else if is_build(company_step.runner_for(company_manifest.step_at(hm, at))) == false {
                     company_cmd.refuse(io, publish_plan.rule_not_accepted());
                     company_cmd.line(io, "reason: ", "only a builder or writer step leaves an artifact to publish");
                 } else {

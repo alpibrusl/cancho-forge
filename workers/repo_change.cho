@@ -1,0 +1,648 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import std.process;
+import forge.company_files;
+import forge.gate_env;
+import forge.gate_task;
+import forge.journal_io;
+import forge.repo_row;
+import forge.repo_task;
+import forge.snapshot;
+import forge.verbs;
+
+// The change worker (docs/company.md section 16; docs/company-lifecycle.md section 4.2): a `sync` worker of the contract
+// (docs/worker-contract.md). One `execute` request on stdin, one response on stdout, exit 0. The task is `repo.change`: it names a checkout of
+// the operator's, a compiler revision and pin files, and the build tool, agent, provider and model to answer a change request with. The
+// request text is the file `change.txt` Forge wrote in `grants.execution_dir`. The worker
+//
+//   1. checks the task again (`repo_task.check`; Forge checked it first, a worker trusts no caller);
+//   2. asks the checkout for its HEAD commit, its tree and whether it is clean (nothing modified, staged or untracked): a dirty one is
+//      `repo-checkout-dirty`, one that is not a git checkout `repo-unusable`;
+//   3. copies the checkout's tracked files to `<ev>/base` (the copy the build tool is given) and to `<ev>/fresh` (a second copy that nobody
+//      touches, for the check), and reads each pin file of the copy: one that is not the operator's `compiler_rev` is `repo-pin-mismatch`
+//      and nothing is built;
+//   4. runs `cancho-build --repo <ev>/base --change <ev>/change.txt --kind K ... --work <ev>/work`, in a group of its own that it kills at
+//      its deadline. The build tool works on a COPY and never sees the checkout;
+//   5. takes `<ev>/work/change.patch` (and `usage.jsonl`) out as regular files of its own (`<ev>/change.patch`), asks the checkout for its
+//      state again and compares: any difference is `repo-checkout-changed`; and applies the patch to `<ev>/fresh` with `patch --dry-run`:
+//      a patch that does not apply is `patch-not-applicable`;
+//   6. writes `report.json` and `build.log` and answers with `change.patch`, `report.json` and `build.log` as evidence.
+//
+// The patch is a CLAIM: Forge reads it again and bounds it (`patch_check`), and its check judges it. This worker never writes the checkout:
+// every command it runs against the checkout is `git rev-parse`, `git status` or `git ls-files`.
+//
+// Authority (`cancho authority`, docs/authority-repo-change.txt): `Exec` narrowed to `/bin/sh` (git, tar, patch, cp and the build tool run
+// through it), the file system for the evidence and the pin files (every path has passed `gate_task.path_ok`), a clock; no network.
+
+fn log_cap() -> [] int {
+    return 8388608;
+}
+
+fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] (buffer.Buffer, bool) {
+    var all = buffer.empty(heap, 1024);
+    var c = getchar(io);
+    var n = 0;
+    while c >= 0 {
+        if n >= 1048576 {
+            return (all, false);
+        }
+        all = buffer.push(heap, all, byte_of(c));
+        n = n + 1;
+        c = getchar(io);
+    }
+    return (all, true);
+}
+
+fn shell_args[&h, &s](heap: &!h Heap, script: &s [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), "-c");
+    b = buffer.push(heap, b, byte_of(0));
+    b = buffer.append(heap, b, script);
+    return buffer.push(heap, b, byte_of(0));
+}
+
+// `/bin/sh -c script`, the shell leading a group of its own that the deadline kills; its output (the script joins stderr to it) captured under
+// `most` bytes. The exit status (0 or more), or -1 not started, -2 the deadline, -3 too much output, -4 a signal.
+fn sh[&h, &x, &c, &s, &v](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, script: &s [byte], env: &v [byte], most: int, deadline_ms: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll] (int, buffer.Buffer) {
+    match process.channels() {
+        process.Channels::Failed(e) => {
+            return (0 - 1, buffer.empty(heap, 1));
+        }
+        process.Channels::Ok(to_child, child_in, from_child, child_out) => {
+            let args = shell_args(heap, script);
+            var out = buffer.empty(heap, 1);
+            var status = 0 - 1;
+            borrow args as &ab in {
+                match exec_spawn_detached(exec, "/bin/sh", buffer.bytes(ab), env, Stdio::Pipe(child_in), Stdio::Pipe(child_out), Stdio::Null) {
+                    Spawned::Failed(e) => {
+                        process.close(to_child, from_child);
+                    }
+                    Spawned::Ok(child) => {
+                        let (got, ran) = process.capture(heap, clock, child, to_child, from_child, "", most, deadline_ms);
+                        buffer.drop(heap, out);
+                        out = got;
+                        match ran {
+                            process.Ran::Code(n) => {
+                                status = n;
+                            }
+                            process.Ran::Signaled(s) => {
+                                status = 0 - 4;
+                            }
+                            process.Ran::TimedOut => {
+                                status = 0 - 2;
+                            }
+                            process.Ran::TooMuch => {
+                                status = 0 - 3;
+                            }
+                            process.Ran::Failed(e) => {
+                                status = 0 - 1;
+                            }
+                        }
+                    }
+                }
+            }
+            buffer.drop(heap, args);
+            return (status, out);
+        }
+    }
+}
+
+fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
+    if journal_io.path_ok(fs, path) == false {
+        return 0 - 2;
+    }
+    match open_write(fs, path) {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, contents);
+            }
+            file_close(file);
+            return rc;
+        }
+    }
+}
+
+fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of(47));
+    return buffer.append(heap, b, name);
+}
+
+fn text_of[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] &s [byte] {
+    if node >= 0 && json.is_string(tape, node) && json.string_plain(tape, node) {
+        return json.string_view(src, tape, node);
+    }
+    return src[0..0];
+}
+
+fn int_of_node[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] int {
+    if node >= 0 && json.is_int(tape, node) && json.fits_int(src, tape, node) {
+        return json.to_int(src, tape, node);
+    }
+    return 0 - 1;
+}
+
+fn is[&s, &t](src: &s [byte], tape: &t [int], node: int, text: &static [byte]) -> [] bool {
+    return node >= 0 && json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+fn entry[&h, &p, &s](heap: &!h Heap, w: json.Writer, id: &static [byte], kind: &static [byte], path: &p [byte], sha: &s [byte], size: int) -> [heap] json.Writer {
+    var x = json.begin_object(heap, w);
+    x = json.put_key(heap, x, "id");
+    x = json.put_string(heap, x, id);
+    x = json.put_key(heap, x, "kind");
+    x = json.put_string(heap, x, kind);
+    x = json.put_key(heap, x, "ref");
+    x = json.put_string(heap, x, path);
+    x = json.put_key(heap, x, "sha256");
+    x = json.put_string(heap, x, sha);
+    x = json.put_key(heap, x, "bytes");
+    x = json.put_int(heap, x, size);
+    return json.end_object(heap, x);
+}
+
+// The response. `code` empty means `succeeded`; otherwise `failed` with that error code. `evidence` is the JSON text of the evidence array
+// ("" for none).
+fn answer[&h, &i, &r, &k, &e](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], code: &static [byte], message: &static [byte], evidence: &e [byte]) -> [heap, io_write] int {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "state");
+    if len(code) == 0 {
+        w = json.put_string(heap, w, "succeeded");
+    } else {
+        w = json.put_string(heap, w, "failed");
+    }
+    w = json.put_key(heap, w, "task_id");
+    w = json.put_string(heap, w, task_id);
+    w = json.put_key(heap, w, "summary");
+    if len(code) == 0 {
+        w = json.put_string(heap, w, "change patch; the report is report.json");
+    } else {
+        w = json.put_string(heap, w, message);
+    }
+    w = json.put_key(heap, w, "evidence");
+    if len(evidence) == 0 {
+        w = json.begin_array(heap, w);
+        w = json.end_array(heap, w);
+    } else {
+        w = json.put_fragment(heap, w, evidence);
+    }
+    w = json.put_key(heap, w, "error");
+    if len(code) == 0 {
+        w = json.put_null(heap, w);
+    } else {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "code");
+        w = json.put_string(heap, w, code);
+        w = json.put_key(heap, w, "message");
+        w = json.put_string(heap, w, message);
+        w = json.put_key(heap, w, "retryable");
+        w = json.put_bool(heap, w, false);
+        w = json.end_object(heap, w);
+    }
+    w = json.end_object(heap, w);
+    let out = json.finish(w);
+    borrow out as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, out);
+    return 0;
+}
+
+fn refuse[&h, &i, &r, &k](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], why: repo_task.Refusal) -> [heap, io_write] int {
+    return answer(heap, io, request_id, task_id, repo_task.rule_name(why), "the task was refused before anything ran", "");
+}
+
+// The report: what was asked of the checkout, what its state was, how the build ended.
+fn report_json[&h, &r, &c, &b, &t](heap: &!h Heap, repo: &r [byte], kind: &c [byte], base: &b [byte], tree: &t [byte], ending: &static [byte], builder_exit: int, patch_bytes: int, log_bytes: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "schema");
+    w = json.put_string(heap, w, "forge-change-report/1");
+    w = json.put_key(heap, w, "repo");
+    w = json.put_string(heap, w, repo);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, kind);
+    w = json.put_key(heap, w, "base");
+    w = json.put_string(heap, w, base);
+    w = json.put_key(heap, w, "tree");
+    w = json.put_string(heap, w, tree);
+    w = json.put_key(heap, w, "ending");
+    w = json.put_string(heap, w, ending);
+    w = json.put_key(heap, w, "builder_exit");
+    w = json.put_int(heap, w, builder_exit);
+    w = json.put_key(heap, w, "patch_bytes");
+    w = json.put_int(heap, w, patch_bytes);
+    w = json.put_key(heap, w, "log_bytes");
+    w = json.put_int(heap, w, log_bytes);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+fn env_block[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var env = buffer.append(heap, buffer.empty(heap, 64), "PATH=");
+    env = buffer.append(heap, env, gate_env.fixed_path());
+    return buffer.push(heap, env, byte_of(0));
+}
+
+// Do the two outputs of `state_script` say the same, and is the second clean?
+fn unchanged[&a, &b](first: &a [byte], second: &b [byte]) -> [] bool {
+    return repo_task.state_ok(second) && repo_task.state_clean(second) && bytes.equal(first, second);
+}
+
+// Does every pin file of the copy `base_dir` pin `rev`? `pins` is the request's array (a missing one: the default `.cancho-rev`).
+fn pins_hold[&h, &f, &d, &s, &t, &v](heap: &!h Heap, fs: &f Fs(""), base_dir: &d [byte], src: &s [byte], tp: &t [int], pins: int, rev: &v [byte]) -> [heap, fs_read(""), dir_read, file_read] bool {
+    if pins < 0 || !json.is_array(tp, pins) || json.count(tp, pins) < 1 || json.count(tp, pins) > 4 {
+        return false;
+    }
+    var ok = true;
+    let n = json.count(tp, pins);
+    var k = pins + 1;
+    var j = 0;
+    while j < n {
+        let name = text_of(src, tp, k);
+        if !repo_row.pin_name_ok(name) {
+            ok = false;
+        } else {
+            let (data, why) = company_files.read_artifact(heap, fs, base_dir, name);
+            var held = false;
+            if why == 0 {
+                borrow data as &dbb in {
+                    held = repo_row.pin_matches(name, buffer.bytes(dbb), rev);
+                }
+            }
+            if !held {
+                ok = false;
+            }
+            buffer.drop(heap, data);
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// What a stage of the shell came to, as the worker's code: "" for success.
+fn shell_fault(status: int, bad: &static [byte]) -> [] &static [byte] {
+    if status == 0 {
+        return "";
+    }
+    if status == 0 - 2 {
+        return "change-timeout";
+    }
+    if status == 0 - 3 {
+        return "change-output-overflow";
+    }
+    return bad;
+}
+
+// The evidence and the answer once the run is over: `build.log` and `report.json` always (they say what happened), `change.patch` when the
+// run left one that passed every stage. `code` empty is `succeeded`.
+fn finish[&h, &i, &f, &r, &k, &p, &q, &b, &t, &u, &w](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), request_id: &r [byte], task_id: &k [byte], exec_dir: &p [byte], repo: &q [byte], kind: &b [byte], base: &t [byte], tree: &u [byte], log: &w [byte], code: &static [byte], message: &static [byte], ending: &static [byte], builder_exit: int, with_patch: bool) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write] int {
+    var patch_bytes = 0;
+    var patch_sha = buffer.empty(heap, 1);
+    if with_patch {
+        let (data, why) = company_files.read_artifact(heap, fs, exec_dir, "change.patch");
+        if why == 0 {
+            buffer.drop(heap, patch_sha);
+            borrow data as &db in {
+                patch_sha = snapshot.hex_digest(heap, buffer.bytes(db));
+                patch_bytes = buffer.size(db);
+            }
+        }
+        buffer.drop(heap, data);
+    }
+    let report = report_json(heap, repo, kind, base, tree, ending, builder_exit, patch_bytes, len(log));
+    let log_path = under(heap, exec_dir, "build.log");
+    let report_path = under(heap, exec_dir, "report.json");
+    let log_sha = snapshot.hex_digest(heap, log);
+    borrow report as &rb in {
+        let report_sha = snapshot.hex_digest(heap, buffer.bytes(rb));
+        var rc = 0;
+        borrow log_path as &lp in {
+            rc = write_file(fs, buffer.bytes(lp), log);
+        }
+        if rc == 0 {
+            borrow report_path as &pp in {
+                rc = write_file(fs, buffer.bytes(pp), buffer.bytes(rb));
+            }
+        }
+        if rc != 0 {
+            answer(heap, io, request_id, task_id, "evidence-unwritable", "the evidence could not be written in the execution directory", "");
+        } else {
+            var w = json.writer(heap, 512);
+            w = json.begin_array(heap, w);
+            borrow log_sha as &ls in {
+                borrow report_sha as &rs in {
+                    w = entry(heap, w, "ev-1", "log", "build.log", buffer.bytes(ls), len(log));
+                    w = entry(heap, w, "ev-2", "report", "report.json", buffer.bytes(rs), buffer.size(rb));
+                    if with_patch && patch_bytes > 0 {
+                        borrow patch_sha as &ps in {
+                            w = entry(heap, w, "ev-3", "patch", "change.patch", buffer.bytes(ps), patch_bytes);
+                        }
+                    }
+                }
+            }
+            w = json.end_array(heap, w);
+            let ev = json.finish(w);
+            borrow ev as &evb in {
+                answer(heap, io, request_id, task_id, code, message, buffer.bytes(evb));
+            }
+            buffer.drop(heap, ev);
+        }
+        buffer.drop(heap, report_sha);
+    }
+    buffer.drop(heap, patch_sha);
+    buffer.drop(heap, log_sha);
+    buffer.drop(heap, log_path);
+    buffer.drop(heap, report_path);
+    buffer.drop(heap, report);
+    return 0;
+}
+
+// A task that has passed `repo_task.check`: the stages of the head of this file.
+fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), request_id: &r [byte], task_id: &k [byte], src: &s [byte], tp: &t [int], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), exec_detached, clock, poll] int {
+    let task = json.get(src, tp, 0, "task");
+    let input = json.get(src, tp, task, "input");
+    let grants = json.get(src, tp, 0, "grants");
+    let repo = text_of(src, tp, json.get(src, tp, input, "repo"));
+    let kind = text_of(src, tp, json.get(src, tp, input, "kind"));
+    let provider = text_of(src, tp, json.get(src, tp, input, "provider"));
+    let model = text_of(src, tp, json.get(src, tp, input, "model"));
+    let rev = text_of(src, tp, json.get(src, tp, input, "compiler_rev"));
+    let pins = json.get(src, tp, input, "pins");
+    var attempts = int_of_node(src, tp, json.get(src, tp, input, "attempts"));
+    var agent_seconds = int_of_node(src, tp, json.get(src, tp, input, "agent_seconds"));
+    if attempts < 0 {
+        attempts = 0 - 1;
+    }
+    let ev = text_of(src, tp, json.get(src, tp, grants, "execution_dir"));
+    let checkout = text_of(src, tp, json.get(src, tp, grants, "checkout"));
+    let tools = text_of(src, tp, json.get(src, tp, grants, "tools_dir"));
+    let checker = text_of(src, tp, json.get(src, tp, grants, "checker"));
+    let agent = text_of(src, tp, json.get(src, tp, grants, "agent"));
+    let env = env_block(heap);
+    let total = repo_task.runner_deadline_ms(timeout_ms);
+    let start = clock_ms(clock);
+    var code = "";
+    var message = "";
+    var ending = "not-started";
+    var builder_exit = 0 - 1;
+    var log = buffer.empty(heap, 1);
+    var state1 = buffer.empty(heap, 1);
+    var with_patch = false;
+    borrow env as &eb in {
+        // 1. the checkout's state
+        let s1 = repo_task.state_script(heap, checkout);
+        borrow s1 as &s1b in {
+            let (status, out) = sh(heap, exec, clock, buffer.bytes(s1b), buffer.bytes(eb), 4096, total);
+            buffer.drop(heap, state1);
+            state1 = out;
+            borrow state1 as &st1 in {
+                if status != 0 || !repo_task.state_ok(buffer.bytes(st1)) {
+                    code = "repo-unusable";
+                    message = "the checkout is not a git checkout the worker can read";
+                } else if !repo_task.state_clean(buffer.bytes(st1)) {
+                    code = "repo-checkout-dirty";
+                    message = "the checkout has modified, staged or untracked files";
+                }
+            }
+        }
+        buffer.drop(heap, s1);
+        // 2. the two copies
+        var copies = 0;
+        while len(code) == 0 && copies < 2 {
+            var sub = "base";
+            if copies == 1 {
+                sub = "fresh";
+            }
+            let ms = repo_task.materialise_script(heap, checkout, ev, sub);
+            borrow ms as &msb in {
+                let (status, out) = sh(heap, exec, clock, buffer.bytes(msb), buffer.bytes(eb), 65536, total);
+                buffer.drop(heap, log);
+                log = out;
+                if status != 0 {
+                    code = "repo-unusable";
+                    message = "the tracked files of the checkout could not be copied";
+                }
+            }
+            buffer.drop(heap, ms);
+            copies = copies + 1;
+        }
+        // 3. the pins of the copy at the base commit
+        if len(code) == 0 {
+            let base_dir = under(heap, ev, "base");
+            borrow base_dir as &bd in {
+                if !pins_hold(heap, fs, buffer.bytes(bd), src, tp, pins, rev) {
+                    code = "repo-pin-mismatch";
+                    message = "a pin file of the checkout at its base commit is not the operator's compiler_rev";
+                }
+            }
+            buffer.drop(heap, base_dir);
+        }
+        // 4. the build
+        if len(code) == 0 {
+            var remaining = total - (clock_ms(clock) - start);
+            if remaining < 1 {
+                remaining = 1;
+            }
+            let bs = repo_task.build_script(heap, tools, ev, checker, agent, kind, provider, model, attempts, agent_seconds);
+            borrow bs as &bsb in {
+                let (status, out) = sh(heap, exec, clock, buffer.bytes(bsb), buffer.bytes(eb), log_cap(), remaining);
+                buffer.drop(heap, log);
+                log = out;
+                builder_exit = status;
+                ending = "exited";
+                if status == 0 {
+                    code = "";
+                } else if status == 1 {
+                    code = "change-stuck";
+                    message = "the build tool gave up: every attempt was refused";
+                } else if status == 2 {
+                    code = "change-refused-args";
+                    message = "the build tool refused its arguments or the repository copy";
+                } else if status == 4 {
+                    code = "change-provider-error";
+                    message = "the build tool could not reach the model provider";
+                } else if status == 0 - 2 {
+                    code = "change-timeout";
+                    message = "the build did not finish inside the worker's deadline; its group was killed";
+                    ending = "timeout";
+                } else if status == 0 - 3 {
+                    code = "change-output-overflow";
+                    message = "the build wrote more than the log cap; its group was killed";
+                    ending = "output-overflow";
+                } else if status == 0 - 1 {
+                    code = "change-not-started";
+                    message = "the shell for the build could not be started";
+                    ending = "not-started";
+                } else {
+                    code = "change-failed";
+                    message = "the build tool ended with an unexpected status";
+                }
+            }
+            buffer.drop(heap, bs);
+        }
+        // 5. the patch, the checkout again, the patch against the fresh copy
+        if len(code) == 0 {
+            let cs = repo_task.collect_script(heap, ev);
+            borrow cs as &csb in {
+                let (status, out) = sh(heap, exec, clock, buffer.bytes(csb), buffer.bytes(eb), 65536, total);
+                if status == 1 {
+                    code = "patch-missing";
+                    message = "the build said done and left no change.patch that is a regular file";
+                } else if status != 0 {
+                    code = "evidence-unwritable";
+                    message = "the patch could not be copied into the execution directory";
+                }
+                buffer.drop(heap, out);
+            }
+            buffer.drop(heap, cs);
+        }
+        if len(code) == 0 {
+            let s2 = repo_task.state_script(heap, checkout);
+            borrow s2 as &s2b in {
+                let (status, out) = sh(heap, exec, clock, buffer.bytes(s2b), buffer.bytes(eb), 4096, total);
+                var same = false;
+                borrow state1 as &st1 in {
+                    borrow out as &ob in {
+                        same = unchanged(buffer.bytes(st1), buffer.bytes(ob));
+                    }
+                }
+                if status != 0 || !same {
+                    code = "repo-checkout-changed";
+                    message = "the checkout is not what it was when the step began";
+                }
+                buffer.drop(heap, out);
+            }
+            buffer.drop(heap, s2);
+        }
+        if len(code) == 0 {
+            let aps = repo_task.apply_script(heap, ev);
+            borrow aps as &apb in {
+                let (status, out) = sh(heap, exec, clock, buffer.bytes(apb), buffer.bytes(eb), 65536, total);
+                if status != 0 {
+                    code = "patch-not-applicable";
+                    message = "the patch does not apply to a fresh copy of the base commit";
+                }
+                buffer.drop(heap, out);
+            }
+            buffer.drop(heap, aps);
+        }
+        if len(code) == 0 {
+            with_patch = true;
+        }
+    }
+    borrow state1 as &s1b in {
+        borrow log as &lb in {
+            finish(heap, io, fs, request_id, task_id, ev, repo, kind, repo_task.state_head(buffer.bytes(s1b)), repo_task.state_tree(buffer.bytes(s1b)), buffer.bytes(lb), code, message, ending, builder_exit, with_patch);
+        }
+    }
+    buffer.drop(heap, state1);
+    buffer.drop(heap, log);
+    buffer.drop(heap, env);
+    return 0;
+}
+
+fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh")) -> [heap, io_read, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), exec_detached, clock, poll] int {
+    let (request, whole) = read_request(heap, io);
+    var code = 0;
+    if !whole {
+        code = 4;
+    }
+    borrow request as &rb in {
+        let src = buffer.bytes(rb);
+        let tape = box_slice(heap, json.tape_len(src), 0);
+        borrow mut tape as &!t in {
+            let tp = contents(t);
+            if whole && json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                let task = json.get(src, tp, 0, "task");
+                let input = json.get(src, tp, task, "input");
+                let limits = json.get(src, tp, 0, "limits");
+                let grants = json.get(src, tp, 0, "grants");
+                let rid = json.get(src, tp, 0, "request_id");
+                let tid = json.get(src, tp, task, "id");
+                let timeout = json.get(src, tp, limits, "timeout_ms");
+                var timeout_ms = 0;
+                if timeout >= 0 && json.is_int(tp, timeout) && json.fits_int(src, tp, timeout) {
+                    timeout_ms = json.to_int(src, tp, timeout);
+                }
+                if is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") && is(src, tp, json.get(src, tp, 0, "verb"), "capabilities") && len(text_of(src, tp, rid)) > 0 {
+                    let reply = verbs.capabilities_reply(heap, text_of(src, tp, rid), "repo-change", "0.1.0", "sync", repo_task.task_type(), repo_task.max_timeout_ms(), 1048576);
+                    borrow reply as &yb in {
+                        io.write_all(io, buffer.bytes(yb));
+                    }
+                    io.newline(io);
+                    buffer.drop(heap, reply);
+                } else if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
+                    code = 4;
+                } else {
+                    var attempts = int_of_node(src, tp, json.get(src, tp, input, "attempts"));
+                    var agent_seconds = int_of_node(src, tp, json.get(src, tp, input, "agent_seconds"));
+                    if attempts < 0 {
+                        attempts = 0 - 1;
+                    }
+                    if agent_seconds < 0 {
+                        agent_seconds = 0 - 1;
+                    }
+                    match repo_task.check(text_of(src, tp, json.get(src, tp, task, "type")), text_of(src, tp, json.get(src, tp, grants, "execution_dir")), text_of(src, tp, json.get(src, tp, grants, "checkout")), text_of(src, tp, json.get(src, tp, grants, "tools_dir")), text_of(src, tp, json.get(src, tp, grants, "checker")), text_of(src, tp, json.get(src, tp, grants, "agent")), text_of(src, tp, json.get(src, tp, input, "repo")), text_of(src, tp, json.get(src, tp, input, "kind")), text_of(src, tp, json.get(src, tp, input, "provider")), text_of(src, tp, json.get(src, tp, input, "model")), text_of(src, tp, json.get(src, tp, input, "compiler_rev")), timeout_ms, attempts, agent_seconds) {
+                        repo_task.Checked::Refused(why) => {
+                            refuse(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), why);
+                        }
+                        repo_task.Checked::Held => {
+                            execute_task(heap, io, fs, clock, exec, text_of(src, tp, rid), text_of(src, tp, tid), src, tp, timeout_ms);
+                        }
+                    }
+                }
+            } else {
+                code = 4;
+            }
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, request);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    release(args);
+    let sh_exec = narrow(exec, "/bin/sh");
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow fs as &f in {
+        borrow clock as &c in {
+            borrow sh_exec as &x in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        code = serve(h, i, f, c, x);
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(clock);
+    release(sh_exec);
+    release(console);
+    release(memory);
+    return code;
+}

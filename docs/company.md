@@ -143,7 +143,7 @@ edit touches is hygiene, not a boundary. (A symbolic link from outside pointing 
 
 | key | meaning | needed by |
 |---|---|---|
-| `workers` | directory holding the worker programs `cancho_code`, `gate_runner`, `check_guard`, `tool_run` and `repo_publish` (built from `workers/*.cho`) | every run (`check_guard` by every check) |
+| `workers` | directory holding the worker programs `cancho_code`, `gate_runner`, `check_guard`, `tool_run`, `repo_publish` and `repo_change` (built from `workers/*.cho`) | every run (`check_guard` by every check) |
 | `tools`, `checker`, `agent` | `forge build`'s `<tools>`, `<checker>`, `<agent>`: the directory of `cancho-build`, the compiler it calls, the agent command | every builder or writer step |
 | `guide` | `forge build`'s `guide=PATH`: the plan guide a builder or writer step's `cancho-build` is started with (`--guide <path>`, carried in the worker request). Absolute, and held at parse time to the rule `forge build` holds its guide to (`gate_task.path_ok`: `A-Za-z0-9._/-` only, no `..`, at most 512 bytes); Forge does not open it. Without it the tool is started with no `--guide`, which the real `cancho-build` refuses unless the step's workdir already holds a valid `plan.json` | optional; in practice every builder or writer step |
 | `gates` | `{"<step id>": {"repo", "revision", "checkout"}}`: what a qa or reviewer step reports the gate of; `repo` must be on the gate runner's allow-list, `revision` a 40-hex commit, `checkout` an absolute path | each qa or reviewer step |
@@ -506,6 +506,23 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 | `patch-kind-invalid` | a `repo.change` patch that is empty, truncated, has other prefixes than `base/` and `tree/`, or holds a rename, a mode change or a binary hunk | 14 | unit `test_a_patch_with_a_rename_is_patch_kind_invalid` and the two after it |
 | `patch-path-denied` | a path of the patch that the operator row's `publish_allow` does not allow, `publish_deny` denies, or that is not a plain relative path | 14 | unit `test_a_patch_outside_publish_allow_is_patch_path_denied`, `test_a_patch_inside_publish_deny_is_patch_path_denied` |
 | `patch-too-large` | more files than `max_patch_files` or more added lines than `max_patch_lines` | 14 | unit `test_a_patch_over_max_patch_lines_or_files_is_patch_too_large` |
+| `repo-unconfigured` | a `repo.change` step whose repository the operator file has no `repos` row for | 1 | run (company_change.sh) `unconfigured` |
+| `repo-kind-mismatch` | the operator row's `kind` is not the manifest's for that repository | 1 | `kindmismatch` |
+| `repo-invalid` | the change worker's task names a repository id or compiler revision that is malformed (a worker check; Forge's own rows already hold them) | 1 | unit |
+| `repo-unusable` | the checkout is not a git checkout the worker can read, or its tracked files could not be copied; holds the step | 14 | `nogit` |
+| `repo-checkout-dirty` | the checkout has modified, staged or untracked files when the step begins; nothing is built; holds the step | 14 | `dirty` |
+| `repo-checkout-changed` | the checkout's HEAD, tree or cleanliness differs when the build ends (the tripwire of design 4.2 item 5, made by the worker); holds the step | 14 | `plant` |
+| `repo-pin-mismatch` | a pin file of the checkout at its base commit is not the operator's `compiler_rev`; nothing is built; holds the step | 14 | `pin` |
+| `patch-not-applicable` | the build's patch does not apply to a fresh copy of the base commit (and is otherwise inside the bounds); holds the step | 14 | `stale` |
+| `patch-missing` | the build said done and left no `change.patch` that is a regular file (a link included); holds the step | 14 | `nopatch`, `linkpatch` |
+| `change-refused` | what a later run prints for a step held by a repository or patch refusal (the specific tag was printed when it happened); `retry:<id>` frees it | 14 | later run of `outside` |
+| `change-stuck` | the build tool gave up (exit 1): `worker-error:` of a `step-failed`, nothing held | 15 | `stuck` |
+| `change-provider-error` | the build tool could not reach the model provider (exit 4): `worker-error:` of a `step-failed` | 15 | `provider` |
+| `change-refused-args` | the build tool refused its arguments or the repository copy (exit 2): `worker-error:` of a `step-failed` | 15 | `usage` |
+| `change-failed` | the build tool ended with a status that is none of 0, 1, 2, 4: `worker-error:` of a `step-failed` | 15 | none (no stand-in mode ends so) |
+| `change-timeout` | the build did not finish inside the worker's deadline (four fifths of `build_timeout_ms`); its group is killed | 15 | `hang` |
+| `change-output-overflow` | the build wrote more than the 8 MiB log cap; its group is killed | 15 | none |
+| `change-not-started` | the shell for the build could not be started | 15 | none |
 | `gate-unknown` | a step's `gate` not in `human_gates`; `decide` about a gate that is neither listed nor `retry:<step id>` | 1 | unit `test_a_gate_that_is_not_a_human_gate_is_refused`; `check_company.sh` `decide: a gate the manifest does not list is gate-unknown` |
 | `budget-missing` | no `budget`, or one of its five numbers absent | 1 | unit `test_a_missing_budget_or_price_table_is_refused` |
 | `price-table-missing` | `budget.price_table` absent (manifest); in the run, a table that is not there, unreadable, or does not price the manifest's model | 1 | unit `test_a_missing_budget_or_price_table_is_refused`; run.sh `no price table`, `a price table without the model` |
@@ -805,9 +822,9 @@ with the checked-in file.
 
 ## 16. `repo.change`: a change request on an existing repository (slice 1 of [`company-lifecycle.md`](company-lifecycle.md))
 
-**Status.** The manifest and operator-file side and the patch bounds are built and unit-tested (this section, part A). The worker and
-the runner (part B) are described in the next paragraphs only once they exist. Nothing here has run with a real model or a real
-`cancho-build --repo`.
+**Status: built and tested with a stand-in build tool** (`tests/conformance/company_change.sh`, unit tests; all run by `scripts/gate.sh`).
+**Not run with the real `cancho-build --repo`, not run with a model, and not run against a real repository.** Slice 1 of the design:
+no change records, no flows, no clock, no publish of a patch, no deploy.
 
 **Manifest.** Root `repos`: an optional array of at most 64 closed objects `{"id", "kind"}`. `id` is a name as a step id is (no dot
 name); `kind` is `library`, `program` or `service` (`repo-kind-invalid`); an id twice is `repo-duplicate`. A step may carry two more
@@ -830,3 +847,60 @@ counted by their headers so a header-looking line inside a hunk is data.
 **Decisions where the design document and the code differ.** (1) `change_kind` is a new optional step key: the design names no source
 for `--kind`, and the tool's default (`feature`) would force a test on a bug fix the operator may not want. (2) The tags `repo-required`,
 `repo-task-invalid` and `repo-change-kind-invalid` are new; the design gives the two manifest-shape tests no tag.
+
+**The step.** `forge company run` starts a `repo.change` step like a builder's: the same refusals that write nothing (`check-missing`,
+`step-dir-missing`, `operator-invalid` for an operator file without `tools`, `checker` or `agent`), plus `repo-unconfigured` (no `repos` row
+for the step's repository) and `repo-kind-mismatch` (the row's `kind` is not the manifest's); then the needs are verified (not delivered),
+`company.step.admitted` is written, the step's `input` is written decoded to `steps/<id>/ev/change.txt`, and the **change worker**
+(`workers/repo_change.cho`, in the operator's `workers` directory beside `cancho_code`, `gate_runner`, `check_guard`, `tool_run` and
+`repo_publish`) is run with a deadline of `build_timeout_ms`. The worker, in order:
+
+1. asks the checkout for HEAD, its tree and whether it is clean (`git rev-parse`, `git status`): `repo-unusable`, `repo-checkout-dirty`;
+2. copies the checkout's **tracked** files (`git ls-files`, `tar`; no `.git`) twice, to `ev/base` (given to the build tool) and `ev/fresh`
+   (nobody touches it; the check applies the patch to a copy of it, as the design's "second copy"). The checkout is never an argument of the
+   build tool, and the worker runs nothing but those read-only git commands against it;
+3. reads each pin file of `ev/base` (`.cancho-rev` and/or `cancho.toml`, the row's `pins`): not the row's `compiler_rev` is
+   `repo-pin-mismatch`, and nothing is built;
+4. runs `cancho-build --repo ev/base --change ev/change.txt --kind K --checker C --work ev/work --agent 'A' --provider P --model M` (plus
+   `--attempts` and `--agent-seconds` when the operator file sets `attempts` and `agent_seconds`) in a process group of its own, killed at
+   its deadline. The agent command is held to a closed character set (`repo_task.agent_ok`) because it goes between quotes in a shell
+   text; the request text never does (it is a file);
+5. takes `ev/work/change.patch` out as a regular file of its own (`patch-missing` for none or a link) with `usage.jsonl`, asks the checkout for
+   its state again (`repo-checkout-changed` for any difference), and applies the patch to `ev/fresh` with `patch --dry-run`
+   (`patch-not-applicable`).
+
+Forge then records the build's spend (whatever the ending), reads `change.patch` itself (a regular file of at most 16 MiB, like any artifact),
+and bounds it with `patch_check` against the row (`patch-kind-invalid`, `patch-path-denied`, `patch-too-large`; a patch the worker found not
+applicable is bounded first, so a rename is named a rename); appends `company.step.change` (`repo`, `base`, `tree`, `patch_sha256`, `files`,
+`added`; replay checks the shape, an older Forge skips it) and runs the step's `check` with the patch and the execution directory as its
+arguments. The check is the operator's program: it should apply the patch to a copy of `ev/fresh`, run the repository's gate (and the
+held-out audit) and print `TOTAL a/b`. Acceptance is unchanged (`a == b`, `b > 0`, Forge ran it); the artifact is `change.patch`.
+
+**What holds and what fails.** A refusal about the repository or the patch (`repo-unusable`, `repo-checkout-dirty`, `repo-checkout-changed`,
+`repo-pin-mismatch`, `patch-missing`, `patch-not-applicable`, `patch-kind-invalid`, `patch-path-denied`, `patch-too-large`) is recorded as
+`company.step.check_unavailable` with that tag and **holds** the step (exit 14); a later run prints `change-refused` and starts nothing until
+`retry:<id>` is approved. A build that ends without a claim (`change-stuck`, `change-provider-error`, `change-refused-args`, `change-timeout`,
+`change-output-overflow`, `change-failed`, `change-not-started`) is `step-failed` with `worker-error: <code>`, exit 15, nothing held, as a
+build's. A patch the check scores below full is `check-failed` as ever (the lying worker). The worker is a task of the step's workspace
+(`steps/<id>/journal.jsonl`, task ids `change-n`) and is never retried by itself: a change spends tokens.
+
+**The checkout is written by nothing here.** `forge company publish` stays the only verb that writes a checkout and it does not take a change
+step (`publish-step-not-accepted`); it never pushes. Applying an accepted patch is a person's `git apply` until slice 2.
+
+**Authority.** The forge binary's report (`docs/authority.txt`) is unchanged. The worker's is `docs/authority-repo-change.txt`: the gate
+runner's rows plus `fs_read`, `dir_read` and `file_read` (the pin files and the patch are read to be hashed), `Exec` narrowed to `/bin/sh`, a
+clock; no network, no signals, no command line. `scripts/gate.sh` compares it with the checked-in file.
+
+**Deferred from the slice, said plainly.** *Audit never shrinks* (`audit-shrank`, `audit/regress/`) is slice 3 of the design and is not built:
+nothing records or compares an audit's `b`. *Scope file:* the design has Forge write `ev/scope.txt` for the worker; the real tool's scope is
+fixed in the tool (`src/**.cho`, `tests/**.cho`), so Forge enforces the row's patterns on the result and writes no `scope.txt`. *Branch:* a
+row's `branch` is accepted and recorded nowhere; the base is the checkout's HEAD. *Kill and resume:* a Forge killed mid-change leaves the
+step admitted and not accepted and the next run admits it again (tested), but the change worker has no supervisor: the build it started may
+still be running and is not reaped (the stand-in test kills it by hand). *`repo-checkout-changed`* is compared by the worker at the end of
+the build, not by Forge from outside; Forge cannot run git. Not measured: whether a model can write such a patch (M-1 of the design).
+
+**More decisions where the design and the code differ.** (3) The throw-away copy is made with `git ls-files` and `tar`, not a git checkout, as
+cancho-code's `--repo` copies with `tar` (its `docs/repo-patch.md`). (4) The patch has `base/` and `tree/` prefixes (`diff -ruN base tree`),
+not `a/` and `b/`; `patch_check` requires them. (5) The check receives the patch and `ev`, not a second copy it makes itself: `ev/fresh` is
+that copy. (6) `repo-unconfigured` and `repo-kind-mismatch` are found when the step starts, not at `forge company check`, which never reads the
+operator file. (7) `compiler_rev` is compared with the pin file of the copy at the base commit by the worker, which holds the file text.

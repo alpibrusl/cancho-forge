@@ -1,0 +1,175 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.test;
+import forge.repo_task;
+
+// Unit tests for src/repo_task.cho: the `repo.change` task (docs/company.md section 16): what a task may say, the shell texts, how the
+// checkout's state is read, the worker codes, and the request. The worker and the runner are tests/conformance/company_change.sh.
+// Run with `cancho test`.
+
+fn flag(b: bool) -> [] int {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+fn tag_of(c: repo_task.Checked) -> [] &static [byte] {
+    match c {
+        repo_task.Checked::Held => {
+            return "";
+        }
+        repo_task.Checked::Refused(why) => {
+            return repo_task.rule_name(why);
+        }
+    }
+}
+
+fn good(ty: &static [byte], ev: &static [byte], ck: &static [byte], agent: &static [byte], kind: &static [byte], rev: &static [byte], timeout: int, attempts: int) -> [] &static [byte] {
+    return tag_of(repo_task.check(ty, ev, ck, "/t", "/c/cancho", agent, "diff", kind, "stand", "m1", rev, timeout, attempts, 0));
+}
+
+fn test_a_good_task_is_held_and_each_fault_has_its_tag() -> [] int {
+    let rev = "f4ead824f33b291a0ad7620a34a0c1346a7abe4f";
+    test.assert_eq(len(good("repo.change", "/ev", "/ck", "stand-in-agent", "bug", rev, 10000, 0)), 0);
+    test.assert(bytes.equal(good("repo.gate", "/ev", "/ck", "a", "bug", rev, 10000, 0), "task-type-invalid"));
+    test.assert(bytes.equal(good("repo.change", "ev", "/ck", "a", "bug", rev, 10000, 0), "path-invalid"));
+    test.assert(bytes.equal(good("repo.change", "/ev", "/ck/../x", "a", "bug", rev, 10000, 0), "path-invalid"));
+    test.assert(bytes.equal(good("repo.change", "/ev", "/ck", "a", "bug", rev, 1999, 0), "limits-invalid"));
+    test.assert(bytes.equal(good("repo.change", "/ev", "/ck", "a", "chore", rev, 10000, 0), "repo-change-kind-invalid"));
+    test.assert(bytes.equal(good("repo.change", "/ev", "/ck", "a; rm -rf x", "bug", rev, 10000, 0), "operator-invalid"));
+    test.assert(bytes.equal(good("repo.change", "/ev", "/ck", "a", "bug", rev, 10000, 21), "operator-invalid"));
+    test.assert(bytes.equal(good("repo.change", "/ev", "/ck", "a", "bug", "f4ead82", 10000, 0), "repo-invalid"));
+    return 0;
+}
+
+fn test_the_agent_command_cannot_carry_shell_syntax() -> [] int {
+    test.assert_eq(flag(repo_task.agent_ok("stand-in-agent")), 1);
+    test.assert_eq(flag(repo_task.agent_ok("/opt/agent --fast=1 --x a,b")), 1);
+    test.assert_eq(flag(repo_task.agent_ok("")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("-x")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a'b")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a\"b")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a$b")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a`b")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a;b")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a|b")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a&b")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a>b")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a\nb")), 0);
+    test.assert_eq(flag(repo_task.agent_ok("a\\b")), 0);
+    return 0;
+}
+
+fn test_words_are_names() -> [] int {
+    test.assert_eq(flag(repo_task.word_ok("claude-haiku-4.5")), 1);
+    test.assert_eq(flag(repo_task.word_ok("-x")), 0);
+    test.assert_eq(flag(repo_task.word_ok(".x")), 0);
+    test.assert_eq(flag(repo_task.word_ok("a b")), 0);
+    test.assert_eq(flag(repo_task.word_ok("")), 0);
+    return 0;
+}
+
+fn test_the_state_of_a_checkout_is_read_from_what_state_script_prints() -> [] int {
+    let a = "0123456789012345678901234567890123456789\n9876543210987654321098765432109876543210\nclean\n";
+    let b = "0123456789012345678901234567890123456789\n9876543210987654321098765432109876543210\ndirty\n";
+    test.assert_eq(flag(repo_task.state_ok(a)), 1);
+    test.assert_eq(flag(repo_task.state_clean(a)), 1);
+    test.assert_eq(flag(repo_task.state_ok(b)), 1);
+    test.assert_eq(flag(repo_task.state_clean(b)), 0);
+    test.assert(bytes.equal(repo_task.state_head(a), "0123456789012345678901234567890123456789"));
+    test.assert(bytes.equal(repo_task.state_tree(a), "9876543210987654321098765432109876543210"));
+    test.assert_eq(flag(repo_task.state_ok("")), 0);
+    test.assert_eq(flag(repo_task.state_ok("fatal: not a git repository\n")), 0);
+    test.assert_eq(flag(repo_task.state_ok("0123456789012345678901234567890123456789\n9876543210987654321098765432109876543210\nclean")), 0);
+    test.assert_eq(len(repo_task.state_head("junk")), 0);
+    return 0;
+}
+
+fn test_the_shell_texts_hold_only_paths_and_closed_words[&h](heap: &!h Heap) -> [heap] int {
+    let s = repo_task.state_script(heap, "/ck");
+    borrow s as &sb in {
+        test.assert(bytes.equal(buffer.bytes(sb), "exec 2>&1; cd /ck || exit 2; git rev-parse --verify HEAD || exit 3; git rev-parse \"HEAD^{tree}\" || exit 3; if [ -z \"$(git status --porcelain --untracked-files=all)\" ]; then echo clean; else echo dirty; fi"));
+    }
+    buffer.drop(heap, s);
+    let m = repo_task.materialise_script(heap, "/ck", "/ev", "base");
+    borrow m as &mb in {
+        test.assert(bytes.equal(buffer.bytes(mb), "exec 2>&1; rm -rf /ev/base /ev/tracked.lst /ev/tracked.tar; mkdir /ev/base || exit 1; cd /ck || exit 2; git ls-files -z > /ev/tracked.lst || exit 3; tar --null -T /ev/tracked.lst -cf /ev/tracked.tar || exit 4; tar -xf /ev/tracked.tar -C /ev/base || exit 5; rm -f /ev/tracked.lst /ev/tracked.tar"));
+    }
+    buffer.drop(heap, m);
+    let b = repo_task.build_script(heap, "/t", "/ev", "/c/cancho", "stand-in-agent", "bug", "stand", "m1", 0, 0);
+    borrow b as &bb in {
+        test.assert(bytes.equal(buffer.bytes(bb), "exec 2>&1; rm -rf /ev/work; cd /ev || exit 2; exec /t/cancho-build --repo /ev/base --change /ev/change.txt --kind bug --checker /c/cancho --work /ev/work --agent 'stand-in-agent' --provider stand --model m1"));
+    }
+    buffer.drop(heap, b);
+    let b2 = repo_task.build_script(heap, "/t", "/ev", "/c/cancho", "a", "feature", "p", "m", 3, 90);
+    borrow b2 as &bb2 in {
+        let t2 = buffer.bytes(bb2);
+        test.assert(len(t2) > 64);
+        test.assert(bytes.equal(t2[len(t2) - 32..len(t2)], " --attempts 3 --agent-seconds 90"));
+    }
+    buffer.drop(heap, b2);
+    let a = repo_task.apply_script(heap, "/ev");
+    borrow a as &ab in {
+        test.assert(bytes.equal(buffer.bytes(ab), "exec 2>&1; patch -p1 --dry-run -s -d /ev/fresh -i /ev/change.patch"));
+    }
+    buffer.drop(heap, a);
+    return 0;
+}
+
+fn test_the_worker_codes_are_known_and_only_repo_and_patch_ones_hold_the_step() -> [] int {
+    test.assert(bytes.equal(repo_task.known_code("repo-checkout-dirty"), "repo-checkout-dirty"));
+    test.assert(bytes.equal(repo_task.known_code("change-stuck"), "change-stuck"));
+    test.assert_eq(len(repo_task.known_code("rm -rf")), 0);
+    test.assert_eq(len(repo_task.known_code("")), 0);
+    test.assert_eq(flag(repo_task.holds_step("repo-checkout-changed")), 1);
+    test.assert_eq(flag(repo_task.holds_step("repo-pin-mismatch")), 1);
+    test.assert_eq(flag(repo_task.holds_step("patch-not-applicable")), 1);
+    test.assert_eq(flag(repo_task.holds_step("change-stuck")), 0);
+    test.assert_eq(flag(repo_task.holds_step("change-timeout")), 0);
+    test.assert_eq(flag(repo_task.holds_step("")), 0);
+    return 0;
+}
+
+fn test_the_request_is_json_with_the_checkout_in_grants_and_not_in_the_input[&h](heap: &!h Heap) -> [heap] int {
+    let pins = "[\".cancho-rev\",\"cancho.toml\"]";
+    let tape0 = box_slice(heap, json.tape_len(pins), 0);
+    borrow mut tape0 as &!tw0 in {
+        test.assert(json.parse(pins, contents(tw0)) > 0);
+        let req = repo_task.request(heap, "change-1-1", 1, "change-1", "diff", "bug", "stand", "m1", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", pins, contents(tw0), 0, 3, 0, 10000, 1048576, "/ev", "/ck", "/t", "/c/cancho", "stand-in-agent");
+        borrow req as &rb in {
+            let src = buffer.bytes(rb);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            borrow mut tape as &!tw in {
+                let tp = contents(tw);
+                test.assert(json.parse(src, tp) > 0);
+                let task = json.get(src, tp, 0, "task");
+                let input = json.get(src, tp, task, "input");
+                let grants = json.get(src, tp, 0, "grants");
+                test.assert(json.string_equals(src, tp, json.get(src, tp, task, "type"), "repo.change"));
+                test.assert(json.string_equals(src, tp, json.get(src, tp, input, "repo"), "diff"));
+                test.assert_eq(json.count(tp, json.get(src, tp, input, "pins")), 2);
+                test.assert(json.get(src, tp, input, "checkout") < 0);
+                test.assert(json.string_equals(src, tp, json.get(src, tp, grants, "checkout"), "/ck"));
+                test.assert(json.string_equals(src, tp, json.get(src, tp, grants, "agent"), "stand-in-agent"));
+                test.assert_eq(json.to_int(src, tp, json.get(src, tp, input, "attempts")), 3);
+            }
+            unbox_slice(heap, tape);
+        }
+        buffer.drop(heap, req);
+    }
+    unbox_slice(heap, tape0);
+    return 0;
+}
+
+fn test_the_task_id_and_deadlines() -> [] int {
+    test.assert_eq(repo_task.runner_deadline_ms(10000), 8000);
+    test.assert(bytes.equal(repo_task.patch_file(), "change.patch"));
+    test.assert(bytes.equal(repo_task.change_file(), "change.txt"));
+    test.assert_eq(flag(repo_task.kind_ok("rename")), 1);
+    test.assert_eq(flag(repo_task.kind_ok("fix")), 0);
+    return 0;
+}
