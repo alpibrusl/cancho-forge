@@ -65,6 +65,7 @@ pub res struct CompanyState {
     gates: map.Map[int],
     admitted: map.Map[int],
     changes: map.Map[int],
+    chginfo: map.Map[int],
     report: journal.Report,
 }
 
@@ -384,6 +385,19 @@ fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -
     return 0;
 }
 
+// The lengths of the four strings a proposed record keeps (repo 1 to 64, kind 1 to 16, title 1 to 200, body hash exactly 64), packed in 20 bits, or -1
+// when one is out of its range. The record's strings are kept decoded in the artifact buffer, in that order, from an offset `change_field` unpacks.
+fn info_lens[&s, &t](src: &s [byte], tp: &t [int]) -> [] int {
+    let r = json.string_length(src, tp, json.get(src, tp, 0, "repo"));
+    let k = json.string_length(src, tp, json.get(src, tp, 0, "ckind"));
+    let t = json.string_length(src, tp, json.get(src, tp, 0, "title"));
+    let h = json.string_length(src, tp, json.get(src, tp, 0, "body_sha256"));
+    if r < 1 || r > 64 || k < 1 || k > 16 || t < 1 || t > 200 || h != 64 {
+        return 0 - 1;
+    }
+    return r + 128 * k + 4096 * t;
+}
+
 // The state of change `id` in `changes`: 0 unknown, 1 proposed, 2 admitted, 3 rejected.
 fn change_state_in[&c, &i](changes: &c map.Map[int], id: &i [byte]) -> [] int {
     return map.get(changes, id, 0);
@@ -408,8 +422,9 @@ fn decide_change[&h, &g](heap: &!h Heap, changes: map.Map[int], gate: &g [byte],
 }
 
 // Apply one complete line (no newline) that must carry `expect` as its `seq`. Answers the two maps and 0, or a rule code.
-fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], scores: &!c [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], changes: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], map.Map[int], buffer.Buffer, int) {
+fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], scores: &!c [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], changes: map.Map[int], info: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], map.Map[int], map.Map[int], buffer.Buffer, int) {
     var gs = gates;
+    var inf = info;
     var ad = admitted;
     var cs = changes;
     var ar = arts;
@@ -470,10 +485,18 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                     borrow cs as &cb in {
                         known = change_state_in(cb, id);
                     }
-                    if named == false || strings == false || field(line, tp, 0, "body_bytes") < 0 || known != 0 {
+                    let packed = info_lens(line, tp);
+                    if named == false || strings == false || field(line, tp, 0, "body_bytes") < 0 || known != 0 || packed < 0 {
                         rule = bad;
                     } else {
                         cs = map.put(heap, cs, id, 1);
+                        let (a0, start) = size_of(ar);
+                        var a1 = put_decoded(heap, a0, line, tp, json.get(line, tp, 0, "repo"));
+                        a1 = put_decoded(heap, a1, line, tp, json.get(line, tp, 0, "ckind"));
+                        a1 = put_decoded(heap, a1, line, tp, json.get(line, tp, 0, "title"));
+                        a1 = put_decoded(heap, a1, line, tp, json.get(line, tp, 0, "body_sha256"));
+                        ar = a1;
+                        inf = map.put(heap, inf, id, start * 1048576 + packed);
                     }
                 } else if bytes.equal(kind, kind_change_admitted()) {
                     var known = 0;
@@ -566,7 +589,7 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
         }
     }
     unbox_slice(heap, tape);
-    return (gs, ad, cs, ar, rule);
+    return (gs, ad, cs, inf, ar, rule);
 }
 
 // `out` with the decoded text of the JSON string at `node` of `src` appended (nothing for a node that is not a string).
@@ -637,6 +660,7 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     var gates = map.empty(heap, 16, 0, 0);
     var admitted = map.empty(heap, 16, 0, 0);
     var changes = map.empty(heap, 16, 0, 0);
+    var chginfo = map.empty(heap, 16, 0, 0);
     var records = 0;
     var good = 0;
     var start = 0;
@@ -655,10 +679,11 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
                         let xa = contents(xw);
                         while k < len(journal_text) && rule == 0 {
                             if int_of(journal_text[k]) == 10 {
-                                let (g, a, c, t, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, sc, xa, gates, admitted, changes, arts);
+                                let (g, a, c, i, t, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, sc, xa, gates, admitted, changes, chginfo, arts);
                                 gates = g;
                                 admitted = a;
                                 changes = c;
+                                chginfo = i;
                                 arts = t;
                                 if r == 0 {
                                     records = records + 1;
@@ -678,11 +703,11 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     }
     let torn = len(journal_text) - journal.after_last_newline(journal_text);
     let report = journal.Report { records: records, valid_bytes: good, total_bytes: len(journal_text), torn_bytes: torn, tasks: 0, rule: rule, line: bad_line };
-    return CompanyState { accepted: accepted, spend: spend, held: held, scores: scores, arts: arts, art_at: art_at, gates: gates, admitted: admitted, changes: changes, report: report };
+    return CompanyState { accepted: accepted, spend: spend, held: held, scores: scores, arts: arts, art_at: art_at, gates: gates, admitted: admitted, changes: changes, chginfo: chginfo, report: report };
 }
 
 pub fn drop[&h](heap: &!h Heap, s: CompanyState) -> [heap] int {
-    let CompanyState { accepted, spend, held, scores, arts, art_at, gates, admitted, changes, report } = s;
+    let CompanyState { accepted, spend, held, scores, arts, art_at, gates, admitted, changes, chginfo, report } = s;
     unbox_slice(heap, accepted);
     unbox_slice(heap, spend);
     unbox_slice(heap, held);
@@ -692,6 +717,7 @@ pub fn drop[&h](heap: &!h Heap, s: CompanyState) -> [heap] int {
     map.drop(heap, gates);
     map.drop(heap, admitted);
     map.drop(heap, changes);
+    map.drop(heap, chginfo);
     return 0;
 }
 
@@ -743,6 +769,39 @@ pub fn gate_state[&g, &s](s: &s CompanyState, gate: &g [byte]) -> [] int {
 // How many times step `step` was admitted (the resume assertion: an accepted step is not admitted again).
 pub fn admitted_count[&i, &s](s: &s CompanyState, step: &i [byte]) -> [] int {
     return map.get(s.admitted, step, 0);
+}
+
+// A field of change `id`'s proposed record, as the journal wrote it: 0 repo, 1 kind, 2 title, 3 SHA-256 of the request. Empty for a change the journal
+// does not hold or a `which` outside the four.
+pub fn change_field[&i, &s](s: &s CompanyState, id: &i [byte], which: int) -> [] &s [byte] {
+    let text = buffer.bytes(s.arts);
+    let v = map.get(s.chginfo, id, 0);
+    if v <= 0 || which < 0 || which > 3 {
+        return text[0..0];
+    }
+    let start = v / 1048576;
+    let lens = v % 1048576;
+    let r = lens % 128;
+    let k = lens / 128 % 32;
+    let t = lens / 4096;
+    var at = start;
+    var len_of = r;
+    if which >= 1 {
+        at = at + r;
+        len_of = k;
+    }
+    if which >= 2 {
+        at = at + k;
+        len_of = t;
+    }
+    if which == 3 {
+        at = at + t;
+        len_of = 64;
+    }
+    if at + len_of > len(text) {
+        return text[0..0];
+    }
+    return text[at..at + len_of];
 }
 
 // The state of change `id`: 0 unknown, 1 proposed, 2 admitted, 3 rejected.

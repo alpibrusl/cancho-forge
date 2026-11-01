@@ -6,6 +6,7 @@ import std.bytes;
 import std.io;
 import std.json;
 import forge.company_budget;
+import forge.company_derive;
 import forge.company_graph;
 import forge.company_manifest;
 import forge.company_state;
@@ -516,7 +517,7 @@ pub fn status_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, arg
                 refuse(io, task.rule_name(task.Rule::PathInvalid));
                 code = 2;
             } else {
-                code = status_of(heap, fs, io, buffer.bytes(mp), buffer.bytes(jp), as_json);
+                code = status_of(heap, fs, io, dir, buffer.bytes(mp), buffer.bytes(jp), as_json);
             }
         }
     }
@@ -525,7 +526,7 @@ pub fn status_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, arg
     return code;
 }
 
-fn status_of[&h, &f, &i, &m, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, mpath: &m [byte], jpath: &j [byte], as_json: bool) -> [heap, fs_read(""), file_read, io_write] int {
+fn status_of[&h, &f, &i, &d, &m, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], as_json: bool) -> [heap, fs_read(""), file_read, io_write] int {
     let (text, errno) = read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
     var code = 1;
     if errno != 0 {
@@ -537,7 +538,13 @@ fn status_of[&h, &f, &i, &m, &j](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, mpat
                     refuse(io, company_manifest.rule_name(why));
                 }
                 company_manifest.ManifestResult::Held(held) => {
-                    code = status_with(heap, fs, io, held, jpath, as_json);
+                    let (ext, why) = company_derive.load(heap, fs, dir, jpath, held);
+                    if why != 0 {
+                        refuse(io, company_derive.rule_of_code(why));
+                        company_manifest.drop(heap, ext);
+                    } else {
+                        code = status_with(heap, fs, io, ext, jpath, as_json);
+                    }
                 }
             }
         }
@@ -683,7 +690,7 @@ pub fn decide_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, arg
                                 code = 3;
                             }
                             lock.Lock::Held(held) => {
-                                code = decide_locked(heap, fs, io, buffer.bytes(mp), buffer.bytes(jp), arg(args, 4), verdict, buffer.bytes(rb));
+                                code = decide_locked(heap, fs, io, dir, buffer.bytes(mp), buffer.bytes(jp), arg(args, 4), verdict, buffer.bytes(rb));
                                 lock.let_go(held);
                             }
                         }
@@ -700,7 +707,7 @@ pub fn decide_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, arg
 }
 
 // The lock is held: read the manifest, then decide against it.
-fn decide_locked[&h, &f, &i, &m, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, mpath: &m [byte], jpath: &j [byte], gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn decide_locked[&h, &f, &i, &d, &m, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     let (text, errno) = read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
     var code = 1;
     if errno != 0 {
@@ -712,7 +719,13 @@ fn decide_locked[&h, &f, &i, &m, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: 
                     refuse(io, company_manifest.rule_name(why));
                 }
                 company_manifest.ManifestResult::Held(held) => {
-                    code = decide_with(heap, fs, io, held, jpath, gate, verdict, reason);
+                    let (ext, why) = company_derive.load(heap, fs, dir, jpath, held);
+                    if why != 0 {
+                        refuse(io, company_derive.rule_of_code(why));
+                        company_manifest.drop(heap, ext);
+                    } else {
+                        code = decide_with(heap, fs, io, ext, jpath, gate, verdict, reason);
+                    }
                 }
             }
         }
