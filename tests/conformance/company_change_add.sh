@@ -2,7 +2,7 @@
 # `forge company change add` and the `admit:<id>` gate end to end (docs/company.md section 17; docs/company-lifecycle.md sections 4.1 and 4.4). The
 # program under test is the forge binary; this script is the oracle only (sha256sum, cat, grep). It reaches every tag of the verb: repo-unknown,
 # change-kind-invalid, change-justification-missing, change-malformed (a title of two lines, a request that cannot be read, an empty one),
-# change-too-large, and gate-unknown for an `admit:` gate with no proposed change behind it; and the good paths: a bug admitted by the act, a
+# change-too-large, flow-unknown (a manifest with flows and none named after the kind), and gate-unknown for an `admit:` gate with no proposed change behind it; and the good paths: a bug admitted by the act, a
 # feature that waits, an admit decision that admits it, a rejected one that rejects it, a decision recorded before the proposal that counts for
 # nothing, the request file and its hash, the journal holding the hash and never the text, and `status format=json` counting the changes.
 # Prints `ok ...` / `FAIL ...` lines; exit 1 if any FAIL or the build failed.
@@ -87,6 +87,16 @@ expect "a decided change has no admit: gate left" 1 "refusal: gate-unknown"
 rm -r "$co/changes"
 add diff bug defect "t" "$w/req1.txt";            expect "no changes/ directory: the request cannot be written, exit 3, no record" 3 "error: cannot write changes/"
 check "that wrote no record (eight so far: four proposals, two admissions, two decisions)" [ "$(lines)" = 8 ]
+
+# a manifest that declares flows must have the flow named after the kind
+co2="$w/co2"
+mkdir -p "$co2/changes" || exit 1
+printf '{"id":"co","mission":"m","model":{"provider":"stand","name":"m1"},"budget":{"input":1,"output":1,"cache_write":1,"cache_read":1,"max_cost":1,"price_table":"prices.json"},"human_gates":["go"],"roles":["builder"],"repos":[{"id":"diff","kind":"library"}],"flows":{"bug":[{"id":"fix","role":"builder","task_type":"repo.change","needs":[],"input":"x","check":"c.sh"}]},"steps":[{"id":"s","role":"builder","task_type":"repo.change","needs":[],"input":"x","check":"c.sh","repo":"diff","change_kind":"bug"}]}' > "$co2/company.json"
+"$F" company change add "$co2" repo=diff kind=feature justification=operator "title=t" "file=$w/req1.txt" > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "a manifest with flows and none named feature: flow-unknown" 1 "refusal: flow-unknown"
+check "that wrote nothing" sh -c "[ ! -e '$co2/company.journal' ] && [ -z \"\$(ls '$co2/changes')\" ]"
+"$F" company change add "$co2" repo=diff kind=bug justification=defect "title=t" "file=$w/req1.txt" > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "the kind that has its flow is taken: chg-0001 admitted" 0 "change chg-0001: admitted"
 
 if [ "$fail" -eq 0 ]; then echo "ok   company change add: done"; fi
 exit "$fail"

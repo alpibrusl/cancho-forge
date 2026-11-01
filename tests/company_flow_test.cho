@@ -1,0 +1,189 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_manifest;
+
+// Unit tests for the `flows` of src/company_manifest.cho (docs/company-lifecycle.md section 3, docs/company.md section 18): named templates of steps in
+// the shape of `steps`, held to the same rules with their own ids, and to three more. Run with `cancho test`.
+
+fn doc[&h, &f](heap: &!h Heap, flows: &f [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},");
+    o = buffer.append(heap, o, "\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},");
+    o = buffer.append(heap, o, "\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\"],");
+    if len(flows) > 0 {
+        o = buffer.append(heap, o, "\"flows\":");
+        o = buffer.append(heap, o, flows);
+        o = buffer.append(heap, o, ",");
+    }
+    return buffer.append(heap, o, "\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}");
+}
+
+fn rule_of[&h, &f](heap: &!h Heap, flows: &f [byte]) -> [heap] &static [byte] {
+    let d = doc(heap, flows);
+    var out = "";
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                out = company_manifest.rule_name(r);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return out;
+}
+
+fn fix() -> [] &static [byte] {
+    return "{\"id\":\"fix\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"}";
+}
+
+fn test_a_manifest_with_no_flows_is_valid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, ""), ""));
+    return 0;
+}
+
+fn test_a_flow_of_a_repo_change_step_with_no_repo_is_valid[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":[{\"id\":\"fix\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"}]}"), ""));
+    return 0;
+}
+
+fn test_two_flows_may_reuse_one_step_id_and_the_manifests_own_id[&h](heap: &!h Heap) -> [heap] int {
+    let two = "{\"bug\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}],\"feature\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}";
+    test.assert(bytes.equal(rule_of(heap, two), ""));
+    return 0;
+}
+
+fn test_a_flow_step_naming_a_repo_is_flow_repo_forbidden[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":[{\"id\":\"fix\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\",\"repo\":\"diff\"}]}"), "flow-repo-forbidden"));
+    return 0;
+}
+
+fn test_a_flow_step_needing_a_step_outside_the_flow_is_flow_needs_foreign[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":[{\"id\":\"gate\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"a\"],\"input\":\"x\"}]}"), "flow-needs-foreign"));
+    return 0;
+}
+
+fn test_a_flow_needing_its_own_step_is_valid_and_a_ring_is_step_cycle[&h](heap: &!h Heap) -> [heap] int {
+    let two = "{\"bug\":[{\"id\":\"repro\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"gate\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"repro\"],\"input\":\"x\"}]}";
+    test.assert(bytes.equal(rule_of(heap, two), ""));
+    let ring = "{\"bug\":[{\"id\":\"p\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"q\"],\"input\":\"x\"},{\"id\":\"q\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"p\"],\"input\":\"x\"}]}";
+    test.assert(bytes.equal(rule_of(heap, ring), "step-cycle"));
+    return 0;
+}
+
+fn one_step[&h](heap: &!h Heap, out: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    var o = out;
+    if n > 0 {
+        o = buffer.append(heap, o, ",");
+    }
+    o = buffer.append(heap, o, "{\"id\":\"s");
+    o = buffer.push_nat(heap, o, n);
+    return buffer.append(heap, o, "\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}");
+}
+
+fn flow_of[&h](heap: &!h Heap, steps: int) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 2048), "{\"bug\":[");
+    var k = 0;
+    while k < steps {
+        o = one_step(heap, o, k);
+        k = k + 1;
+    }
+    return buffer.append(heap, o, "]}");
+}
+
+fn test_a_flow_of_seventeen_steps_is_flow_too_long_and_sixteen_is_valid[&h](heap: &!h Heap) -> [heap] int {
+    let ok = flow_of(heap, 16);
+    borrow ok as &ob in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(ob)), ""));
+    }
+    buffer.drop(heap, ok);
+    let long = flow_of(heap, 17);
+    borrow long as &lb in {
+        test.assert(bytes.equal(rule_of(heap, buffer.bytes(lb)), "flow-too-long"));
+    }
+    buffer.drop(heap, long);
+    return 0;
+}
+
+fn test_a_flow_step_is_held_to_the_step_rules[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":[{\"id\":\"x\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"gate\":\"nope\"}]}"), "gate-unknown"));
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":[{\"id\":\"x\",\"role\":\"product\",\"task_type\":\"none\",\"needs\":[],\"input\":\"x\"}]}"), "role-unknown"));
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":[{\"id\":\"x\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\"}]}"), "check-missing"));
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":[{\"id\":\"x\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\",\"unknown\":1}]}"), "manifest-unknown-field"));
+    let twice = "{\"bug\":[{\"id\":\"x\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"},{\"id\":\"x\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}";
+    test.assert(bytes.equal(rule_of(heap, twice), "step-id-duplicate"));
+    return 0;
+}
+
+fn test_flows_that_are_not_an_object_of_nonempty_step_arrays_are_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "[]"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":[]}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "{\"bug\":{}}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "{\"bad name\":[{\"id\":\"x\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}"), "manifest-malformed"));
+    return 0;
+}
+
+fn test_the_accessors_read_the_flows_in_order[&h](heap: &!h Heap) -> [heap] int {
+    let flows = "{\"bug\":[{\"id\":\"repro\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"i1\"},{\"id\":\"fix\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[\"repro\"],\"input\":\"i2\",\"check\":\"c.sh\"}],\"feature\":[{\"id\":\"build\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"i3\"}]}";
+    let d = doc(heap, flows);
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert_eq(company_manifest.flow_count(mr), 2);
+                    test.assert(bytes.equal(company_manifest.flow_name_at(mr, 0), "bug"));
+                    test.assert(bytes.equal(company_manifest.flow_name_at(mr, 1), "feature"));
+                    test.assert_eq(company_manifest.flow_index(mr, "feature"), 1);
+                    test.assert_eq(company_manifest.flow_index(mr, "feedback"), 0 - 1);
+                    test.assert_eq(company_manifest.flow_step_count(mr, 0), 2);
+                    test.assert_eq(company_manifest.flow_step_count(mr, 1), 1);
+                    test.assert_eq(company_manifest.flow_step_count(mr, 5), 0);
+                    let second = company_manifest.flow_step_at(mr, 0, 1);
+                    test.assert(bytes.equal(company_manifest.step_id(mr, second), "fix"));
+                    test.assert(bytes.equal(company_manifest.step_input(mr, second), "i2"));
+                    test.assert(bytes.equal(company_manifest.step_need(mr, second, 0), "repro"));
+                    test.assert(company_manifest.is_repo_change(second));
+                    let third = company_manifest.flow_step_at(mr, 1, 0);
+                    test.assert(bytes.equal(company_manifest.step_id(mr, third), "build"));
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_manifest_without_flows_has_none[&h](heap: &!h Heap) -> [heap] int {
+    let d = doc(heap, "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert_eq(company_manifest.flow_count(mr), 0);
+                    test.assert_eq(company_manifest.flow_index(mr, "bug"), 0 - 1);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_the_flow_refusal_tags_are_the_documented_ones() -> [] int {
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::FlowTooLong), "flow-too-long"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::FlowRepoForbidden), "flow-repo-forbidden"));
+    test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::FlowNeedsForeign), "flow-needs-foreign"));
+    return 0;
+}

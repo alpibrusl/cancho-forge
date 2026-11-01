@@ -944,3 +944,24 @@ the verb does not hold (the `repo.change` worker already records the base it bui
 slice 4. Records written now therefore count, as the design says of older ones, as outside every window. (3) There is no `company.change.rejected`
 record: a rejection is the `admit:` decision itself, and replay derives the state. (4) The record's kind is `ckind` because `kind` is the journal's
 own field. Not measured: nothing about a model.
+
+## 18. Flows: named templates of steps (slice 2, part B1, of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status: manifest shape and accessors built and tested; nothing runs a flow yet.** Unit tests `tests/company_flow_test.cho`; `flow-unknown` in
+`tests/conformance/company_change_add.sh`. Derived steps (`<change id>.<template id>`, a pure function of manifest and journal), the runner for
+them and the provisioner that makes their `steps/<id>/ev` are the next parts and are not built: a change in this part still turns into no work.
+
+**Manifest.** Root `flows`: an optional object of at most 16 flows, each a name (as a step id is) and an array of 1 to 16 steps in the shape of
+`steps` (an empty array, a name that is not a name or an array that is not an array is `manifest-malformed`). A flow step is held to the rules of a
+manifest step with its own ids: role, task type, `check`, `gate`, `contract` / `library`, ids unique **within the flow** (two flows, or a flow and
+`steps`, may use one id), `needs` among the flow's own steps and no ring (`step-cycle`), plus: more than 16 steps `flow-too-long`; a `repo` key
+`flow-repo-forbidden` (a derived `repo.change` step takes the repository of its change, so the template names none; a `repo.change` flow step needs
+a `check`, not a `repo`); a `needs` entry that is no step of the same flow `flow-needs-foreign`. A manifest with no `flows` is read exactly as before.
+
+**`change add`.** A manifest that declares `flows` must have the flow named after the kind of every change it takes (`bug`, `feature`,
+`compiler-bump`, `feedback`): otherwise `flow-unknown`, exit 1, nothing written. A manifest with no `flows` still takes changes (part A), which
+nothing yet acts on.
+
+**Accessors** (`company_manifest`): `flow_count`, `flow_name_at`, `flow_index`, `flow_step_count`, `flow_step_at` (a `Step`, read with the ordinary
+`step_*` readers). **Where the design and the code differ:** the design makes `flow-unknown` a manifest-time refusal; a manifest cannot know the
+kinds its changes will have, so the check is made when a change is taken, and only for manifests that opted in with `flows`.
