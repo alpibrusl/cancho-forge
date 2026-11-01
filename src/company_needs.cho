@@ -1,0 +1,231 @@
+edition 9;
+module forge.company_needs;
+
+import std.buffer;
+import std.bytes;
+import std.dirs;
+import std.io;
+import std.json;
+import forge.company_cmd;
+import forge.company_files;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_state;
+import forge.company_step;
+import forge.journal_io;
+
+// The needs of a worker step (split from src/company_runner.cho, which was at its 2,000-line ceiling; behaviour unchanged): what a step is
+// given of the steps it needs, checked against the journal before the step is admitted. `take_needs` is the one entry point.
+
+fn say[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
+    return company_cmd.line(io, label, value);
+}
+
+fn refuse[&i, &t](io: &!i Io, tag: &t [byte]) -> [io_write] int {
+    return company_cmd.refuse(io, tag);
+}
+
+fn hex_of[&h, &b](heap: &!h Heap, data: &b [byte]) -> [heap] buffer.Buffer {
+    return company_files.hex_of(heap, data);
+}
+
+// ---- needs (task 8c) -------------------------------------------------------------------------------------------------------
+
+// The needs of step `id`, `needs` (`company_step.needs_text`, from the journal). FIRST every need is checked (`check_need`) and its
+// bytes kept: each artifact is read again beneath its directory by `read_artifact`, as at acceptance, and must be the step's own
+// artifact (`company_step.artifact_rel`) with the SHA-256 the journal recorded. The first that is not stops the step before it is
+// admitted: `refusal: artifact-invalid`, `step:`, `need:`, `artifact:`, `reason: needs-missing|needs-changed`, exit 14, and
+// NOTHING is written or removed anywhere (not even a hold: the step is not at fault, and the next run checks again, so putting the
+// accepted bytes back lets it run). Only when all passed, and with `deliver` (a builder or writer step): the names Forge owns in
+// `evdir` (`needs.json` and every `needs-*`) left by an earlier start are removed, then the very bytes checked are written,
+// `needs-<need id>-<artifact name>` each, and `needs.json` last (none for a step with nothing to give). 0 or the exit status.
+pub fn take_needs[&h, &f, &i, &m, &d, &n, &k, &e](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], id: &n [byte], needs: &k [byte], deliver: bool, evdir: &e [byte]) -> [heap, fs_read(""), dir_read, dir_write, file_read, file_write, io_write] int {
+    if len(needs) == 0 && deliver == false {
+        return 0;
+    }
+    var code = 0;
+    var count = 0;
+    let tape = box_slice(heap, json.tape_len(needs), 0);
+    borrow mut tape as &!tw in {
+        if len(needs) > 0 {
+            if json.parse(needs, contents(tw)) <= 0 {
+                code = company_step.exit_io();
+            } else if json.is_array(contents(tw), 0) == false {
+                code = company_step.exit_io();
+            } else {
+                count = json.count(contents(tw), 0);
+            }
+        }
+    }
+    if code != 0 {
+        say(io, "error: cannot read the needs of step ", id);
+    }
+    // Every need checked, its bytes appended to `all`, and where in `spans` (start, length).
+    var all = buffer.empty(heap, 256);
+    let spans = box_slice(heap, 2 * count + 2, 0);
+    borrow tape as &tr in {
+        let tp = contents(tr);
+        var j = 0;
+        while j < count && code == 0 {
+            let (data, c) = check_need(heap, fs, io, hm, dir, id, needs, tp, json.at(tp, 0, j));
+            code = c;
+            var start = 0;
+            borrow all as &ab in {
+                start = buffer.size(ab);
+            }
+            borrow data as &db in {
+                all = buffer.append(heap, all, buffer.bytes(db));
+                borrow mut spans as &!sw in {
+                    contents(sw)[2 * j] = start;
+                    contents(sw)[2 * j + 1] = buffer.size(db);
+                }
+            }
+            buffer.drop(heap, data);
+            j = j + 1;
+        }
+        if code == 0 && deliver {
+            borrow all as &ab in {
+                borrow spans as &sb in {
+                    code = give_needs(heap, fs, io, hm, id, needs, tp, count, buffer.bytes(ab), contents(sb), evdir);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, all);
+    unbox_slice(heap, spans);
+    unbox_slice(heap, tape);
+    return code;
+}
+
+// All needs passed: clear what an earlier start left in `evdir`, write each copy (`all` sliced by `spans`), then `needs.json`.
+fn give_needs[&h, &f, &i, &m, &n, &k, &t, &a, &s, &e](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, hm: &m company_manifest.Manifest, id: &n [byte], needs: &k [byte], tp: &t [int], count: int, all: &a [byte], sp: &s [int], evdir: &e [byte]) -> [heap, fs_read(""), dir_read, dir_write, file_write, io_write] int {
+    var code = 0;
+    if journal_io.path_ok(fs, evdir) == false {
+        say(io, "error: cannot open the execution directory of step ", id);
+        return company_step.exit_io();
+    }
+    match open_dir(fs, evdir) {
+        DirOpened::Failed(e) => {
+            say(io, "error: cannot open the execution directory of step ", id);
+            code = company_step.exit_io();
+        }
+        DirOpened::Ok(opened) => {
+            var ed = opened;
+            borrow ed as &edr in {
+                clear_needs(heap, edr);
+                var j = 0;
+                while j < count && code == 0 {
+                    let need = json.string_view(needs, tp, json.get(needs, tp, json.at(tp, 0, j), "step"));
+                    let at = company_graph.index_of(hm, need);
+                    var runner = company_step.Runner::Unsupported;
+                    if at >= 0 {
+                        runner = company_step.runner_for(company_manifest.step_at(hm, at));
+                    }
+                    let name = company_step.needs_name(heap, need, runner);
+                    borrow name as &nb in {
+                        if company_files.put_beneath(edr, buffer.bytes(nb), all[sp[2 * j]..sp[2 * j] + sp[2 * j + 1]]) != 0 {
+                            say(io, "error: cannot give step ", id);
+                            code = company_step.exit_io();
+                        }
+                    }
+                    buffer.drop(heap, name);
+                    j = j + 1;
+                }
+                if code == 0 && len(needs) > 0 {
+                    if company_files.put_beneath(edr, company_step.needs_file(), needs) != 0 {
+                        say(io, "error: cannot write needs.json for step ", id);
+                        code = company_step.exit_io();
+                    }
+                }
+            }
+            dir_close(ed);
+        }
+    }
+    return code;
+}
+
+// Remove beneath `d` every name Forge gives a step (`needs.json`, `needs-*`), left by an earlier start: what a step is given is
+// exactly the current needs. `unlinkat` removes a link itself; a directory of such a name is left (its removal fails, and the
+// write over it then fails as an I/O error).
+fn clear_needs[&h, &d](heap: &!h Heap, d: &d Dir) -> [heap, dir_read, dir_write] int {
+    let names = dirs.list(heap, d, 65536);
+    var removed = 0;
+    borrow names as &nr in {
+        var i = 0;
+        while i < dirs.count(nr) {
+            let nm = dirs.name(nr, i);
+            var ours = bytes.equal(nm, company_step.needs_file());
+            if len(nm) > 6 {
+                if bytes.equal(nm[0..6], "needs-") {
+                    ours = true;
+                }
+            }
+            if ours {
+                match dir_remove(d, nm) {
+                    Done::Ok(n) => {
+                        removed = removed + 1;
+                    }
+                    Done::Failed(e) => {
+                        removed = removed;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+    dirs.drop(heap, names);
+    return removed;
+}
+
+// One need, the object at `node` of the needs list `src`, checked: its bytes and 0, or the exit status of the refusal (printed).
+fn check_need[&h, &f, &i, &m, &d, &n, &s, &t](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], id: &n [byte], src: &s [byte], tp: &t [int], node: int) -> [heap, fs_read(""), dir_read, file_read, io_write] (buffer.Buffer, int) {
+    let need = json.string_view(src, tp, json.get(src, tp, node, "step"));
+    let art = json.get(src, tp, node, "artifact");
+    let sha = json.get(src, tp, node, "sha256");
+    let at = company_graph.index_of(hm, need);
+    var runner = company_step.Runner::Unsupported;
+    if at >= 0 {
+        runner = company_step.runner_for(company_manifest.step_at(hm, at));
+    }
+    let rel = company_step.artifact_rel(heap, need, runner);
+    var why = 2;
+    var data = buffer.empty(heap, 1);
+    borrow rel as &rb in {
+        if buffer.size(rb) > 0 && json.string_equals(src, tp, art, buffer.bytes(rb)) {
+            // The directory the artifact is beneath: the company directory for a person's step (`company.json`, which
+            // `needs_text` leaves out), else the need's execution directory (`artifact_rel` matched, so the runner is real).
+            var adir = buffer.append(heap, buffer.empty(heap, 64), dir);
+            if bytes.equal(buffer.bytes(rb), company_step.artifact_name(company_step.Runner::Person)) == false {
+                adir = buffer.append(heap, buffer.append(heap, buffer.append(heap, adir, "/steps/"), need), "/ev");
+            }
+            borrow adir as &ab in {
+                buffer.drop(heap, data);
+                let (got, w) = company_files.read_artifact(heap, fs, buffer.bytes(ab), company_step.artifact_name(runner));
+                data = got;
+                why = w;
+            }
+            buffer.drop(heap, adir);
+            if why == 0 {
+                borrow data as &db in {
+                    let hex = hex_of(heap, buffer.bytes(db));
+                    borrow hex as &hb in {
+                        if json.string_equals(src, tp, sha, buffer.bytes(hb)) == false {
+                            why = 5;
+                        }
+                    }
+                    buffer.drop(heap, hex);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, rel);
+    if why != 0 {
+        refuse(io, company_step.rule_artifact_invalid());
+        say(io, "step: ", id);
+        say(io, "need: ", need);
+        say(io, "artifact: ", json.string_view(src, tp, art));
+        say(io, "reason: ", company_step.needs_reason(why));
+        return (data, company_step.exit_check_unavailable());
+    }
+    return (data, 0);
+}
