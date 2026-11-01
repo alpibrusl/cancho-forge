@@ -141,13 +141,17 @@ fn add_checked[&h, &f, &i, &d, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f Fs
     var code = 1;
     let kc = company_change.kind_code(kind);
     var known = false;
+    var flowless = false;
     borrow man as &mm in {
         known = company_manifest.repo_index(mm, repo) >= 0;
+        flowless = company_manifest.flow_count(mm) > 0 && company_manifest.flow_index(mm, kind) < 0;
     }
     if known == false {
         company_cmd.refuse(io, "repo-unknown");
     } else if kc == 0 {
         company_cmd.refuse(io, company_change.rule_kind_invalid());
+    } else if flowless {
+        company_cmd.refuse(io, company_change.rule_flow_unknown());
     } else if company_change.justification_ok(kc, why) == false {
         company_cmd.refuse(io, company_change.rule_justification_missing());
     } else if company_change.title_ok(title) == false {

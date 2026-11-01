@@ -844,6 +844,10 @@ ones by `tests/conformance/journal_files.cho`):
 | `repo-kind-invalid` | a `repos` entry of the manifest whose `kind` is not `library`, `program` or `service` (`docs/company.md` section 16) | `test_a_repos_row_with_a_kind_outside_the_three_is_repo_kind_invalid` |
 | `repo-duplicate` | two `repos` entries with the same `id` | `test_two_repos_with_one_id_are_repo_duplicate` |
 | `repo-unknown` | a step's `repo` that no `repos` entry has; and the `repo=` of `forge company change add` when the manifest does not list it | `test_a_step_naming_a_repo_the_manifest_does_not_list_is_repo_unknown` |
+| `flow-too-long` | a flow of `flows` with more than 16 steps | `test_a_flow_of_seventeen_steps_is_flow_too_long_and_sixteen_is_valid` |
+| `flow-repo-forbidden` | a flow step with a `repo` key (a derived `repo.change` step takes the repository of its change) | `test_a_flow_step_naming_a_repo_is_flow_repo_forbidden` |
+| `flow-needs-foreign` | a flow step whose `needs` names a step that is not of the same flow | `test_a_flow_step_needing_a_step_outside_the_flow_is_flow_needs_foreign` |
+| `flow-unknown` | `forge company change add` against a manifest that declares `flows` but has none named after the change's kind | `flow-unknown` cases of `tests/conformance/company_change_add.sh` |
 | `change-malformed` | `forge company change add` with a title that is not one line of 1 to 200 bytes of plain text, or a request file that cannot be read or is empty (exit 1, nothing written) | `change add` cases of `tests/conformance/company_change_add.sh`; `test_a_title_is_one_line_of_at_most_200_bytes` |
 | `change-kind-invalid` | a change `kind` that is not `bug`, `feature`, `compiler-bump` or `feedback` | `test_the_four_kinds_and_no_other`; conformance `company_change_add.sh` |
 | `change-justification-missing` | a change whose justification the kind does not allow (`defect` for a `bug`, `maintenance` for a `compiler-bump`, `operator` or `goal:<id>` for a `feature` or `feedback`) | `test_a_kind_allows_only_its_justifications`; conformance `company_change_add.sh` |

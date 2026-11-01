@@ -15,6 +15,7 @@ import std.json;
 //     "budget": { "input", "output", "cache_write", "cache_read", "max_cost", "price_table" },
 //     "human_gates": [name...], "roles": [role...],
 //     "repos": [ { "id", "kind": "library" | "program" | "service" } ... ]?,
+//     "flows": { "<flow name>": [ step... ] ... }?,
 //     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "contract"?, "library"?, "gate"?,
 //                  "repo"?, "change_kind"? } ... ] }
 //
@@ -42,6 +43,11 @@ import std.json;
 //      gate (not in `human_gates`)                                                       gate-unknown
 //   8. a `needs` entry that is no step id                                                step-needs-unknown
 //   9. a step that needs itself, or any cycle                                            step-cycle
+//  10. `flows` (docs/company-lifecycle.md section 3): each flow is an array of at most 16 steps in the shape of `steps`, held to the same
+//      rules (5, 6, 7, 8, 9 above, with its own ids); and to these, in order:
+//      a flow longer than 16 steps                                                      flow-too-long
+//      a `repo` key in a flow step (a derived step takes the change's repository)       flow-repo-forbidden
+//      a `needs` entry that is no step of the same flow                                 flow-needs-foreign
 //
 // Names (a step id, a gate, a role) are 1 to 64 bytes of letters, digits, `-`, `_` and `.`, written without an escape: a control
 // character or a space in an id is `manifest-malformed`, a value like any other, never a trap. A step id is also a directory name
@@ -91,6 +97,12 @@ pub enum Refusal {
     RepoTaskInvalid,
     // A step's `change_kind` that is not `bug`, `feature`, `refactor` or `rename` (the kinds of `cancho-build --kind`).
     RepoChangeKindInvalid,
+    // A flow of `flows` with more than 16 steps.
+    FlowTooLong,
+    // A flow step that names a `repo`: a derived `repo.change` step takes the repository of its change.
+    FlowRepoForbidden,
+    // A flow step whose `needs` names a step that is not of the same flow.
+    FlowNeedsForeign,
     // No `budget` object, or one of its five numbers is absent.
     BudgetMissing,
     // No `budget.price_table`, or an empty one.
@@ -156,6 +168,15 @@ pub fn rule_name(r: Refusal) -> [] &static [byte] {
         Refusal::RepoChangeKindInvalid => {
             return "repo-change-kind-invalid";
         }
+        Refusal::FlowTooLong => {
+            return "flow-too-long";
+        }
+        Refusal::FlowRepoForbidden => {
+            return "flow-repo-forbidden";
+        }
+        Refusal::FlowNeedsForeign => {
+            return "flow-needs-foreign";
+        }
         Refusal::BudgetMissing => {
             return "budget-missing";
         }
@@ -218,6 +239,7 @@ pub res struct Manifest {
     steps: int,
     gates: int,
     repos: int,
+    flows: int,
     step_count: int,
     input: int,
     output: int,
@@ -266,7 +288,8 @@ pub fn max_repos() -> [] int {
 // ---- the checks -----------------------------------------------------------------------------------------------------------
 // Each answers 0 for held, else a code: 1 malformed, 2 unknown field, 3 duplicate, 4 needs unknown, 5 cycle, 6 role unknown, 7 task
 // type, 8 check missing, 9 gate unknown, 10 budget missing, 11 price table missing, 12 contract on a role that builds nothing, 13 library on a role that builds nothing, 14 library that is not a module name, 15 library without a contract,
-// 16 repo kind, 17 repo duplicate, 18 repo unknown, 19 repo required, 20 repo on the wrong task type, 21 change kind.
+// 16 repo kind, 17 repo duplicate, 18 repo unknown, 19 repo required, 20 repo on the wrong task type, 21 change kind, 22 flow too long, 23 repo in a flow step,
+// 24 flow needs a step of another flow.
 
 fn refusal_of(code: int) -> [] Refusal {
     if code == 2 {
@@ -328,6 +351,15 @@ fn refusal_of(code: int) -> [] Refusal {
     }
     if code == 21 {
         return Refusal::RepoChangeKindInvalid;
+    }
+    if code == 22 {
+        return Refusal::FlowTooLong;
+    }
+    if code == 23 {
+        return Refusal::FlowRepoForbidden;
+    }
+    if code == 24 {
+        return Refusal::FlowNeedsForeign;
     }
     return Refusal::ManifestMalformed;
 }
@@ -717,7 +749,7 @@ fn repo_listed[&s, &t, &n](src: &s [byte], tp: &t [int], repos: int, name: &n [b
 // The `repo` and `change_kind` of one step (docs/company-lifecycle.md section 8.1): a `repo.change` step names a repository of `repos`
 // (19 without one, 18 for one that is not listed), may name a `change_kind`, and takes no `contract` or `library`; any other task type
 // names neither (20).
-fn repo_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, tcode: int, repos: int) -> [] int {
+fn repo_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, tcode: int, repos: int, in_flow: bool) -> [] int {
     let repo = json.get(src, tp, step, "repo");
     let kind = json.get(src, tp, step, "change_kind");
     if tcode != 4 {
@@ -728,6 +760,12 @@ fn repo_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, tcode: int, 
     }
     if json.get(src, tp, step, "contract") >= 0 || json.get(src, tp, step, "library") >= 0 {
         return 20;
+    }
+    if in_flow {
+        if kind >= 0 && !change_kind_ok(json.string_view(src, tp, kind)) {
+            return 21;
+        }
+        return 0;
     }
     if repo < 0 {
         return 19;
@@ -806,7 +844,7 @@ fn repos_rules_code[&s, &t](src: &s [byte], tp: &t [int], repos: int) -> [] int 
 }
 
 // Role, task type, check and gate of one step, against the roles in use and the human gates.
-fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, gates: int, repos: int) -> [] int {
+fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, gates: int, repos: int, in_flow: bool) -> [] int {
     let role_node = json.get(src, tp, step, "role");
     let role = role_code(json.string_view(src, tp, role_node));
     if role < 0 || !in_names(src, tp, roles, role_node) {
@@ -820,7 +858,7 @@ fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, 
     if (role == 0 || role == 4) && (check < 0 || len(json.string_view(src, tp, check)) == 0) {
         return 8;
     }
-    let repo_code = repo_rules_code(src, tp, step, tcode, repos);
+    let repo_code = repo_rules_code(src, tp, step, tcode, repos, in_flow);
     if repo_code != 0 {
         return repo_code;
     }
@@ -948,9 +986,90 @@ fn graph_code[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], steps: i
     return code;
 }
 
+// The most flows, and the most steps of one (docs/company-lifecycle.md section 3).
+pub fn max_flows() -> [] int {
+    return 16;
+}
+
+pub fn max_flow_steps() -> [] int {
+    return 16;
+}
+
+// `flows`: an object of at most 16 flows, each a name and an array of 1 to 16 steps. The shape of every flow, then its rules, in the order of the header.
+fn flows_code[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], flows: int, roles: int, gates: int) -> [heap] int {
+    if !json.is_object(tp, flows) || json.count(tp, flows) > max_flows() {
+        return 1;
+    }
+    let n = json.count(tp, flows);
+    var j = flows + 1;
+    var k = 0;
+    while k < n {
+        if !json.string_plain(tp, j) || !name_ok(json.string_view(src, tp, j), 64) {
+            return 1;
+        }
+        var e = flows + 1;
+        var q = 0;
+        while q < k {
+            if bytes.equal(json.string_view(src, tp, j), json.string_view(src, tp, e)) {
+                return 1;
+            }
+            e = json.skip(tp, e + 1);
+            q = q + 1;
+        }
+        let arr = j + 1;
+        if !json.is_array(tp, arr) || json.count(tp, arr) < 1 {
+            return 1;
+        }
+        if json.count(tp, arr) > max_flow_steps() {
+            return 22;
+        }
+        var i = 0;
+        while i < json.count(tp, arr) {
+            let c = step_shape_code(src, tp, json.at(tp, arr, i));
+            if c != 0 {
+                return c;
+            }
+            i = i + 1;
+        }
+        j = json.skip(tp, arr);
+        k = k + 1;
+    }
+    j = flows + 1;
+    k = 0;
+    while k < n {
+        let arr = j + 1;
+        let dup = duplicate_code(src, tp, arr);
+        if dup != 0 {
+            return dup;
+        }
+        var i = 0;
+        while i < json.count(tp, arr) {
+            let step = json.at(tp, arr, i);
+            if json.get(src, tp, step, "repo") >= 0 {
+                return 23;
+            }
+            let c = step_rules_code(src, tp, step, roles, gates, 0 - 1, true);
+            if c != 0 {
+                return c;
+            }
+            i = i + 1;
+        }
+        var g = graph_code(heap, src, tp, arr);
+        if g == 4 {
+            g = 24;
+        }
+        if g != 0 {
+            return g;
+        }
+        j = json.skip(tp, arr);
+        k = k + 1;
+    }
+    return 0;
+}
+
 // Everything but the size and the JSON: the root object `0` of the tape over `src`.
 fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] int {
-    let keys = keys_code(src, tp, 0, "id mission model budget human_gates roles repos steps");
+    let keys = keys_code(src, tp, 0, "id mission model budget human_gates roles repos flows steps");
     if keys != 0 {
         return keys;
     }
@@ -1016,13 +1135,21 @@ fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] 
     }
     i = 0;
     while i < json.count(tp, steps) {
-        let c = step_rules_code(src, tp, json.at(tp, steps, i), roles, gates, repos);
+        let c = step_rules_code(src, tp, json.at(tp, steps, i), roles, gates, repos, false);
         if c != 0 {
             return c;
         }
         i = i + 1;
     }
-    return graph_code(heap, src, tp, steps);
+    let g = graph_code(heap, src, tp, steps);
+    if g != 0 {
+        return g;
+    }
+    let flows = json.get(src, tp, 0, "flows");
+    if flows >= 0 {
+        return flows_code(heap, src, tp, flows, roles, gates);
+    }
+    return 0;
 }
 
 // ---- parse ----------------------------------------------------------------------------------------------------------------
@@ -1052,6 +1179,7 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
     var steps = 0 - 1;
     var gates = 0 - 1;
     var repos = 0 - 1;
+    var flows = 0 - 1;
     var count = 0;
     var input = 0;
     var output = 0;
@@ -1067,6 +1195,7 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
         steps = json.get(text, tp, 0, "steps");
         gates = json.get(text, tp, 0, "human_gates");
         repos = json.get(text, tp, 0, "repos");
+        flows = json.get(text, tp, 0, "flows");
         count = json.count(tp, steps);
         input = json.to_int(text, tp, json.get(text, tp, budget, "input"));
         output = json.to_int(text, tp, json.get(text, tp, budget, "output"));
@@ -1074,11 +1203,11 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
         cache_read = json.to_int(text, tp, json.get(text, tp, budget, "cache_read"));
         max_cost = json.to_int(text, tp, json.get(text, tp, budget, "max_cost"));
     }
-    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
+    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, flows: flows, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
 }
 
 pub fn drop[&h](heap: &!h Heap, m: Manifest) -> [heap] int {
-    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, step_count, input, output, cache_write, cache_read, max_cost } = m;
+    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, flows, step_count, input, output, cache_write, cache_read, max_cost } = m;
     buffer.drop(heap, text);
     unbox_slice(heap, tape);
     return 0;
@@ -1190,16 +1319,79 @@ pub fn library_name_ok[&n](name: &n [byte]) -> [] bool {
 
 // Step `i`, 0-based; an `i` outside 0 to `step_count - 1` is the first step.
 pub fn step_at[&m](m: &m Manifest, i: int) -> [] Step {
-    let tp = contents(m.tape);
-    let src = buffer.bytes(m.text);
     var at = i;
     if at < 0 || at >= m.step_count {
         at = 0;
     }
-    let node = json.at(tp, m.steps, at);
+    return step_of_node(m, json.at(contents(m.tape), m.steps, at));
+}
+
+// The step whose object is node `node` of the tape.
+fn step_of_node[&m](m: &m Manifest, node: int) -> [] Step {
+    let tp = contents(m.tape);
+    let src = buffer.bytes(m.text);
     let role = role_code(json.string_view(src, tp, json.get(src, tp, node, "role")));
     let tcode = type_code(json.string_view(src, tp, json.get(src, tp, node, "task_type")));
     return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), contract: json.get(src, tp, node, "contract"), library: json.get(src, tp, node, "library"), gate: json.get(src, tp, node, "gate"), repo: json.get(src, tp, node, "repo"), change_kind: json.get(src, tp, node, "change_kind") };
+}
+
+// ---- flows ----------------------------------------------------------------------------------------------------------------
+
+// The key node of flow number `k` of `flows` (the array is the next node), or -1.
+fn flow_key[&m](m: &m Manifest, k: int) -> [] int {
+    let tp = contents(m.tape);
+    if m.flows < 0 || k < 0 || k >= json.count(tp, m.flows) {
+        return 0 - 1;
+    }
+    var j = m.flows + 1;
+    var q = 0;
+    while q < k {
+        j = json.skip(tp, j + 1);
+        q = q + 1;
+    }
+    return j;
+}
+
+// How many flows the manifest declares (0 for a manifest with no `flows`).
+pub fn flow_count[&m](m: &m Manifest) -> [] int {
+    if m.flows < 0 {
+        return 0;
+    }
+    return json.count(contents(m.tape), m.flows);
+}
+
+pub fn flow_name_at[&m](m: &m Manifest, k: int) -> [] &m [byte] {
+    return text_at(m, flow_key(m, k));
+}
+
+// The number of the flow called `name`, or -1.
+pub fn flow_index[&m, &n](m: &m Manifest, name: &n [byte]) -> [] int {
+    var k = 0;
+    while k < flow_count(m) {
+        if bytes.equal(flow_name_at(m, k), name) {
+            return k;
+        }
+        k = k + 1;
+    }
+    return 0 - 1;
+}
+
+// The steps of flow `k`; 0 for none.
+pub fn flow_step_count[&m](m: &m Manifest, k: int) -> [] int {
+    let key = flow_key(m, k);
+    if key < 0 {
+        return 0;
+    }
+    return json.count(contents(m.tape), key + 1);
+}
+
+// Step `i` of flow `k` (the first step of the manifest's `steps` for an index outside the flow: callers check the counts).
+pub fn flow_step_at[&m](m: &m Manifest, k: int, i: int) -> [] Step {
+    let key = flow_key(m, k);
+    if key < 0 || i < 0 || i >= flow_step_count(m, k) {
+        return step_at(m, 0);
+    }
+    return step_of_node(m, json.at(contents(m.tape), key + 1, i));
 }
 
 pub fn step_id[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
