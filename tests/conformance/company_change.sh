@@ -205,10 +205,36 @@ run "$w/co-hang" "$w/op-hang.json"
 pid=$(cat "$w/co-hang/steps/chg/ev/work/pids.txt" 2> /dev/null)
 check "hang: the build is ended at the worker's deadline (change-timeout, exit 15) and its group is gone" sh -c "[ \$(cat '$w/rc') = 15 ] && grep -qx 'worker-error: change-timeout' '$w/out' && [ -n '$pid' ] && ! kill -0 '$pid' 2> /dev/null"
 
-# ---- publish stays the only verb that writes a checkout, and it does not take a change step
-printf '{"workers":"%s","tools":"%s","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent","repos":{"diff":{"kind":"library","checkout":"%s","compiler_rev":"%s","publish_allow":["src/**"],"max_patch_files":3,"max_patch_lines":9},"x":{"kind":"library","checkout":"%s","compiler_rev":"%s","publish_allow":["src/**"],"max_patch_files":3,"max_patch_lines":9}},"publish":{"chg":{"repo":"alpibrusl/cancho-diff","checkout":"%s","files":{"project.cho":"src/diff.cho"}}}}' "$w/workers" "$w/tools" "$w/ck1" "$REV" "$w/ck1" "$REV" "$w/ck1" > "$w/op-pub.json"
+# ---- publish of an accepted patch (docs/company.md section 21): applied in cancho to the checkout at the base commit, on a fresh branch, with its
+# provenance, committed, never pushed
+git -C "$w/ck1" remote add origin https://github.com/alpibrusl/cancho-diff.git
+git -C "$w/ck1" config user.email forge@example.invalid; git -C "$w/ck1" config user.name forge
+home=$(git -C "$w/ck1" symbolic-ref --short HEAD)
+pubop() { # name, extra row fields
+  printf '{"workers":"%s","tools":"%s","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent","repos":{"diff":{"kind":"library","slug":"alpibrusl/cancho-diff","checkout":"%s","compiler_rev":"%s","publish_allow":["src/**"],"max_patch_files":3,"max_patch_lines":9%s}}}' "$w/workers" "$w/tools" "$w/ck1" "$REV" "$2" > "$w/$1.json"
+}
+pubop op-pub ""
 "$F" company publish "$w/co1" "$w/op-pub.json" chg forge/chg > "$w/out" 2> /dev/null; echo $? > "$w/rc"
-check "publish: a change step is not a step publish takes (publish-step-not-accepted), the checkout untouched" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: publish-step-not-accepted' '$w/out' && [ -z \"\$(git -C '$w/ck1' status --porcelain --untracked-files=all)\" ] && [ \"\$(git -C '$w/ck1' branch | wc -l)\" = 1 ]"
+check "publish: an accepted change step is published: exit 0, published and commit lines" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'published: forge/chg' '$w/out' && grep -q '^commit: ' '$w/out'"
+check "publish: the branch holds the patched file (the patch applied in cancho) and a provenance of its own" sh -c "git -C '$w/ck1' show forge/chg:src/a.cho | tail -1 | grep -qx edited && git -C '$w/ck1' show forge/chg:docs/provenance/chg.md | grep -q 'base commit' && git -C '$w/ck1' show forge/chg:docs/provenance/chg.md | grep -q '$base'"
+check "publish: exactly the patch's file and the provenance changed" sh -c "[ \"\$(git -C '$w/ck1' diff --name-only $home forge/chg | sort | tr '\\n' ' ')\" = 'docs/provenance/chg.md src/a.cho ' ]"
+check "publish: the checkout is back on its branch, clean, and its file is the one it was" sh -c "[ \"\$(git -C '$w/ck1' symbolic-ref --short HEAD)\" = '$home' ] && [ -z \"\$(git -C '$w/ck1' status --porcelain --untracked-files=all)\" ] && ! tail -1 '$w/ck1/src/a.cho' | grep -qx edited"
+check "publish: steps/chg/pr.md is written and nothing was pushed" sh -c "[ -s '$w/co1/steps/chg/pr.md' ] && [ -z \"\$(git -C '$w/ck1' for-each-ref refs/remotes)\" ]"
+"$F" company publish "$w/co1" "$w/op-pub.json" chg forge/chg > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "publish: the same branch again is publish-branch-exists, exit 1" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: publish-branch-exists' '$w/out'"
+pubop op-noslug ""
+sed 's/"slug":"alpibrusl\/cancho-diff",//' "$w/op-noslug.json" > "$w/op-noslug2.json"
+"$F" company publish "$w/co1" "$w/op-noslug2.json" chg forge/other > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "publish: a repos row without a slug is publish-not-configured" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: publish-not-configured' '$w/out'"
+printf 'moved\n' > "$w/ck1/README.md"; git_in "$w/ck1" add README.md; git_in "$w/ck1" commit -q -m moved
+"$F" company publish "$w/co1" "$w/op-pub.json" chg forge/stale > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "publish: the checkout moved since the patch was made: patch-base-stale, exit 1, no branch" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: patch-base-stale' '$w/out' && ! git -C '$w/ck1' rev-parse --verify --quiet refs/heads/forge/stale > /dev/null"
+git_in "$w/ck1" reset -q --hard "$base"
+cp "$w/co1/steps/chg/ev/change.patch" "$w/kept.patch"
+printf '\n' >> "$w/co1/steps/chg/ev/change.patch"
+"$F" company publish "$w/co1" "$w/op-pub.json" chg forge/tampered > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "publish: a patch edited after acceptance is publish-artifact-changed, exit 1, no branch" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: publish-artifact-changed' '$w/out' && ! git -C '$w/ck1' rev-parse --verify --quiet refs/heads/forge/tampered > /dev/null"
+cp "$w/kept.patch" "$w/co1/steps/chg/ev/change.patch"
 
 # ---- a patch edited after acceptance: the next step that needs it is refused
 mkrepo ck4; operator op4 "$w/ck4"
