@@ -1,0 +1,270 @@
+edition 9;
+module forge.repo_call;
+
+import std.buffer;
+import std.io;
+import std.json;
+import std.map;
+import forge.dispatch;
+import forge.gate_run;
+import forge.journal;
+import forge.journal_io;
+import forge.lock;
+import forge.repo_task;
+import forge.retry;
+import forge.task;
+import forge.worker;
+
+// Forge's side of a `repo.change` task (docs/company.md section 16): one call takes a task from nothing to a state in the journal of a
+// workspace, as `forge.tool_call.run` does for `tool.run`, with the change worker (`workers/repo_change.cho`) as the worker:
+//
+//   task.proposed, task.approved   (human: the operator, whose file named the repository, the checkout and the build tool)
+//   the task is checked            (forge.repo_task.check: a refusal is a `refusal` record and the task stays `approved`)
+//   task.ready, task.running, execution.started
+//   the change worker is started   (forge.worker.execute: a real child process, a deadline, an output cap, the evidence recomputed)
+//   a refusal record               (when the ending is one: its rule tag; and the worker's own `error.code`, one of `repo_task.known_code`)
+//   execution.finished             (worker, basis "claimed")
+//   task.verification | ready | blocked
+//
+// A change **writes** (it spends a model's tokens), so it is never retried by itself (`retry-write-refused`): the operator decides to spend
+// more by approving `retry:<step>`. What the worker claims is a CLAIM: nothing here accepts it; the runner bounds the patch itself and the
+// step's check judges it (src/company_runner.cho).
+
+pub enum Outcome {
+    Refused(repo_task.Refusal),
+    Journal(int),
+    // The run ended; whether the worker claimed a patch (a `succeeded` reply).
+    Ended(dispatch.Ending, bool),
+}
+
+pub struct Finished {
+    outcome: Outcome,
+    state: int,
+    number: int,
+    attempts: int,
+    // The worker's own `error.code` of the last attempt when it is one it has (`repo_task.known_code`), else "".
+    worker_code: &static [byte],
+}
+
+fn code_of[&h, &o](heap: &!h Heap, out: &o [byte]) -> [heap] &static [byte] {
+    var code = "";
+    let tape = box_slice(heap, json.tape_len(out), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(out, tp) > 0 && json.is_object(tp, 0) {
+            let c = json.get(out, tp, json.get(out, tp, 0, "error"), "code");
+            if json.is_string(tp, c) && json.string_plain(tp, c) {
+                code = repo_task.known_code(json.string_view(out, tp, c));
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return code;
+}
+
+// Run the task. `journal_path` is the workspace's journal (the caller holds its lock); `workers` the directory holding `repo_change`. The
+// texts are the operator's (`src`, its tape `tp`, `pins` a node of it or -1) and the manifest's.
+pub fn run[&h, &f, &x, &w, &c, &j, &r, &t, &i, &o, &d, &k, &a, &p, &m, &v, &s, &u, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], repo: &r [byte], kind: &t [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts_ceiling: int, agent_seconds: int, checkout: &o [byte], tools_dir: &d [byte], checker: &k [byte], agent: &a [byte], execution_dir: &e [byte], timeout_ms: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write] Finished {
+    let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
+    if report.rule != 0 || recovered.errno != 0 {
+        map.drop(heap, existing);
+        var rule = report.rule;
+        if rule == 0 {
+            rule = 0 - 1;
+        }
+        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, attempts: 0, worker_code: "" };
+    }
+    let id = repo_task.task_id(heap, report.tasks + 1);
+    var state = 0;
+    var attempts = 0;
+    var outcome = Outcome::Journal(0 - 1);
+    var worker_code = "";
+    borrow id as &ib in {
+        let tid = buffer.bytes(ib);
+        let fresh = report.records == 0;
+        var seq = report.records + 1;
+        var tasks = existing;
+        let (t1, s1) = gate_run.move_to(heap, fs, journal_path, tasks, seq, tid, task.State::Proposed, task.Actor::Human, fresh);
+        let (t2, s2) = gate_run.move_to(heap, fs, journal_path, t1, s1, tid, task.State::Approved, task.Actor::Human, false);
+        tasks = t2;
+        seq = s2;
+        match repo_task.check(repo_task.task_type(), execution_dir, checkout, tools_dir, checker, agent, repo, kind, provider, model, rev, timeout_ms, attempts_ceiling, agent_seconds) {
+            repo_task.Checked::Refused(why) => {
+                seq = gate_run.note(heap, fs, journal_path, seq, tid, repo_task.rule_name(why), false);
+                outcome = Outcome::Refused(why);
+            }
+            repo_task.Checked::Held => {
+                let (t3, s3) = gate_run.move_to(heap, fs, journal_path, tasks, seq, tid, task.State::Ready, task.Actor::Forge, false);
+                let (t4, s4) = gate_run.move_to(heap, fs, journal_path, t3, s3, tid, task.State::Running, task.Actor::Forge, false);
+                tasks = t4;
+                seq = gate_run.note_execution(heap, fs, journal_path, s4, "execution.started", tid, "");
+                if seq < 0 {
+                    outcome = Outcome::Journal(0 - 1);
+                } else {
+                    attempts = 1;
+                    let request_id = gate_run.request_id_of(heap, tid, attempts);
+                    borrow request_id as &rb in {
+                        let req = repo_task.request(heap, buffer.bytes(rb), attempts, tid, repo, kind, provider, model, rev, src, tp, pins, attempts_ceiling, agent_seconds, timeout_ms, 1048576, execution_dir, checkout, tools_dir, checker, agent);
+                        borrow req as &qb in {
+                            let (out, ran) = worker.run(heap, exec, workers, clock, "repo_change", buffer.bytes(qb), 1048576, timeout_ms);
+                            var ending = dispatch.Ending::Timeout;
+                            borrow out as &ob in {
+                                ending = worker.settle_run(heap, fs, ran, buffer.bytes(ob), buffer.bytes(rb), tid, execution_dir, false);
+                                if !gate_run.succeeded(ending) {
+                                    worker_code = code_of(heap, buffer.bytes(ob));
+                                }
+                            }
+                            buffer.drop(heap, out);
+                            let consequence = dispatch.consequence(ending);
+                            let decision = retry.decide(consequence, attempts, false);
+                            let tag = dispatch.rule_tag(ending);
+                            if len(tag) > 0 {
+                                seq = gate_run.note(heap, fs, journal_path, seq, tid, tag, false);
+                            }
+                            if len(worker_code) > 0 {
+                                seq = gate_run.note(heap, fs, journal_path, seq, tid, worker_code, false);
+                            }
+                            var claimed = false;
+                            match decision {
+                                retry.Decision::NotRetryable => {
+                                    if gate_run.succeeded(ending) {
+                                        seq = gate_run.note_execution(heap, fs, journal_path, seq, "execution.finished", tid, "done");
+                                        claimed = true;
+                                    }
+                                }
+                                retry.Decision::Again => {
+                                    seq = gate_run.note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);
+                                }
+                                retry.Decision::Exhausted => {
+                                    seq = gate_run.note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);
+                                }
+                                retry.Decision::WriteRefused => {
+                                    seq = gate_run.note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);
+                                }
+                            }
+                            let (t5, s5) = gate_run.move_to(heap, fs, journal_path, tasks, seq, tid, retry.target_after(consequence, decision), task.Actor::Forge, false);
+                            tasks = t5;
+                            seq = s5;
+                            outcome = Outcome::Ended(ending, claimed);
+                        }
+                        buffer.drop(heap, req);
+                    }
+                    buffer.drop(heap, request_id);
+                }
+            }
+        }
+        if seq < 0 {
+            outcome = Outcome::Journal(0 - 1);
+        }
+        borrow tasks as &tb in {
+            state = journal.state_of(tb, tid);
+        }
+        map.drop(heap, tasks);
+    }
+    buffer.drop(heap, id);
+    return Finished { outcome: outcome, state: state, number: report.tasks + 1, attempts: attempts, worker_code: worker_code };
+}
+
+fn line[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
+    io.write_all(io, label);
+    io.write_all(io, value);
+    io.newline(io);
+    return 0;
+}
+
+// What a run came to, printed as `forge gate` prints its own, and the exit status: 0 a claim (the task is in verification), 1 refused (the
+// journal, or the task by `repo_task`), 3 the journal could not be read or written, 4 the run ended without a claim.
+fn show[&h, &i](heap: &!h Heap, io: &!i Io, done: Finished) -> [heap, io_write, err_write] int {
+    var code = 4;
+    var id = repo_task.task_id(heap, done.number);
+    borrow id as &ib in {
+        if done.number > 0 {
+            line(io, "task: ", buffer.bytes(ib));
+            line(io, "state: ", task.code_name(done.state));
+        }
+        match done.outcome {
+            Outcome::Journal(rule) => {
+                if rule > 0 {
+                    io.error_all(io, "forge: the journal is refused: ");
+                    io.error_all(io, task.rule_code_name(rule));
+                    io.error_all(io, "\n");
+                    code = 1;
+                } else {
+                    io.error_all(io, "forge: the journal cannot be read or written\n");
+                    code = 3;
+                }
+            }
+            Outcome::Refused(why) => {
+                line(io, "refused: ", repo_task.rule_name(why));
+                code = 1;
+            }
+            Outcome::Ended(ending, claimed) => {
+                let tag = dispatch.rule_tag(ending);
+                if len(tag) > 0 {
+                    line(io, "refusal: ", tag);
+                }
+                line(io, "ending: ", dispatch.consequence_name(dispatch.consequence(ending)));
+                if len(done.worker_code) > 0 {
+                    line(io, "worker-error: ", done.worker_code);
+                }
+                if claimed {
+                    io.write_all(io, "(a worker's claim: the task is in verification, not accepted)\n");
+                    code = 0;
+                }
+            }
+        }
+    }
+    buffer.drop(heap, id);
+    return code;
+}
+
+// One `repo.change` task in the workspace `dir` (its journal and lock), its worker beneath `workers`: the lock, the run, the printing. The
+// exit status as `show` has it and the worker's own code ("" when it gave none).
+pub fn run_step[&h, &f, &x, &c, &i, &d, &w, &r, &t, &p, &m, &v, &s, &u, &o, &k, &a, &e, &n](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, timeout_ms: int, dir: &d [byte], workers: &w [byte], repo: &r [byte], kind: &t [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts_ceiling: int, agent_seconds: int, checkout: &o [byte], tools_dir: &n [byte], checker: &k [byte], agent: &a [byte], execution_dir: &e [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] (int, &static [byte]) {
+    let jpath = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/journal.jsonl");
+    let lpath = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/lock");
+    var code = 0;
+    var worker_code = "";
+    borrow jpath as &jb in {
+        borrow lpath as &lb in {
+            if journal_io.path_ok(fs, buffer.bytes(jb)) == false || journal_io.path_ok(fs, workers) == false {
+                io.error_all(io, "forge: path-invalid: <dir> and <workers> must be absolute, with no .. component\n");
+                code = 2;
+            } else {
+                match lock.acquire(fs, buffer.bytes(lb)) {
+                    lock.Lock::Refused(rule) => {
+                        io.error_all(io, "forge: ");
+                        io.error_all(io, task.rule_code_name(rule));
+                        io.error_all(io, ": the workspace cannot be written\n");
+                        code = 3;
+                    }
+                    lock.Lock::Failed(errno) => {
+                        io.error_all(io, "forge: the lock of the workspace could not be taken\n");
+                        code = 3;
+                    }
+                    lock.Lock::Held(held) => {
+                        match open_dir(fs, workers) {
+                            DirOpened::Failed(errno) => {
+                                io.error_all(io, "forge: cannot open the workers directory\n");
+                                code = 3;
+                            }
+                            DirOpened::Ok(opened) => {
+                                var wdir = opened;
+                                borrow wdir as &wd in {
+                                    let done = run(heap, fs, exec, wd, clock, buffer.bytes(jb), repo, kind, provider, model, rev, src, tp, pins, attempts_ceiling, agent_seconds, checkout, tools_dir, checker, agent, execution_dir, timeout_ms);
+                                    worker_code = done.worker_code;
+                                    code = show(heap, io, done);
+                                }
+                                dir_close(wdir);
+                            }
+                        }
+                        lock.let_go(held);
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, lpath);
+    return (code, worker_code);
+}

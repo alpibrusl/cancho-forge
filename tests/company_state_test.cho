@@ -950,3 +950,45 @@ fn test_a_library_record_without_its_fields_is_event_malformed[&h](heap: &!h Hea
     buffer.drop(heap, j);
     return 0;
 }
+
+fn test_a_change_record_replays_and_changes_nothing_else[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = add(heap, j, company_state.change_files(heap, 2, "a", "diff", "0123456789012345678901234567890123456789", "9876543210987654321098765432109876543210", "abc", 2, 7));
+    j = add(heap, j, company_state.accepted(heap, 3, "a", "steps/a/ev/change.patch", "abc"));
+    borrow j as &jb in {
+        let p = probe_of(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.records, 3);
+        test.assert_eq(p.mask, 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_change_record_without_its_fields_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = buffer.append(heap, j, "{\"v\":1,\"seq\":2,\"kind\":\"company.step.change\",\"task\":\"a\",\"repo\":\"diff\",\"base\":\"x\",\"tree\":\"y\",\"patch_sha256\":\"z\",\"files\":1}\n");
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(jb)), "event-malformed"));
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+// A repository or patch refusal (`repo-...`, `patch-...`) is held code 5, `change-refused`; a reason that merely resembles one is not.
+fn test_a_repo_or_patch_refusal_holds_the_step_as_change_refused[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.check_unavailable(heap, 1, "a", "patch-path-denied"));
+    j = add(heap, j, company_state.check_unavailable(heap, 2, "b", "repo-checkout-dirty"));
+    j = add(heap, j, company_state.check_unavailable(heap, 3, "c", "patch"));
+    borrow j as &jb in {
+        let p = held_probe(heap, buffer.bytes(jb));
+        test.assert_eq(p.rule, 0);
+        test.assert_eq(p.held, 5 + 50 + 200);
+    }
+    buffer.drop(heap, j);
+    test.assert(bytes.equal(company_state.held_name(5), "change-refused"));
+    return 0;
+}

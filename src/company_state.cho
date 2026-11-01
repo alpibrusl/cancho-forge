@@ -97,6 +97,12 @@ pub fn kind_library() -> [] &static [byte] {
     return "company.step.library";
 }
 
+// A `repo.change` step's patch, hashed by Forge before its check runs: the repository, the base commit and its tree (as the change worker
+// reported them), the patch's SHA-256 and the files and added lines Forge counted in it. Replay checks its shape and nothing else.
+pub fn kind_change() -> [] &static [byte] {
+    return "company.step.change";
+}
+
 // The prefix of a retry gate: `retry:<step id>` is a decision a person records with `forge company decide` to let a step whose
 // check failed (or was unavailable) be run again. It is not in `human_gates`; any step id of the manifest makes one.
 pub fn retry_prefix() -> [] &static [byte] {
@@ -167,6 +173,24 @@ pub fn library_files[&h, &s, &n, &a, &b](heap: &!h Heap, seq: int, step: &s [byt
     w = json.put_string(heap, w, src_sha256);
     w = json.put_key(heap, w, "tests_sha256");
     w = json.put_string(heap, w, tests_sha256);
+    return closed(heap, w);
+}
+
+// Step `step` left the patch `patch_sha256` against `base` (a commit) whose tree was `tree`, in repository `repo`, touching `files` files and adding `added` lines.
+pub fn change_files[&h, &s, &r, &b, &t, &p](heap: &!h Heap, seq: int, step: &s [byte], repo: &r [byte], base: &b [byte], tree: &t [byte], patch_sha256: &p [byte], files: int, added: int) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_change(), step);
+    w = json.put_key(heap, w, "repo");
+    w = json.put_string(heap, w, repo);
+    w = json.put_key(heap, w, "base");
+    w = json.put_string(heap, w, base);
+    w = json.put_key(heap, w, "tree");
+    w = json.put_string(heap, w, tree);
+    w = json.put_key(heap, w, "patch_sha256");
+    w = json.put_string(heap, w, patch_sha256);
+    w = json.put_key(heap, w, "files");
+    w = json.put_int(heap, w, files);
+    w = json.put_key(heap, w, "added");
+    w = json.put_int(heap, w, added);
     return closed(heap, w);
 }
 
@@ -298,6 +322,14 @@ fn set_held[&k](held: &!k [int], at: int, code: int) -> [] int {
     return 0;
 }
 
+// Is `reason` the tag of a `repo.change` step's repository or patch refusal (`repo-...`, `patch-...`)? Such a hold is code 5.
+fn change_reason[&r](reason: &r [byte]) -> [] bool {
+    if len(reason) > 5 && bytes.equal(reason[0..5], "repo-") {
+        return true;
+    }
+    return len(reason) > 6 && bytes.equal(reason[0..6], "patch-");
+}
+
 // Add four token counts to the four slots of `spend` from `base` (the caller keeps `base + 3` in range).
 fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -> [] int {
     spend[base] = clamp_add(spend[base], a);
@@ -358,6 +390,11 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                     if named == false || strings == false {
                         rule = bad;
                     }
+                } else if bytes.equal(kind, kind_change()) {
+                    let strings = json.is_string(tp, json.get(line, tp, 0, "repo")) && json.is_string(tp, json.get(line, tp, 0, "base")) && json.is_string(tp, json.get(line, tp, 0, "tree")) && json.is_string(tp, json.get(line, tp, 0, "patch_sha256"));
+                    if named == false || strings == false || field(line, tp, 0, "files") < 0 || field(line, tp, 0, "added") < 0 {
+                        rule = bad;
+                    }
                 } else if bytes.equal(kind, kind_check_failed()) {
                     let score = field(line, tp, 0, "score");
                     let total = field(line, tp, 0, "total");
@@ -380,6 +417,9 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                         }
                         if json.string_equals(line, tp, why, "usage-invalid") {
                             code = 4;
+                        }
+                        if change_reason(json.string_view(line, tp, why)) {
+                            code = 5;
                         }
                         set_held(held, company_graph.index_of(man, id), code);
                     }
@@ -690,6 +730,9 @@ pub fn held_name(code: int) -> [] &static [byte] {
     }
     if code == 4 {
         return "usage-invalid";
+    }
+    if code == 5 {
+        return "change-refused";
     }
     return "check-unavailable";
 }

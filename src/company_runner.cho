@@ -26,7 +26,10 @@ import forge.journal_io;
 import forge.lock;
 import forge.recover;
 import forge.recover_io;
+import forge.patch_check;
+import forge.repo_call;
 import forge.repo_row;
+import forge.repo_task;
 import forge.step_run;
 import forge.task;
 import forge.tool_call;
@@ -150,6 +153,14 @@ fn rule_step_failed() -> [] &static [byte] {
 
 fn rule_operator_invalid() -> [] &static [byte] {
     return "operator-invalid";
+}
+
+fn rule_repo_unconfigured() -> [] &static [byte] {
+    return "repo-unconfigured";
+}
+
+fn rule_repo_kind_mismatch() -> [] &static [byte] {
+    return "repo-kind-mismatch";
 }
 
 fn rule_gate_open() -> [] &static [byte] {
@@ -569,7 +580,7 @@ fn run_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n, &z](heap: &!h Heap, fs: 
     let step = company_manifest.step_at(hm, k);
     let id = company_manifest.step_id(hm, step);
     let check = company_manifest.step_check(hm, step);
-    let runner = company_step.runner_of(step.role);
+    let runner = company_step.runner_for(step);
     let timeout = company_step.op_ms(op, tp, "check_timeout_ms", check_timeout_default());
     match runner {
         company_step.Runner::Unsupported => {
@@ -610,6 +621,9 @@ fn run_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n, &z](heap: &!h Heap, fs: 
         }
         company_step.Runner::Tool => {
             return tool_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, k, seq, existed, needs);
+        }
+        company_step.Runner::Change => {
+            return change_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, k, seq, existed, before, before_cost, needs);
         }
     }
 }
@@ -700,6 +714,220 @@ fn tool_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n](heap: &!h Heap, fs: &f 
     }
     buffer.drop(heap, rel);
     return code;
+}
+
+// ---- a repo.change step (docs/company.md section 16) ----------------------------------------------------------------------------
+
+// A `repo.change` step: the request text in `change.txt`, the change worker on a COPY of the operator's checkout (`repo_call.run_step`), the
+// patch it claims read and bounded by Forge itself (`patch_check`), and the step's check judging it. Refusals that write nothing, as a
+// build's: no `check` (`check-missing`), an operator file without `tools`, `checker` or `agent` (`operator-invalid`), no row for the
+// step's repository (`repo-unconfigured`) or one of another kind (`repo-kind-mismatch`), no `steps/<id>/ev` (`step-dir-missing`). The
+// repository's own refusals (a dirty or moved checkout, a pin that is not the row's `compiler_rev`, a patch that does not apply) and Forge's
+// bounds on the patch HOLD the step (`company.step.check_unavailable` with the tag; `retry:<id>` frees it), exit 14, as an artifact
+// Forge will not read does; a worker that ends without a claim (stuck, a provider error, a deadline) is `step-failed`, exit 15. What the
+// build spent is recorded whatever the ending. The checkout is written by nothing here: the worker runs only `git rev-parse`, `git status`
+// and `git ls-files` against it, and `forge company publish` stays the only verb that writes a checkout.
+fn change_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices: company_budget.Prices, k: int, seq: int, existed: bool, before: company_budget.Usage, before_cost: int, needs: &n [byte]) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let step = company_manifest.step_at(hm, k);
+    let id = company_manifest.step_id(hm, step);
+    if len(company_manifest.step_check(hm, step)) == 0 {
+        refuse(io, company_manifest.rule_name(company_manifest.Refusal::CheckMissing));
+        say(io, "step: ", id);
+        return company_step.exit_refused();
+    }
+    let repo = company_manifest.step_repo(hm, step);
+    let ri = company_manifest.repo_index(hm, repo);
+    let row = repo_row.row_of(op, tp, repo);
+    if len(company_step.op_text(op, tp, "tools")) == 0 || len(company_step.op_text(op, tp, "checker")) == 0 || len(company_step.op_text(op, tp, "agent")) == 0 {
+        refuse(io, rule_operator_invalid());
+        say(io, "step: ", id);
+        return company_step.exit_refused();
+    }
+    if ri < 0 || row < 0 {
+        refuse(io, rule_repo_unconfigured());
+        say(io, "step: ", id);
+        say(io, "repo: ", repo);
+        return company_step.exit_refused();
+    }
+    if repo_row.resolve(op, tp, repo, company_manifest.repo_kind_name(company_manifest.repo_kind_at(hm, ri))) != 0 {
+        refuse(io, rule_repo_kind_mismatch());
+        say(io, "step: ", id);
+        say(io, "repo: ", repo);
+        return company_step.exit_refused();
+    }
+    let rel = glue(heap, "steps/", id);
+    var stepdir = buffer.empty(heap, 1);
+    borrow rel as &rb in {
+        buffer.drop(heap, stepdir);
+        stepdir = company_cmd.under(heap, dir, buffer.bytes(rb));
+    }
+    var code = 0;
+    borrow rel as &rb in {
+        borrow stepdir as &sb in {
+            let evdir = glue(heap, buffer.bytes(sb), "/ev");
+            borrow evdir as &eb in {
+                if dir_present(fs, buffer.bytes(eb)) == false {
+                    refuse(io, rule_step_dir_missing());
+                    say(io, "step: ", id);
+                    code = company_step.exit_refused();
+                } else {
+                    code = take_needs(heap, fs, io, hm, dir, id, needs, false, buffer.bytes(eb));
+                    if code == 0 {
+                        code = record_buffer(heap, fs, io, jpath, company_state.admitted(heap, seq, id, buffer.bytes(rb)), existed == false);
+                    }
+                    if code == 0 {
+                        code = change_run(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, step, row, seq + 1, before, before_cost, buffer.bytes(rb), buffer.bytes(eb), buffer.bytes(sb));
+                    }
+                }
+            }
+            buffer.drop(heap, evdir);
+        }
+    }
+    buffer.drop(heap, rel);
+    buffer.drop(heap, stepdir);
+    return code;
+}
+
+// The step is admitted: write the request, run the worker, record the spend, bound the patch, record it, run the check.
+fn change_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &e, &w](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices: company_budget.Prices, step: company_manifest.Step, row: int, seq: int, before: company_budget.Usage, before_cost: int, rel: &r [byte], evdir: &e [byte], stepdir: &w [byte]) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let id = company_manifest.step_id(hm, step);
+    let workers = company_step.op_text(op, tp, "workers");
+    var next = seq;
+    if write_decoded(heap, fs, hm, step, evdir, "/change.txt") != 0 {
+        say(io, "error: cannot write the request of step ", id);
+        return company_step.exit_io();
+    }
+    var kind = company_manifest.step_change_kind(hm, step);
+    if len(kind) == 0 {
+        kind = "feature";
+    }
+    let repo = company_manifest.step_repo(hm, step);
+    let rev = repo_row.field_text(op, tp, row, "compiler_rev");
+    let pins = json.get(op, tp, row, "pins");
+    let bt = company_step.op_ms(op, tp, "build_timeout_ms", step_run.build_spec().timeout);
+    let (ran, worker_code) = repo_call.run_step(heap, fs, exec, clock, io, bt, stepdir, workers, repo, kind, company_manifest.provider_of(hm), company_manifest.model_of(hm), rev, op, tp, pins, company_step.op_int(op, tp, "attempts", 0), company_step.op_int(op, tp, "agent_seconds", 0), repo_row.field_text(op, tp, row, "checkout"), company_step.op_text(op, tp, "tools"), company_step.op_text(op, tp, "checker"), company_step.op_text(op, tp, "agent"), evdir);
+    // What the build spent is recorded whatever its ending.
+    let (spent_code, after_seq) = record_spend(heap, fs, io, jpath, id, evdir, prices, before, before_cost, next);
+    if spent_code != 0 {
+        return spent_code;
+    }
+    next = after_seq;
+    if ran != 0 {
+        if ran == 4 && repo_task.holds_step(worker_code) {
+            // A patch that does not apply is judged first by what Forge can read of it: a rename, a path outside the row, a size over the
+            // bound are named for what they are, `patch-not-applicable` only for a patch that is otherwise inside the bounds.
+            var tag = worker_code;
+            if bytes.equal(worker_code, "patch-not-applicable") {
+                let (late, lwhy) = company_files.read_artifact(heap, fs, evdir, "change.patch");
+                if lwhy == 0 {
+                    borrow late as &lb in {
+                        let lv = patch_check.check(buffer.bytes(lb), op, tp, json.get(op, tp, row, "publish_allow"), json.get(op, tp, row, "publish_deny"), repo_row.field_int(op, tp, row, "max_patch_files"), repo_row.field_int(op, tp, row, "max_patch_lines"));
+                        if lv.code != 0 {
+                            tag = patch_check.rule_name(lv.code);
+                        }
+                    }
+                }
+                buffer.drop(heap, late);
+            }
+            return change_refused(heap, fs, io, jpath, id, tag, next);
+        }
+        refuse(io, rule_step_failed());
+        say(io, "step: ", id);
+        say_nat(heap, io, "exit: ", ran);
+        return company_step.exit_step_failed();
+    }
+    let (patch, why) = company_files.read_artifact(heap, fs, evdir, "change.patch");
+    var code = 0;
+    if why != 0 {
+        let shown = glue(heap, rel, "/ev/change.patch");
+        borrow shown as &swb in {
+            code = refuse_artifact(heap, fs, io, jpath, id, buffer.bytes(swb), why, next);
+        }
+        buffer.drop(heap, shown);
+        buffer.drop(heap, patch);
+        return code;
+    }
+    var verdict = patch_check.Verdict { code: 1, files: 0, added: 0 };
+    borrow patch as &pb in {
+        verdict = patch_check.check(buffer.bytes(pb), op, tp, json.get(op, tp, row, "publish_allow"), json.get(op, tp, row, "publish_deny"), repo_row.field_int(op, tp, row, "max_patch_files"), repo_row.field_int(op, tp, row, "max_patch_lines"));
+    }
+    if verdict.code != 0 {
+        buffer.drop(heap, patch);
+        return change_refused(heap, fs, io, jpath, id, patch_check.rule_name(verdict.code), next);
+    }
+    let (report, rwhy) = company_files.read_artifact(heap, fs, evdir, "report.json");
+    var base = buffer.empty(heap, 1);
+    var tree = buffer.empty(heap, 1);
+    var good = false;
+    if rwhy == 0 {
+        borrow report as &rpb in {
+            let src = buffer.bytes(rpb);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            borrow mut tape as &!tw in {
+                let rtp = contents(tw);
+                if json.parse(src, rtp) > 0 && json.is_object(rtp, 0) {
+                    let bn = json.get(src, rtp, 0, "base");
+                    let tn = json.get(src, rtp, 0, "tree");
+                    if json.is_string(rtp, bn) && json.is_string(rtp, tn) && repo_row.rev_ok(json.string_view(src, rtp, bn)) && repo_row.rev_ok(json.string_view(src, rtp, tn)) {
+                        buffer.drop(heap, base);
+                        buffer.drop(heap, tree);
+                        base = buffer.append(heap, buffer.empty(heap, 41), json.string_view(src, rtp, bn));
+                        tree = buffer.append(heap, buffer.empty(heap, 41), json.string_view(src, rtp, tn));
+                        good = true;
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+    }
+    buffer.drop(heap, report);
+    if good == false {
+        let shown = glue(heap, rel, "/ev/report.json");
+        borrow shown as &swb in {
+            code = refuse_artifact(heap, fs, io, jpath, id, buffer.bytes(swb), 4, next);
+        }
+        buffer.drop(heap, shown);
+    } else {
+        var sha = buffer.empty(heap, 1);
+        borrow patch as &pb in {
+            buffer.drop(heap, sha);
+            sha = hex_of(heap, buffer.bytes(pb));
+        }
+        borrow base as &bb in {
+            borrow tree as &tb in {
+                borrow sha as &hb in {
+                    code = record_buffer(heap, fs, io, jpath, company_state.change_files(heap, next, id, repo, buffer.bytes(bb), buffer.bytes(tb), buffer.bytes(hb), verdict.files, verdict.added), false);
+                }
+            }
+        }
+        buffer.drop(heap, sha);
+        if code == 0 {
+            let artifact = company_cmd.under(heap, evdir, "change.patch");
+            var shown = buffer.append(heap, glue(heap, rel, "/ev/"), "change.patch");
+            borrow artifact as &ab in {
+                borrow shown as &wb in {
+                    code = check_and_accept(heap, fs, exec, clock, io, dir, workers, jpath, id, company_manifest.step_check(hm, step), buffer.bytes(ab), buffer.bytes(wb), evdir, "change.patch", next + 1, company_step.op_ms(op, tp, "check_timeout_ms", check_timeout_default()));
+                }
+            }
+            buffer.drop(heap, artifact);
+            buffer.drop(heap, shown);
+        }
+    }
+    buffer.drop(heap, base);
+    buffer.drop(heap, tree);
+    buffer.drop(heap, patch);
+    return code;
+}
+
+// A repository or patch refusal: `refusal: <tag>`, `step:`, recorded as an unavailable check (held; `retry:<id>` frees it), exit 14.
+fn change_refused[&h, &f, &i, &j, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], id: &n [byte], tag: &static [byte], seq: int) -> [heap, fs_read(""), fs_write(""), file_write, io_write] int {
+    let wrote = record_buffer(heap, fs, io, jpath, company_state.check_unavailable(heap, seq, id, tag), false);
+    if wrote != 0 {
+        return wrote;
+    }
+    refuse(io, tag);
+    say(io, "step: ", id);
+    return company_step.exit_check_unavailable();
 }
 
 // A product step with no check and an approved gate: accepted on the decision, its artifact the manifest Forge hashes now.
@@ -1115,6 +1343,12 @@ fn library_record[&h, &f, &i, &j, &m, &r, &e](heap: &!h Heap, fs: &f Fs(""), io:
 // The step's `input`, decoded from its JSON string, written to `<stepdir>/brief.txt` (truncated first). 0 or an errno (-2: a path
 // that is not ok).
 fn write_brief[&h, &f, &m, &w](heap: &!h Heap, fs: &f Fs(""), hm: &m company_manifest.Manifest, step: company_manifest.Step, stepdir: &w [byte]) -> [heap, fs_write(""), file_write] int {
+    return write_decoded(heap, fs, hm, step, stepdir, "/brief.txt");
+}
+
+// The step's `input`, decoded, written to `<dir><name>` (`name` begins with `/`; a `repo.change` step's request text is `change.txt` in
+// its execution directory).
+fn write_decoded[&h, &f, &m, &w, &z](heap: &!h Heap, fs: &f Fs(""), hm: &m company_manifest.Manifest, step: company_manifest.Step, stepdir: &w [byte], name: &z [byte]) -> [heap, fs_write(""), file_write] int {
     let text = company_manifest.step_input(hm, step);
     let quoted = glue(heap, "\"", text);
     var q = buffer.append(heap, quoted, "\"");
@@ -1132,7 +1366,7 @@ fn write_brief[&h, &f, &m, &w](heap: &!h Heap, fs: &f Fs(""), hm: &m company_man
                         borrow mut out as &!ow in {
                             json.string_into(src, tp, 0, contents(ow));
                         }
-                        let path = glue(heap, stepdir, "/brief.txt");
+                        let path = glue(heap, stepdir, name);
                         borrow path as &pb in {
                             borrow out as &or in {
                                 rc = write_file(fs, buffer.bytes(pb), contents(or));
@@ -1322,7 +1556,7 @@ fn give_needs[&h, &f, &i, &m, &n, &k, &t, &a, &s, &e](heap: &!h Heap, fs: &f Fs(
                     let at = company_graph.index_of(hm, need);
                     var runner = company_step.Runner::Unsupported;
                     if at >= 0 {
-                        runner = company_step.runner_of(company_manifest.step_at(hm, at).role);
+                        runner = company_step.runner_for(company_manifest.step_at(hm, at));
                     }
                     let name = company_step.needs_name(heap, need, runner);
                     borrow name as &nb in {
@@ -1388,7 +1622,7 @@ fn check_need[&h, &f, &i, &m, &d, &n, &s, &t](heap: &!h Heap, fs: &f Fs(""), io:
     let at = company_graph.index_of(hm, need);
     var runner = company_step.Runner::Unsupported;
     if at >= 0 {
-        runner = company_step.runner_of(company_manifest.step_at(hm, at).role);
+        runner = company_step.runner_for(company_manifest.step_at(hm, at));
     }
     let rel = company_step.artifact_rel(heap, need, runner);
     var why = 2;

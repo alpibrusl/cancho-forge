@@ -1,0 +1,435 @@
+edition 9;
+module forge.repo_task;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import forge.build_task;
+import forge.gate_task;
+import forge.repo_row;
+
+// The `repo.change` task (docs/company-lifecycle.md section 4.2, docs/company.md section 16): a change request against a repository that
+// already exists, answered with a patch. This module is the pure half, as `forge.tool_task` is for `tool.run`: what a task may say, the
+// refusals with their rule tags, the shell texts the worker starts, how the checkout's state is read, and the request Forge builds.
+// `workers/repo_change.cho` is the process half and `forge.repo_call` is Forge's side.
+//
+// Who chooses what. The manifest names the repository and the request text; the OPERATOR FILE names the checkout, the compiler revision,
+// the build tool, the agent and the bounds. Nothing here takes a path or a command from the request text: the text reaches the build
+// tool as a FILE (`change.txt`) Forge wrote, never in an argument vector. Every path in a shell text has passed `gate_task.path_ok`
+// (letters, digits, `._/-`), every other word is a closed name, and the agent command passes `agent_ok`, so no shell metacharacter is in
+// any text the worker builds.
+
+// What a task is refused for. Each has a rule tag (docs/architecture.md section 7) and a test that reaches it.
+pub enum Refusal {
+    // `task.type` is not `repo.change`.
+    TaskTypeInvalid,
+    // The execution directory, the checkout, the tools directory or the checker is not a path the worker will use.
+    PathInvalid,
+    // `limits.timeout_ms` is outside 2 s to a day.
+    LimitsInvalid,
+    // The change kind is not `bug`, `feature`, `refactor` or `rename`.
+    ChangeKindInvalid,
+    // The agent command, provider or model is not text the worker will put in a command, or a build ceiling is out of range.
+    OperatorInvalid,
+    // The repository id, the compiler revision or the pin files are malformed.
+    RepoInvalid,
+}
+
+pub enum Checked {
+    Held,
+    Refused(Refusal),
+}
+
+pub fn rule_name(r: Refusal) -> [] &static [byte] {
+    match r {
+        Refusal::TaskTypeInvalid => {
+            return "task-type-invalid";
+        }
+        Refusal::PathInvalid => {
+            return "path-invalid";
+        }
+        Refusal::LimitsInvalid => {
+            return "limits-invalid";
+        }
+        Refusal::ChangeKindInvalid => {
+            return "repo-change-kind-invalid";
+        }
+        Refusal::OperatorInvalid => {
+            return "operator-invalid";
+        }
+        Refusal::RepoInvalid => {
+            return "repo-invalid";
+        }
+    }
+}
+
+pub fn task_type() -> [] &static [byte] {
+    return "repo.change";
+}
+
+pub fn min_timeout_ms() -> [] int {
+    return 2000;
+}
+
+pub fn max_timeout_ms() -> [] int {
+    return 86400000;
+}
+
+// The most of the build tool's console output that is kept (`build.log`).
+pub fn log_cap() -> [] int {
+    return 8388608;
+}
+
+// The worker's own deadline, four fifths of Forge's (as the gate runner's): the build is started in a group of its own, which Forge's kill
+// of the worker does not reach, so the worker must end it first.
+pub fn runner_deadline_ms(timeout_ms: int) -> [] int {
+    return timeout_ms / 5 * 4;
+}
+
+// The name of the file Forge writes the request text to, and of the directories and files the worker makes in the execution directory.
+pub fn change_file() -> [] &static [byte] {
+    return "change.txt";
+}
+
+// The patch: the step's artifact.
+pub fn patch_file() -> [] &static [byte] {
+    return "change.patch";
+}
+
+// Is `kind` one of the four kinds of `cancho-build --kind`?
+pub fn kind_ok[&k](kind: &k [byte]) -> [] bool {
+    return bytes.equal(kind, "bug") || bytes.equal(kind, "feature") || bytes.equal(kind, "refactor") || bytes.equal(kind, "rename");
+}
+
+fn name_char(c: int) -> [] bool {
+    let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+    let digit = c >= 48 && c <= 57;
+    return letter || digit || c == 45 || c == 95 || c == 46;
+}
+
+// A repository id, provider or model: 1 to 64 bytes of letters, digits, `-`, `_`, `.`, not starting with `-` or `.` (it is never an option
+// or a hidden name).
+pub fn word_ok[&w](word: &w [byte]) -> [] bool {
+    if len(word) < 1 || len(word) > 64 {
+        return false;
+    }
+    var i = 0;
+    while i < len(word) {
+        if !name_char(int_of(word[i])) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return int_of(word[0]) != 45 && int_of(word[0]) != 46;
+}
+
+// The agent command (it goes between single quotes in the build's shell text): 1 to 512 bytes of letters, digits, space and `. _ / : = @ % , + -`
+// (the characters `cancho-build` itself allows in a path), not starting with `-`. No quote, `$`, backtick, backslash, `;`, `&`, `|`, `<`,
+// `>`, newline or other control byte can be in it.
+pub fn agent_ok[&a](agent: &a [byte]) -> [] bool {
+    if len(agent) < 1 || len(agent) > 512 || int_of(agent[0]) == 45 {
+        return false;
+    }
+    var i = 0;
+    while i < len(agent) {
+        let c = int_of(agent[i]);
+        let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        let punct = c == 32 || c == 46 || c == 95 || c == 47 || c == 58 || c == 61 || c == 64 || c == 37 || c == 44 || c == 43 || c == 45;
+        if !letter && !digit && !punct {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// A build ceiling that may be absent (0): 1 to `hi` otherwise.
+fn ceiling_ok(n: int, hi: int) -> [] bool {
+    return n == 0 || n >= 1 && n <= hi;
+}
+
+// The first thing wrong with a task, in a fixed order: type, paths, limits, kind, the operator's texts, the repository.
+pub fn check[&y, &e, &c, &t, &k, &a, &i, &r, &p, &m, &v](task_type_text: &y [byte], execution_dir: &e [byte], checkout: &c [byte], tools_dir: &t [byte], checker: &k [byte], agent: &a [byte], repo: &i [byte], kind: &r [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], timeout_ms: int, attempts: int, agent_seconds: int) -> [] Checked {
+    if !bytes.equal(task_type_text, task_type()) {
+        return Checked::Refused(Refusal::TaskTypeInvalid);
+    }
+    if !gate_task.path_ok(execution_dir) || !gate_task.path_ok(checkout) || !gate_task.path_ok(tools_dir) || !gate_task.path_ok(checker) {
+        return Checked::Refused(Refusal::PathInvalid);
+    }
+    if timeout_ms < min_timeout_ms() || timeout_ms > max_timeout_ms() {
+        return Checked::Refused(Refusal::LimitsInvalid);
+    }
+    if !kind_ok(kind) {
+        return Checked::Refused(Refusal::ChangeKindInvalid);
+    }
+    if !agent_ok(agent) || !word_ok(provider) || !word_ok(model) || !ceiling_ok(attempts, 20) || !ceiling_ok(agent_seconds, 3600) {
+        return Checked::Refused(Refusal::OperatorInvalid);
+    }
+    if !word_ok(repo) || !repo_row.rev_ok(rev) {
+        return Checked::Refused(Refusal::RepoInvalid);
+    }
+    return Checked::Held;
+}
+
+// The error code a change worker's reply carries, as its own static text when it is one of its codes, else "". Forge records only a code
+// it knows: the reply is a worker's, untrusted text. The first group is the task's refusals; then what the checkout or the patch was
+// refused for (`repo-...`, `patch-not-applicable`: these HOLD the step, `company.step.check_unavailable`); then how the run ended.
+pub fn known_code[&c](code: &c [byte]) -> [] &static [byte] {
+    if bytes.equal(code, "task-type-invalid") {
+        return "task-type-invalid";
+    }
+    if bytes.equal(code, "path-invalid") {
+        return "path-invalid";
+    }
+    if bytes.equal(code, "limits-invalid") {
+        return "limits-invalid";
+    }
+    if bytes.equal(code, "repo-change-kind-invalid") {
+        return "repo-change-kind-invalid";
+    }
+    if bytes.equal(code, "operator-invalid") {
+        return "operator-invalid";
+    }
+    if bytes.equal(code, "repo-invalid") {
+        return "repo-invalid";
+    }
+    if bytes.equal(code, "repo-unusable") {
+        return "repo-unusable";
+    }
+    if bytes.equal(code, "repo-checkout-dirty") {
+        return "repo-checkout-dirty";
+    }
+    if bytes.equal(code, "repo-checkout-changed") {
+        return "repo-checkout-changed";
+    }
+    if bytes.equal(code, "repo-pin-mismatch") {
+        return "repo-pin-mismatch";
+    }
+    if bytes.equal(code, "patch-not-applicable") {
+        return "patch-not-applicable";
+    }
+    if bytes.equal(code, "patch-missing") {
+        return "patch-missing";
+    }
+    if bytes.equal(code, "change-stuck") {
+        return "change-stuck";
+    }
+    if bytes.equal(code, "change-provider-error") {
+        return "change-provider-error";
+    }
+    if bytes.equal(code, "change-refused-args") {
+        return "change-refused-args";
+    }
+    if bytes.equal(code, "change-failed") {
+        return "change-failed";
+    }
+    if bytes.equal(code, "change-timeout") {
+        return "change-timeout";
+    }
+    if bytes.equal(code, "change-output-overflow") {
+        return "change-output-overflow";
+    }
+    if bytes.equal(code, "change-not-started") {
+        return "change-not-started";
+    }
+    if bytes.equal(code, "evidence-unwritable") {
+        return "evidence-unwritable";
+    }
+    return "";
+}
+
+// Does a worker code refuse the repository or the patch (it holds the step), as opposed to a run that ended without a claim?
+pub fn holds_step[&c](code: &c [byte]) -> [] bool {
+    return bytes.equal(code, "repo-unusable") || bytes.equal(code, "repo-checkout-dirty") || bytes.equal(code, "repo-checkout-changed") || bytes.equal(code, "repo-pin-mismatch") || bytes.equal(code, "patch-not-applicable") || bytes.equal(code, "patch-missing");
+}
+
+// The id of the `n`th change task of a workspace: `change-n`.
+pub fn task_id[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    return buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 16), "change-"), n);
+}
+
+// ---- the shell texts ---------------------------------------------------------------------------------------------------------
+// Each is a `/bin/sh -c` text. `exec 2>&1` first so one captured stream holds both. Every path was held to `gate_task.path_ok`.
+
+fn cat3[&h, &a, &b, &c](heap: &!h Heap, out: buffer.Buffer, a: &a [byte], b: &b [byte], c: &c [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.append(heap, buffer.append(heap, out, a), b), c);
+}
+
+// Print the checkout's HEAD commit, the tree of that commit and whether the working tree is clean (nothing modified, staged or untracked).
+pub fn state_script[&h, &c](heap: &!h Heap, checkout: &c [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 256), "exec 2>&1; cd ");
+    b = buffer.append(heap, b, checkout);
+    return buffer.append(heap, b, " || exit 2; git rev-parse --verify HEAD || exit 3; git rev-parse \"HEAD^{tree}\" || exit 3; if [ -z \"$(git status --porcelain --untracked-files=all)\" ]; then echo clean; else echo dirty; fi");
+}
+
+// Make `<ev>/<sub>` a copy of the checkout's TRACKED files (no `.git`, nothing untracked): the file list and a tar beside it, removed again.
+pub fn materialise_script[&h, &c, &e, &s](heap: &!h Heap, checkout: &c [byte], ev: &e [byte], sub: &s [byte]) -> [heap] buffer.Buffer {
+    var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 256), "exec 2>&1; rm -rf "), ev, "/", sub);
+    b = cat3(heap, b, " ", ev, "/tracked.lst ");
+    b = cat3(heap, b, ev, "/tracked.tar; mkdir ", ev);
+    b = cat3(heap, b, "/", sub, " || exit 1; cd ");
+    b = cat3(heap, b, checkout, " || exit 2; git ls-files -z > ", ev);
+    b = cat3(heap, b, "/tracked.lst || exit 3; tar --null -T ", ev, "/tracked.lst -cf ");
+    b = cat3(heap, b, ev, "/tracked.tar || exit 4; tar -xf ", ev);
+    b = cat3(heap, b, "/tracked.tar -C ", ev, "/");
+    b = cat3(heap, b, sub, " || exit 5; rm -f ", ev);
+    return cat3(heap, b, "/tracked.lst ", ev, "/tracked.tar");
+}
+
+// The build: `cancho-build --repo <ev>/base --change <ev>/change.txt --kind K --checker C --work <ev>/work --agent 'A' --provider P --model M`
+// and the ceilings the operator set. `exec` so the status is the tool's.
+pub fn build_script[&h, &t, &e, &k, &a, &c, &p, &m, &y](heap: &!h Heap, tools: &t [byte], ev: &e [byte], checker: &k [byte], agent: &a [byte], kind: &c [byte], provider: &p [byte], model: &m [byte], attempts: int, agent_seconds: int) -> [heap] buffer.Buffer {
+    var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 512), "exec 2>&1; rm -rf "), ev, "/work; cd ", ev);
+    b = cat3(heap, b, " || exit 2; exec ", tools, "/");
+    b = cat3(heap, b, build_task.tool_name(), " --repo ", ev);
+    b = cat3(heap, b, "/base --change ", ev, "/");
+    b = cat3(heap, b, change_file(), " --kind ", kind);
+    b = cat3(heap, b, " --checker ", checker, " --work ");
+    b = cat3(heap, b, ev, "/work --agent '", agent);
+    b = cat3(heap, b, "' --provider ", provider, " --model ");
+    b = buffer.append(heap, b, model);
+    if attempts > 0 {
+        b = buffer.push_nat(heap, buffer.append(heap, b, " --attempts "), attempts);
+    }
+    if agent_seconds > 0 {
+        b = buffer.push_nat(heap, buffer.append(heap, b, " --agent-seconds "), agent_seconds);
+    }
+    return b;
+}
+
+// Take the tool's patch (and its usage log, when it left one) out of its work directory as plain regular files of ours: a link of the
+// tool's making is not followed (exit 1 for a patch that is not a regular file there, 2 for a copy that failed).
+pub fn collect_script[&h, &e](heap: &!h Heap, ev: &e [byte]) -> [heap] buffer.Buffer {
+    var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 256), "exec 2>&1; W="), ev, "/work; E=", ev);
+    b = buffer.append(heap, b, "; [ -f \"$W/change.patch\" ] && [ ! -L \"$W/change.patch\" ] || exit 1; rm -f \"$E/change.patch\" \"$E/usage.jsonl\"; cp \"$W/change.patch\" \"$E/change.patch\" || exit 2; if [ -f \"$W/usage.jsonl\" ] && [ ! -L \"$W/usage.jsonl\" ]; then cp \"$W/usage.jsonl\" \"$E/usage.jsonl\" || exit 2; fi");
+    return b;
+}
+
+// Does the patch apply to the pristine copy `<ev>/fresh`? (`patch -p1`, nothing written.)
+pub fn apply_script[&h, &e](heap: &!h Heap, ev: &e [byte]) -> [heap] buffer.Buffer {
+    var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 128), "exec 2>&1; patch -p1 --dry-run -s -d "), ev, "/fresh -i ", ev);
+    return buffer.append(heap, b, "/change.patch");
+}
+
+// ---- reading the checkout's state ------------------------------------------------------------------------------------------
+
+fn hex40_at[&o](out: &o [byte], at: int) -> [] bool {
+    if len(out) < at + 41 || int_of(out[at + 40]) != 10 {
+        return false;
+    }
+    return repo_row.rev_ok(out[at..at + 40]);
+}
+
+// Is `out` what `state_script` prints: two 40-hex lines and `clean` or `dirty`?
+pub fn state_ok[&o](out: &o [byte]) -> [] bool {
+    if !hex40_at(out, 0) || !hex40_at(out, 41) {
+        return false;
+    }
+    let rest = out[82..len(out)];
+    return bytes.equal(rest, "clean\n") || bytes.equal(rest, "dirty\n");
+}
+
+pub fn state_clean[&o](out: &o [byte]) -> [] bool {
+    return state_ok(out) && bytes.equal(out[82..len(out)], "clean\n");
+}
+
+// The commit and the tree of an `state_ok` output ("" otherwise).
+pub fn state_head[&o](out: &o [byte]) -> [] &o [byte] {
+    if !state_ok(out) {
+        return out[0..0];
+    }
+    return out[0..40];
+}
+
+pub fn state_tree[&o](out: &o [byte]) -> [] &o [byte] {
+    if !state_ok(out) {
+        return out[0..0];
+    }
+    return out[41..81];
+}
+
+// ---- the request -------------------------------------------------------------------------------------------------------------
+
+// The pin files of the row (`pins` is a node of `src`, -1 for the default `.cancho-rev`) written as a JSON array.
+fn put_pins[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tp: &t [int], pins: int) -> [heap] json.Writer {
+    var x = json.begin_array(heap, w);
+    if pins < 0 {
+        x = json.put_string(heap, x, ".cancho-rev");
+    } else {
+        let n = json.count(tp, pins);
+        var k = pins + 1;
+        var j = 0;
+        while j < n {
+            if json.is_string(tp, k) && json.string_plain(tp, k) {
+                x = json.put_string(heap, x, json.string_view(src, tp, k));
+            }
+            k = json.skip(tp, k);
+            j = j + 1;
+        }
+    }
+    return json.end_array(heap, x);
+}
+
+// The `execute` request of a `repo.change` task. The pins are a node of `src` (the operator file) or -1. The checkout, the tools directory,
+// the checker and the agent are in `grants`, never in `task.input`.
+pub fn request[&h, &r, &k, &i, &c, &p, &m, &v, &e, &o, &t, &x, &a, &s, &u](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &k [byte], repo: &i [byte], kind: &c [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts: int, agent_seconds: int, timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], checkout: &o [byte], tools_dir: &t [byte], checker: &x [byte], agent: &a [byte]) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "verb");
+    w = json.put_string(heap, w, "execute");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "attempt");
+    w = json.put_int(heap, w, attempt);
+    w = json.put_key(heap, w, "task");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "id");
+    w = json.put_string(heap, w, task_id_text);
+    w = json.put_key(heap, w, "type");
+    w = json.put_string(heap, w, task_type());
+    w = json.put_key(heap, w, "input");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "repo");
+    w = json.put_string(heap, w, repo);
+    w = json.put_key(heap, w, "kind");
+    w = json.put_string(heap, w, kind);
+    w = json.put_key(heap, w, "provider");
+    w = json.put_string(heap, w, provider);
+    w = json.put_key(heap, w, "model");
+    w = json.put_string(heap, w, model);
+    w = json.put_key(heap, w, "compiler_rev");
+    w = json.put_string(heap, w, rev);
+    w = json.put_key(heap, w, "pins");
+    w = put_pins(heap, w, src, tp, pins);
+    w = json.put_key(heap, w, "attempts");
+    w = json.put_int(heap, w, attempts);
+    w = json.put_key(heap, w, "agent_seconds");
+    w = json.put_int(heap, w, agent_seconds);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "limits");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "timeout_ms");
+    w = json.put_int(heap, w, timeout_ms);
+    w = json.put_key(heap, w, "max_output_bytes");
+    w = json.put_int(heap, w, max_output_bytes);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "grants");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "execution_dir");
+    w = json.put_string(heap, w, execution_dir);
+    w = json.put_key(heap, w, "checkout");
+    w = json.put_string(heap, w, checkout);
+    w = json.put_key(heap, w, "tools_dir");
+    w = json.put_string(heap, w, tools_dir);
+    w = json.put_key(heap, w, "checker");
+    w = json.put_string(heap, w, checker);
+    w = json.put_key(heap, w, "agent");
+    w = json.put_string(heap, w, agent);
+    w = json.end_object(heap, w);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
