@@ -24,7 +24,8 @@ prepare() { rm -rf "$work/base" "$work/tree"; cp -r "$repo" "$work/base"; cp -r 
 finish() { (cd "$work" && diff -ruN base tree > change.patch); printf '[CHANGE_PATCH]\t%s/change.patch\n[CHANGE_VERDICT]\tdone\n' "$work"; exit 0; }
 usage() { printf '{"provider":"stand","model":"m1","task":"t","sample":0,"in":%s,"out":10,"thinking":0,"cache_write":0,"cache_read":0,"stop":"end_turn","outcome":"ok","status":200,"reply_chars":1,"program_chars":1,"ms":1}\n' "$1" >> "$work/usage.jsonl"; }
 case "$mode" in
-  good)      prepare; printf 'edited\n' >> "$work/tree/src/a.cho"; finish ;;
+  good|The)  # `The`: the first word of every request Forge frames for a derived step (docs/company.md section 19): it edits like `good`
+             prepare; printf 'edited\n' >> "$work/tree/src/a.cho"; finish ;;
   spend)     prepare; usage 600; usage 500; printf 'edited\n' >> "$work/tree/src/a.cho"; finish ;;
   outside)   prepare; printf 'more\n' >> "$work/tree/docs/x.md"; finish ;;
   denied)    prepare; printf 'more\n' >> "$work/tree/src/secret/k.cho"; finish ;;

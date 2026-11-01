@@ -13,6 +13,7 @@ import forge.await_run;
 import forge.await_task;
 import forge.company_budget;
 import forge.company_cmd;
+import forge.company_derive;
 import forge.company_files;
 import forge.company_graph;
 import forge.company_manifest;
@@ -254,10 +255,15 @@ fn run_locked[&h, &f, &x, &c, &i, &d, &m, &j, &o, &z](heap: &!h Heap, fs: &f Fs(
                     refuse(io, company_manifest.rule_name(why));
                 }
                 company_manifest.ManifestResult::Held(held) => {
-                    borrow held as &hm in {
-                        code = with_operator(heap, fs, exec, clock, io, hm, dir, jpath, opath, sig);
+                    let (ext, why) = company_derive.load(heap, fs, dir, jpath, held);
+                    if why != 0 {
+                        refuse(io, company_derive.rule_of_code(why));
+                    } else {
+                        borrow ext as &hm in {
+                            code = with_operator(heap, fs, exec, clock, io, hm, dir, jpath, opath, sig);
+                        }
                     }
-                    company_manifest.drop(heap, held);
+                    company_manifest.drop(heap, ext);
                 }
             }
         }

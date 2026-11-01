@@ -96,6 +96,25 @@ check "good: a second run admits nothing again (the step was admitted once)" sh 
 "$F" company status "$w/co1" > "$w/status"
 check "good: forge company status shows the step accepted" sh -c "grep -q 'accepted' '$w/status'"
 
+# ---- a derived step: a flow of the manifest, instantiated by an admitted change (docs/company.md section 19)
+mkrepo ckd; operator opd "$w/ckd"
+cod="$w/cod"
+mkdir -p "$cod/steps/chg/ev" "$cod/steps/chg-0001.fix/ev" "$cod/changes" || exit 1
+cp "$w/co1/prices.json" "$w/co1/audit_change.sh" "$cod/" || exit 1
+printf '{"id":"co","mission":"m","model":{"provider":"stand","name":"m1"},"budget":{"input":100000,"output":100000,"cache_write":100000,"cache_read":100000,"max_cost":10,"price_table":"prices.json"},"human_gates":["go"],"roles":["builder"],"repos":[{"id":"diff","kind":"library"}],"flows":{"bug":[{"id":"fix","role":"builder","task_type":"repo.change","needs":[],"input":"unused: a repo.change step takes the request","check":"audit_change.sh"}]},"steps":[{"id":"chg","role":"builder","task_type":"repo.change","needs":[],"input":"good","check":"audit_change.sh","repo":"diff","change_kind":"bug"}]}' > "$cod/company.json"
+printf 'the output is too noisy for logs\n' > "$w/derived-request.txt"
+run "$cod" "$w/opd.json"
+check "derived: the manifest's own step runs first" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: chg' '$w/out'"
+"$F" company change add "$cod" repo=diff kind=bug justification=defect "title=noisy output" "file=$w/derived-request.txt" > "$w/out" 2>&1
+check "derived: a bug change is admitted by the act" grep -q "change chg-0001: admitted" "$w/out"
+run "$cod" "$w/opd.json"
+check "derived: the derived step runs, is accepted, and the run is done" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: chg-0001.fix' '$w/out' && grep -qx 'done: steps accepted 2' '$w/out'"
+check "derived: its patch is in its own step directory" sh -c "grep -q '^+edited' '$cod/steps/chg-0001.fix/ev/change.patch'"
+check "derived: the change worker got the change's repository (the record names it)" sh -c "grep 'company.step.change' '$cod/company.journal' | grep -q '\"task\":\"chg-0001.fix\"' && grep 'company.step.change' '$cod/company.journal' | grep '\"task\":\"chg-0001.fix\"' | grep -q '\"repo\":\"diff\"'"
+check "derived: the request reaches the model as a file, framed: the preamble, the title, the body" sh -c "head -c 24 '$cod/steps/chg-0001.fix/ev/change.txt' | grep -q 'The text below is a ch' && grep -q '^title: noisy output' '$cod/steps/chg-0001.fix/ev/change.txt' && grep -q 'the output is too noisy for logs' '$cod/steps/chg-0001.fix/ev/change.txt'"
+run "$cod" "$w/opd.json"
+check "derived: a second run admits nothing again" sh -c "[ \$(cat '$w/rc') = 0 ] && [ \$(grep -c 'company.step.admitted' '$cod/company.journal') = 2 ]"
+
 # ---- the build tool writes the copy it was given
 mkrepo ck2; operator op2 "$w/ck2"; mkco co2 "editbase"
 run "$w/co2" "$w/op2.json"

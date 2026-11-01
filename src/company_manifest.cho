@@ -227,6 +227,7 @@ pub struct Step {
     gate: int,
     repo: int,
     change_kind: int,
+    src: int,
 }
 
 // A manifest that passed every check. It owns its text and the tape over it, so it is `res`: end it with `drop`.
@@ -240,6 +241,10 @@ pub res struct Manifest {
     gates: int,
     repos: int,
     flows: int,
+    dtext: buffer.Buffer,
+    dtape: Box[[int]],
+    dsteps: int,
+    dcount: int,
     step_count: int,
     input: int,
     output: int,
@@ -1203,13 +1208,15 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
         cache_read = json.to_int(text, tp, json.get(text, tp, budget, "cache_read"));
         max_cost = json.to_int(text, tp, json.get(text, tp, budget, "max_cost"));
     }
-    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, flows: flows, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
+    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, flows: flows, dtext: buffer.empty(heap, 1), dtape: box_slice(heap, 1, 0), dsteps: 0 - 1, dcount: 0, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost });
 }
 
 pub fn drop[&h](heap: &!h Heap, m: Manifest) -> [heap] int {
-    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, flows, step_count, input, output, cache_write, cache_read, max_cost } = m;
+    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, flows, dtext, dtape, dsteps, dcount, step_count, input, output, cache_write, cache_read, max_cost } = m;
     buffer.drop(heap, text);
     unbox_slice(heap, tape);
+    buffer.drop(heap, dtext);
+    unbox_slice(heap, dtape);
     return 0;
 }
 
@@ -1290,7 +1297,13 @@ pub fn gate_at[&m](m: &m Manifest, k: int) -> [] &m [byte] {
     return text_at(m, json.at(contents(m.tape), m.gates, k));
 }
 
+// All the steps: the manifest's own, then the derived ones (`extend`).
 pub fn step_count[&m](m: &m Manifest) -> [] int {
+    return m.step_count + m.dcount;
+}
+
+// The manifest's own steps, the ones before the derived ones.
+pub fn own_step_count[&m](m: &m Manifest) -> [] int {
     return m.step_count;
 }
 
@@ -1319,20 +1332,38 @@ pub fn library_name_ok[&n](name: &n [byte]) -> [] bool {
 
 // Step `i`, 0-based; an `i` outside 0 to `step_count - 1` is the first step.
 pub fn step_at[&m](m: &m Manifest, i: int) -> [] Step {
+    if i >= m.step_count && i < m.step_count + m.dcount {
+        return step_of(m, 1, json.at(contents(m.dtape), m.dsteps, i - m.step_count));
+    }
     var at = i;
     if at < 0 || at >= m.step_count {
         at = 0;
     }
-    return step_of_node(m, json.at(contents(m.tape), m.steps, at));
+    return step_of(m, 0, json.at(contents(m.tape), m.steps, at));
 }
 
-// The step whose object is node `node` of the tape.
-fn step_of_node[&m](m: &m Manifest, node: int) -> [] Step {
-    let tp = contents(m.tape);
-    let src = buffer.bytes(m.text);
-    let role = role_code(json.string_view(src, tp, json.get(src, tp, node, "role")));
-    let tcode = type_code(json.string_view(src, tp, json.get(src, tp, node, "task_type")));
-    return Step { id: json.get(src, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(src, tp, node, "needs"), input: json.get(src, tp, node, "input"), check: json.get(src, tp, node, "check"), contract: json.get(src, tp, node, "contract"), library: json.get(src, tp, node, "library"), gate: json.get(src, tp, node, "gate"), repo: json.get(src, tp, node, "repo"), change_kind: json.get(src, tp, node, "change_kind") };
+// The step whose object is node `node` of the tape of source `src` (0 the manifest's own text, 1 the derived steps').
+fn step_of[&m](m: &m Manifest, src: int, node: int) -> [] Step {
+    var tp = contents(m.tape);
+    var text = buffer.bytes(m.text);
+    if src == 1 {
+        tp = contents(m.dtape);
+        text = buffer.bytes(m.dtext);
+    }
+    let role = role_code(json.string_view(text, tp, json.get(text, tp, node, "role")));
+    let tcode = type_code(json.string_view(text, tp, json.get(text, tp, node, "task_type")));
+    return Step { id: json.get(text, tp, node, "id"), role: role_of(role), task_type: type_of(tcode), needs: json.get(text, tp, node, "needs"), input: json.get(text, tp, node, "input"), check: json.get(text, tp, node, "check"), contract: json.get(text, tp, node, "contract"), library: json.get(text, tp, node, "library"), gate: json.get(text, tp, node, "gate"), repo: json.get(text, tp, node, "repo"), change_kind: json.get(text, tp, node, "change_kind"), src: src };
+}
+
+// The text of node `node` of the source a step came from.
+fn text_of[&m](m: &m Manifest, src: int, node: int) -> [] &m [byte] {
+    if src == 1 {
+        if node < 0 {
+            return buffer.bytes(m.dtext)[0..0];
+        }
+        return json.string_view(buffer.bytes(m.dtext), contents(m.dtape), node);
+    }
+    return text_at(m, node);
 }
 
 // ---- flows ----------------------------------------------------------------------------------------------------------------
@@ -1391,55 +1422,156 @@ pub fn flow_step_at[&m](m: &m Manifest, k: int, i: int) -> [] Step {
     if key < 0 || i < 0 || i >= flow_step_count(m, k) {
         return step_at(m, 0);
     }
-    return step_of_node(m, json.at(contents(m.tape), key + 1, i));
+    return step_of(m, 0, json.at(contents(m.tape), key + 1, i));
 }
 
 pub fn step_id[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
-    return text_at(m, s.id);
+    return text_of(m, s.src, s.id);
 }
 
 // The step's input as written (an escape in it is still escaped).
 pub fn step_input[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
-    return text_at(m, s.input);
+    return text_of(m, s.src, s.input);
 }
 
 // The step's check file name, empty when it has none.
 pub fn step_check[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
-    return text_at(m, s.check);
+    return text_of(m, s.src, s.check);
 }
 
 // The step's contract file name (a builder's or writer's), empty when it has none.
 pub fn step_contract[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
-    return text_at(m, s.contract);
+    return text_of(m, s.src, s.contract);
 }
 
 // The step's library name (a builder's or writer's), empty when it has none.
 pub fn step_library[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
-    return text_at(m, s.library);
+    return text_of(m, s.src, s.library);
 }
 
 // The step's gate, empty when it has none.
 pub fn step_gate[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
-    return text_at(m, s.gate);
+    return text_of(m, s.src, s.gate);
 }
 
 pub fn step_needs_count[&m](m: &m Manifest, s: Step) -> [] int {
+    if s.src == 1 {
+        return json.count(contents(m.dtape), s.needs);
+    }
     return json.count(contents(m.tape), s.needs);
 }
 
 // The id of what the step needs, `k`th (0-based); empty outside the list.
 pub fn step_need[&m](m: &m Manifest, s: Step, k: int) -> [] &m [byte] {
+    if s.src == 1 {
+        return text_of(m, 1, json.at(contents(m.dtape), s.needs, k));
+    }
     return text_at(m, json.at(contents(m.tape), s.needs, k));
+}
+
+// Is the step a derived one (from a flow, for a change)?
+pub fn step_is_derived(s: Step) -> [] bool {
+    return s.src == 1;
+}
+
+// The step's role and task type as written in a manifest, for the writer of derived steps.
+pub fn step_role_name(s: Step) -> [] &static [byte] {
+    match s.role {
+        Role::Builder => {
+            return "builder";
+        }
+        Role::Qa => {
+            return "qa";
+        }
+        Role::Analyst => {
+            return "analyst";
+        }
+        Role::Reviewer => {
+            return "reviewer";
+        }
+        Role::Writer => {
+            return "writer";
+        }
+        Role::Product => {
+            return "product";
+        }
+    }
+}
+
+pub fn step_task_name(s: Step) -> [] &static [byte] {
+    match s.task_type {
+        TaskType::ProjectBuild => {
+            return "project.build";
+        }
+        TaskType::RepoGate => {
+            return "repo.gate";
+        }
+        TaskType::ToolRun => {
+            return "tool.run";
+        }
+        TaskType::None => {
+            return "none";
+        }
+        TaskType::RepoChange => {
+            return "repo.change";
+        }
+    }
+}
+
+// ---- derived steps ----------------------------------------------------------------------------------------------------------
+
+// Add derived steps (docs/company.md section 19): `derived` is a JSON array of step objects in the shape of `steps`, written by Forge from a
+// flow and a change (src/company_derive.cho). They are read after the manifest's own steps, by step number, with the same readers. 0 when added;
+// 1 when the text is not an array of steps (or the manifest already has derived steps), 2 when the steps would pass the 256 of `max_steps`.
+// The manifest is handed back either way.
+pub fn extend[&h, &t](heap: &!h Heap, m: Manifest, derived: &t [byte]) -> [heap] (Manifest, int) {
+    var have = 0;
+    var own_count = 0;
+    borrow m as &mr in {
+        have = mr.dcount;
+        own_count = mr.step_count;
+    }
+    if have > 0 {
+        return (m, 1);
+    }
+    let dt = box_slice(heap, json.tape_len(derived), 0);
+    var code = 1;
+    var count = 0;
+    var node = 0 - 1;
+    borrow mut dt as &!w in {
+        let tp = contents(w);
+        if json.parse(derived, tp) > 0 && json.is_array(tp, 0) {
+            code = 0;
+            node = 0;
+            count = json.count(tp, 0);
+            var i = 0;
+            while i < count && code == 0 {
+                code = step_shape_code(derived, tp, json.at(tp, 0, i));
+                i = i + 1;
+            }
+        }
+    }
+    if code == 0 && own_count + count > max_steps() {
+        code = 2;
+    }
+    if code != 0 {
+        unbox_slice(heap, dt);
+        return (m, code);
+    }
+    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, flows, dtext, dtape, dsteps, dcount, step_count, input, output, cache_write, cache_read, max_cost } = m;
+    buffer.drop(heap, dtext);
+    unbox_slice(heap, dtape);
+    return (Manifest { text: text, tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, flows: flows, dtext: buffer.append(heap, buffer.empty(heap, len(derived) + 1), derived), dtape: dt, dsteps: node, dcount: count, step_count: step_count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost }, 0);
 }
 
 // The step's repository id (a `repo.change` step's), empty when it has none.
 pub fn step_repo[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
-    return text_at(m, s.repo);
+    return text_of(m, s.src, s.repo);
 }
 
 // The step's `change_kind` as written, empty when it has none (`cancho-build`'s default, `feature`, is then used).
 pub fn step_change_kind[&m](m: &m Manifest, s: Step) -> [] &m [byte] {
-    return text_at(m, s.change_kind);
+    return text_of(m, s.src, s.change_kind);
 }
 
 // Does the step run as a `repo.change` task?

@@ -965,3 +965,45 @@ nothing yet acts on.
 **Accessors** (`company_manifest`): `flow_count`, `flow_name_at`, `flow_index`, `flow_step_count`, `flow_step_at` (a `Step`, read with the ordinary
 `step_*` readers). **Where the design and the code differ:** the design makes `flow-unknown` a manifest-time refusal; a manifest cannot know the
 kinds its changes will have, so the check is made when a change is taken, and only for manifests that opted in with `flows`.
+
+## 19. Derived steps (slice 2, part B2, of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status: built and tested, no model.** Unit tests `tests/company_derive_test.cho`, `tests/company_change_test.cho`; `tests/conformance/company_derive.sh`
+(`status` and `decide`); a derived `repo.change` step run by the real change worker with the stand-in build tool in `tests/conformance/company_change.sh`
+(`derived:` cases). **Not built:** the provisioner. The operator still makes `steps/<derived id>/ev` by hand (`step-dir-missing` otherwise), so a change
+still needs a person to make one directory per derived step before `forge company run` can start it. Not measured: anything about a model.
+
+**What is derived.** For every change the journal holds in the state *admitted* (never a proposed or rejected one), the steps of the flow named after its
+kind, if the manifest has one (a manifest that has none for that kind derives nothing for it; `change add` refuses such a change when the manifest declares
+`flows`, but a flow removed later is not an error). A derived step is a pure function of the manifest, the journal and the change's request file; nothing
+about it is stored, and removing nothing from the journal removes none of them.
+
+| field | value |
+|---|---|
+| `id` | `<change id>.<template step id>`, for example `chg-0007.fix` (also its directory `steps/chg-0007.fix` and its retry gate `retry:chg-0007.fix`) |
+| `needs` | the template's, each prefixed the same way, so a derived step needs only steps of its own change |
+| `input` | a `repo.change` step: the request, framed; any other step: the template's own |
+| `repo` | a `repo.change` step: the change's repository (`repo` in the journal's `company.change.proposed`) |
+| `change_kind` | the template's, else the change's kind when it is `bug` or `feature` |
+| `role`, `task_type`, `check`, `contract`, `library`, `gate` | the template's |
+
+**The frame** (design section 4.4). The request is text from outside the company, so a `repo.change` step's input is a fixed preamble saying so, then
+`title: <title>`, then the body of `changes/<id>.txt`, cut with a marker (`\n[cut]`) until it fits the manifest's 16 KiB text limit *as escaped*. It is a
+mitigation and not a control: the check, the audit, the gate and the path bounds do not read it, and a model can still follow text that looks like an
+instruction (design section 4.4; the builder has no tools today).
+
+**Numbering and the verbs.** The manifest's own steps come first, then the derived ones in change order and flow order; one run uses one numbering
+(`company_manifest.extend`, a second text and tape inside the manifest). `status`, `decide` and `run` derive after they parse the manifest and read the
+journal (`company_derive.load`): `status format=json` lists the derived steps with the others; `decide` knows their gates and `retry:<derived id>`
+(and `gate-unknown` for any other); `run` runs them as it runs any step, the same refusals, the same acceptance, the same budget. A journal that cannot be
+read or replayed derives nothing and the verb reports it as it always did. An admitted change cannot appear while a run holds the lock, so the
+derivation is made once per invocation. `publish` does not derive: a derived step is not published (slice 2, later).
+
+**Refusals** (exit 1, nothing written): `change-body-missing` (an admitted change whose request file is not there: put it back or the company
+cannot be read), `derived-steps-too-many` (manifest steps and derived steps pass 256), `derived-steps-invalid` (a defect of Forge).
+
+**Where the design and the code differ.** (1) The request is read from `changes/<id>.txt` at each invocation, not once at admission: replacing the
+file changes the next derivation, as editing `company.json` changes the steps. The journal holds the file's SHA-256 but nothing compares it yet; a
+check that the file is the one proposed is open (it is the retention work of design section 4.4). (2) A change whose flow has been removed derives no
+step instead of being refused. (3) The company ends when every step, derived included, is accepted; a change admitted later reopens a company that
+said `done`.

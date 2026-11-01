@@ -36,7 +36,7 @@ fn add[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [he
 }
 
 fn proposed[&h](heap: &!h Heap, seq: int, id: &static [byte]) -> [heap] buffer.Buffer {
-    return company_state.change_proposed(heap, seq, id, "diff", "feature", "operator", "ana", "a title", "00", 12, "operator");
+    return company_state.change_proposed(heap, seq, id, "diff", "feature", "operator", "ana", "a title", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 12, "operator");
 }
 
 fn probe_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] Probe {
@@ -252,5 +252,53 @@ fn test_a_journal_without_changes_has_none[&h](heap: &!h Heap) -> [heap] int {
     let p = probe_of(heap, "");
     test.assert_eq(p.rule, 0);
     test.assert_eq(p.all, 0);
+    return 0;
+}
+
+fn test_the_fields_of_a_proposed_record_are_kept[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                borrow j as &jb in {
+                    let s = company_state.replay(heap, buffer.bytes(jb), mr);
+                    borrow s as &sr in {
+                        test.assert(bytes.equal(company_state.change_field(sr, "chg-0001", 0), "diff"));
+                        test.assert(bytes.equal(company_state.change_field(sr, "chg-0001", 1), "feature"));
+                        test.assert(bytes.equal(company_state.change_field(sr, "chg-0001", 2), "a title"));
+                        test.assert_eq(len(company_state.change_field(sr, "chg-0001", 3)), 64);
+                        test.assert_eq(len(company_state.change_field(sr, "chg-0002", 0)), 0);
+                        test.assert_eq(len(company_state.change_field(sr, "chg-0001", 9)), 0);
+                    }
+                    company_state.drop(heap, s);
+                }
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(why) => {
+            test.assert(false);
+        }
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_proposed_record_with_a_title_over_200_bytes_or_a_short_hash_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var long = buffer.empty(heap, 256);
+    var k = 0;
+    while k < 201 {
+        long = buffer.push(heap, long, byte_of(97));
+        k = k + 1;
+    }
+    var j = buffer.empty(heap, 512);
+    borrow long as &lb in {
+        j = add(heap, j, company_state.change_proposed(heap, 1, "chg-0001", "diff", "bug", "operator", "ana", buffer.bytes(lb), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1, "defect"));
+    }
+    buffer.drop(heap, long);
+    test.assert_eq(probe_journal(heap, j).rule, task.rule_code(task.Rule::EventMalformed));
+    var short = buffer.empty(heap, 256);
+    short = add(heap, short, company_state.change_proposed(heap, 1, "chg-0001", "diff", "bug", "operator", "ana", "t", "00", 1, "defect"));
+    test.assert_eq(probe_journal(heap, short).rule, task.rule_code(task.Rule::EventMalformed));
     return 0;
 }

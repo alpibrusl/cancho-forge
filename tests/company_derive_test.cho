@@ -1,0 +1,168 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_derive;
+import forge.company_manifest;
+
+// Unit tests for the derived steps of src/company_manifest.cho (`extend`) and the frame of src/company_derive.cho (docs/company.md section 19). The
+// derivation from a journal and the request files is tested end to end in tests/conformance/company_derive.sh. Run with `cancho test`.
+
+fn manifest_text() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\"],\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}";
+}
+
+fn derived_text() -> [] &static [byte] {
+    return "[{\"id\":\"chg-0001.fix\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"the request\",\"check\":\"c.sh\",\"repo\":\"diff\",\"change_kind\":\"bug\"},{\"id\":\"chg-0001.gate\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"chg-0001.fix\"],\"input\":\"y\",\"gate\":\"g\"}]";
+}
+
+// Run `check` on a manifest extended with `derived`; the answer of `extend`.
+fn extend_code[&h, &d](heap: &!h Heap, derived: &d [byte]) -> [heap] int {
+    var code = 0 - 1;
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            let (m2, c) = company_manifest.extend(heap, m, derived);
+            code = c;
+            company_manifest.drop(heap, m2);
+        }
+        company_manifest.ManifestResult::Refused(why) => {
+            test.assert(false);
+        }
+    }
+    return code;
+}
+
+fn test_derived_steps_follow_the_manifests_own_by_step_number[&h](heap: &!h Heap) -> [heap] int {
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            let (m2, c) = company_manifest.extend(heap, m, derived_text());
+            test.assert_eq(c, 0);
+            borrow m2 as &mr in {
+                test.assert_eq(company_manifest.step_count(mr), 3);
+                test.assert_eq(company_manifest.own_step_count(mr), 1);
+                let own = company_manifest.step_at(mr, 0);
+                test.assert(bytes.equal(company_manifest.step_id(mr, own), "a"));
+                test.assert(company_manifest.step_is_derived(own) == false);
+                let fix = company_manifest.step_at(mr, 1);
+                test.assert(company_manifest.step_is_derived(fix));
+                test.assert(bytes.equal(company_manifest.step_id(mr, fix), "chg-0001.fix"));
+                test.assert(bytes.equal(company_manifest.step_input(mr, fix), "the request"));
+                test.assert(bytes.equal(company_manifest.step_check(mr, fix), "c.sh"));
+                test.assert(bytes.equal(company_manifest.step_repo(mr, fix), "diff"));
+                test.assert(bytes.equal(company_manifest.step_change_kind(mr, fix), "bug"));
+                test.assert(company_manifest.is_repo_change(fix));
+                let gate = company_manifest.step_at(mr, 2);
+                test.assert_eq(company_manifest.step_needs_count(mr, gate), 1);
+                test.assert(bytes.equal(company_manifest.step_need(mr, gate, 0), "chg-0001.fix"));
+                test.assert(bytes.equal(company_manifest.step_gate(mr, gate), "g"));
+                test.assert(bytes.equal(company_manifest.step_role_name(gate), "qa"));
+                test.assert(bytes.equal(company_manifest.step_task_name(gate), "repo.gate"));
+            }
+            company_manifest.drop(heap, m2);
+        }
+        company_manifest.ManifestResult::Refused(why) => {
+            test.assert(false);
+        }
+    }
+    return 0;
+}
+
+fn test_text_that_is_not_an_array_of_steps_is_refused_and_the_manifest_kept[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(extend_code(heap, "{}"), 1);
+    test.assert_eq(extend_code(heap, "not json"), 1);
+    test.assert_eq(extend_code(heap, "[{\"id\":\"x\"}]"), 1);
+    test.assert_eq(extend_code(heap, "[]"), 0);
+    return 0;
+}
+
+fn test_a_manifest_is_extended_once[&h](heap: &!h Heap) -> [heap] int {
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            let (m2, c) = company_manifest.extend(heap, m, derived_text());
+            test.assert_eq(c, 0);
+            let (m3, again) = company_manifest.extend(heap, m2, derived_text());
+            test.assert_eq(again, 1);
+            borrow m3 as &mr in {
+                test.assert_eq(company_manifest.step_count(mr), 3);
+            }
+            company_manifest.drop(heap, m3);
+        }
+        company_manifest.ManifestResult::Refused(why) => {
+            test.assert(false);
+        }
+    }
+    return 0;
+}
+
+fn test_steps_past_the_256_are_refused[&h](heap: &!h Heap) -> [heap] int {
+    var many = buffer.append(heap, buffer.empty(heap, 4096), "[");
+    var k = 0;
+    while k < 256 {
+        if k > 0 {
+            many = buffer.append(heap, many, ",");
+        }
+        many = buffer.append(heap, many, "{\"id\":\"d");
+        many = buffer.push_nat(heap, many, k);
+        many = buffer.append(heap, many, "\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}");
+        k = k + 1;
+    }
+    many = buffer.append(heap, many, "]");
+    borrow many as &mb in {
+        test.assert_eq(extend_code(heap, buffer.bytes(mb)), 2);
+    }
+    buffer.drop(heap, many);
+    return 0;
+}
+
+fn test_a_short_request_is_framed_whole_with_the_title[&h](heap: &!h Heap) -> [heap] int {
+    let f = company_derive.framed(heap, "noisy output", "make it quieter");
+    borrow f as &fb in {
+        let text = buffer.bytes(fb);
+        test.assert(len(text) > 100);
+        test.assert(bytes.equal(text[len(text) - 15..len(text)], "make it quieter"));
+        test.assert(bytes.equal(text[0..20], "The text below is a "));
+    }
+    buffer.drop(heap, f);
+    return 0;
+}
+
+fn test_a_request_that_does_not_fit_is_cut_with_a_marker[&h](heap: &!h Heap) -> [heap] int {
+    var body = buffer.empty(heap, 20000);
+    var k = 0;
+    while k < 20000 {
+        body = buffer.push(heap, body, byte_of(97));
+        k = k + 1;
+    }
+    borrow body as &bb in {
+        let f = company_derive.framed(heap, "t", buffer.bytes(bb));
+        borrow f as &fb in {
+            let text = buffer.bytes(fb);
+            test.assert(len(text) <= company_manifest.max_text());
+            test.assert(bytes.equal(text[len(text) - 6..len(text)], "\n[cut]"));
+        }
+        buffer.drop(heap, f);
+    }
+    buffer.drop(heap, body);
+    return 0;
+}
+
+fn test_a_request_full_of_quotes_is_cut_until_its_escaped_form_fits[&h](heap: &!h Heap) -> [heap] int {
+    var body = buffer.empty(heap, 20000);
+    var k = 0;
+    while k < 9000 {
+        body = buffer.push(heap, body, byte_of(34));
+        k = k + 1;
+    }
+    borrow body as &bb in {
+        let f = company_derive.framed(heap, "t", buffer.bytes(bb));
+        borrow f as &fb in {
+            let text = buffer.bytes(fb);
+            test.assert(len(text) < 9000);
+            test.assert(len(text) > 1000);
+        }
+        buffer.drop(heap, f);
+    }
+    buffer.drop(heap, body);
+    return 0;
+}
