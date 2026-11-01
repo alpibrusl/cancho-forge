@@ -369,6 +369,14 @@ pub fn status_json[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, 
     w = json.end_array(heap, w);
     w = put_gates(heap, w, m, s);
     w = put_open_gates(heap, w, m, s);
+    if company_state.change_count(s, 0) > 0 {
+        w = json.put_key(heap, w, "changes");
+        w = json.begin_object(heap, w);
+        w = put_count(heap, w, "proposed", company_state.change_count(s, 1));
+        w = put_count(heap, w, "admitted", company_state.change_count(s, 2));
+        w = put_count(heap, w, "rejected", company_state.change_count(s, 3));
+        w = json.end_object(heap, w);
+    }
     w = json.put_key(heap, w, "budget");
     w = json.begin_object(heap, w);
     w = put_tokens(heap, w, "limits", company_manifest.budget_input(m), company_manifest.budget_output(m), company_manifest.budget_cache_write(m), company_manifest.budget_cache_read(m));
@@ -729,11 +737,17 @@ fn event_for[&h, &f, &g, &r](heap: &!h Heap, fs: &f Fs(""), seq: int, gate: &g [
     return ev;
 }
 
+// Is `gate` an `admit:<change id>` gate? Such a gate is not in the manifest: it exists while the change it names is proposed.
+fn is_admit[&g](gate: &g [byte]) -> [] bool {
+    let p = company_state.admit_prefix();
+    return len(gate) > len(p) && bytes.equal(gate[0..len(p)], p);
+}
+
 // Replay the journal against `held`, refuse an unknown gate or a refused journal, else append the decision. Ends `held`.
 fn decide_with[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, held: company_manifest.Manifest, jpath: &j [byte], gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     var code = 1;
     borrow held as &hm in {
-        if company_manifest.has_gate(hm, gate) == false && company_state.retry_step(hm, gate) < 0 {
+        if company_manifest.has_gate(hm, gate) == false && company_state.retry_step(hm, gate) < 0 && is_admit(gate) == false {
             refuse(io, company_manifest.rule_name(company_manifest.Refusal::GateUnknown));
         } else {
             let existed = journal_io.exists(fs, jpath);
@@ -753,6 +767,8 @@ fn decide_with[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io
                                 line(io, "line: ", buffer.bytes(nb));
                             }
                             buffer.drop(heap, n);
+                        } else if is_admit(gate) && company_state.change_state(sr, gate[len(company_state.admit_prefix())..len(gate)]) != 1 {
+                            refuse(io, company_manifest.rule_name(company_manifest.Refusal::GateUnknown));
                         } else {
                             code = append_decision(heap, fs, io, jpath, existed, rep, gate, verdict, reason);
                         }

@@ -811,6 +811,9 @@ new `tests/conformance/company_change.sh` run by `scripts/gate.sh`; every refusa
 The slice is **done** when those are green with the stand-in. It says nothing about whether a model can write such a patch (M-1) and
 must be reported that way, as `company.md` reports every number.
 
+> **Slice 2, part A built** (change records, `forge company change add`, the `admit:` gate): [`company.md`](company.md) section 17. Flows,
+> the provisioner, issue intake and the patch publish are the rest of slice 2 and are not built.
+
 ### 8.2 The order of the rest
 
 Each ends with a gate that reaches its tags and, where it spends money, a measured run recorded in `spike/RESULTS.md` (the rule of

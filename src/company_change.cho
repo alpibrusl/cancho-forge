@@ -1,0 +1,135 @@
+edition 9;
+module forge.company_change;
+
+import std.buffer;
+import std.bytes;
+
+// A change request's closed fields and the rules that judge them (docs/company-lifecycle.md section 4.1, docs/company.md section 17). Pure: no row
+// beyond `heap`. `forge company change add` (src/company_cmd.cho) calls these before it writes anything; replay (src/company_state.cho) reads the
+// records they led to and trusts none of the words in them.
+//
+// A kind selects who may ask for it and which justification it may carry:
+//
+//   bug             justification `defect`                          admitted by the operator's own act (no gate)
+//   feature         justification `operator` or `goal:<goal id>`    needs `admit:<id>`
+//   compiler-bump   justification `maintenance`                    admitted by the operator's own act (no gate)
+//   feedback        justification `operator` or `goal:<goal id>`    needs `admit:<id>`
+//
+// The tags (docs/company.md section 17): `change-malformed` (a missing or repeated argument, a title that is not one line of at most 200 bytes of
+// plain text, a request file that cannot be read), `change-kind-invalid`, `change-justification-missing` (none, or one the kind does not allow),
+// `change-too-large` (a request text over 16 KiB), and `repo-unknown` (a repository the manifest does not list, a tag of the repos rows).
+
+pub fn max_body() -> [] int {
+    return 16384;
+}
+
+pub fn max_title() -> [] int {
+    return 200;
+}
+
+pub fn rule_malformed() -> [] &static [byte] {
+    return "change-malformed";
+}
+
+pub fn rule_kind_invalid() -> [] &static [byte] {
+    return "change-kind-invalid";
+}
+
+pub fn rule_justification_missing() -> [] &static [byte] {
+    return "change-justification-missing";
+}
+
+pub fn rule_too_large() -> [] &static [byte] {
+    return "change-too-large";
+}
+
+// 1 bug, 2 feature, 3 compiler-bump, 4 feedback, 0 any other word.
+pub fn kind_code[&k](kind: &k [byte]) -> [] int {
+    if bytes.equal(kind, "bug") {
+        return 1;
+    }
+    if bytes.equal(kind, "feature") {
+        return 2;
+    }
+    if bytes.equal(kind, "compiler-bump") {
+        return 3;
+    }
+    if bytes.equal(kind, "feedback") {
+        return 4;
+    }
+    return 0;
+}
+
+// Does an operator's change of kind `code` (`kind_code`) need no `admit:` decision?
+pub fn admitted_by_operator(code: int) -> [] bool {
+    return code == 1 || code == 3;
+}
+
+// Is `goal:<id>` with `<id>` a name of 1 to 64 letters, digits, `-` and `_`?
+fn goal_ok[&j](j: &j [byte]) -> [] bool {
+    if len(j) < 6 || len(j) > 69 || bytes.equal(j[0..5], "goal:") == false {
+        return false;
+    }
+    var k = 5;
+    while k < len(j) {
+        let c = int_of(j[k]);
+        let word = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 45 || c == 95;
+        if word == false {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// May a change of kind `code` carry the justification `j`?
+pub fn justification_ok[&j](code: int, j: &j [byte]) -> [] bool {
+    if code == 1 {
+        return bytes.equal(j, "defect");
+    }
+    if code == 3 {
+        return bytes.equal(j, "maintenance");
+    }
+    if code == 2 || code == 4 {
+        return bytes.equal(j, "operator") || goal_ok(j);
+    }
+    return false;
+}
+
+// Is `title` one line of 1 to 200 bytes with no control byte? (Shown by `status` through the JSON writer, which escapes it either way.)
+pub fn title_ok[&t](title: &t [byte]) -> [] bool {
+    if len(title) < 1 || len(title) > max_title() {
+        return false;
+    }
+    var k = 0;
+    while k < len(title) {
+        let c = int_of(title[k]);
+        if c < 32 || c == 127 {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// `chg-` and the number in at least four digits, zero-padded: the id Forge assigns, from the journal, never from the source.
+pub fn id_of[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    var digits = buffer.empty(heap, 8);
+    var rest = n;
+    var count = 0;
+    while rest > 0 || count < 4 {
+        digits = buffer.push(heap, digits, byte_of(48 + rest % 10));
+        rest = rest / 10;
+        count = count + 1;
+    }
+    var out = buffer.append(heap, buffer.empty(heap, 12), "chg-");
+    var k = count;
+    borrow digits as &db in {
+        while k > 0 {
+            out = buffer.push(heap, out, buffer.bytes(db)[k - 1]);
+            k = k - 1;
+        }
+    }
+    buffer.drop(heap, digits);
+    return out;
+}

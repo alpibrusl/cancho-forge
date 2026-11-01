@@ -904,3 +904,43 @@ cancho-code's `--repo` copies with `tar` (its `docs/repo-patch.md`). (4) The pat
 not `a/` and `b/`; `patch_check` requires them. (5) The check receives the patch and `ev`, not a second copy it makes itself: `ev/fresh` is
 that copy. (6) `repo-unconfigured` and `repo-kind-mismatch` are found when the step starts, not at `forge company check`, which never reads the
 operator file. (7) `compiler_rev` is compared with the pin file of the copy at the base commit by the worker, which holds the file text.
+
+## 17. Change requests: `company.change.*` and `forge company change add` (slice 2, part A, of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status: built and tested, no model, no network.** Unit tests `tests/company_change_test.cho`; end to end `tests/conformance/company_change_add.sh`
+(run by `scripts/gate.sh`). This is the first part of slice 2 of the design: the change *records*, the verb that proposes one, and the `admit:`
+gate. **Not built from slice 2:** `flows` and derived steps, the provisioner, intake of issues from files, the patch publish, `change-duplicate`,
+`change-rate-limited` and `change-base-unknown`. A change in this part is a recorded, gated request that nothing yet turns into work.
+
+**Records.** `company.change.proposed` (the record's `task` is the change id; `repo`, `ckind`, `source_type`, `source_ref`, `title`, `body_sha256`,
+`body_bytes`, `justification`) and `company.change.admitted` (the id only). Replay shapes both and keeps a state per id: *proposed*, *admitted*,
+*rejected*. A second `proposed` for one id, or an `admitted` for an id that is not proposed, is `event-malformed`. An older Forge skips both kinds
+and so silently ignores the changes (stated in the design, section 4.1). `status format=json` gains `"changes": {"proposed", "admitted", "rejected"}`
+when the journal holds any change, and is unchanged when it holds none.
+
+**The gate.** `admit:<change id>` is a gate of its own family beside `retry:<step id>`. `forge company decide <dir> admit:chg-0002 approved <reason...>`
+moves a *proposed* change to admitted, `rejected` to rejected. It exists only while the change is proposed: for an unknown, an admitted or a
+rejected change the verb answers `gate-unknown` and writes nothing, and replay ignores a decision recorded before the change was proposed or after it
+was decided. Only a decision after the thing it decides counts, so a stale approval has nothing to find (design, section 4.1; the existing
+`human_gates` are not changed by this).
+
+**The verb.** `forge company change add <company-dir> repo=<id> kind=<kind> justification=<word> title=<text> file=<abs path>`: five `NAME=value`
+arguments in any order, each once (anything else is bad usage, exit 2; a relative `file` is `path-invalid`, exit 2). It takes the writer lock and
+replays the journal as `decide` does. Refusals, exit 1 and nothing written: `repo-unknown` (the manifest's `repos` does not list it),
+`change-kind-invalid`, `change-justification-missing`, `change-malformed` (title, or a request file that cannot be read or is empty),
+`change-too-large` (over 16 KiB). The id is `chg-NNNN`, one past the number of changes in the journal, never from the source. The request text is
+copied to `changes/<id>.txt` **before** the journal is touched (an I/O error is exit 3; a stray request file with no record is harmless), and the
+journal holds its SHA-256 and byte length, never the text. The source is `operator`, its reference the OS user as `decide` records it. A `bug` and a
+`compiler-bump` are admitted by the act (a second record in the same write); a `feature` and a `feedback` stay proposed until an `admit:` decision.
+Justification by kind: `bug` `defect`; `compiler-bump` `maintenance`; `feature` and `feedback` `operator` or `goal:<id>` (`goals.json` does not
+exist yet, so only the shape of the id is checked).
+
+**Authority.** No new capability: the verb holds the rows of `decide` (`fs_read`, `fs_write`, `file_read`, `file_write`, `io_write`);
+`docs/authority.txt` is unchanged.
+
+**Where the design and the code differ.** (1) The request is `changes/<id>.txt`, not `changes/<id>/body.txt`: Forge cannot make a directory, so
+`changes/` is the operator's, made once, as `steps/<id>/ev` is. (2) The record has no `base` and no `at`: `base` needs the checkout and a git call
+the verb does not hold (the `repo.change` worker already records the base it built on, `company.step.change`), and `at` belongs to the clock of
+slice 4. Records written now therefore count, as the design says of older ones, as outside every window. (3) There is no `company.change.rejected`
+record: a rejection is the `admit:` decision itself, and replay derives the state. (4) The record's kind is `ckind` because `kind` is the journal's
+own field. Not measured: nothing about a model.
