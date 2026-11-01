@@ -1,0 +1,286 @@
+edition 9;
+module forge.company_change_cmd;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import forge.company_cmd;
+import forge.company_change;
+import forge.company_files;
+import forge.company_manifest;
+import forge.company_state;
+import forge.journal;
+import forge.journal_io;
+import forge.lock;
+import forge.task;
+
+// `forge company change add <company-dir> repo=<id> kind=<kind> justification=<word> title=<text> file=<abs path>`
+// (docs/company-lifecycle.md sections 4.1 and 4.4, docs/company.md section 17): the operator's way to put a change request in the journal.
+// The five arguments are `NAME=value`, in any order, each exactly once (anything else is bad usage, exit 2). The verb takes the writer lock
+// (`<dir>/lock`), reads the manifest and replays the journal as `decide` does, refuses (exit 1, `refusal: <tag>`, nothing written) a
+// repository the manifest does not list (`repo-unknown`), a kind outside the four (`change-kind-invalid`), a justification the kind does not
+// allow or none (`change-justification-missing`), a title that is not one line of at most 200 bytes (`change-malformed`) and a request file
+// that cannot be read or is over 16 KiB (`change-malformed`, `change-too-large`). The id is `chg-NNNN`, the next number by the journal.
+//
+// The request text is copied to `<dir>/changes/<id>.txt` (Forge cannot make a directory: the operator makes `changes/`, as for `steps/<id>/ev`)
+// BEFORE the journal is touched, and the journal holds its SHA-256 and byte length, never the text. The source is `operator`, its reference the
+// OS user as `decide` records it. A `bug` and a `compiler-bump` are admitted by this act (a second record, `company.change.admitted`, in the same
+// write); a `feature` and a `feedback` stay `proposed` until `forge company decide <dir> admit:<id> approved <reason...>`.
+// Authority: the rows of `decide` (fs_read, fs_write, file_read, file_write, io_write) and no other.
+
+// The value of argument `k` when it starts with `name` + "=", else an empty slice.
+fn value_of[&g, &n](args: &g Args, k: int, name: &n [byte]) -> [args] &g [byte] {
+    let a = arg(args, k);
+    if len(a) > len(name) + 1 && bytes.equal(a[0..len(name)], name) && int_of(a[len(name)]) == 61 {
+        return a[len(name) + 1..len(a)];
+    }
+    return a[0..0];
+}
+
+// The index of the one argument from 5 on that starts with `name=`, -1 for none, -2 for a name twice.
+fn find_arg[&g, &n](args: &g Args, name: &n [byte]) -> [args] int {
+    var at = 0 - 1;
+    var k = 5;
+    while k < arg_count(args) {
+        if len(value_of(args, k, name)) > 0 {
+            if at >= 0 {
+                return 0 - 2;
+            }
+            at = k;
+        }
+        k = k + 1;
+    }
+    return at;
+}
+
+// Is every argument from 5 on one of the five names, with a value?
+fn all_known[&g](args: &g Args) -> [args] bool {
+    var k = 5;
+    while k < arg_count(args) {
+        let known = len(value_of(args, k, "repo")) > 0 || len(value_of(args, k, "kind")) > 0 || len(value_of(args, k, "justification")) > 0 || len(value_of(args, k, "title")) > 0 || len(value_of(args, k, "file")) > 0;
+        if known == false {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+pub fn add_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    if arg_count(args) != 10 || bytes.equal(arg(args, 3), "add") == false || all_known(args) == false {
+        return 2;
+    }
+    let r = find_arg(args, "repo");
+    let k = find_arg(args, "kind");
+    let j = find_arg(args, "justification");
+    let t = find_arg(args, "title");
+    let p = find_arg(args, "file");
+    if r < 0 || k < 0 || j < 0 || t < 0 || p < 0 {
+        return 2;
+    }
+    let dir = arg(args, 4);
+    let mpath = company_cmd.under(heap, dir, "company.json");
+    let jpath = company_cmd.under(heap, dir, "company.journal");
+    let lpath = company_cmd.under(heap, dir, "lock");
+    var code = 1;
+    borrow mpath as &mp in {
+        borrow jpath as &jp in {
+            borrow lpath as &lp in {
+                if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false || journal_io.path_ok(fs, buffer.bytes(lp)) == false || journal_io.path_ok(fs, value_of(args, p, "file")) == false {
+                    company_cmd.refuse(io, task.rule_name(task.Rule::PathInvalid));
+                    code = 2;
+                } else {
+                    match lock.acquire(fs, buffer.bytes(lp)) {
+                        lock.Lock::Refused(rule) => {
+                            company_cmd.refuse(io, task.rule_code_name(rule));
+                            code = 1;
+                        }
+                        lock.Lock::Failed(errno) => {
+                            company_cmd.line(io, "error: cannot take the lock of the company directory", "");
+                            code = 3;
+                        }
+                        lock.Lock::Held(held) => {
+                            code = add_locked(heap, fs, io, dir, buffer.bytes(mp), buffer.bytes(jp), value_of(args, r, "repo"), value_of(args, k, "kind"), value_of(args, j, "justification"), value_of(args, t, "title"), value_of(args, p, "file"));
+                            lock.let_go(held);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, mpath);
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, lpath);
+    return code;
+}
+
+// The lock is held: the manifest first.
+fn add_locked[&h, &f, &i, &d, &m, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], repo: &r [byte], kind: &k [byte], why: &y [byte], title: &t [byte], file: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
+    var code = 1;
+    if errno != 0 {
+        company_cmd.refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(bad) => {
+                    company_cmd.refuse(io, company_manifest.rule_name(bad));
+                }
+                company_manifest.ManifestResult::Held(man) => {
+                    code = add_checked(heap, fs, io, dir, man, jpath, repo, kind, why, title, file);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The closed fields, against the manifest; then the request file.
+fn add_checked[&h, &f, &i, &d, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], man: company_manifest.Manifest, jpath: &j [byte], repo: &r [byte], kind: &k [byte], why: &y [byte], title: &t [byte], file: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var code = 1;
+    let kc = company_change.kind_code(kind);
+    var known = false;
+    borrow man as &mm in {
+        known = company_manifest.repo_index(mm, repo) >= 0;
+    }
+    if known == false {
+        company_cmd.refuse(io, "repo-unknown");
+    } else if kc == 0 {
+        company_cmd.refuse(io, company_change.rule_kind_invalid());
+    } else if company_change.justification_ok(kc, why) == false {
+        company_cmd.refuse(io, company_change.rule_justification_missing());
+    } else if company_change.title_ok(title) == false {
+        company_cmd.refuse(io, company_change.rule_malformed());
+    } else {
+        let (body, errno) = company_cmd.read_limited(heap, fs, file, company_change.max_body() + 1);
+        var size = 0;
+        borrow body as &bb in {
+            size = len(buffer.bytes(bb));
+        }
+        if errno != 0 || size == 0 {
+            company_cmd.refuse(io, company_change.rule_malformed());
+        } else if size > company_change.max_body() {
+            company_cmd.refuse(io, company_change.rule_too_large());
+        } else {
+            borrow body as &bb in {
+                code = add_replayed(heap, fs, io, dir, man, jpath, repo, kind, kc, why, title, buffer.bytes(bb));
+            }
+            buffer.drop(heap, body);
+            return code;
+        }
+        buffer.drop(heap, body);
+    }
+    company_manifest.drop(heap, man);
+    return code;
+}
+
+// Replay the journal (refused as `decide` refuses), then write the body and the record(s).
+fn add_replayed[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], man: company_manifest.Manifest, jpath: &j [byte], repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var code = 1;
+    let existed = journal_io.exists(fs, jpath);
+    let (data, errno) = journal_io.read_all(heap, fs, jpath);
+    if errno != 0 {
+        company_cmd.line(io, "error: cannot read company.journal", "");
+        code = 3;
+    } else {
+        borrow data as &db in {
+            borrow man as &mm in {
+                let state = company_state.replay(heap, buffer.bytes(db), mm);
+                borrow state as &sr in {
+                    let rep = company_state.report_of(sr);
+                    if rep.rule != 0 {
+                        company_cmd.refuse(io, task.rule_code_name(rep.rule));
+                        code = 1;
+                    } else {
+                        code = add_written(heap, fs, io, dir, jpath, existed, rep, company_state.change_count(sr, 0) + 1, repo, kind, kc, why, title, body);
+                    }
+                }
+                company_state.drop(heap, state);
+            }
+        }
+    }
+    buffer.drop(heap, data);
+    company_manifest.drop(heap, man);
+    return code;
+}
+
+// The next number is `n`: the body file, then the journal.
+fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], jpath: &j [byte], existed: bool, rep: journal.Report, n: int, repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let id = company_change.id_of(heap, n);
+    var code = 1;
+    borrow id as &ib in {
+        var rel = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 32), "changes/"), buffer.bytes(ib));
+        rel = buffer.append(heap, rel, ".txt");
+        var bpath = buffer.empty(heap, 1);
+        borrow rel as &rb in {
+            buffer.drop(heap, bpath);
+            bpath = company_cmd.under(heap, dir, buffer.bytes(rb));
+        }
+        buffer.drop(heap, rel);
+        borrow bpath as &bp in {
+            if journal_io.exists(fs, buffer.bytes(bp)) {
+                company_cmd.line(io, "error: the request file already exists: changes/", buffer.bytes(ib));
+                code = 3;
+            } else if journal_io.append(fs, buffer.bytes(bp), body, true) != 0 {
+                company_cmd.line(io, "error: cannot write changes/<id>.txt (the operator makes the directory changes/)", "");
+                code = 3;
+            } else {
+                code = add_recorded(heap, fs, io, jpath, existed, rep, buffer.bytes(ib), repo, kind, kc, why, title, body);
+            }
+        }
+        buffer.drop(heap, bpath);
+    }
+    buffer.drop(heap, id);
+    return code;
+}
+
+// The record(s), one write.
+fn add_recorded[&h, &f, &i, &j, &x, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], existed: bool, rep: journal.Report, id: &x [byte], repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let cut_to = journal.recovery_cut(rep);
+    if cut_to >= 0 {
+        if journal_io.cut_torn_tail(fs, jpath, cut_to) != 0 {
+            company_cmd.line(io, "error: cannot cut the torn tail of company.journal", "");
+            return 3;
+        }
+    }
+    let sha = company_files.hex_of(heap, body);
+    let (environ, errno) = company_cmd.read_limited(heap, fs, "/proc/self/environ", 65536);
+    var ev = buffer.empty(heap, 1);
+    buffer.drop(heap, ev);
+    borrow sha as &sb in {
+        borrow environ as &eb in {
+            if errno == 0 {
+                ev = company_state.change_proposed(heap, rep.records + 1, id, repo, kind, "operator", company_cmd.user_in_environ(buffer.bytes(eb)), title, buffer.bytes(sb), len(body), why);
+            } else {
+                ev = company_state.change_proposed(heap, rep.records + 1, id, repo, kind, "operator", "unknown", title, buffer.bytes(sb), len(body), why);
+            }
+        }
+    }
+    if company_change.admitted_by_operator(kc) {
+        let more = company_state.change_admitted(heap, rep.records + 2, id);
+        borrow more as &mb in {
+            ev = buffer.append(heap, ev, buffer.bytes(mb));
+        }
+        buffer.drop(heap, more);
+    }
+    var status = 0;
+    borrow ev as &evb in {
+        status = journal_io.append(fs, jpath, buffer.bytes(evb), existed == false);
+    }
+    buffer.drop(heap, ev);
+    buffer.drop(heap, sha);
+    buffer.drop(heap, environ);
+    if status != 0 {
+        company_cmd.line(io, "error: cannot write company.journal", "");
+        return 3;
+    }
+    io.write_all(io, "change ");
+    io.write_all(io, id);
+    if company_change.admitted_by_operator(kc) {
+        company_cmd.line(io, ": ", "admitted");
+    } else {
+        company_cmd.line(io, ": ", "proposed");
+    }
+    return 0;
+}

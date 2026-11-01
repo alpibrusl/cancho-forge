@@ -64,6 +64,7 @@ pub res struct CompanyState {
     art_at: Box[[int]],
     gates: map.Map[int],
     admitted: map.Map[int],
+    changes: map.Map[int],
     report: journal.Report,
 }
 
@@ -101,6 +102,23 @@ pub fn kind_library() -> [] &static [byte] {
 // reported them), the patch's SHA-256 and the files and added lines Forge counted in it. Replay checks its shape and nothing else.
 pub fn kind_change() -> [] &static [byte] {
     return "company.step.change";
+}
+
+// A change request (docs/company-lifecycle.md section 4.1, docs/company.md section 17): `company.change.proposed` (task = the change id `chg-NNNN`;
+// repo, ckind, source_type, source_ref, title, body_sha256, body_bytes, justification) and `company.change.admitted` (task = the id). The state of a
+// change is replay, never a stored word: proposed, admitted (an `admitted` record, or an approved `admit:<id>` decision recorded after the change
+// was proposed) or rejected (a rejected `admit:<id>` decision recorded after it was proposed).
+pub fn kind_change_proposed() -> [] &static [byte] {
+    return "company.change.proposed";
+}
+
+pub fn kind_change_admitted() -> [] &static [byte] {
+    return "company.change.admitted";
+}
+
+// The prefix of an admit gate: `admit:<change id>`.
+pub fn admit_prefix() -> [] &static [byte] {
+    return "admit:";
 }
 
 // The prefix of a retry gate: `retry:<step id>` is a decision a person records with `forge company decide` to let a step whose
@@ -226,6 +244,33 @@ pub fn gate_decided[&h, &g, &v, &u, &r](heap: &!h Heap, seq: int, gate: &g [byte
     return closed(heap, w);
 }
 
+// A change `id` was proposed for repository `repo`; `body_sha256` and `body_bytes` name the request text, which is a file and never the journal's.
+pub fn change_proposed[&h, &i, &r, &k, &t, &u, &s, &b, &j](heap: &!h Heap, seq: int, id: &i [byte], repo: &r [byte], ckind: &k [byte], source_type: &t [byte], source_ref: &u [byte], title: &s [byte], body_sha256: &b [byte], body_bytes: int, justification: &j [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_change_proposed(), id);
+    w = json.put_key(heap, w, "repo");
+    w = json.put_string(heap, w, repo);
+    w = json.put_key(heap, w, "ckind");
+    w = json.put_string(heap, w, ckind);
+    w = json.put_key(heap, w, "source_type");
+    w = json.put_string(heap, w, source_type);
+    w = json.put_key(heap, w, "source_ref");
+    w = json.put_string(heap, w, source_ref);
+    w = json.put_key(heap, w, "title");
+    w = json.put_string(heap, w, title);
+    w = json.put_key(heap, w, "body_sha256");
+    w = json.put_string(heap, w, body_sha256);
+    w = json.put_key(heap, w, "body_bytes");
+    w = json.put_int(heap, w, body_bytes);
+    w = json.put_key(heap, w, "justification");
+    w = json.put_string(heap, w, justification);
+    return closed(heap, w);
+}
+
+// The change `id` is admitted without a gate (an operator's `bug` or `compiler-bump`).
+pub fn change_admitted[&h, &i](heap: &!h Heap, seq: int, id: &i [byte]) -> [heap] buffer.Buffer {
+    return closed(heap, opened(heap, seq, kind_change_admitted(), id));
+}
+
 // One call of step `step` used these tokens.
 pub fn spend_recorded[&h, &s](heap: &!h Heap, seq: int, step: &s [byte], input: int, output: int, cache_write: int, cache_read: int) -> [heap] buffer.Buffer {
     var w = opened(heap, seq, kind_spend_recorded(), step);
@@ -339,10 +384,34 @@ fn add_tokens[&s](spend: &!s [int], base: int, a: int, b: int, c: int, d: int) -
     return 0;
 }
 
+// The state of change `id` in `changes`: 0 unknown, 1 proposed, 2 admitted, 3 rejected.
+fn change_state_in[&c, &i](changes: &c map.Map[int], id: &i [byte]) -> [] int {
+    return map.get(changes, id, 0);
+}
+
+// A decision of gate `gate` (verdict state `to`: 2 admitted, 3 rejected): when the gate is `admit:<id>` and change `id` is still proposed, it moves it.
+// A decision on an unknown or already decided change changes nothing: only a decision recorded after the thing it decides counts.
+fn decide_change[&h, &g](heap: &!h Heap, changes: map.Map[int], gate: &g [byte], to: int) -> [heap] map.Map[int] {
+    let p = admit_prefix();
+    var out = changes;
+    if len(gate) > len(p) && bytes.equal(gate[0..len(p)], p) {
+        let id = gate[len(p)..len(gate)];
+        var now = 0;
+        borrow out as &ob in {
+            now = change_state_in(ob, id);
+        }
+        if now == 1 {
+            out = map.put(heap, out, id, to);
+        }
+    }
+    return out;
+}
+
 // Apply one complete line (no newline) that must carry `expect` as its `seq`. Answers the two maps and 0, or a rule code.
-fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], scores: &!c [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], buffer.Buffer, int) {
+fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], scores: &!c [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], changes: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], map.Map[int], buffer.Buffer, int) {
     var gs = gates;
     var ad = admitted;
+    var cs = changes;
     var ar = arts;
     var rule = 0;
     let tape = box_slice(heap, json.tape_len(line), 0);
@@ -395,6 +464,27 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                     if named == false || strings == false || field(line, tp, 0, "files") < 0 || field(line, tp, 0, "added") < 0 {
                         rule = bad;
                     }
+                } else if bytes.equal(kind, kind_change_proposed()) {
+                    let strings = json.is_string(tp, json.get(line, tp, 0, "repo")) && json.is_string(tp, json.get(line, tp, 0, "ckind")) && json.is_string(tp, json.get(line, tp, 0, "source_type")) && json.is_string(tp, json.get(line, tp, 0, "source_ref")) && json.is_string(tp, json.get(line, tp, 0, "title")) && json.is_string(tp, json.get(line, tp, 0, "body_sha256")) && json.is_string(tp, json.get(line, tp, 0, "justification"));
+                    var known = 0;
+                    borrow cs as &cb in {
+                        known = change_state_in(cb, id);
+                    }
+                    if named == false || strings == false || field(line, tp, 0, "body_bytes") < 0 || known != 0 {
+                        rule = bad;
+                    } else {
+                        cs = map.put(heap, cs, id, 1);
+                    }
+                } else if bytes.equal(kind, kind_change_admitted()) {
+                    var known = 0;
+                    borrow cs as &cb in {
+                        known = change_state_in(cb, id);
+                    }
+                    if named == false || known != 1 {
+                        rule = bad;
+                    } else {
+                        cs = map.put(heap, cs, id, 2);
+                    }
                 } else if bytes.equal(kind, kind_check_failed()) {
                     let score = field(line, tp, 0, "score");
                     let total = field(line, tp, 0, "total");
@@ -434,8 +524,10 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                     } else if json.string_equals(line, tp, verdict, "approved") {
                         gs = map.put(heap, gs, json.string_view(line, tp, gate), 1);
                         set_held(held, retry_step(man, json.string_view(line, tp, gate)), 0);
+                        cs = decide_change(heap, cs, json.string_view(line, tp, gate), 2);
                     } else if json.string_equals(line, tp, verdict, "rejected") {
                         gs = map.put(heap, gs, json.string_view(line, tp, gate), 2);
+                        cs = decide_change(heap, cs, json.string_view(line, tp, gate), 3);
                     } else {
                         rule = bad;
                     }
@@ -474,7 +566,7 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
         }
     }
     unbox_slice(heap, tape);
-    return (gs, ad, ar, rule);
+    return (gs, ad, cs, ar, rule);
 }
 
 // `out` with the decoded text of the JSON string at `node` of `src` appended (nothing for a node that is not a string).
@@ -544,6 +636,7 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     var arts = buffer.empty(heap, 256);
     var gates = map.empty(heap, 16, 0, 0);
     var admitted = map.empty(heap, 16, 0, 0);
+    var changes = map.empty(heap, 16, 0, 0);
     var records = 0;
     var good = 0;
     var start = 0;
@@ -562,9 +655,10 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
                         let xa = contents(xw);
                         while k < len(journal_text) && rule == 0 {
                             if int_of(journal_text[k]) == 10 {
-                                let (g, a, t, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, sc, xa, gates, admitted, arts);
+                                let (g, a, c, t, r) = apply(heap, journal_text[start..k], records + 1, m, acc, sp, hd, sc, xa, gates, admitted, changes, arts);
                                 gates = g;
                                 admitted = a;
+                                changes = c;
                                 arts = t;
                                 if r == 0 {
                                     records = records + 1;
@@ -584,11 +678,11 @@ pub fn replay[&h, &t, &m](heap: &!h Heap, journal_text: &t [byte], m: &m company
     }
     let torn = len(journal_text) - journal.after_last_newline(journal_text);
     let report = journal.Report { records: records, valid_bytes: good, total_bytes: len(journal_text), torn_bytes: torn, tasks: 0, rule: rule, line: bad_line };
-    return CompanyState { accepted: accepted, spend: spend, held: held, scores: scores, arts: arts, art_at: art_at, gates: gates, admitted: admitted, report: report };
+    return CompanyState { accepted: accepted, spend: spend, held: held, scores: scores, arts: arts, art_at: art_at, gates: gates, admitted: admitted, changes: changes, report: report };
 }
 
 pub fn drop[&h](heap: &!h Heap, s: CompanyState) -> [heap] int {
-    let CompanyState { accepted, spend, held, scores, arts, art_at, gates, admitted, report } = s;
+    let CompanyState { accepted, spend, held, scores, arts, art_at, gates, admitted, changes, report } = s;
     unbox_slice(heap, accepted);
     unbox_slice(heap, spend);
     unbox_slice(heap, held);
@@ -597,6 +691,7 @@ pub fn drop[&h](heap: &!h Heap, s: CompanyState) -> [heap] int {
     unbox_slice(heap, art_at);
     map.drop(heap, gates);
     map.drop(heap, admitted);
+    map.drop(heap, changes);
     return 0;
 }
 
@@ -648,6 +743,27 @@ pub fn gate_state[&g, &s](s: &s CompanyState, gate: &g [byte]) -> [] int {
 // How many times step `step` was admitted (the resume assertion: an accepted step is not admitted again).
 pub fn admitted_count[&i, &s](s: &s CompanyState, step: &i [byte]) -> [] int {
     return map.get(s.admitted, step, 0);
+}
+
+// The state of change `id`: 0 unknown, 1 proposed, 2 admitted, 3 rejected.
+pub fn change_state[&i, &s](s: &s CompanyState, id: &i [byte]) -> [] int {
+    return map.get(s.changes, id, 0);
+}
+
+// How many changes the journal holds in `state` (1 proposed, 2 admitted, 3 rejected); 0 for any other number. `change_count(s, 0)` is all of them.
+pub fn change_count[&s](s: &s CompanyState, state: int) -> [] int {
+    if state == 0 {
+        return map.size(s.changes);
+    }
+    var n = 0;
+    var e = 0;
+    while e < map.entries(s.changes) {
+        if map.is_live(s.changes, e) && map.value_at(s.changes, e) == state {
+            n = n + 1;
+        }
+        e = e + 1;
+    }
+    return n;
 }
 
 pub fn spend_input[&s](s: &s CompanyState) -> [] int {

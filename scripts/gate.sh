@@ -12,6 +12,7 @@
 #   company run          `forge company run` end to end, real workers, the lying-worker test (tests/conformance/company_run.sh)
 #   company kill         `forge company run` killed mid-step and run again: nothing left running, each step accepted once (tests/conformance/company_kill.sh)
 #   company change      `forge company run` of a repo.change step, the change worker real, a stand-in build tool (tests/conformance/company_change.sh)
+#   company change add  `forge company change add` and the `admit:` gate end to end, every tag of the verb (tests/conformance/company_change_add.sh)
 #   company publish lib `forge company publish` of a library step (tests/conformance/repo_publish_library.sh)
 #   company publish     `forge company publish` end to end against throw-away git repositories, the publish worker real: the good path, one case per refusal tag, the hostile cases (tests/conformance/repo_publish.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
@@ -203,6 +204,12 @@ CANCHO="$C" sh tests/conformance/company_change.sh "$scratch/company-change" > "
 cat "$scratch/company-change.out"
 if grep -q '^FAIL ' "$scratch/company-change.out"; then fail=1; fi
 
+echo "== forge company change add (the operator's change requests and the admit: gate; tests/conformance/company_change_add.sh)"
+mkdir "$scratch/company-change-add" || exit 1
+CANCHO="$C" sh tests/conformance/company_change_add.sh "$scratch/company-change-add" > "$scratch/company-change-add.out" || fail=1
+cat "$scratch/company-change-add.out"
+if grep -q '^FAIL ' "$scratch/company-change-add.out"; then fail=1; fi
+
 echo "== conformance (kill at every crash point)"
 # crash_points starts crash_writer as a child and kills it at each step of
 # append, sync, snapshot and rename. `narrow` takes only a literal (cancho
@@ -293,7 +300,7 @@ fi
 
 echo "== docs: every rule tag the company code can print is in docs/company.md and docs/architecture.md"
 # An oracle from outside the program: the tags are the kebab-case string literals of the company files and the tool task (listed; workers/*.cho are left out: their literals include non-tag names).
-company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_check.cho src/company_cmd.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_needs.cho src/company_run.cho src/company_runner.cho src/company_state.cho src/company_step.cho src/company_publish.cho src/publish_plan.cho src/step_run.cho src/tool_call.cho src/tool_task.cho src/repo_row.cho src/patch_check.cho src/repo_task.cho src/repo_call.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
+company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_change.cho src/company_change_cmd.cho src/company_check.cho src/company_cmd.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_needs.cho src/company_run.cho src/company_runner.cho src/company_state.cho src/company_step.cho src/company_publish.cho src/publish_plan.cho src/step_run.cho src/tool_call.cho src/tool_task.cho src/repo_row.cho src/patch_check.cho src/repo_task.cho src/repo_call.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
 for t in $company_tags; do
   for d in docs/company.md docs/architecture.md; do
     if grep -qF "\`$t\`" "$d"; then :; else echo "FAIL docs: tag $t is not in $d"; fail=1; fi

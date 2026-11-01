@@ -1,0 +1,256 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_change;
+import forge.company_manifest;
+import forge.company_state;
+import forge.task;
+
+// Unit tests for src/company_change.cho and the change records of src/company_state.cho (docs/company.md section 17): the closed fields of a
+// change request, the id Forge assigns, and the replay of `company.change.proposed`, `company.change.admitted` and `admit:<id>` decisions. Run with
+// `cancho test`.
+
+fn manifest_text() -> [] &static [byte] {
+    return "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"qa\"],\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}";
+}
+
+struct Probe {
+    rule: int,
+    all: int,
+    proposed: int,
+    admitted: int,
+    rejected: int,
+    first: int,
+    second: int,
+}
+
+fn add[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = journal;
+    borrow record as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return out;
+}
+
+fn proposed[&h](heap: &!h Heap, seq: int, id: &static [byte]) -> [heap] buffer.Buffer {
+    return company_state.change_proposed(heap, seq, id, "diff", "feature", "operator", "ana", "a title", "00", 12, "operator");
+}
+
+fn probe_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] Probe {
+    var p = Probe { rule: 0 - 1, all: 0, proposed: 0, admitted: 0, rejected: 0, first: 0, second: 0 };
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    p = Probe { rule: company_state.report_of(sr).rule, all: company_state.change_count(sr, 0), proposed: company_state.change_count(sr, 1), admitted: company_state.change_count(sr, 2), rejected: company_state.change_count(sr, 3), first: company_state.change_state(sr, "chg-0001"), second: company_state.change_state(sr, "chg-0002") };
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(why) => {
+            test.assert(false);
+        }
+    }
+    return p;
+}
+
+fn probe_journal[&h](heap: &!h Heap, j: buffer.Buffer) -> [heap] Probe {
+    var p = Probe { rule: 0 - 1, all: 0, proposed: 0, admitted: 0, rejected: 0, first: 0, second: 0 };
+    borrow j as &jb in {
+        p = probe_of(heap, buffer.bytes(jb));
+    }
+    buffer.drop(heap, j);
+    return p;
+}
+
+fn test_the_four_kinds_and_no_other() -> [] int {
+    test.assert_eq(company_change.kind_code("bug"), 1);
+    test.assert_eq(company_change.kind_code("feature"), 2);
+    test.assert_eq(company_change.kind_code("compiler-bump"), 3);
+    test.assert_eq(company_change.kind_code("feedback"), 4);
+    test.assert_eq(company_change.kind_code("Bug"), 0);
+    test.assert_eq(company_change.kind_code(""), 0);
+    test.assert_eq(company_change.kind_code("refactor"), 0);
+    return 0;
+}
+
+fn test_only_an_operators_bug_and_bump_are_admitted_by_the_act() -> [] int {
+    test.assert(company_change.admitted_by_operator(1));
+    test.assert(company_change.admitted_by_operator(3));
+    test.assert(company_change.admitted_by_operator(2) == false);
+    test.assert(company_change.admitted_by_operator(4) == false);
+    return 0;
+}
+
+fn test_a_kind_allows_only_its_justifications() -> [] int {
+    test.assert(company_change.justification_ok(1, "defect"));
+    test.assert(company_change.justification_ok(1, "operator") == false);
+    test.assert(company_change.justification_ok(1, "goal:g-1") == false);
+    test.assert(company_change.justification_ok(3, "maintenance"));
+    test.assert(company_change.justification_ok(3, "defect") == false);
+    test.assert(company_change.justification_ok(2, "operator"));
+    test.assert(company_change.justification_ok(2, "goal:g-adoption"));
+    test.assert(company_change.justification_ok(2, "defect") == false);
+    test.assert(company_change.justification_ok(4, "goal:g_2"));
+    test.assert(company_change.justification_ok(4, "") == false);
+    test.assert(company_change.justification_ok(0, "operator") == false);
+    return 0;
+}
+
+fn test_a_goal_justification_is_a_name() -> [] int {
+    test.assert(company_change.justification_ok(2, "goal:") == false);
+    test.assert(company_change.justification_ok(2, "goal:a b") == false);
+    test.assert(company_change.justification_ok(2, "goal:a/b") == false);
+    test.assert(company_change.justification_ok(2, "goal:../x") == false);
+    return 0;
+}
+
+fn test_a_title_is_one_line_of_at_most_200_bytes() -> [] int {
+    test.assert(company_change.title_ok("the diff output is too noisy"));
+    test.assert(company_change.title_ok("") == false);
+    test.assert(company_change.title_ok("two\nlines") == false);
+    test.assert(company_change.title_ok("tab\there") == false);
+    return 0;
+}
+
+fn test_the_id_is_chg_and_four_digits_at_least[&h](heap: &!h Heap) -> [heap] int {
+    let one = company_change.id_of(heap, 1);
+    borrow one as &ob in {
+        test.assert(bytes.equal(buffer.bytes(ob), "chg-0001"));
+    }
+    buffer.drop(heap, one);
+    let big = company_change.id_of(heap, 12345);
+    borrow big as &bb in {
+        test.assert(bytes.equal(buffer.bytes(bb), "chg-12345"));
+    }
+    buffer.drop(heap, big);
+    let n = company_change.id_of(heap, 42);
+    borrow n as &nb in {
+        test.assert(bytes.equal(buffer.bytes(nb), "chg-0042"));
+    }
+    buffer.drop(heap, n);
+    return 0;
+}
+
+fn test_a_proposed_change_is_proposed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, 0);
+    test.assert_eq(p.all, 1);
+    test.assert_eq(p.proposed, 1);
+    test.assert_eq(p.first, 1);
+    test.assert_eq(p.second, 0);
+    return 0;
+}
+
+fn test_an_admitted_record_admits_it[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    j = add(heap, j, company_state.change_admitted(heap, 2, "chg-0001"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, 0);
+    test.assert_eq(p.admitted, 1);
+    test.assert_eq(p.proposed, 0);
+    test.assert_eq(p.first, 2);
+    return 0;
+}
+
+fn test_an_approved_admit_gate_after_the_proposal_admits_it[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "admit:chg-0001", "approved", "ana", "ok"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, 0);
+    test.assert_eq(p.first, 2);
+    return 0;
+}
+
+fn test_a_rejected_admit_gate_rejects_it[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "admit:chg-0001", "rejected", "ana", "no"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rejected, 1);
+    test.assert_eq(p.first, 3);
+    return 0;
+}
+
+fn test_a_decision_recorded_before_the_proposal_counts_for_nothing[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "admit:chg-0001", "approved", "ana", "early"));
+    j = add(heap, j, proposed(heap, 2, "chg-0001"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, 0);
+    test.assert_eq(p.first, 1);
+    return 0;
+}
+
+fn test_a_later_rejection_does_not_undo_an_admission[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    j = add(heap, j, company_state.gate_decided(heap, 2, "admit:chg-0001", "approved", "ana", "ok"));
+    j = add(heap, j, company_state.gate_decided(heap, 3, "admit:chg-0001", "rejected", "ana", "changed my mind"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.first, 2);
+    return 0;
+}
+
+fn test_two_changes_are_counted_apart[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    j = add(heap, j, proposed(heap, 2, "chg-0002"));
+    j = add(heap, j, company_state.change_admitted(heap, 3, "chg-0002"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.all, 2);
+    test.assert_eq(p.proposed, 1);
+    test.assert_eq(p.admitted, 1);
+    test.assert_eq(p.first, 1);
+    test.assert_eq(p.second, 2);
+    return 0;
+}
+
+fn test_a_change_proposed_twice_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    j = add(heap, j, proposed(heap, 2, "chg-0001"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, task.rule_code(task.Rule::EventMalformed));
+    return 0;
+}
+
+fn test_admitting_what_was_never_proposed_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.change_admitted(heap, 1, "chg-0009"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, task.rule_code(task.Rule::EventMalformed));
+    return 0;
+}
+
+fn test_admitting_twice_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    j = add(heap, j, company_state.change_admitted(heap, 2, "chg-0001"));
+    j = add(heap, j, company_state.change_admitted(heap, 3, "chg-0001"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, task.rule_code(task.Rule::EventMalformed));
+    return 0;
+}
+
+fn test_a_proposed_record_without_its_fields_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    let p = probe_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"company.change.proposed\",\"task\":\"chg-0001\",\"repo\":\"diff\"}\n");
+    test.assert_eq(p.rule, task.rule_code(task.Rule::EventMalformed));
+    return 0;
+}
+
+fn test_a_journal_without_changes_has_none[&h](heap: &!h Heap) -> [heap] int {
+    let p = probe_of(heap, "");
+    test.assert_eq(p.rule, 0);
+    test.assert_eq(p.all, 0);
+    return 0;
+}

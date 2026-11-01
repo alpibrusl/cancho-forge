@@ -9,6 +9,7 @@ import forge.await_run;
 import forge.await_task;
 import forge.build_run;
 import forge.build_task;
+import forge.company_change_cmd;
 import forge.company_cmd;
 import forge.company_publish;
 import forge.company_runner;
@@ -105,7 +106,7 @@ fn show[&i, &h](io: &!i Io, heap: &!h Heap, text: buffer.Buffer) -> [heap, io_wr
 }
 
 fn usage[&i](io: &!i Io) -> [err_write] int {
-    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n       forge company check <manifest.json> | forge company status <company-dir> [format=json]\n       forge company decide <company-dir> <gate> approved|rejected <reason...> | forge company run <company-dir> <operator-file>\n       forge company publish <company-dir> <operator-file> <step-id> <branch>\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
+    io.error_all(io, "usage: forge status <dir> | forge history <dir> [task-id] | forge recover <dir> [<workers>]\n       forge await <dir> <workers> <task-id> [timeout-ms] | forge cancel <dir> <workers> <task-id>\n       forge gate <dir> <workers> <repo> <revision> <checkout> <execution-dir> [timeout-ms] [NAME=value ...]\n       forge build <dir> <workers> <tools> <brief-file> <execution-dir> <checker> <provider> <model> <agent> [timeout-ms] [NAME=value ...]\n       forge company check <manifest.json> | forge company status <company-dir> [format=json]\n       forge company decide <company-dir> <gate> approved|rejected <reason...> | forge company run <company-dir> <operator-file>\n       forge company publish <company-dir> <operator-file> <step-id> <branch>\n       forge company change add <company-dir> repo=<id> kind=<kind> justification=<word> title=<text> file=<abs path>\n  <dir> is an absolute path holding journal.jsonl; the other paths are absolute too\n");
     return 2;
 }
 
@@ -723,6 +724,9 @@ fn recover[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(
 fn company[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), fs_write(""), file_read, file_write, io_write, err_write] int {
     if arg_count(args) >= 7 && bytes.equal(arg(args, 2), "decide") {
         return company_cmd.decide_cmd(heap, fs, io, args);
+    }
+    if arg_count(args) >= 4 && bytes.equal(arg(args, 2), "change") {
+        return company_change_cmd.add_cmd(heap, fs, io, args);
     }
     if arg_count(args) == 4 && bytes.equal(arg(args, 2), "check") {
         return company_cmd.check_cmd(heap, fs, io, args);
