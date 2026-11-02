@@ -130,5 +130,33 @@ expect "run with now= that is not a date is clock-invalid" 1 "refusal: clock-inv
 "$F" company run "$co3" "$w/none.json" later=2026-11-04 > "$w/out" 2>&1; echo $? > "$w/rc"
 expect "run with a sixth word that is not now= is usage, exit 2" 2 ""
 
+# the intake limits (docs/company.md section 24)
+mkintake() { # name, intake json
+  c="$w/$1"; mkdir -p "$c/changes" || exit 1
+  printf '{"id":"co","mission":"m","model":{"provider":"stand","name":"m1"},"budget":{"input":1,"output":1,"cache_write":1,"cache_read":1,"max_cost":1,"price_table":"prices.json"},"human_gates":["go"],"roles":["builder"],"repos":[{"id":"diff","kind":"library"},{"id":"api","kind":"service"}],"intake":%s,"steps":[{"id":"s","role":"builder","task_type":"repo.change","needs":[],"input":"x","check":"c.sh","repo":"diff","change_kind":"bug"}]}' "$2" > "$c/company.json"
+}
+addto() { # dir repo kind justification [now]
+  d=$1; extra=""; [ -n "${5:-}" ] && extra="now=$5"
+  "$F" company change add "$d" "repo=$2" "kind=$3" "justification=$4" "title=t" "file=$w/req1.txt" $extra > "$w/out" 2>&1; echo $? > "$w/rc"
+}
+mkintake co4 '{"max_open_per_repo":2}'
+addto "$w/co4" diff feature operator; expect "intake: the first open change of a repository is taken" 0 "change chg-0001: proposed"
+addto "$w/co4" diff feature operator; expect "intake: the second is taken" 0 "change chg-0002: proposed"
+addto "$w/co4" api feature operator;  expect "intake: another repository has its own count: taken" 0 "change chg-0003: proposed"
+addto "$w/co4" diff feature operator; expect "intake: the third open change of the repository is change-rate-limited, exit 1" 1 "refusal: change-rate-limited"
+check "intake: the refusal names the limit and wrote nothing (three changes, three files)" sh -c "grep -qx 'limit: changes open for the repository (intake.max_open_per_repo)' '$w/out' && [ \"\$(ls '$w/co4/changes' | wc -l | tr -d ' ')\" = 3 ] && [ \"\$(wc -l < '$w/co4/company.journal' | tr -d ' ')\" = 3 ]"
+"$F" company decide "$w/co4" admit:chg-0001 rejected "no" > /dev/null 2>&1
+addto "$w/co4" diff feature operator;  expect "intake: a change rejected is no longer open: the next is taken" 0 "change chg-0004: proposed"
+
+mkintake co5 '{"max_per_window":2}'
+addto "$w/co5" diff bug defect 2026-11-02;  expect "intake: the first proposal of the window" 0 "change chg-0001: admitted"
+addto "$w/co5" diff bug defect 2026-11-02;  expect "intake: the second" 0 "change chg-0002: admitted"
+addto "$w/co5" diff bug defect 2026-11-03;  expect "intake: the third in the window is change-rate-limited, exit 1" 1 "refusal: change-rate-limited"
+check "intake: the refusal names the window limit and wrote nothing new (2 changes, 2 files, 2 day records at most)" sh -c "grep -qx 'limit: proposals in the window (intake.max_per_window)' '$w/out' && [ \"\$(ls '$w/co5/changes' | wc -l | tr -d ' ')\" = 2 ] && ! grep -q '2026-11-03' '$w/co5/company.journal'"
+addto "$w/co5" diff bug defect 2026-12-15;  expect "intake: 43 days later the window holds none: taken" 0 "change chg-0003: admitted"
+mkintake co6 '{"max_per_window":1}'
+addto "$w/co6" diff bug defect;  expect "intake: no day anywhere, no window: the first is taken" 0 "change chg-0001: admitted"
+addto "$w/co6" diff bug defect;  expect "intake: and so is the second (a journal with no day has no window)" 0 "change chg-0002: admitted"
+
 if [ "$fail" -eq 0 ]; then echo "ok   company change add: done"; fi
 exit "$fail"
