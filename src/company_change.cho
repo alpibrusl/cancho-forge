@@ -17,7 +17,7 @@ import std.bytes;
 //
 // The tags (docs/company.md section 17): `change-malformed` (a missing or repeated argument, a title that is not one line of at most 200 bytes of
 // plain text, a request file that cannot be read), `change-kind-invalid`, `change-justification-missing` (none, or one the kind does not allow),
-// `change-too-large` (a request text over 16 KiB), `flow-unknown` (the manifest declares `flows` and none is named after the kind), and `repo-unknown` (a repository the manifest does not list, a tag of the repos rows).
+// `change-too-large` (a request text over 16 KiB), `change-rate-limited` (the manifest's `intake` limits), `flow-unknown` (the manifest declares `flows` and none is named after the kind), and `repo-unknown` (a repository the manifest does not list, a tag of the repos rows).
 
 pub fn max_body() -> [] int {
     return 16384;
@@ -42,6 +42,12 @@ pub fn rule_justification_missing() -> [] &static [byte] {
 // A manifest that declares `flows` must have the flow named after the kind of every change it takes (docs/company.md section 18).
 pub fn rule_flow_unknown() -> [] &static [byte] {
     return "flow-unknown";
+}
+
+// The manifest's `intake` limits (docs/company.md section 24): more proposals in the window than `max_per_window`, or more changes open for the repository
+// than `max_open_per_repo`.
+pub fn rule_rate_limited() -> [] &static [byte] {
+    return "change-rate-limited";
 }
 
 pub fn rule_too_large() -> [] &static [byte] {

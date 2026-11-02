@@ -1113,3 +1113,21 @@ Replay keeps three ledgers for this, in `company_state`: the cost on each day, t
 **Not covered**, as in the design (section 2.3): hosting and any recurring cost of a running service are not tokens and are not counted. **Where the design and the code differ:**
 (1) a change held by its cap goes to the `held` state of the design only in the sense that its model steps are not started; no record says so and `retry:` does not free it
 (raising the cap in the manifest does). (2) A change whose cap is a cost of `0` can never start a model step.
+
+## 24. Intake limits: `intake` and `change-rate-limited` (slice 4, part C, of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status: built and tested, no model** (`tests/company_intake_test.cho`; the `intake:` cases of `tests/conformance/company_change_add.sh`). It limits what a flood of change
+requests can cost in attention (design section 4.4); today the only source is the operator's own `change add`, so the limits are not yet a defence against anything but a
+script that adds changes in a loop. They become one when issue intake (slice 7) feeds the same verb.
+
+The manifest gains an optional closed object `intake` with at least one of `max_per_window` and `max_open_per_repo` (each 1 to 1000; a key left out takes the design's default, 20 and 5,
+**when `intake` is present**; a manifest without `intake` has no limits and is read as before). `forge company change add` refuses with **`change-rate-limited`**, exit 1, a `limit:` line saying
+which and nothing written, when
+- **the window** already holds `max_per_window` proposals: the changes proposed on the last `rolling.days` days (30 when the budget has no `rolling`) up to today, today being
+  `now=` when given, else the last day the journal holds. A change proposed under no day is in no window, and with no day at all there is no window (only the open limit applies);
+- **the repository** already has `max_open_per_repo` open changes: *proposed*, or *admitted and not finished*, where finished means every step derived for it is accepted. A change
+  admitted whose kind has no flow derives no step, so nothing is open about it and it is not counted. A rejected change is not open.
+
+`change add` now derives the steps of the admitted changes (as `status` and `run` do) to tell an open change from a finished one, so it also refuses, as they do, with
+`change-body-missing` when an admitted change's request file is not there. **Where the design and the code differ:** the design's "terminal" states (`abandoned`, `superseded`, `reverted`, `released`,
+`deployed`) do not exist yet; "finished" stands in for them. The refusal does not "leave the file in `intake/`": there is no `intake/` directory until issue intake exists.

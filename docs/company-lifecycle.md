@@ -816,8 +816,8 @@ must be reported that way, as `company.md` reports every number.
 > document proposed in section 3; the patch publish: section 21, the patch applied in cancho and not by `patch`). **Not built from slice 2:** issue
 > intake from files, the re-derivation of a stale base, `change-duplicate`, `change-rate-limited`, `base` and `at` on the change record.
 >
-> **Slice 4, parts A and B built** (the day: [`company.md`](company.md) section 22; the rolling and per-change budget: section 23). Part C (`intake` limits,
-> `change-rate-limited`) is not.
+> **Slice 4 built** (the day: [`company.md`](company.md) section 22; the rolling and per-change budget: section 23; the `intake` limits and
+> `change-rate-limited`: section 24).
 
 ### 8.2 The order of the rest
 

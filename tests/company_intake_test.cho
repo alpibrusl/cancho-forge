@@ -1,0 +1,238 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_change;
+import forge.company_manifest;
+import forge.company_state;
+import forge.company_time;
+
+// Unit tests for the intake limits (docs/company.md section 24): the manifest's `intake` keys and the two counts `company_state` gives `forge company
+// change add` (proposals in a window, changes open for a repository). Run with `cancho test`.
+
+fn manifest_with[&h, &x](heap: &!h Heap, extra: &x [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1,\"output\":1,\"cache_write\":1,\"cache_read\":1,\"max_cost\":1,\"price_table\":\"p.json\"},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\"],\"repos\":[{\"id\":\"diff\",\"kind\":\"library\"},{\"id\":\"api\",\"kind\":\"service\"}],\"flows\":{\"bug\":[{\"id\":\"fix\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\"}]},");
+    o = buffer.append(heap, o, extra);
+    return buffer.append(heap, o, "\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}");
+}
+
+fn rule_of[&h, &x](heap: &!h Heap, extra: &x [byte]) -> [heap] &static [byte] {
+    let d = manifest_with(heap, extra);
+    var out = "";
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                out = company_manifest.rule_name(r);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return out;
+}
+
+fn test_a_manifest_without_intake_has_no_limits[&h](heap: &!h Heap) -> [heap] int {
+    let d = manifest_with(heap, "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert_eq(company_manifest.intake_per_window(mr), 0);
+                    test.assert_eq(company_manifest.intake_open_per_repo(mr), 0);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_the_keys_left_out_take_the_defaults_and_the_keys_given_are_read[&h](heap: &!h Heap) -> [heap] int {
+    let d = manifest_with(heap, "\"intake\":{\"max_per_window\":3},");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert_eq(company_manifest.intake_per_window(mr), 3);
+                    test.assert_eq(company_manifest.intake_open_per_repo(mr), 5);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    let e = manifest_with(heap, "\"intake\":{\"max_per_window\":7,\"max_open_per_repo\":2},");
+    borrow e as &eb in {
+        match company_manifest.parse(heap, buffer.bytes(eb)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert_eq(company_manifest.intake_per_window(mr), 7);
+                    test.assert_eq(company_manifest.intake_open_per_repo(mr), 2);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, e);
+    return 0;
+}
+
+fn test_an_intake_that_is_not_what_it_says_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, "\"intake\":{},"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "\"intake\":[],"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "\"intake\":{\"max_per_window\":0},"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "\"intake\":{\"max_per_window\":1001},"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "\"intake\":{\"max_open_per_repo\":-1},"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, "\"intake\":{\"max_open_per_repo\":1,\"x\":1},"), "manifest-unknown-field"));
+    test.assert(bytes.equal(rule_of(heap, "\"intake\":{\"max_per_window\":5},"), ""));
+    return 0;
+}
+
+// ---- the counts ---------------------------------------------------------------------------------------------------------------------------------
+
+fn sha() -> [] &static [byte] {
+    return "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+}
+
+fn add[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = journal;
+    borrow record as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return out;
+}
+
+fn proposed[&h](heap: &!h Heap, seq: int, id: &static [byte], repo: &static [byte], kind: &static [byte]) -> [heap] buffer.Buffer {
+    return company_state.change_proposed(heap, seq, id, repo, kind, "operator", "ana", "t", sha(), 1, "operator");
+}
+
+// Replay `text` against the manifest with the derived step of change chg-0001 added, and hand the state to `check`'s numbers.
+struct Counts {
+    window_all: int,
+    window_one: int,
+    open_diff: int,
+    open_api: int,
+}
+
+fn counts_of[&h, &t](heap: &!h Heap, text: &t [byte], today: int, days: int) -> [heap] Counts {
+    var c = Counts { window_all: 0 - 1, window_one: 0 - 1, open_diff: 0 - 1, open_api: 0 - 1 };
+    let d = manifest_with(heap, "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                let (m2, why) = company_manifest.extend(heap, m, "[{\"id\":\"chg-0001.fix\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\",\"repo\":\"diff\"}]");
+                test.assert_eq(why, 0);
+                borrow m2 as &mr in {
+                    let s = company_state.replay(heap, text, mr);
+                    borrow s as &sr in {
+                        test.assert_eq(company_state.report_of(sr).rule, 0);
+                        c = Counts { window_all: company_state.proposals_since(heap, sr, today, days), window_one: company_state.proposals_since(heap, sr, today, 1), open_diff: company_state.open_in_repo(heap, mr, sr, "diff"), open_api: company_state.open_in_repo(heap, mr, sr, "api") };
+                    }
+                    company_state.drop(heap, s);
+                }
+                company_manifest.drop(heap, m2);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return c;
+}
+
+fn day(text: &static [byte]) -> [] int {
+    return company_time.day_of(text);
+}
+
+fn test_proposals_are_counted_by_the_day_they_were_made_on[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.clock_set(heap, 1, "2026-11-01"));
+    j = add(heap, j, proposed(heap, 2, "chg-0001", "diff", "bug"));
+    j = add(heap, j, company_state.clock_set(heap, 3, "2026-11-05"));
+    j = add(heap, j, proposed(heap, 4, "chg-0002", "diff", "feature"));
+    j = add(heap, j, proposed(heap, 5, "chg-0003", "api", "feature"));
+    borrow j as &jb in {
+        let c = counts_of(heap, buffer.bytes(jb), day("2026-11-05"), 30);
+        test.assert_eq(c.window_all, 3);
+        test.assert_eq(c.window_one, 2);
+        let late = counts_of(heap, buffer.bytes(jb), day("2026-12-15"), 30);
+        test.assert_eq(late.window_all, 0);
+        let edge = counts_of(heap, buffer.bytes(jb), day("2026-11-30"), 30);
+        test.assert_eq(edge.window_all, 3);
+        let edge2 = counts_of(heap, buffer.bytes(jb), day("2026-12-01"), 30);
+        test.assert_eq(edge2.window_all, 2);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_proposal_made_under_no_day_is_in_no_window[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, proposed(heap, 1, "chg-0001", "diff", "bug"));
+    borrow j as &jb in {
+        test.assert_eq(counts_of(heap, buffer.bytes(jb), day("2026-11-05"), 30).window_all, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_proposed_change_is_open_and_a_rejected_one_is_not[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, proposed(heap, 1, "chg-0001", "diff", "feature"));
+    j = add(heap, j, proposed(heap, 2, "chg-0002", "diff", "feature"));
+    j = add(heap, j, company_state.gate_decided(heap, 3, "admit:chg-0002", "rejected", "ana", "no"));
+    j = add(heap, j, proposed(heap, 4, "chg-0003", "api", "feature"));
+    borrow j as &jb in {
+        let c = counts_of(heap, buffer.bytes(jb), 0, 30);
+        test.assert_eq(c.open_diff, 1);
+        test.assert_eq(c.open_api, 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_an_admitted_change_is_open_until_its_derived_steps_are_accepted[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, proposed(heap, 1, "chg-0001", "diff", "bug"));
+    j = add(heap, j, company_state.change_admitted(heap, 2, "chg-0001"));
+    borrow j as &jb in {
+        test.assert_eq(counts_of(heap, buffer.bytes(jb), 0, 30).open_diff, 1);
+    }
+    j = add(heap, j, company_state.accepted(heap, 3, "chg-0001.fix", "steps/chg-0001.fix/ev/change.patch", "00"));
+    borrow j as &jb2 in {
+        test.assert_eq(counts_of(heap, buffer.bytes(jb2), 0, 30).open_diff, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_an_admitted_change_of_a_kind_with_no_flow_is_not_open[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, proposed(heap, 1, "chg-0005", "diff", "feedback"));
+    j = add(heap, j, company_state.change_admitted(heap, 2, "chg-0005"));
+    borrow j as &jb in {
+        test.assert_eq(counts_of(heap, buffer.bytes(jb), 0, 30).open_diff, 0);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_the_tag_is_the_documented_one() -> [] int {
+    test.assert(bytes.equal(company_change.rule_rate_limited(), "change-rate-limited"));
+    return 0;
+}

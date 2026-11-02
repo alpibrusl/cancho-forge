@@ -7,6 +7,7 @@ import std.json;
 import std.map;
 import std.option;
 import forge.company_budget;
+import forge.company_change;
 import forge.company_graph;
 import forge.company_time;
 import forge.company_manifest;
@@ -601,6 +602,13 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                         a1 = put_decoded(heap, a1, line, tp, json.get(line, tp, 0, "body_sha256"));
                         ar = a1;
                         inf = map.put(heap, inf, id, start * 1048576 + packed);
+                        if spend[slot_day()] > 0 {
+                            let yk = ledger_key(heap, "y:", id);
+                            borrow yk as &ykb in {
+                                inf = map.put(heap, inf, buffer.bytes(ykb), spend[slot_day()]);
+                            }
+                            buffer.drop(heap, yk);
+                        }
                     }
                 } else if bytes.equal(kind, kind_change_admitted()) {
                     var known = 0;
@@ -984,6 +992,79 @@ pub fn spent_since_micro[&h, &s](heap: &!h Heap, s: &s CompanyState, today: int,
         d = d - 1;
     }
     return total;
+}
+
+// The day change `id` was proposed on (a day number), or 0 when the journal had no day then.
+pub fn change_day[&h, &i, &s](heap: &!h Heap, s: &s CompanyState, id: &i [byte]) -> [heap] int {
+    let k = ledger_key(heap, "y:", id);
+    var n = 0;
+    borrow k as &kb in {
+        n = map.get(s.chginfo, buffer.bytes(kb), 0);
+    }
+    buffer.drop(heap, k);
+    return n;
+}
+
+// How many changes were proposed on the `days` days up to and including day number `today` (docs/company.md section 24). A change proposed under no day
+// is in no window.
+pub fn proposals_since[&h, &s](heap: &!h Heap, s: &s CompanyState, today: int, days: int) -> [heap] int {
+    var n = 0;
+    var k = 1;
+    let total = map.size(s.changes);
+    while k <= total {
+        let id = company_change.id_of(heap, k);
+        borrow id as &ib in {
+            let d = change_day(heap, s, buffer.bytes(ib));
+            if d > 0 && d <= today && d > today - days {
+                n = n + 1;
+            }
+        }
+        buffer.drop(heap, id);
+        k = k + 1;
+    }
+    return n;
+}
+
+// Is change `id` finished: it has derived steps and every one is accepted? (A change with no flow has no steps and is never finished by this.)
+fn change_finished[&m, &s, &i](m: &m company_manifest.Manifest, s: &s CompanyState, id: &i [byte]) -> [] bool {
+    var steps = 0;
+    var open = 0;
+    var k = company_manifest.own_step_count(m);
+    while k < company_manifest.step_count(m) {
+        let sid = company_manifest.step_id(m, company_manifest.step_at(m, k));
+        if len(sid) > len(id) && bytes.equal(sid[0..len(id)], id) && int_of(sid[len(id)]) == 46 {
+            steps = steps + 1;
+            if accepted_at(s, k) == false {
+                open = open + 1;
+            }
+        }
+        k = k + 1;
+    }
+    return steps > 0 && open == 0;
+}
+
+// How many changes of repository `repo` are open: proposed, or admitted and not finished. A change admitted with no flow to turn it into work is not
+// counted (nothing is open about it).
+pub fn open_in_repo[&h, &m, &s, &r](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s CompanyState, repo: &r [byte]) -> [heap] int {
+    var n = 0;
+    var k = 1;
+    let total = map.size(s.changes);
+    while k <= total {
+        let id = company_change.id_of(heap, k);
+        borrow id as &ib in {
+            if bytes.equal(change_field(s, buffer.bytes(ib), 0), repo) {
+                let st = change_state(s, buffer.bytes(ib));
+                if st == 1 {
+                    n = n + 1;
+                } else if st == 2 && company_manifest.flow_index(m, change_field(s, buffer.bytes(ib), 1)) >= 0 && change_finished(m, s, buffer.bytes(ib)) == false {
+                    n = n + 1;
+                }
+            }
+        }
+        buffer.drop(heap, id);
+        k = k + 1;
+    }
+    return n;
 }
 
 // The last day a `company.clock.set` record gave (a day number, `company_time.day_of`), or 0 when the journal holds none.

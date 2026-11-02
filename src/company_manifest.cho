@@ -16,6 +16,7 @@ import std.json;
 //                 "rolling"?: { "days", "max_cost" }, "per_change"?: { "max_cost"?, "max_attempts"? } },
 //     "human_gates": [name...], "roles": [role...],
 //     "repos": [ { "id", "kind": "library" | "program" | "service" } ... ]?,
+//     "intake": { "max_per_window"?, "max_open_per_repo"? }?,
 //     "flows": { "<flow name>": [ step... ] ... }?,
 //     "steps": [ { "id", "role", "task_type", "needs": [id...], "input", "check"?, "contract"?, "library"?, "gate"?,
 //                  "repo"?, "change_kind"? } ... ] }
@@ -256,6 +257,8 @@ pub res struct Manifest {
     rolling_cost: int,
     change_cost: int,
     change_attempts: int,
+    intake_window: int,
+    intake_open: int,
 }
 
 pub enum ManifestResult {
@@ -638,6 +641,30 @@ fn budget_shape_code[&s, &t](src: &s [byte], tp: &t [int], budget: int) -> [] in
         return 1;
     }
     return caps_shape_code(src, tp, budget);
+}
+
+// `intake` (docs/company.md section 24): a closed object of `max_per_window` and `max_open_per_repo`, each 1 to 1000, at least one. The limits of
+// `forge company change add`.
+fn intake_shape_code[&s, &t](src: &s [byte], tp: &t [int], intake: int) -> [] int {
+    if !json.is_object(tp, intake) {
+        return 1;
+    }
+    let k = keys_code(src, tp, intake, "max_per_window max_open_per_repo");
+    if k != 0 {
+        return k;
+    }
+    if json.count(tp, intake) < 1 {
+        return 1;
+    }
+    let a = json.get(src, tp, intake, "max_per_window");
+    let b = json.get(src, tp, intake, "max_open_per_repo");
+    if a >= 0 && (!is_count(src, tp, a) || json.to_int(src, tp, a) < 1 || json.to_int(src, tp, a) > 1000) {
+        return 1;
+    }
+    if b >= 0 && (!is_count(src, tp, b) || json.to_int(src, tp, b) < 1 || json.to_int(src, tp, b) > 1000) {
+        return 1;
+    }
+    return 0;
 }
 
 // `rolling` (`days` 1 to 3660 and `max_cost`, both required) and `per_change` (`max_cost` and `max_attempts` 1 to 1000, at least one): closed objects of
@@ -1121,7 +1148,7 @@ fn flows_code[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], flows: i
 
 // Everything but the size and the JSON: the root object `0` of the tape over `src`.
 fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] int {
-    let keys = keys_code(src, tp, 0, "id mission model budget human_gates roles repos flows steps");
+    let keys = keys_code(src, tp, 0, "id mission model budget human_gates roles repos flows intake steps");
     if keys != 0 {
         return keys;
     }
@@ -1154,6 +1181,13 @@ fn validate[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] 
         let r = repos_shape_code(src, tp, repos);
         if r != 0 {
             return r;
+        }
+    }
+    let intake = json.get(src, tp, 0, "intake");
+    if intake >= 0 {
+        let k = intake_shape_code(src, tp, intake);
+        if k != 0 {
+            return k;
         }
     }
     var i = 0;
@@ -1242,6 +1276,8 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
     var rolling_cost = 0;
     var change_cost = 0 - 1;
     var change_attempts = 0;
+    var intake_window = 0;
+    var intake_open = 0;
     borrow tape as &r in {
         let tp = contents(r);
         id = json.get(text, tp, 0, "id");
@@ -1263,6 +1299,17 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
             rolling_days = json.to_int(text, tp, json.get(text, tp, rolling, "days"));
             rolling_cost = json.to_int(text, tp, json.get(text, tp, rolling, "max_cost"));
         }
+        let intake = json.get(text, tp, 0, "intake");
+        if intake >= 0 {
+            intake_window = 20;
+            intake_open = 5;
+            if json.get(text, tp, intake, "max_per_window") >= 0 {
+                intake_window = json.to_int(text, tp, json.get(text, tp, intake, "max_per_window"));
+            }
+            if json.get(text, tp, intake, "max_open_per_repo") >= 0 {
+                intake_open = json.to_int(text, tp, json.get(text, tp, intake, "max_open_per_repo"));
+            }
+        }
         let each = json.get(text, tp, budget, "per_change");
         if json.get(text, tp, each, "max_cost") >= 0 {
             change_cost = json.to_int(text, tp, json.get(text, tp, each, "max_cost"));
@@ -1271,11 +1318,11 @@ pub fn parse[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] ManifestResult {
             change_attempts = json.to_int(text, tp, json.get(text, tp, each, "max_attempts"));
         }
     }
-    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, flows: flows, dtext: buffer.empty(heap, 1), dtape: box_slice(heap, 1, 0), dsteps: 0 - 1, dcount: 0, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost, rolling_days: rolling_days, rolling_cost: rolling_cost, change_cost: change_cost, change_attempts: change_attempts });
+    return ManifestResult::Held(Manifest { text: buffer.append(heap, buffer.empty(heap, len(text)), text), tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, flows: flows, dtext: buffer.empty(heap, 1), dtape: box_slice(heap, 1, 0), dsteps: 0 - 1, dcount: 0, step_count: count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost, rolling_days: rolling_days, rolling_cost: rolling_cost, change_cost: change_cost, change_attempts: change_attempts, intake_window: intake_window, intake_open: intake_open });
 }
 
 pub fn drop[&h](heap: &!h Heap, m: Manifest) -> [heap] int {
-    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, flows, dtext, dtape, dsteps, dcount, step_count, input, output, cache_write, cache_read, max_cost, rolling_days, rolling_cost, change_cost, change_attempts } = m;
+    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, flows, dtext, dtape, dsteps, dcount, step_count, input, output, cache_write, cache_read, max_cost, rolling_days, rolling_cost, change_cost, change_attempts, intake_window, intake_open } = m;
     buffer.drop(heap, text);
     unbox_slice(heap, tape);
     buffer.drop(heap, dtext);
@@ -1348,6 +1395,16 @@ pub fn budget_change_cost[&m](m: &m Manifest) -> [] int {
 
 pub fn budget_change_attempts[&m](m: &m Manifest) -> [] int {
     return m.change_attempts;
+}
+
+// The intake limits (`intake`): proposals accepted per window, and changes open per repository; 0 for both when the manifest has no `intake`, else the
+// key's value, or its default (20 and 5) when the key is left out.
+pub fn intake_per_window[&m](m: &m Manifest) -> [] int {
+    return m.intake_window;
+}
+
+pub fn intake_open_per_repo[&m](m: &m Manifest) -> [] int {
+    return m.intake_open;
 }
 
 // Is `name` one of the manifest's `human_gates`? An empty name is not.
@@ -1640,10 +1697,10 @@ pub fn extend[&h, &t](heap: &!h Heap, m: Manifest, derived: &t [byte]) -> [heap]
         unbox_slice(heap, dt);
         return (m, code);
     }
-    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, flows, dtext, dtape, dsteps, dcount, step_count, input, output, cache_write, cache_read, max_cost, rolling_days, rolling_cost, change_cost, change_attempts } = m;
+    let Manifest { text, tape, id, provider, price_table, steps, gates, repos, flows, dtext, dtape, dsteps, dcount, step_count, input, output, cache_write, cache_read, max_cost, rolling_days, rolling_cost, change_cost, change_attempts, intake_window, intake_open } = m;
     buffer.drop(heap, dtext);
     unbox_slice(heap, dtape);
-    return (Manifest { text: text, tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, flows: flows, dtext: buffer.append(heap, buffer.empty(heap, len(derived) + 1), derived), dtape: dt, dsteps: node, dcount: count, step_count: step_count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost, rolling_days: rolling_days, rolling_cost: rolling_cost, change_cost: change_cost, change_attempts: change_attempts }, 0);
+    return (Manifest { text: text, tape: tape, id: id, provider: provider, price_table: price_table, steps: steps, gates: gates, repos: repos, flows: flows, dtext: buffer.append(heap, buffer.empty(heap, len(derived) + 1), derived), dtape: dt, dsteps: node, dcount: count, step_count: step_count, input: input, output: output, cache_write: cache_write, cache_read: cache_read, max_cost: max_cost, rolling_days: rolling_days, rolling_cost: rolling_cost, change_cost: change_cost, change_attempts: change_attempts, intake_window: intake_window, intake_open: intake_open }, 0);
 }
 
 // The step's repository id (a `repo.change` step's), empty when it has none.
