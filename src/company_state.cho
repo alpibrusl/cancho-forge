@@ -418,6 +418,86 @@ fn info_lens[&s, &t](src: &s [byte], tp: &t [int]) -> [] int {
     return r + 128 * k + 4096 * t;
 }
 
+// ---- the ledgers of the rolling and per-change caps (docs/company.md section 23) --------------------------------------------------------------
+// Kept in `chginfo`, which is only ever read by key: `d:<day number>` the cost recorded on a day, `c:<change id>` the cost of the steps of a change,
+// `t:<change id>` how many times its model steps were admitted.
+
+fn ledger_key[&h, &n](heap: &!h Heap, prefix: &static [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.append(heap, buffer.empty(heap, 24), prefix), name);
+}
+
+fn day_key[&h](heap: &!h Heap, day: int) -> [heap] buffer.Buffer {
+    return buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 24), "d:"), day);
+}
+
+fn bump[&h, &k](heap: &!h Heap, ledger: map.Map[int], key: &k [byte], add: int) -> [heap] map.Map[int] {
+    var now = 0;
+    borrow ledger as &lb in {
+        now = map.get(lb, key, 0);
+    }
+    return map.put(heap, ledger, key, clamp_add(now, add));
+}
+
+// The change a derived step belongs to: its id up to the first dot (`chg-0007.fix` is of `chg-0007`), or empty for a step of the manifest's own.
+fn change_of_step[&m](man: &m company_manifest.Manifest, at: int) -> [] &m [byte] {
+    let id = company_manifest.step_id(man, company_manifest.step_at(man, at));
+    if at < 0 || at < company_manifest.own_step_count(man) {
+        return id[0..0];
+    }
+    var k = 0;
+    while k < len(id) && int_of(id[k]) != 46 {
+        k = k + 1;
+    }
+    return id[0..k];
+}
+
+// A ledger entry of a model step's spend or admission (`cost` micro-dollars; `tries` 1 for an admission).
+fn ledger_step[&h, &m](heap: &!h Heap, ledger: map.Map[int], man: &m company_manifest.Manifest, at: int, cost: int, tries: int) -> [heap] map.Map[int] {
+    var out = ledger;
+    let change = change_of_step(man, at);
+    if len(change) > 0 {
+        if tries > 0 {
+            let k = ledger_key(heap, "t:", change);
+            borrow k as &kb in {
+                out = bump(heap, out, buffer.bytes(kb), tries);
+            }
+            buffer.drop(heap, k);
+        }
+        if cost > 0 {
+            let k = ledger_key(heap, "c:", change);
+            borrow k as &kb in {
+                out = bump(heap, out, buffer.bytes(kb), cost);
+            }
+            buffer.drop(heap, k);
+        }
+    }
+    return out;
+}
+
+// Does a step of this role use model tokens (a copy of `company_run.uses_model`, which imports this module)?
+fn uses_model(role: company_manifest.Role) -> [] bool {
+    match role {
+        company_manifest.Role::Builder => {
+            return true;
+        }
+        company_manifest.Role::Writer => {
+            return true;
+        }
+        company_manifest.Role::Qa => {
+            return false;
+        }
+        company_manifest.Role::Analyst => {
+            return false;
+        }
+        company_manifest.Role::Reviewer => {
+            return false;
+        }
+        company_manifest.Role::Product => {
+            return false;
+        }
+    }
+}
+
 // The state of change `id` in `changes`: 0 unknown, 1 proposed, 2 admitted, 3 rejected.
 fn change_state_in[&c, &i](changes: &c map.Map[int], id: &i [byte]) -> [] int {
     return map.get(changes, id, 0);
@@ -475,6 +555,10 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                             seen = map.get(ab, id, 0);
                         }
                         ad = map.put(heap, ad, id, seen + 1);
+                        let who = company_graph.index_of(man, id);
+                        if who >= 0 && uses_model(company_manifest.step_at(man, who).role) {
+                            inf = ledger_step(heap, inf, man, who, 0, 1);
+                        }
                     }
                 } else if bytes.equal(kind, kind_accepted()) {
                     let artifact = json.get(line, tp, 0, "artifact");
@@ -611,6 +695,14 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                                 add_tokens(spend, base, a, b, c, d);
                                 spend[base + 4] = clamp_add(spend[base + 4], cost);
                             }
+                            inf = ledger_step(heap, inf, man, at, cost, 0);
+                        }
+                        if spend[slot_day()] > 0 && cost > 0 {
+                            let dk = day_key(heap, spend[slot_day()]);
+                            borrow dk as &dkb in {
+                                inf = bump(heap, inf, buffer.bytes(dkb), cost);
+                            }
+                            buffer.drop(heap, dk);
                         }
                     }
                 }
@@ -854,6 +946,44 @@ pub fn change_count[&s](s: &s CompanyState, state: int) -> [] int {
         e = e + 1;
     }
     return n;
+}
+
+// The cost recorded for the steps of change `id`, in micro-dollars (the steps that ran under a day-less journal count too).
+pub fn change_spent_micro[&h, &i, &s](heap: &!h Heap, s: &s CompanyState, id: &i [byte]) -> [heap] int {
+    let k = ledger_key(heap, "c:", id);
+    var n = 0;
+    borrow k as &kb in {
+        n = map.get(s.chginfo, buffer.bytes(kb), 0);
+    }
+    buffer.drop(heap, k);
+    return n;
+}
+
+// How many times the model steps of change `id` were admitted.
+pub fn change_tries[&h, &i, &s](heap: &!h Heap, s: &s CompanyState, id: &i [byte]) -> [heap] int {
+    let k = ledger_key(heap, "t:", id);
+    var n = 0;
+    borrow k as &kb in {
+        n = map.get(s.chginfo, buffer.bytes(kb), 0);
+    }
+    buffer.drop(heap, k);
+    return n;
+}
+
+// The cost recorded on the `days` days up to and including day number `today`, in micro-dollars. A spend record written before any `company.clock.set`
+// belongs to no day and is in no window.
+pub fn spent_since_micro[&h, &s](heap: &!h Heap, s: &s CompanyState, today: int, days: int) -> [heap] int {
+    var total = 0;
+    var d = today;
+    while d > today - days && d > 0 {
+        let k = day_key(heap, d);
+        borrow k as &kb in {
+            total = clamp_add(total, map.get(s.chginfo, buffer.bytes(kb), 0));
+        }
+        buffer.drop(heap, k);
+        d = d - 1;
+    }
+    return total;
 }
 
 // The last day a `company.clock.set` record gave (a day number, `company_time.day_of`), or 0 when the journal holds none.

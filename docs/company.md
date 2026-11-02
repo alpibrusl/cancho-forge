@@ -1081,3 +1081,35 @@ this feature, or by a verb not given `now=`, belong to the day of the record bef
 says what day it is for the records after it. The information is the same (replay knows the day of every record), and no record builder or runner function had to be
 changed: the runner appends records from some thirty places. A consequence: two invocations on the same day leave one marker, not one `at` each. Whether Forge may read the
 clock itself is still open question 6, and this keeps the answer no.
+
+## 23. The rolling and per-change budget (slice 4, part B, of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status: built and tested, no model** (`tests/company_caps_test.cho`; the `caps:` cases of `tests/conformance/company_change.sh`). Not measured: what a real change costs
+(M-2 of the design) and so what a sensible `per_change` default is.
+
+The manifest's `budget` gains two optional closed objects, beside the lifetime keys, which stay required and stay the hard stop:
+
+```json
+"budget": { "input": ..., "output": ..., "cache_write": ..., "cache_read": ..., "max_cost": 2, "price_table": "prices.json",
+            "rolling":    { "days": 30, "max_cost": 40 },
+            "per_change": { "max_cost": 3, "max_attempts": 6 } }
+```
+
+`rolling` needs both keys (`days` 1 to 3660, `max_cost` whole dollars); `per_change` needs at least one of `max_cost` (whole dollars; `0` is a cap of nothing) and
+`max_attempts` (1 to 1000). Anything else is `manifest-malformed`, an extra key `manifest-unknown-field`. A manifest with neither is read exactly as before.
+
+**Checked where the lifetime cap is: before a model step starts** (`company_run.next_action`), so a running step can pass a cap by one step, as it can the lifetime one.
+- **Rolling.** The cost recorded on the `days` days up to and including the journal's last day (`company.clock.set`, section 22) may not reach `max_cost`: at or over it
+  every model step is held, `refusal: budget-exhausted`, `window: rolling`, exit 12. A spend record written before any day is in **no** window (it still counts in the
+  lifetime cap), and a journal with no day has no window at all, so the cap never fires: a company that wants a rolling cap runs with `now=`.
+- **Per change.** The steps of a change are its derived steps (`chg-0007.*`). Their recorded cost may not reach `per_change.max_cost` (`refusal: budget-exhausted`,
+  `window: change`, `change: chg-0007`), and their model steps may be admitted at most `per_change.max_attempts` times in all, retries included (`refusal: `
+  `change-attempts-exhausted`, `change: chg-0007`). A change at its cap holds **only its own** model steps: the run goes on with every other step, and ends with the exit
+  (12) of a spent budget only when nothing else can start. A step of the manifest's own is under neither cap.
+- The lifetime budget is judged first, then the rolling cap, then the change's. Which one stopped the run is in the `window:` line.
+
+Replay keeps three ledgers for this, in `company_state`: the cost on each day, the cost of each change, and the admissions of each change.
+
+**Not covered**, as in the design (section 2.3): hosting and any recurring cost of a running service are not tokens and are not counted. **Where the design and the code differ:**
+(1) a change held by its cap goes to the `held` state of the design only in the sense that its model steps are not started; no record says so and `retry:` does not free it
+(raising the cap in the manifest does). (2) A change whose cap is a cost of `0` can never start a model step.

@@ -1,0 +1,333 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_budget;
+import forge.company_manifest;
+import forge.company_run;
+import forge.company_state;
+import forge.company_time;
+
+// Unit tests for the rolling and per-change caps (docs/company.md section 23): the `budget` keys of the manifest, the ledgers `company_state` keeps, and
+// what `company_run.next_action` answers with them. Run with `cancho test`.
+
+fn manifest_with[&h, &b](heap: &!h Heap, budget_extra: &b [byte]) -> [heap] buffer.Buffer {
+    var o = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":9999999,\"output\":9999999,\"cache_write\":9999999,\"cache_read\":9999999,\"max_cost\":100,\"price_table\":\"p.json\"");
+    o = buffer.append(heap, o, budget_extra);
+    return buffer.append(heap, o, "},\"human_gates\":[\"g\"],\"roles\":[\"builder\",\"qa\"],\"steps\":[{\"id\":\"a\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}]}");
+}
+
+fn rule_of[&h, &b](heap: &!h Heap, budget_extra: &b [byte]) -> [heap] &static [byte] {
+    let d = manifest_with(heap, budget_extra);
+    var out = "";
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                out = company_manifest.rule_name(r);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return out;
+}
+
+fn test_a_budget_without_caps_is_valid_and_has_none[&h](heap: &!h Heap) -> [heap] int {
+    let d = manifest_with(heap, "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert_eq(company_manifest.budget_rolling_days(mr), 0);
+                    test.assert_eq(company_manifest.budget_change_cost(mr), 0 - 1);
+                    test.assert_eq(company_manifest.budget_change_attempts(mr), 0);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_the_caps_are_read[&h](heap: &!h Heap) -> [heap] int {
+    let d = manifest_with(heap, ",\"rolling\":{\"days\":30,\"max_cost\":40},\"per_change\":{\"max_cost\":3,\"max_attempts\":6}");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert_eq(company_manifest.budget_rolling_days(mr), 30);
+                    test.assert_eq(company_manifest.budget_rolling_cost(mr), 40);
+                    test.assert_eq(company_manifest.budget_change_cost(mr), 3);
+                    test.assert_eq(company_manifest.budget_change_attempts(mr), 6);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
+
+fn test_a_per_change_cap_may_hold_one_key_and_a_zero_cost_cap_is_a_cap[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, ",\"per_change\":{\"max_attempts\":2}"), ""));
+    test.assert(bytes.equal(rule_of(heap, ",\"per_change\":{\"max_cost\":0}"), ""));
+    return 0;
+}
+
+fn test_caps_that_are_not_what_they_say_are_malformed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(bytes.equal(rule_of(heap, ",\"rolling\":{\"days\":0,\"max_cost\":1}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"rolling\":{\"days\":3661,\"max_cost\":1}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"rolling\":{\"days\":7}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"rolling\":{\"max_cost\":7}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"rolling\":[]"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"per_change\":{}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"per_change\":{\"max_attempts\":0}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"per_change\":{\"max_attempts\":1001}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"per_change\":{\"max_cost\":-1}"), "manifest-malformed"));
+    test.assert(bytes.equal(rule_of(heap, ",\"per_change\":{\"max_cost\":1,\"other\":2}"), "manifest-unknown-field"));
+    test.assert(bytes.equal(rule_of(heap, ",\"rolling\":{\"days\":1,\"max_cost\":1,\"x\":2}"), "manifest-unknown-field"));
+    return 0;
+}
+
+// ---- next_action with caps ------------------------------------------------------------------------------------------------------------
+
+fn derived() -> [] &static [byte] {
+    return "[{\"id\":\"chg-0001.fix\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"c.sh\",\"repo\":\"diff\"}]";
+}
+
+fn add[&h](heap: &!h Heap, journal: buffer.Buffer, record: buffer.Buffer) -> [heap] buffer.Buffer {
+    var out = journal;
+    borrow record as &rb in {
+        out = buffer.append(heap, out, buffer.bytes(rb));
+    }
+    buffer.drop(heap, record);
+    return out;
+}
+
+fn plenty() -> [] company_budget.Limits {
+    return company_budget.Limits { input: 99999999, output: 99999999, cache_write: 99999999, cache_read: 99999999 };
+}
+
+// The action number of a decision: Start(k) is k, Stop(tag) is 1000 + tag, anything else is -1.
+fn code_of(a: company_run.Action) -> [] int {
+    match a {
+        company_run.Action::Start(k) => {
+            return k;
+        }
+        company_run.Action::Stop(tag) => {
+            return 1000 + tag;
+        }
+        company_run.Action::WaitGate(k) => {
+            return 0 - 1;
+        }
+        company_run.Action::Blocked(k) => {
+            return 0 - 1;
+        }
+        company_run.Action::Done => {
+            return 0 - 1;
+        }
+        company_run.Action::Held(k) => {
+            return 0 - 1;
+        }
+        company_run.Action::Failed(k) => {
+            return 0 - 1;
+        }
+    }
+}
+
+// What the run does next for `journal`, with the derived fix step added to the manifest and `caps` (the lifetime ceiling is $100 at a cost of `lifetime` micro).
+fn decide[&h, &j](heap: &!h Heap, journal: &j [byte], caps: company_run.Caps, lifetime: int) -> [heap] int {
+    var code = 0 - 2;
+    let d = manifest_with(heap, "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                let (m2, why) = company_manifest.extend(heap, m, derived());
+                test.assert_eq(why, 0);
+                borrow m2 as &mr in {
+                    // The manifest's own qa step is accepted first, so that the derived step is the one the run looks at.
+                    let first = company_state.accepted(heap, 1, "a", "steps/a/ev/report.json", "00");
+                    var full = buffer.empty(heap, 512);
+                    borrow first as &fb in {
+                        full = buffer.append(heap, full, buffer.bytes(fb));
+                    }
+                    buffer.drop(heap, first);
+                    full = buffer.append(heap, full, journal);
+                    borrow full as &fu in {
+                        let s = company_state.replay(heap, buffer.bytes(fu), mr);
+                        borrow s as &sr in {
+                            test.assert_eq(company_state.report_of(sr).rule, 0);
+                            let failed = box_slice(heap, company_manifest.step_count(mr), false);
+                            borrow failed as &fr in {
+                                code = code_of(company_run.next_action(heap, mr, sr, plenty(), lifetime, company_budget.dollars_to_micro(100), caps, contents(fr)));
+                            }
+                            unbox_slice(heap, failed);
+                        }
+                        company_state.drop(heap, s);
+                    }
+                    buffer.drop(heap, full);
+                }
+                company_manifest.drop(heap, m2);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return code;
+}
+
+fn caps(today: int, days: int, rolling_dollars: int, change_dollars: int, attempts: int) -> [] company_run.Caps {
+    var each = 0 - 1;
+    if change_dollars >= 0 {
+        each = company_budget.dollars_to_micro(change_dollars);
+    }
+    return company_run.Caps { today: today, rolling_days: days, rolling_micro: company_budget.dollars_to_micro(rolling_dollars), change_micro: each, attempts: attempts };
+}
+
+fn spend[&h](heap: &!h Heap, seq: int, micro: int) -> [heap] buffer.Buffer {
+    return company_state.spend_priced(heap, seq, "chg-0001.fix", 1, 1, 0, 0, micro);
+}
+
+fn day(text: &static [byte]) -> [] int {
+    return company_time.day_of(text);
+}
+
+fn test_without_caps_the_derived_model_step_starts[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, spend(heap, 2, 3000000));
+    borrow j as &jb in {
+        test.assert_eq(decide(heap, buffer.bytes(jb), company_run.no_caps(), 3000000), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_change_that_spent_its_cap_is_held_with_its_step[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, spend(heap, 2, 2500000));
+    j = add(heap, j, spend(heap, 3, 500000));
+    borrow j as &jb in {
+        let code = decide(heap, buffer.bytes(jb), caps(0, 0, 0, 3, 0), 3000000);
+        test.assert_eq(code % 8, company_run.stop_change_cost());
+        test.assert_eq(company_run.stop_step(code - 1000), 1);
+        test.assert(bytes.equal(company_run.stop_name(code - 1000), "budget-exhausted"));
+        test.assert(bytes.equal(company_run.stop_window(code - 1000), "change"));
+        test.assert_eq(decide(heap, buffer.bytes(jb), caps(0, 0, 0, 4, 0), 3000000), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_change_that_used_its_attempts_is_held[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.admitted(heap, 2, "chg-0001.fix", "t1"));
+    j = add(heap, j, company_state.admitted(heap, 3, "chg-0001.fix", "t2"));
+    borrow j as &jb in {
+        let code = decide(heap, buffer.bytes(jb), caps(0, 0, 0, 0 - 1, 2), 0);
+        test.assert_eq(code % 8, company_run.stop_attempts());
+        test.assert(bytes.equal(company_run.stop_name(code - 1000), "change-attempts-exhausted"));
+        test.assert_eq(decide(heap, buffer.bytes(jb), caps(0, 0, 0, 0 - 1, 3), 0), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_the_rolling_cap_counts_the_days_in_its_window[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.clock_set(heap, 2, "2026-11-02"));
+    j = add(heap, j, spend(heap, 3, 3000000));
+    borrow j as &jb in {
+        let at_day = day("2026-11-02");
+        let code = decide(heap, buffer.bytes(jb), caps(at_day, 7, 2, 0 - 1, 0), 3000000);
+        test.assert_eq(code % 8, company_run.stop_rolling());
+        test.assert(bytes.equal(company_run.stop_window(code - 1000), "rolling"));
+        test.assert_eq(decide(heap, buffer.bytes(jb), caps(day("2026-11-08"), 7, 2, 0 - 1, 0), 3000000), 1000 + company_run.stop_rolling());
+        test.assert_eq(decide(heap, buffer.bytes(jb), caps(day("2026-11-09"), 7, 2, 0 - 1, 0), 3000000), 1);
+        test.assert_eq(decide(heap, buffer.bytes(jb), caps(at_day, 7, 5, 0 - 1, 0), 3000000), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_spend_recorded_before_any_day_is_in_no_window[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, spend(heap, 2, 9000000));
+    j = add(heap, j, company_state.clock_set(heap, 3, "2026-11-02"));
+    borrow j as &jb in {
+        test.assert_eq(decide(heap, buffer.bytes(jb), caps(day("2026-11-02"), 30, 1, 0 - 1, 0), 9000000), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_no_day_means_no_rolling_window[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, spend(heap, 2, 9000000));
+    borrow j as &jb in {
+        test.assert_eq(decide(heap, buffer.bytes(jb), caps(0, 30, 1, 0 - 1, 0), 9000000), 1);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_the_lifetime_budget_outranks_the_other_caps[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.clock_set(heap, 2, "2026-11-02"));
+    j = add(heap, j, spend(heap, 3, 3000000));
+    borrow j as &jb in {
+        test.assert_eq(decide(heap, buffer.bytes(jb), caps(day("2026-11-02"), 7, 1, 1, 1), 200000000), 1000 + company_run.stop_budget());
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_the_ledgers_sum_the_days_and_the_changes[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.clock_set(heap, 1, "2026-11-02"));
+    j = add(heap, j, spend(heap, 2, 1000000));
+    j = add(heap, j, company_state.clock_set(heap, 3, "2026-11-04"));
+    j = add(heap, j, spend(heap, 4, 2000000));
+    j = add(heap, j, company_state.admitted(heap, 5, "chg-0001.fix", "t1"));
+    let d = manifest_with(heap, "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                let (m2, why) = company_manifest.extend(heap, m, derived());
+                test.assert_eq(why, 0);
+                borrow m2 as &mr in {
+                    borrow j as &jb in {
+                        let s = company_state.replay(heap, buffer.bytes(jb), mr);
+                        borrow s as &sr in {
+                            test.assert_eq(company_state.spent_since_micro(heap, sr, day("2026-11-04"), 1), 2000000);
+                            test.assert_eq(company_state.spent_since_micro(heap, sr, day("2026-11-04"), 3), 3000000);
+                            test.assert_eq(company_state.spent_since_micro(heap, sr, day("2026-11-03"), 1), 0);
+                            test.assert_eq(company_state.change_spent_micro(heap, sr, "chg-0001"), 3000000);
+                            test.assert_eq(company_state.change_spent_micro(heap, sr, "chg-0002"), 0);
+                            test.assert_eq(company_state.change_tries(heap, sr, "chg-0001"), 1);
+                        }
+                        company_state.drop(heap, s);
+                    }
+                }
+                company_manifest.drop(heap, m2);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    buffer.drop(heap, j);
+    return 0;
+}

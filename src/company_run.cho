@@ -49,17 +49,82 @@ pub enum Action {
     Failed(int),
 }
 
-// The tag of `Stop` for a spent budget.
+// The tags of `Stop`: 1 the lifetime budget is spent, 2 the rolling cap (`budget.rolling`) is reached, 3 a change has spent its own cap
+// (`budget.per_change.max_cost`), 4 a change has used its attempts (`budget.per_change.max_attempts`). docs/company.md section 23.
 pub fn stop_budget() -> [] int {
     return 1;
 }
 
+pub fn stop_rolling() -> [] int {
+    return 2;
+}
+
+pub fn stop_change_cost() -> [] int {
+    return 3;
+}
+
+pub fn stop_attempts() -> [] int {
+    return 4;
+}
+
 // The rule name of a `Stop` tag; empty for a tag that is not one.
 pub fn stop_name(tag: int) -> [] &static [byte] {
-    if tag == stop_budget() {
+    let code = tag % 8;
+    if code == stop_budget() || code == stop_rolling() || code == stop_change_cost() {
         return "budget-exhausted";
     }
+    if code == stop_attempts() {
+        return "change-attempts-exhausted";
+    }
     return "";
+}
+
+// Which budget a `Stop` tag is: `lifetime`, `rolling` or `change` (the `window:` line of `budget-exhausted`); empty for the attempts and for a tag that is none.
+pub fn stop_window(tag: int) -> [] &static [byte] {
+    let code = tag % 8;
+    if code == stop_budget() {
+        return "lifetime";
+    }
+    if code == stop_rolling() {
+        return "rolling";
+    }
+    if code == stop_change_cost() {
+        return "change";
+    }
+    return "";
+}
+
+// A `Stop` of a change's cap (3, 4) carries the step it holds back above its low three bits: `tag / 8 - 1` is that step's number, -1 for the others.
+pub fn stop_step(tag: int) -> [] int {
+    return tag / 8 - 1;
+}
+
+// The caps of the manifest's `budget` that are not the lifetime ones, as the run loop has them: `today` the last day the journal holds (0: none, and no
+// window applies), the rolling window's days (0: no rolling cap) and ceiling, the per-change ceiling (-1: none) and attempts (0: none), the ceilings
+// in micro-dollars.
+pub struct Caps {
+    today: int,
+    rolling_days: int,
+    rolling_micro: int,
+    change_micro: int,
+    attempts: int,
+}
+
+pub fn no_caps() -> [] Caps {
+    return Caps { today: 0, rolling_days: 0, rolling_micro: 0, change_micro: 0 - 1, attempts: 0 };
+}
+
+// The change a step of the manifest's derived steps belongs to (its id up to the first dot), or empty for one of the manifest's own.
+fn change_of[&m](m: &m company_manifest.Manifest, i: int) -> [] &m [byte] {
+    let id = company_manifest.step_id(m, company_manifest.step_at(m, i));
+    if i < company_manifest.own_step_count(m) {
+        return id[0..0];
+    }
+    var k = 0;
+    while k < len(id) && int_of(id[k]) != 46 {
+        k = k + 1;
+    }
+    return id[0..k];
 }
 
 // Does a step of this role use model tokens (and so count against the budget)? Builder and writer steps do (section 4.2: both are
@@ -98,11 +163,16 @@ fn failed_at[&f](failed: &f [bool], i: int) -> [] bool {
 // The next action. `limits` are the token ceilings of the manifest's budget, `spent_cost_micro` the cost so far and
 // `max_cost_micro` its ceiling, both in micro-dollars (`company_budget.exhausted`). `failed[i]` is true for a step whose worker
 // ended without a claim earlier in this invocation of the run (all false at its start): such a step is not started again.
-pub fn next_action[&m, &s, &f](m: &m company_manifest.Manifest, s: &s company_state.CompanyState, limits: company_budget.Limits, spent_cost_micro: int, max_cost_micro: int, failed: &f [bool]) -> [] Action {
+pub fn next_action[&h, &m, &s, &f](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, limits: company_budget.Limits, spent_cost_micro: int, max_cost_micro: int, caps: Caps, failed: &f [bool]) -> [heap] Action {
     let n = company_manifest.step_count(m);
     let flags = company_state.accepted_flags(s);
     let spent = company_budget.usage_of(company_state.spend_input(s), company_state.spend_output(s), company_state.spend_cache_write(s), company_state.spend_cache_read(s));
     let broke = company_budget.exhausted(spent, limits, spent_cost_micro, max_cost_micro);
+    var rolled = false;
+    if caps.rolling_days > 0 && caps.today > 0 {
+        rolled = company_state.spent_since_micro(heap, s, caps.today, caps.rolling_days) >= caps.rolling_micro;
+    }
+    var held_tag = stop_budget();
     var pending = 0;
     var held = 0 - 1;
     var waiting = 0 - 1;
@@ -127,11 +197,26 @@ pub fn next_action[&m, &s, &f](m: &m company_manifest.Manifest, s: &s company_st
                 }
             } else if company_graph.needs_met(m, flags, i) {
                 let gate = company_state.step_blocked_by_gate(m, s, i);
+                // What holds a model step back: the lifetime budget (1), the rolling cap (2), its change's cost cap (3) or attempts (4); 0 for nothing.
+                var hold = 0;
+                if uses_model(company_manifest.step_at(m, i).role) {
+                    if broke {
+                        hold = stop_budget();
+                    } else if rolled {
+                        hold = stop_rolling();
+                    } else {
+                        hold = change_hold(heap, m, s, caps, i);
+                        if hold > 0 {
+                            hold = hold + 8 * (i + 1);
+                        }
+                    }
+                }
                 if gate == 1 {
                     // A model step under a spent budget would not run if the gate were approved: the budget holds it.
-                    if broke && uses_model(company_manifest.step_at(m, i).role) {
+                    if hold > 0 {
                         if held < 0 {
                             held = i;
+                            held_tag = hold;
                         }
                     } else if waiting < 0 {
                         waiting = i;
@@ -143,9 +228,10 @@ pub fn next_action[&m, &s, &f](m: &m company_manifest.Manifest, s: &s company_st
                     }
                 }
                 if gate == 0 {
-                    if broke && uses_model(company_manifest.step_at(m, i).role) {
+                    if hold > 0 {
                         if held < 0 {
                             held = i;
+                            held_tag = hold;
                         }
                     } else {
                         return Action::Start(i);
@@ -158,7 +244,46 @@ pub fn next_action[&m, &s, &f](m: &m company_manifest.Manifest, s: &s company_st
     if pending > 0 && gone >= 0 {
         return Action::Failed(gone);
     }
-    return settle(pending, held, waiting, checked, blocked, first_left);
+    let answer = settle(pending, held, waiting, checked, blocked, first_left);
+    match answer {
+        Action::Stop(unused) => {
+            return Action::Stop(held_tag);
+        }
+        Action::Start(k) => {
+            return answer;
+        }
+        Action::WaitGate(k) => {
+            return answer;
+        }
+        Action::Blocked(k) => {
+            return answer;
+        }
+        Action::Done => {
+            return answer;
+        }
+        Action::Held(k) => {
+            return answer;
+        }
+        Action::Failed(k) => {
+            return answer;
+        }
+    }
+}
+
+// What the caps of a change hold back step `i` for: 3 its change has spent `caps.change_micro`, 4 its model steps were admitted `caps.attempts` times
+// already; 0 for neither, and for a step of the manifest's own.
+fn change_hold[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, caps: Caps, i: int) -> [heap] int {
+    let change = change_of(m, i);
+    if len(change) == 0 {
+        return 0;
+    }
+    if caps.change_micro >= 0 && company_state.change_spent_micro(heap, s, change) >= caps.change_micro {
+        return stop_change_cost();
+    }
+    if caps.attempts > 0 && company_state.change_tries(heap, s, change) >= caps.attempts {
+        return stop_attempts();
+    }
+    return 0;
 }
 
 // The answer when no step can start: `pending` steps are not accepted; `held` is the lowest model step the spent budget holds back

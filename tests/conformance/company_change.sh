@@ -131,6 +131,42 @@ lines_before=$(wc -l < "$cod/company.journal" | tr -d ' ')
 "$F" company run "$cod" "$w/opd.json" now=2026-11-01 > "$w/out" 2>&1; echo $? > "$w/rc"
 check "clock: an earlier day is clock-went-back, exit 1, nothing written" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: clock-went-back' '$w/out' && [ \$(wc -l < '$cod/company.journal' | tr -d ' ') = $lines_before ]"
 
+# ---- the rolling and per-change caps (docs/company.md section 23): a run stops before a model step that a cap holds back
+# mkcap NAME BUDGET-EXTRA FLOW: a company with one model step of its own and a flow `bug`; the checkout is a fresh repository
+mkcap() {
+  mkrepo "ck$1"; operator "op$1" "$w/ck$1"
+  c="$w/$1"
+  mkdir -p "$c/steps/chg/ev" "$c/changes" || exit 1
+  cp "$w/co1/prices.json" "$w/co1/audit_change.sh" "$c/" || exit 1
+  printf '{"id":"co","mission":"m","model":{"provider":"stand","name":"m1"},"budget":{"input":100000,"output":100000,"cache_write":100000,"cache_read":100000,"max_cost":10,"price_table":"prices.json"%s},"human_gates":["go"],"roles":["builder"],"repos":[{"id":"diff","kind":"library"}],"flows":{"bug":%s},"steps":[{"id":"chg","role":"builder","task_type":"repo.change","needs":[],"input":"good","check":"audit_change.sh","repo":"diff","change_kind":"bug"}]}' "$2" "$3" > "$c/company.json"
+}
+TWO='[{"id":"fix","role":"builder","task_type":"repo.change","needs":[],"input":"x","check":"audit_change.sh"},{"id":"fix2","role":"builder","task_type":"repo.change","needs":["fix"],"input":"x","check":"audit_change.sh"}]'
+printf 'the output is too noisy for logs\n' > "$w/cap-request.txt"
+
+mkcap cap1 ',"per_change":{"max_attempts":1}' "$TWO"
+run "$w/cap1" "$w/opcap1.json"
+"$F" company change add "$w/cap1" repo=diff kind=bug justification=defect "title=noisy output" "file=$w/cap-request.txt" > "$w/out" 2>&1
+run "$w/cap1" "$w/opcap1.json"
+check "caps: one attempt per change: the first model step of the change runs, the second is held (change-attempts-exhausted, change named, exit 12)" sh -c "[ \$(cat '$w/rc') = 12 ] && grep -qx 'refusal: change-attempts-exhausted' '$w/out' && grep -qx 'change: chg-0001' '$w/out' && grep -q 'accepted' '$w/cap1/company.journal' && grep -c 'company.step.accepted' '$w/cap1/company.journal' | grep -qx 2"
+check "caps: the held step was not admitted" sh -c "! grep -q '\"task\":\"chg-0001.fix2\"' '$w/cap1/company.journal'"
+
+mkcap cap2 ',"per_change":{"max_cost":0}' "$TWO"
+run "$w/cap2" "$w/opcap2.json"
+"$F" company change add "$w/cap2" repo=diff kind=bug justification=defect "title=noisy output" "file=$w/cap-request.txt" > "$w/out" 2>&1
+run "$w/cap2" "$w/opcap2.json"
+check "caps: a per-change cost cap of nothing holds the change's model steps (budget-exhausted, window: change, change named, exit 12)" sh -c "[ \$(cat '$w/rc') = 12 ] && grep -qx 'refusal: budget-exhausted' '$w/out' && grep -qx 'window: change' '$w/out' && grep -qx 'change: chg-0001' '$w/out'"
+check "caps: and nothing of the change was admitted" sh -c "! grep -q 'chg-0001.fix' '$w/cap2/company.journal'"
+
+mkcap cap3 ',"rolling":{"days":7,"max_cost":0}' "$TWO"
+"$F" company run "$w/cap3" "$w/opcap3.json" now=2026-11-02 > "$w/out" 2> "$w/err"; echo $? > "$w/rc"
+check "caps: a rolling cap of nothing, with the day given, holds every model step (budget-exhausted, window: rolling, exit 12)" sh -c "[ \$(cat '$w/rc') = 12 ] && grep -qx 'refusal: budget-exhausted' '$w/out' && grep -qx 'window: rolling' '$w/out' && ! grep -q 'company.step.admitted' '$w/cap3/company.journal'"
+run "$w/cap3" "$w/opcap3.json"
+check "caps: the day stays in the journal, so a run without now= is held too" sh -c "[ \$(cat '$w/rc') = 12 ] && grep -qx 'window: rolling' '$w/out'"
+
+mkcap cap4 ',"rolling":{"days":7,"max_cost":0}' "$TWO"
+run "$w/cap4" "$w/opcap4.json"
+check "caps: a rolling cap with no day anywhere in the journal has no window: the run goes on (exit 0)" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: chg' '$w/out'"
+
 # ---- the build tool writes the copy it was given
 mkrepo ck2; operator op2 "$w/ck2"; mkco co2 "editbase"
 run "$w/co2" "$w/op2.json"
