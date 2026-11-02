@@ -1074,3 +1074,31 @@ test chain gives the valid case and the shifted clock gives the expired one) and
 **What the spikes change in the design** (`pilot-s1.md` is corrected in the same commit): the checker drives the TLS engine itself and reads `ints`-level failure tags; expiry is measured by the shifted-clock probe until an accessor
 exists; the resolver is a deployment setting (a UDP address); a private address is judged after resolution and the connection is made to the literal address, never the name.
 
+## M-1 (docs/company-lifecycle.md section 9): can a Haiku-class builder write a patch against an existing repository? -- harness built, NOT RUN with a model
+
+**Status, 2026-11-02:** no model has been called and no money spent. What was measured is what stands between the question and an answer. Harness: `spike/m1/`
+(`defects.sh` the two past defects of cancho-code, #99 and #103, with the commit each is present at and the commit that fixed it; `A.txt`, `B.txt` their change
+requests; `judge.sh` the oracle, which lays the fix's own fixture over a candidate tree and runs the repository's test; `selftest.sh`; `replay.sh` the replay with a
+dollar ceiling). The comparison tools are `cancho-build --repo` (cancho-code `docs/repo-patch.md`) and `cancho-agent`, both built from cancho-code `main` with the
+compiler pinned at `f4ead824`.
+
+**Judge, measured offline** (`spike/m1/selftest.sh`): for both defects the base commit with the hidden fixture laid over it FAILS the repository's test and the fix
+commit's tree PASSES it (4 of 4). So a changed tree is judged by the repository's own test for the defect, which the model never sees.
+
+**Two findings that stop the replay as planned (measured, 2026-11-02):**
+
+1. **`cancho-build --repo` refuses cancho-code: `bundle-too-large`.** The tool shows the model every `.cho` file of `src/` and `tests/` and caps that at 400,000
+   bytes. cancho-code's hold 1,110,491 bytes (`src/` 948,566, `tests/` 161,925; the largest file, `src/project.cho`, is 129,289), 2.8 times the cap. It is a refusal
+   before any model call, so it cost nothing; it means the tool as built is for small repositories (the design's "a few-hundred-line file" assumption is the
+   tool's size limit, not a preference), and **any company repository over 400 KB of `.cho` cannot be a `repo.change` target** until the tool can be told which
+   paths the model sees.
+2. **The tool's gate expects `tests/NAME_test.cho` and a test that fails on the base; cancho-code's tests of these two defects are shell fixtures.** For kind `bug` the
+   change must add or change a `fn test_*` in a file under `tests/` (`no-test-added` otherwise) and that test must fail on the base (`test-passes-on-base`).
+   The fixtures that closed #99 and #103 are a JSON plan and a text brief checked by `scripts/test-project.sh` and `scripts/test-plan.sh`. A model could write a `_test.cho`
+   for the plan check, but that is not how the repository tests it, and the judge above is the only place where the repository's own test counts.
+
+**What is therefore not known:** the pass rate, the tokens and the dollars of a model on either defect. A narrowed replay (a copy of the repository cut to the files
+the fix touched and what they import, under 400 KB) can be run for the cost of a few cents a call, but its answer is an upper bound for the real repository, and it must be
+reported as one. Price used by `replay.sh` for the ceiling: Haiku 5.5, $0.10 / $0.50 per million input / output tokens up to a 100K-token prompt, $0.50 / $2.50 above
+(Anthropic's price list as of the skill cache of 2026-10-06; cache read and write rates are assumed, see the script header).
+
