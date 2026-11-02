@@ -4,6 +4,10 @@
 > sources named and are marked *(read)*; numbers about the market, prices and demand are **assumptions** and are marked *(assumed)*; nothing was run for this
 > document, no model was called and no money was spent. If this document and the code disagree, the code is right and this document is corrected in place.
 >
+> **Decisions of the maintainer, 2026-11-02** (recorded in section 11): the legal entity is **Alpibru SL**; the board is the maintainer; payments are **prepared and not
+> executed**, and the first subscriptions are **free-trial alpha** ones; hosting is **Hetzner or OVH**; this is an **experiment**, so what is measured is the company's
+> operation and not its commercial success. The name and the domain are not chosen (section 11 has candidates).
+>
 > **What was read** (2026-11-02): cancho-forge `main` at `1ccf372` (`docs/company-lifecycle.md`, `docs/company.md` sections 14 to 24, `docs/autonomy.md`,
 > `docs/roadmap.md` M6 and M7, `docs/threat-model.md` section 4, `docs/isolation.md` headings, `spike/RESULTS.md`); alpibrusl/cancho-industrial `main` (the root
 > README and `platform/README.md`, through the GitHub API; **no source of it was run**). **Not read:** the other cancho packages named in section 7
@@ -28,15 +32,15 @@ growth path: a company that cannot run stage 1 unattended is not ready for stage
 | Stage | Product | New things it forces | Exit criterion (measured, section 6) |
 |---|---|---|---|
 | **S1** | A free, stateless checker on the web and as an API: give a URL, get status, latency, TLS certificate expiry and DNS answers, from our servers | a site, a deploy, abuse controls, content that brings visitors, an own-status monitor | the checker runs a month with its own monitor green, and a change request goes from report to a deployed fix with a person only at the demo |
-| **S2** | A paid API tier: keys, rate limits, a subscription through a hosted payments provider | billing, refunds, support, terms and privacy, price experiments | the first real payment in test mode is reconciled by the finance function; then one in live mode, approved by a person |
+| **S2** | **Alpha accounts with free-trial subscriptions**: an invitation, a key, quotas, a trial period; the paid path is built and tested in the payment provider's test mode and switched off in production | accounts and plans, billing code that never moves money, support, terms and privacy for real users, price experiments as paper | an alpha tenant goes from invitation to first use to the end of its trial with a person only at the demo; a test-mode payment is reconciled by the finance function; no live key exists anywhere |
 | **S3** | Scheduled monitoring and alerts for a customer's URLs | state (monitors, results, incidents), on-call logic, verified ownership of a monitored domain, data export and erasure | an incident the company causes itself is detected by its own monitor, communicated and closed without a person |
 | **S4** | Hosted status pages and subscriber notices | design themes, a customer feedback loop, usage-driven roadmap | the roadmap of a quarter is proposed by the company from its own numbers and admitted by a person |
 
 *Why this product (designed, reasoned, not proven):* a monitoring product exercises every function; the company monitors itself with its own product (dogfooding is
 the monitoring function's work); correctness has a strong independent judge (probe and alert logic against fake servers the builder never sees: slow, down, a bad
 certificate, flapping, a redirect loop); acquisition is by content that can be written, published and measured; money has a clean path through a hosted checkout;
-and S1 needs no state of its own. **What it is not:** evidence of a market. The market for such tools is crowded and the demand for free checkers is *(assumed)*;
-measurement M-P1 (section 10) tests it before anything is built for S2.
+and S1 needs no state of its own. **What it is not:** evidence of a market. The market for such tools is crowded and the demand for free checkers is *(assumed)*. Since this is an experiment, the funnel
+(visits, alpha signups, trials started) is measured because the marketing function needs a number to optimise, not because the business has to succeed (open question 8, answered).
 
 ## 3. The functions: the organisation of the company
 
@@ -72,7 +76,7 @@ commit.**
 | roll back to the last verified release | yes, once per release | after that, the freeze |
 | spend tokens | within the caps (lifecycle 2.3, section 6 below) | raising a cap |
 | spend money outside tokens (hosting, domains, tools, ads) | | every act, until a capped allowance exists (open question 4) |
-| take a payment | the provider does; Forge only reads the result | switching live mode on |
+| take a payment | nothing moves money in the pilot: alpha subscriptions are free; the paid path runs in the provider's test mode only | switching live mode on, ever |
 | refund | up to a cap per day, if the allowance exists | above the cap |
 | change a price | | always |
 | send a message to a customer | templated replies for classes the person approved | anything else |
@@ -150,9 +154,11 @@ the pilot is where that refusal gets argued.
 `threat-model.md` section 4 says payments, contracts and hosting for third parties have "no capability". A company that sells needs a narrow, capped, recorded version of each,
 and this is the document that argues it. **None of it is built, and nothing below is a licence to build without the slice that adds it saying so in its commit.**
 
-1. **Payments** (designed). A hosted checkout provider holds the card data; Forge never sees it and never holds a payment secret. A merchant-of-record provider also takes sales
-   tax off the company. Forge's side is two things: **reading** the provider's exports as files (finance and analytics), and **a webhook receiver** inside the product that verifies
-   a signature and records "tenant T is paid until D" (stateful: from S2). **Test mode first**; live mode is a person's decision. Refunds and price changes are acts of section 4.
+1. **Payments** (designed; **prepared, not executed**). A hosted checkout provider holds the card data; Forge never sees it and never holds a payment secret. The pilot builds the
+   path and runs it **only in the provider's test mode**: a plan, a subscription object with a status and a trial end, a checkout link, a webhook receiver that verifies a signature
+   and records "tenant T is on plan P until D", and a reconciliation of the provider's export against those records by the finance function. **No live key exists in any
+   environment**, and a configuration that holds one is refused by the deploy preflight; live mode is a person's decision, taken outside the pilot. A merchant-of-record provider would
+   also take the sales-tax handling off the company; which provider is open (the choice follows the Spanish entity below). Refunds and price changes are acts of section 4 (there are no live ones).
 2. **Network acts.** Replying to a customer, publishing a post, calling a provider are acts that leave the machine. The design's rule holds: a separately granted, human-gated
    capability per class (`net(...)` narrowed to named hosts, lifecycle section 7.1), reported in the authority diff.
 3. **Abuse.** A service that probes URLs a stranger names can be turned on a third party or on our own network. Controls designed before S1 is deployed: refuse private,
@@ -161,7 +167,16 @@ and this is the document that argues it. **None of it is built, and nothing belo
    before the first probe. The checker's egress runs in the isolation of `isolation.md` (Layer 1 at least, and the deploy slices depend on it anyway).
 4. **Personal data.** A check result can carry a URL with a token in it. The platform's erasure and export are the base; the journal keeps hashes and never request text
    (`company-lifecycle.md` section 2.2 says the same of change requests).
-5. **Terms and privacy** are a person's texts, written from a lawyer's templates, accepted by a person; the company only publishes them.
+5. **Alpibru SL is a Spanish company**, so the texts and the habits below are written for Spain and the EU (not legal advice; a *gestor* or lawyer confirms each): the site names the company,
+   its tax number, address and registry data as the information-society law requires; personal data follows the GDPR (a record of processing, a privacy text, a data-processing
+   agreement for tenants, erasure and export, which the platform base has); digital services sold to consumers and businesses in other EU states bring VAT rules (one-stop shop) that
+   a merchant-of-record provider would carry; invoicing software has its own rules in Spain. None of these bite while the alpha is free, which is another reason it is the first stage; all of
+   them must be decided before a euro moves.
+6. **Hosting** (designed). **Hetzner** first, **OVH** as a second provider later (both are EU, with a documented API). The reasons, as I understand them and to be checked: Hetzner Cloud tokens
+   are scoped to one project, so staging and production are two projects and a token cannot reach the other; servers sit behind a firewall that is itself code; a snapshot is cheap. A probing service
+   needs addresses that sites do not already block and probes from more than one place; both providers' address reputation and regions are measured in S1 before it is promised. The deploy
+   **adapter** (lifecycle section 5.3) is the only holder of the token; Forge never reads it; isolation Layer 1 is in place before the first deploy; **the first deploy of the repository is a person's**.
+7. **Terms and privacy** are a person's texts, written from a lawyer's templates, accepted by a person; the company only publishes them.
 
 ## 9. The scenarios: a week in the life, seeded
 
@@ -190,7 +205,7 @@ The pilot reorders the roadmap by what a scenario needs. The first column is the
 | Order | Piece | Needed by scenario | Notes |
 |---|---|---|---|
 | 1 | **M-1** (can a Haiku-class builder write a patch against existing code?), narrowed replay | 1, 2 | harness in `spike/m1/`; needs a key file and a ceiling; asks the tool for a path scope |
-| 2 | **M-P1**: is there demand for the free tool? | | a person's measurement with a landing page and a counter, before S2 is designed in detail |
+| 2 | **M-P1**: a counter on a landing page for the free tool | 8 | optional: it gives the marketing function its first number; it does not gate anything |
 | 3 | slice 3: repro step, `audit/regress/` | 1, 2 | the audit is the product's oracle |
 | 4 | reviewer distinct from qa (autonomy step 2) | 1 | |
 | 5 | the site repository kind, the writer's claim check, analytics as a file | 8 | |
@@ -199,16 +214,33 @@ The pilot reorders the roadmap by what a scenario needs. The first column is the
 | 8 | signals and alerts, issue intake, goals | 3, 6, 12 | lifecycle slices 7 and 12 |
 | 9 | payments (section 8), the stateful kind, the platform fork | 4, 9, S2 and S3 | argued in its own design before it is built |
 
-## 11. Open questions for the maintainer
+## 11. Decisions taken, and what is still open
 
-1. **Functions as flows and roles, or as roles?** Recommendation: flows over the six roles, owner by manifest. Revisit when two functions need different authority for the same task type.
-2. **Name, domain and legal entity.** The pilot needs a name that can be registered, a domain, and an entity that can hold a payment account. None is chosen.
-3. **Who is the board,** and what do they approve weekly? Recommendation: one person, one demo a week, the decisions of section 4.
-4. **A capped allowance for spend outside tokens** (hosting, domains, tools): a monthly figure the company may spend without asking, recorded as `allowance` in the operator file? Recommendation: none until S1 is deployed.
-5. **When may live payments start,** and who flips it? Recommendation: after S2's test-mode reconciliation passes five weeks running.
-6. **The platform:** fork or vendor `cancho-industrial/platform` (EUPL-1.2 is copyleft), or write the stateful part fresh? Recommendation: fork it as an owned repository and keep its licence; revisit if a customer cannot accept copyleft.
-7. **Hosting provider** for staging and prod, and who holds the first credential.
-8. **Do we keep the product this way if M-P1 says no demand?** Recommendation: yes for S1 (the pilot's value is the company, not the revenue); no for S2 and beyond until demand is measured.
+**Taken (2026-11-02, by the maintainer):**
+
+| Question | Decision |
+|---|---|
+| Legal entity | **Alpibru SL** |
+| Board | **the maintainer**, one person; the decisions of section 4 are theirs |
+| Payments | **prepared and not executed**; the alpha uses **free-trial subscriptions**; test mode only (section 8) |
+| Hosting | **Hetzner or OVH**; this document proposes Hetzner first (section 8, item 6); the choice is confirmed before the first deploy |
+| Keep going without demand | **yes**: it is an experiment; the scoreboard and the measures of section 6 are what is judged, and revenue is not |
+
+**Still open:**
+1. **The name and the domain.** `upcheck` is taken: its name servers answer on `.com`, `.dev`, `.io` and `.app` (a DNS lookup on 2026-11-02, which shows registration, not trademark rights).
+   Candidates whose lookups found **no name servers** on the endings listed (suggesting they are unregistered; confirm with a registrar, and search the Spanish and EU trademark registers before using any):
+   | Candidate | Free on (lookup) | Note |
+   |---|---|---|
+   | **Lanternwatch** | `.dev` `.io` `.app` `.es` `.eu` `.net` (`.com` taken) | a lantern is a signal kept lit; easy to say and spell |
+   | **Cairnwatch** | `.dev` `.io` `.app` `.es` `.eu` `.net` (`.com` taken) | a cairn is a marker left for the next traveller |
+   | **Pingwell** | `.com` `.io` `.es` `.eu` `.net` (`.dev` `.app` taken) | plain about what it does; "ping" is generic |
+   | **Fathomcheck** | `.dev` `.io` `.es` `.eu` `.net` (`.com` `.app` taken) | clumsier |
+   My pick is **Lanternwatch**: pronounceable in Spanish and English, no clash found on six endings, and a brand a design function can work with. A name close to *Sentry* (an established
+   monitoring product) was tried and left out for that reason.
+2. **Functions as flows and roles, or as roles?** Recommendation: flows over the six roles, owner by manifest; revisit when two functions need different authority for the same task type.
+3. **A capped allowance for spend outside tokens** (hosting, domains, tools). Recommendation: none until S1 is deployed, then a small monthly figure recorded in the operator file.
+4. **The platform:** fork or vendor `cancho-industrial/platform` (EUPL-1.2 is copyleft), or write the stateful part fresh? Recommendation: fork it as an owned repository and keep its licence.
+5. **The hosting choice, finally:** Hetzner or OVH, decided after S1's measurement of address reputation and regions.
 
 ## 12. What this document does not do
 
