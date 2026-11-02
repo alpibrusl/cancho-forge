@@ -123,6 +123,13 @@ check "derived: a file where its directory should be is not replaced: step-dir-m
 rm -f "$cod/steps/chg-0002.fix"
 run "$cod" "$w/opd.json"
 check "derived: with the file gone Forge makes the directory and the second change is done" sh -c "[ \$(cat '$w/rc') = 0 ] && [ -d '$cod/steps/chg-0002.fix/ev' ] && grep -qx 'done: steps accepted 3' '$w/out'"
+"$F" company run "$cod" "$w/opd.json" now=2026-11-02 > "$w/out" 2>&1; echo $? > "$w/rc"
+check "clock: run with now= puts the day in the journal once (exit 0, one company.clock.set record)" sh -c "[ \$(cat '$w/rc') = 0 ] && [ \$(grep -c 'company.clock.set' '$cod/company.journal') = 1 ] && '$F' company status '$cod' format=json | grep -q '\"clock\":\"2026-11-02\"'"
+"$F" company run "$cod" "$w/opd.json" now=2026-11-02 > "$w/out" 2>&1
+check "clock: the same day again writes no second record" sh -c "[ \$(grep -c 'company.clock.set' '$cod/company.journal') = 1 ]"
+lines_before=$(wc -l < "$cod/company.journal" | tr -d ' ')
+"$F" company run "$cod" "$w/opd.json" now=2026-11-01 > "$w/out" 2>&1; echo $? > "$w/rc"
+check "clock: an earlier day is clock-went-back, exit 1, nothing written" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: clock-went-back' '$w/out' && [ \$(wc -l < '$cod/company.journal' | tr -d ' ') = $lines_before ]"
 
 # ---- the build tool writes the copy it was given
 mkrepo ck2; operator op2 "$w/ck2"; mkco co2 "editbase"

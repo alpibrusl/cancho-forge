@@ -1,0 +1,128 @@
+edition 9;
+module forge.company_time;
+
+import std.buffer;
+import std.bytes;
+
+// Dates (docs/company-lifecycle.md section 2.2, docs/company.md section 22). Forge reads no clock: a verb that needs the date is given it, as
+// `now=YYYY-MM-DD`, and a journal replays as a pure function of its file. This module is pure: a date as text is a day number (days since
+// 1970-01-01) and back. Only the years 2000 to 9999 are dates, so a day number is never 0 and 0 can mean "no date".
+//
+// The tags (docs/company.md section 22): `clock-invalid` is a `now=` that is not a date of the calendar, and `clock-went-back` a `now=` that is
+// earlier than a date the journal already holds.
+
+pub fn rule_invalid() -> [] &static [byte] {
+    return "clock-invalid";
+}
+
+pub fn rule_went_back() -> [] &static [byte] {
+    return "clock-went-back";
+}
+
+// The `n` digits of `text` from `at` as a number, or -1.
+fn digits[&t](text: &t [byte], at: int, n: int) -> [] int {
+    if at + n > len(text) {
+        return 0 - 1;
+    }
+    var v = 0;
+    var k = 0;
+    while k < n {
+        let c = int_of(text[at + k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        v = v * 10 + c - 48;
+        k = k + 1;
+    }
+    return v;
+}
+
+fn leap(y: int) -> [] bool {
+    return y % 4 == 0 && y % 100 != 0 || y % 400 == 0;
+}
+
+fn days_in(y: int, m: int) -> [] int {
+    if m == 2 {
+        if leap(y) {
+            return 29;
+        }
+        return 28;
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 {
+        return 30;
+    }
+    return 31;
+}
+
+// The day number of year `y`, month `m`, day `d` (the days-from-civil algorithm: months counted from March, 400-year eras).
+fn days_from_civil(y: int, m: int, d: int) -> [] int {
+    var yy = y;
+    if m <= 2 {
+        yy = y - 1;
+    }
+    let era = yy / 400;
+    let yoe = yy - era * 400;
+    var mp = m + 9;
+    if m > 2 {
+        mp = m - 3;
+    }
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// The day number of `text` (exactly `YYYY-MM-DD`, a date of the calendar in the years 2000 to 9999), or -1.
+pub fn day_of[&t](text: &t [byte]) -> [] int {
+    if len(text) != 10 || int_of(text[4]) != 45 || int_of(text[7]) != 45 {
+        return 0 - 1;
+    }
+    let y = digits(text, 0, 4);
+    let m = digits(text, 5, 2);
+    let d = digits(text, 8, 2);
+    if y < 2000 || m < 1 || m > 12 || d < 1 {
+        return 0 - 1;
+    }
+    if d > days_in(y, m) {
+        return 0 - 1;
+    }
+    return days_from_civil(y, m, d);
+}
+
+fn put_padded[&h](heap: &!h Heap, out: buffer.Buffer, n: int, width: int) -> [heap] buffer.Buffer {
+    var o = out;
+    var div = 1;
+    var k = 1;
+    while k < width {
+        div = div * 10;
+        k = k + 1;
+    }
+    while div > 0 {
+        o = buffer.push(heap, o, byte_of(48 + n / div % 10));
+        div = div / 10;
+    }
+    return o;
+}
+
+// `YYYY-MM-DD` of a day number (the civil-from-days algorithm, the inverse of `days_from_civil`).
+pub fn date_of[&h](heap: &!h Heap, day: int) -> [heap] buffer.Buffer {
+    let z = day + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    var m = mp + 3;
+    if mp >= 10 {
+        m = mp - 9;
+    }
+    var y = yoe + era * 400;
+    if m <= 2 {
+        y = y + 1;
+    }
+    var o = put_padded(heap, buffer.empty(heap, 12), y, 4);
+    o = buffer.push(heap, o, byte_of(45));
+    o = put_padded(heap, o, m, 2);
+    o = buffer.push(heap, o, byte_of(45));
+    return put_padded(heap, o, d, 2);
+}

@@ -9,6 +9,7 @@ import forge.company_change;
 import forge.company_files;
 import forge.company_manifest;
 import forge.company_state;
+import forge.company_time;
 import forge.journal;
 import forge.journal_io;
 import forge.lock;
@@ -57,7 +58,7 @@ fn find_arg[&g, &n](args: &g Args, name: &n [byte]) -> [args] int {
 fn all_known[&g](args: &g Args) -> [args] bool {
     var k = 5;
     while k < arg_count(args) {
-        let known = len(value_of(args, k, "repo")) > 0 || len(value_of(args, k, "kind")) > 0 || len(value_of(args, k, "justification")) > 0 || len(value_of(args, k, "title")) > 0 || len(value_of(args, k, "file")) > 0;
+        let known = len(value_of(args, k, "repo")) > 0 || len(value_of(args, k, "kind")) > 0 || len(value_of(args, k, "justification")) > 0 || len(value_of(args, k, "title")) > 0 || len(value_of(args, k, "file")) > 0 || len(value_of(args, k, "now")) > 0;
         if known == false {
             return false;
         }
@@ -66,8 +67,16 @@ fn all_known[&g](args: &g Args) -> [args] bool {
     return true;
 }
 
+// The `now=` value, or an empty slice when argument `nw` is none (-1).
+fn now_of[&g](args: &g Args, nw: int) -> [args] &g [byte] {
+    if nw >= 0 {
+        return value_of(args, nw, "now");
+    }
+    return arg(args, 3)[0..0];
+}
+
 pub fn add_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
-    if arg_count(args) != 10 || bytes.equal(arg(args, 3), "add") == false || all_known(args) == false {
+    if arg_count(args) != 10 && arg_count(args) != 11 || bytes.equal(arg(args, 3), "add") == false || all_known(args) == false {
         return 2;
     }
     let r = find_arg(args, "repo");
@@ -75,8 +84,14 @@ pub fn add_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: 
     let j = find_arg(args, "justification");
     let t = find_arg(args, "title");
     let p = find_arg(args, "file");
-    if r < 0 || k < 0 || j < 0 || t < 0 || p < 0 {
+    let nw = find_arg(args, "now");
+    if r < 0 || k < 0 || j < 0 || t < 0 || p < 0 || nw == 0 - 2 || arg_count(args) == 11 != nw >= 0 {
         return 2;
+    }
+    let now = now_of(args, nw);
+    if nw >= 0 && company_time.day_of(now) < 0 {
+        company_cmd.refuse(io, company_time.rule_invalid());
+        return 1;
     }
     let dir = arg(args, 4);
     let mpath = company_cmd.under(heap, dir, "company.json");
@@ -100,7 +115,7 @@ pub fn add_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: 
                             code = 3;
                         }
                         lock.Lock::Held(held) => {
-                            code = add_locked(heap, fs, io, dir, buffer.bytes(mp), buffer.bytes(jp), value_of(args, r, "repo"), value_of(args, k, "kind"), value_of(args, j, "justification"), value_of(args, t, "title"), value_of(args, p, "file"));
+                            code = add_locked(heap, fs, io, dir, buffer.bytes(mp), buffer.bytes(jp), value_of(args, r, "repo"), value_of(args, k, "kind"), value_of(args, j, "justification"), value_of(args, t, "title"), value_of(args, p, "file"), now);
                             lock.let_go(held);
                         }
                     }
@@ -115,7 +130,7 @@ pub fn add_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: 
 }
 
 // The lock is held: the manifest first.
-fn add_locked[&h, &f, &i, &d, &m, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], repo: &r [byte], kind: &k [byte], why: &y [byte], title: &t [byte], file: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn add_locked[&h, &f, &i, &d, &m, &j, &r, &k, &y, &t, &p, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], repo: &r [byte], kind: &k [byte], why: &y [byte], title: &t [byte], file: &p [byte], now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     let (text, errno) = company_cmd.read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
     var code = 1;
     if errno != 0 {
@@ -127,7 +142,7 @@ fn add_locked[&h, &f, &i, &d, &m, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f
                     company_cmd.refuse(io, company_manifest.rule_name(bad));
                 }
                 company_manifest.ManifestResult::Held(man) => {
-                    code = add_checked(heap, fs, io, dir, man, jpath, repo, kind, why, title, file);
+                    code = add_checked(heap, fs, io, dir, man, jpath, repo, kind, why, title, file, now);
                 }
             }
         }
@@ -137,7 +152,7 @@ fn add_locked[&h, &f, &i, &d, &m, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f
 }
 
 // The closed fields, against the manifest; then the request file.
-fn add_checked[&h, &f, &i, &d, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], man: company_manifest.Manifest, jpath: &j [byte], repo: &r [byte], kind: &k [byte], why: &y [byte], title: &t [byte], file: &p [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn add_checked[&h, &f, &i, &d, &j, &r, &k, &y, &t, &p, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], man: company_manifest.Manifest, jpath: &j [byte], repo: &r [byte], kind: &k [byte], why: &y [byte], title: &t [byte], file: &p [byte], now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     var code = 1;
     let kc = company_change.kind_code(kind);
     var known = false;
@@ -168,7 +183,7 @@ fn add_checked[&h, &f, &i, &d, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f Fs
             company_cmd.refuse(io, company_change.rule_too_large());
         } else {
             borrow body as &bb in {
-                code = add_replayed(heap, fs, io, dir, man, jpath, repo, kind, kc, why, title, buffer.bytes(bb));
+                code = add_replayed(heap, fs, io, dir, man, jpath, repo, kind, kc, why, title, buffer.bytes(bb), now);
             }
             buffer.drop(heap, body);
             return code;
@@ -180,7 +195,7 @@ fn add_checked[&h, &f, &i, &d, &j, &r, &k, &y, &t, &p](heap: &!h Heap, fs: &f Fs
 }
 
 // Replay the journal (refused as `decide` refuses), then write the body and the record(s).
-fn add_replayed[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], man: company_manifest.Manifest, jpath: &j [byte], repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn add_replayed[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], man: company_manifest.Manifest, jpath: &j [byte], repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte], now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     var code = 1;
     let existed = journal_io.exists(fs, jpath);
     let (data, errno) = journal_io.read_all(heap, fs, jpath);
@@ -196,8 +211,11 @@ fn add_replayed[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f F
                     if rep.rule != 0 {
                         company_cmd.refuse(io, task.rule_code_name(rep.rule));
                         code = 1;
+                    } else if len(now) > 0 && company_time.day_of(now) < company_state.last_day(sr) {
+                        company_cmd.refuse(io, company_time.rule_went_back());
+                        code = 1;
                     } else {
-                        code = add_written(heap, fs, io, dir, jpath, existed, rep, company_state.change_count(sr, 0) + 1, repo, kind, kc, why, title, body);
+                        code = add_written(heap, fs, io, dir, jpath, existed, rep, company_state.change_count(sr, 0) + 1, repo, kind, kc, why, title, body, now, company_state.last_day(sr));
                     }
                 }
                 company_state.drop(heap, state);
@@ -210,7 +228,7 @@ fn add_replayed[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f F
 }
 
 // The next number is `n`: the body file, then the journal.
-fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], jpath: &j [byte], existed: bool, rep: journal.Report, n: int, repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b, &w](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], jpath: &j [byte], existed: bool, rep: journal.Report, n: int, repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte], now: &w [byte], last: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     let id = company_change.id_of(heap, n);
     var code = 1;
     borrow id as &ib in {
@@ -230,7 +248,7 @@ fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f Fs
                 company_cmd.line(io, "error: cannot write changes/<id>.txt (the operator makes the directory changes/)", "");
                 code = 3;
             } else {
-                code = add_recorded(heap, fs, io, jpath, existed, rep, buffer.bytes(ib), repo, kind, kc, why, title, body);
+                code = add_recorded(heap, fs, io, jpath, existed, rep, buffer.bytes(ib), repo, kind, kc, why, title, body, now, last);
             }
         }
         buffer.drop(heap, bpath);
@@ -240,13 +258,21 @@ fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f Fs
 }
 
 // The record(s), one write.
-fn add_recorded[&h, &f, &i, &j, &x, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], existed: bool, rep: journal.Report, id: &x [byte], repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn add_recorded[&h, &f, &i, &j, &x, &r, &k, &y, &t, &b, &w](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], existed: bool, rep: journal.Report, id: &x [byte], repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte], now: &w [byte], last: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     let cut_to = journal.recovery_cut(rep);
     if cut_to >= 0 {
         if journal_io.cut_torn_tail(fs, jpath, cut_to) != 0 {
             company_cmd.line(io, "error: cannot cut the torn tail of company.journal", "");
             return 3;
         }
+    }
+    // The day first, in the same write, when `now=` is later than the last one the journal holds.
+    var shift = 0;
+    var clock_ev = buffer.empty(heap, 1);
+    if len(now) > 0 && company_time.day_of(now) > last {
+        buffer.drop(heap, clock_ev);
+        clock_ev = company_state.clock_set(heap, rep.records + 1, now);
+        shift = 1;
     }
     let sha = company_files.hex_of(heap, body);
     let (environ, errno) = company_cmd.read_limited(heap, fs, "/proc/self/environ", 65536);
@@ -255,19 +281,31 @@ fn add_recorded[&h, &f, &i, &j, &x, &r, &k, &y, &t, &b](heap: &!h Heap, fs: &f F
     borrow sha as &sb in {
         borrow environ as &eb in {
             if errno == 0 {
-                ev = company_state.change_proposed(heap, rep.records + 1, id, repo, kind, "operator", company_cmd.user_in_environ(buffer.bytes(eb)), title, buffer.bytes(sb), len(body), why);
+                ev = company_state.change_proposed(heap, rep.records + 1 + shift, id, repo, kind, "operator", company_cmd.user_in_environ(buffer.bytes(eb)), title, buffer.bytes(sb), len(body), why);
             } else {
-                ev = company_state.change_proposed(heap, rep.records + 1, id, repo, kind, "operator", "unknown", title, buffer.bytes(sb), len(body), why);
+                ev = company_state.change_proposed(heap, rep.records + 1 + shift, id, repo, kind, "operator", "unknown", title, buffer.bytes(sb), len(body), why);
             }
         }
     }
     if company_change.admitted_by_operator(kc) {
-        let more = company_state.change_admitted(heap, rep.records + 2, id);
+        let more = company_state.change_admitted(heap, rep.records + 2 + shift, id);
         borrow more as &mb in {
             ev = buffer.append(heap, ev, buffer.bytes(mb));
         }
         buffer.drop(heap, more);
     }
+    if shift == 1 {
+        var joined = buffer.empty(heap, 512);
+        borrow clock_ev as &cb in {
+            joined = buffer.append(heap, joined, buffer.bytes(cb));
+        }
+        borrow ev as &pb in {
+            joined = buffer.append(heap, joined, buffer.bytes(pb));
+        }
+        buffer.drop(heap, ev);
+        ev = joined;
+    }
+    buffer.drop(heap, clock_ev);
     var status = 0;
     borrow ev as &evb in {
         status = journal_io.append(fs, jpath, buffer.bytes(evb), existed == false);

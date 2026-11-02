@@ -10,6 +10,7 @@ import forge.company_derive;
 import forge.company_graph;
 import forge.company_manifest;
 import forge.company_state;
+import forge.company_time;
 import forge.journal;
 import forge.journal_io;
 import forge.lock;
@@ -378,6 +379,13 @@ pub fn status_json[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, 
         w = put_count(heap, w, "rejected", company_state.change_count(s, 3));
         w = json.end_object(heap, w);
     }
+    if company_state.last_day(s) > 0 {
+        let day = company_time.date_of(heap, company_state.last_day(s));
+        borrow day as &db in {
+            w = put_text(heap, w, "clock", buffer.bytes(db));
+        }
+        buffer.drop(heap, day);
+    }
     w = json.put_key(heap, w, "budget");
     w = json.begin_object(heap, w);
     w = put_tokens(heap, w, "limits", company_manifest.budget_input(m), company_manifest.budget_output(m), company_manifest.budget_cache_write(m), company_manifest.budget_cache_read(m));
@@ -664,8 +672,23 @@ pub fn decide_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, arg
     if verdict == 0 {
         return 2;
     }
+    // `now=YYYY-MM-DD` right after the verdict is the day (docs/company.md section 22); the reason is every word after it. A reason that begins with
+    // `now=` is therefore never a reason.
+    var first = 6;
+    var now = arg(args, 5)[0..0];
+    if len(arg(args, 6)) >= 4 && bytes.equal(arg(args, 6)[0..4], "now=") {
+        if arg_count(args) < 8 {
+            return 2;
+        }
+        now = arg(args, 6)[4..len(arg(args, 6))];
+        first = 7;
+        if company_time.day_of(now) < 0 {
+            refuse(io, company_time.rule_invalid());
+            return 1;
+        }
+    }
     let dir = arg(args, 3);
-    let reason = join_args(heap, args, 6);
+    let reason = join_args(heap, args, first);
     let mpath = under(heap, dir, "company.json");
     let jpath = under(heap, dir, "company.journal");
     let lpath = under(heap, dir, "lock");
@@ -690,7 +713,7 @@ pub fn decide_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, arg
                                 code = 3;
                             }
                             lock.Lock::Held(held) => {
-                                code = decide_locked(heap, fs, io, dir, buffer.bytes(mp), buffer.bytes(jp), arg(args, 4), verdict, buffer.bytes(rb));
+                                code = decide_locked(heap, fs, io, dir, buffer.bytes(mp), buffer.bytes(jp), arg(args, 4), verdict, now, buffer.bytes(rb));
                                 lock.let_go(held);
                             }
                         }
@@ -707,7 +730,7 @@ pub fn decide_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, arg
 }
 
 // The lock is held: read the manifest, then decide against it.
-fn decide_locked[&h, &f, &i, &d, &m, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn decide_locked[&h, &f, &i, &d, &m, &j, &g, &n, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], gate: &g [byte], verdict: int, now: &n [byte], reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     let (text, errno) = read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
     var code = 1;
     if errno != 0 {
@@ -724,7 +747,7 @@ fn decide_locked[&h, &f, &i, &d, &m, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), 
                         refuse(io, company_derive.rule_of_code(why));
                         company_manifest.drop(heap, ext);
                     } else {
-                        code = decide_with(heap, fs, io, ext, jpath, gate, verdict, reason);
+                        code = decide_with(heap, fs, io, ext, jpath, gate, verdict, now, reason);
                     }
                 }
             }
@@ -757,7 +780,7 @@ fn is_admit[&g](gate: &g [byte]) -> [] bool {
 }
 
 // Replay the journal against `held`, refuse an unknown gate or a refused journal, else append the decision. Ends `held`.
-fn decide_with[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, held: company_manifest.Manifest, jpath: &j [byte], gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn decide_with[&h, &f, &i, &j, &g, &n, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, held: company_manifest.Manifest, jpath: &j [byte], gate: &g [byte], verdict: int, now: &n [byte], reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     var code = 1;
     borrow held as &hm in {
         if company_manifest.has_gate(hm, gate) == false && company_state.retry_step(hm, gate) < 0 && is_admit(gate) == false {
@@ -782,8 +805,10 @@ fn decide_with[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io
                             buffer.drop(heap, n);
                         } else if is_admit(gate) && company_state.change_state(sr, gate[len(company_state.admit_prefix())..len(gate)]) != 1 {
                             refuse(io, company_manifest.rule_name(company_manifest.Refusal::GateUnknown));
+                        } else if len(now) > 0 && company_time.day_of(now) < company_state.last_day(sr) {
+                            refuse(io, company_time.rule_went_back());
                         } else {
-                            code = append_decision(heap, fs, io, jpath, existed, rep, gate, verdict, reason);
+                            code = append_decision(heap, fs, io, jpath, existed, rep, gate, verdict, reason, now, company_state.last_day(sr));
                         }
                     }
                     company_state.drop(heap, state);
@@ -797,7 +822,7 @@ fn decide_with[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io
 }
 
 // The journal replayed clean (`rep`): cut a torn tail, append the decision as record `rep.records + 1`, print the gate's state.
-fn append_decision[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], existed: bool, rep: journal.Report, gate: &g [byte], verdict: int, reason: &r [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn append_decision[&h, &f, &i, &j, &g, &r, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], existed: bool, rep: journal.Report, gate: &g [byte], verdict: int, reason: &r [byte], now: &n [byte], last: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     let cut_to = journal.recovery_cut(rep);
     if cut_to >= 0 {
         if journal_io.cut_torn_tail(fs, jpath, cut_to) != 0 {
@@ -805,7 +830,19 @@ fn append_decision[&h, &f, &i, &j, &g, &r](heap: &!h Heap, fs: &f Fs(""), io: &!
             return 3;
         }
     }
-    var ev = event_for(heap, fs, rep.records + 1, gate, verdict, reason);
+    // The day first, in the same write, when `now=` is later than the last one the journal holds.
+    var seq = rep.records + 1;
+    var ev = buffer.empty(heap, 1);
+    if len(now) > 0 && company_time.day_of(now) > last {
+        buffer.drop(heap, ev);
+        ev = company_state.clock_set(heap, seq, now);
+        seq = seq + 1;
+    }
+    let decided = event_for(heap, fs, seq, gate, verdict, reason);
+    borrow decided as &db in {
+        ev = buffer.append(heap, ev, buffer.bytes(db));
+    }
+    buffer.drop(heap, decided);
     var status = 0;
     borrow ev as &evb in {
         status = journal_io.append(fs, jpath, buffer.bytes(evb), existed == false);

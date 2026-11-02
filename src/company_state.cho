@@ -8,6 +8,7 @@ import std.map;
 import std.option;
 import forge.company_budget;
 import forge.company_graph;
+import forge.company_time;
 import forge.company_manifest;
 import forge.event;
 import forge.journal;
@@ -103,6 +104,13 @@ pub fn kind_library() -> [] &static [byte] {
 // reported them), the patch's SHA-256 and the files and added lines Forge counted in it. Replay checks its shape and nothing else.
 pub fn kind_change() -> [] &static [byte] {
     return "company.step.change";
+}
+
+// The date (docs/company.md section 22): `company.clock.set` (task = "clock"; `at` = `YYYY-MM-DD`) says what day it is for the records after it, until
+// the next one. A verb given `now=` appends one when the day is later than the last. Replay keeps the last day (`last_day`), and a date that is not
+// one of the calendar or is earlier than the last is `event-malformed`.
+pub fn kind_clock_set() -> [] &static [byte] {
+    return "company.clock.set";
 }
 
 // A change request (docs/company-lifecycle.md section 4.1, docs/company.md section 17): `company.change.proposed` (task = the change id `chg-NNNN`;
@@ -245,6 +253,14 @@ pub fn gate_decided[&h, &g, &v, &u, &r](heap: &!h Heap, seq: int, gate: &g [byte
     return closed(heap, w);
 }
 
+// The day is `at` (`YYYY-MM-DD`) for the records after this one.
+pub fn clock_set[&h, &a](heap: &!h Heap, seq: int, at: &a [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_clock_set(), "clock");
+    w = json.put_key(heap, w, "at");
+    w = json.put_string(heap, w, at);
+    return closed(heap, w);
+}
+
 // A change `id` was proposed for repository `repo`; `body_sha256` and `body_bytes` name the request text, which is a file and never the journal's.
 pub fn change_proposed[&h, &i, &r, &k, &t, &u, &s, &b, &j](heap: &!h Heap, seq: int, id: &i [byte], repo: &r [byte], ckind: &k [byte], source_type: &t [byte], source_ref: &u [byte], title: &s [byte], body_sha256: &b [byte], body_bytes: int, justification: &j [byte]) -> [heap] buffer.Buffer {
     var w = opened(heap, seq, kind_change_proposed(), id);
@@ -314,8 +330,12 @@ fn slot_unpriced() -> [] int {
     return 5;
 }
 
+fn slot_day() -> [] int {
+    return 9;
+}
+
 fn step_base(i: int) -> [] int {
-    return 9 + 5 * i;
+    return 10 + 5 * i;
 }
 
 // Has the spend slice the five slots of step number `i`? Answered without computing `step_base(i)` for an `i` that could overflow.
@@ -507,6 +527,17 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                         rule = bad;
                     } else {
                         cs = map.put(heap, cs, id, 2);
+                    }
+                } else if bytes.equal(kind, kind_clock_set()) {
+                    let at = json.get(line, tp, 0, "at");
+                    var day = 0 - 1;
+                    if json.is_string(tp, at) {
+                        day = company_time.day_of(json.string_view(line, tp, at));
+                    }
+                    if day < 0 || day < spend[slot_day()] {
+                        rule = bad;
+                    } else {
+                        spend[slot_day()] = day;
                     }
                 } else if bytes.equal(kind, kind_check_failed()) {
                     let score = field(line, tp, 0, "score");
@@ -823,6 +854,11 @@ pub fn change_count[&s](s: &s CompanyState, state: int) -> [] int {
         e = e + 1;
     }
     return n;
+}
+
+// The last day a `company.clock.set` record gave (a day number, `company_time.day_of`), or 0 when the journal holds none.
+pub fn last_day[&s](s: &s CompanyState) -> [] int {
+    return contents(s.spend)[slot_day()];
 }
 
 pub fn spend_input[&s](s: &s CompanyState) -> [] int {

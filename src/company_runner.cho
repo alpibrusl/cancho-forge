@@ -12,6 +12,7 @@ import std.process;
 import forge.await_run;
 import forge.await_task;
 import forge.company_budget;
+import forge.company_clock;
 import forge.company_cmd;
 import forge.company_derive;
 import forge.company_files;
@@ -21,6 +22,7 @@ import forge.company_needs;
 import forge.company_provision;
 import forge.company_run;
 import forge.company_state;
+import forge.company_time;
 import forge.company_step;
 import forge.gate_run;
 import forge.gate_env;
@@ -199,8 +201,20 @@ fn glue[&h, &a, &b](heap: &!h Heap, first: &a [byte], second: &b [byte]) -> [hea
 
 // `forge company run <company-dir> <operator-file>`: args are `forge company run <dir> <operator-file>`.
 pub fn run_cmd[&h, &f, &x, &c, &i, &g, &z](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args, sig: &z Signals("INT,TERM")) -> [args, heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write, signals("INT,TERM"), signals_read] int {
-    if arg_count(args) != 5 {
+    if arg_count(args) != 5 && arg_count(args) != 6 {
         return company_step.exit_usage();
+    }
+    var now = arg(args, 4)[0..0];
+    if arg_count(args) == 6 {
+        let word = arg(args, 5);
+        if len(word) < 5 || bytes.equal(word[0..4], "now=") == false {
+            return company_step.exit_usage();
+        }
+        now = word[4..len(word)];
+        if company_time.day_of(now) < 0 {
+            refuse(io, company_time.rule_invalid());
+            return company_step.exit_refused();
+        }
     }
     let dir = arg(args, 3);
     let opath = arg(args, 4);
@@ -229,7 +243,7 @@ pub fn run_cmd[&h, &f, &x, &c, &i, &g, &z](heap: &!h Heap, fs: &f Fs(""), exec: 
                             code = company_step.exit_io();
                         }
                         lock.Lock::Held(held) => {
-                            code = run_locked(heap, fs, exec, clock, io, dir, buffer.bytes(mp), buffer.bytes(jp), opath, sig);
+                            code = run_locked(heap, fs, exec, clock, io, dir, buffer.bytes(mp), buffer.bytes(jp), opath, now, sig);
                             lock.let_go(held);
                         }
                     }
@@ -244,7 +258,7 @@ pub fn run_cmd[&h, &f, &x, &c, &i, &g, &z](heap: &!h Heap, fs: &f Fs(""), exec: 
 }
 
 // The lock is held: the manifest.
-fn run_locked[&h, &f, &x, &c, &i, &d, &m, &j, &o, &z](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], opath: &o [byte], sig: &z Signals("INT,TERM")) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write, signals("INT,TERM"), signals_read] int {
+fn run_locked[&h, &f, &x, &c, &i, &d, &m, &j, &o, &n, &z](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], opath: &o [byte], now: &n [byte], sig: &z Signals("INT,TERM")) -> [heap, exec_under, exec_detached, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write, signals("INT,TERM"), signals_read] int {
     let (text, errno) = company_cmd.read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
     var code = company_step.exit_refused();
     if errno != 0 {
@@ -256,8 +270,16 @@ fn run_locked[&h, &f, &x, &c, &i, &d, &m, &j, &o, &z](heap: &!h Heap, fs: &f Fs(
                     refuse(io, company_manifest.rule_name(why));
                 }
                 company_manifest.ManifestResult::Held(held) => {
+                    var marked = 0;
+                    if len(now) > 0 {
+                        borrow held as &km in {
+                            marked = company_clock.mark(heap, fs, io, jpath, km, now);
+                        }
+                    }
                     let (ext, why) = company_derive.load(heap, fs, dir, jpath, held);
-                    if why != 0 {
+                    if marked != 0 {
+                        code = marked;
+                    } else if why != 0 {
                         refuse(io, company_derive.rule_of_code(why));
                     } else {
                         borrow ext as &hm in {
