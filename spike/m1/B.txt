@@ -1,0 +1,3 @@
+`plancheck` refuses a correct plan with `[PLAN_ERROR] brief-heap`. The plan's signatures are exactly the contract file's, and the brief shows the call of the function with a heap argument (for example `edit_distance(heap, a, b)`), yet the check reports it as "a brief function with a heap its result does not need". A brief whose call already shows the heap must not be refused by that rule; a brief that does not show it still must be.
+
+Add a fixture and a case for the shown-heap brief to the plan test script.
