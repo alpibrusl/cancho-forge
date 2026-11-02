@@ -5,14 +5,16 @@
 #
 # Usage: CANCHO=compiler CODE=cancho-code-checkout replay.sh <key-file> <ceiling dollars> <runs per defect> <results.tsv> <scratch dir, empty, short path>
 #   <key-file>  a file holding the API key (the agent reads it; this script never does and never prints it); its path is made of letters, digits and ._/-
-# Environment: MODEL (default claude-haiku-5-5), ATTEMPTS (3, the attempts inside one run).
+# Environment: MODEL (default claude-haiku-5-5), ATTEMPTS (3, the attempts inside one run), AGENT (the agent command instead of the real one: a stand-in for a
+# test of the plumbing with no key and no network), NARROW (1, the default: replay on the narrowed tree of defects.sh; 0: the whole repository, which the tool refuses).
 # Cost: usage.jsonl of every run is priced at the model's list price: input 0.10 and output 0.50 dollars per million tokens up to 100K prompt tokens, 0.50 and
 # 2.50 above; cache reads at a tenth of the input price and cache writes at 1.25 times it (assumed, not read from the bill). A call over 100K is priced at the
 # higher tier, so the total is an upper bound on a Haiku 5.5 bill, and the ceiling is checked before each run, so one run's worth can pass it.
 set -u
 CODE="${CODE:?set CODE}"; C="${CANCHO:?set CANCHO}"
 key=${1:?key file}; ceiling=${2:?ceiling}; runs=${3:?runs}; out=${4:?results}; w=${5:?scratch}
-model=${MODEL:-claude-haiku-5-5}; attempts=${ATTEMPTS:-3}
+model=${MODEL:-claude-haiku-5-5}; attempts=${ATTEMPTS:-3}; narrow=${NARROW:-1}
+agent=${AGENT:-"$CODE/scripts/cancho-agent.sh --key-file $key"}
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/defects.sh"
 [ -f "$key" ] || { echo "replay: no key file" >&2; exit 2; }
@@ -39,9 +41,14 @@ for d in A B; do
     if awk "BEGIN{exit !($total >= $ceiling)}"; then stopped=1; break 2; fi
     base=$(eval echo \$BASE_$d)
     b="$w/base-$d-$r"; wk="$w/work-$d-$r"
-    mkdir -p "$b" && git -C "$CODE" archive "$base" | tar -x -C "$b" || exit 2
+    if [ "$narrow" = 1 ]; then
+      keep=$(eval echo \$NARROW_$d)
+      mkdir -p "$b" && git -C "$CODE" archive "$base" -- $keep | tar -x -C "$b" || exit 2
+    else
+      mkdir -p "$b" && git -C "$CODE" archive "$base" | tar -x -C "$b" || exit 2
+    fi
     "$CODE/build/cancho-build" --repo "$b" --change "$here/$d.txt" --kind bug --checker "$C" --work "$wk" \
-      --agent "$CODE/scripts/cancho-agent.sh --key-file $key" --provider anthropic --model "$model" --attempts "$attempts" > "$wk.log" 2>&1
+      --agent "$agent" --provider anthropic --model "$model" --attempts "$attempts" > "$wk.log" 2>&1
     rc=$?
     cost=$(cost_of "$wk/usage.jsonl"); tin=$(tokens_of "$wk/usage.jsonl" in); tout=$(tokens_of "$wk/usage.jsonl" out)
     total=$(awk "BEGIN{printf \"%.4f\", $total + $cost}")
