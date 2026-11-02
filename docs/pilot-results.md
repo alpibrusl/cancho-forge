@@ -23,3 +23,5 @@
 ## Log
 
 * **2026-11-02**: the pilot is designed (`pilot.md`, `pilot-s1.md`). Nothing has run. The name is provisional (`pilot/brand.json`); the domain is not bought.
+* **2026-11-02**: spikes P1 to P4 (`spike/RESULTS.md`): resolution, TLS verification with a gap (no `notAfter`), a client that connects to a checked address, a hostile test world (17 cases, in the gate). No function changes status: the spikes are capabilities, not functions.
+

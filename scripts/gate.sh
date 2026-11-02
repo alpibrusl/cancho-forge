@@ -214,6 +214,12 @@ CANCHO="$C" sh spike/p1_check.sh "$scratch/p1" > "$scratch/p1.out" || fail=1
 cat "$scratch/p1.out"
 if grep -q '^FAIL ' "$scratch/p1.out"; then fail=1; fi
 
+echo "== spike P4 (the pilot's test world: a scripted hostile HTTP server seen from outside by curl; spike/p4_check.sh)"
+mkdir "$scratch/p4" || exit 1
+CANCHO="$C" sh spike/p4_check.sh "$scratch/p4" > "$scratch/p4.out" || fail=1
+cat "$scratch/p4.out"
+if grep -q '^FAIL ' "$scratch/p4.out"; then fail=1; fi
+
 echo "== forge company change add (the operator's change requests and the admit: gate; tests/conformance/company_change_add.sh)"
 mkdir "$scratch/company-change-add" || exit 1
 CANCHO="$C" sh tests/conformance/company_change_add.sh "$scratch/company-change-add" > "$scratch/company-change-add.out" || fail=1

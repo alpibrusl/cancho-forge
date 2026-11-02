@@ -1,0 +1,272 @@
+edition 9;
+
+import std.bytes;
+import std.io;
+
+// Spike P4 (docs/pilot-s1.md sections 4 and 6): the held-out audit's test world, in cancho. A scripted HTTP/1.1 server that misbehaves on purpose, one mode a process, at the byte
+// level, on loopback. A raw TCP server, not an HTTP library, because the cases the audit needs (a connection that never answers, a reset after the headers, a Content-Length that lies,
+// a header block over the limit) are the ones a library refuses to produce.
+//
+//     p4_world <port> <connections> <mode> [argument]
+//
+//   ok                   200, body `ok`                          status <n>          answer status n with a one-line body
+//   slow <ms>            wait, then 200                          hang [<ms>]         read the request and say nothing for <ms> (default 30000)
+//   reset                send half a status line and close       close               read the request and close without a word (an empty reply)
+//   abort                accept and close without reading the request: the kernel resets the connection
+//   lie                  Content-Length 100, ten bytes, close    chunked             a valid chunked answer: `hello`
+//   big <n>              Content-Length n, n bytes of `a`        redirect <url>      302 to <url> (to itself: a loop; to another port: a chain)
+//   bighead              a header block of 100 KiB               trickle <n>         a valid answer, one byte at a time, <n> ms apart
+//
+// It serves <connections> connections, one after the other, then exits. The audit starts one process a case; a case that needs a chain starts several.
+
+fn pause[&c](clock: &c Clock, ms: int) -> [poll, clock] int {
+    match poller_new() {
+        Polling::Failed(e) => {
+            return 0 - 1;
+        }
+        Polling::Ok(poller) => {
+            var pw = poller;
+            let until = clock_ms(clock) + ms;
+            region r {
+                let events = alloc_slice[r](4, 0);
+                borrow mut pw as &!pm in {
+                    while clock_ms(clock) < until {
+                        poller_wait(pm, events, until - clock_ms(clock));
+                    }
+                }
+            }
+            poller_close(pw);
+            return 0;
+        }
+    }
+}
+
+fn number[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + c - 48;
+        k = k + 1;
+    }
+    return n;
+}
+
+// Write all of `data` to the connection; false when the peer is gone.
+fn send_all[&c, &d](conn: &!c Conn, data: &d [byte]) -> [conn_write] bool {
+    var at = 0;
+    while at < len(data) {
+        match conn_write(conn, data[at..len(data)]) {
+            Sent::Wrote(n) => {
+                at = at + n;
+            }
+            Sent::Again => {
+                at = at + 0;
+            }
+            Sent::Failed(e) => {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Read until the end of the request head (a blank line) or the peer closes; true when a head arrived.
+fn read_head[&c](conn: &!c Conn) -> [conn_read] bool {
+    var seen = 0;
+    var tail = 0;
+    region r {
+        let buf = alloc_slice[r](4096, byte_of(0));
+        var more = true;
+        while more {
+            match conn_read(conn, buf) {
+                Received::Data(n) => {
+                    var k = 0;
+                    while k < n {
+                        let c = int_of(buf[k]);
+                        if c == 13 && (tail == 0 || tail == 2) || c == 10 && (tail == 1 || tail == 3) {
+                            tail = tail + 1;
+                        } else if c == 13 {
+                            tail = 1;
+                        } else {
+                            tail = 0;
+                        }
+                        if tail == 4 {
+                            seen = 1;
+                            more = false;
+                        }
+                        k = k + 1;
+                    }
+                }
+                Received::End => {
+                    more = false;
+                }
+                Received::Again => {
+                    more = true;
+                }
+                Received::Failed(e) => {
+                    more = false;
+                }
+            }
+        }
+    }
+    return seen == 1;
+}
+
+fn serve_one[&c, &k, &m, &a](conn: &!c Conn, clock: &k Clock, mode: &m [byte], arg: &a [byte]) -> [conn_read, conn_write, poll, clock] int {
+    if bytes.equal(mode, "abort") {
+        return 0;
+    }
+    if read_head(conn) == false {
+        return 0;
+    }
+    if bytes.equal(mode, "close") {
+        return 0;
+    }
+    if bytes.equal(mode, "ok") {
+        send_all(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    } else if bytes.equal(mode, "status") {
+        send_all(conn, "HTTP/1.1 ");
+        send_all(conn, arg);
+        send_all(conn, " X\r\nContent-Length: 3\r\nConnection: close\r\n\r\nxxx");
+    } else if bytes.equal(mode, "slow") {
+        pause(clock, number(arg));
+        send_all(conn, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    } else if bytes.equal(mode, "hang") {
+        var ms = 30000;
+        if number(arg) >= 0 {
+            ms = number(arg);
+        }
+        pause(clock, ms);
+    } else if bytes.equal(mode, "reset") {
+        send_all(conn, "HTTP/1.1 20");
+    } else if bytes.equal(mode, "lie") {
+        send_all(conn, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n0123456789");
+    } else if bytes.equal(mode, "chunked") {
+        send_all(conn, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+    } else if bytes.equal(mode, "big") {
+        send_all(conn, "HTTP/1.1 200 OK\r\nContent-Length: ");
+        send_all(conn, arg);
+        send_all(conn, "\r\nConnection: close\r\n\r\n");
+        var left = number(arg);
+        region r {
+            let block = alloc_slice[r](4096, byte_of(97));
+            while left > 0 {
+                var n = 4096;
+                if left < n {
+                    n = left;
+                }
+                if send_all(conn, block[0..n]) == false {
+                    left = 0;
+                } else {
+                    left = left - n;
+                }
+            }
+        }
+    } else if bytes.equal(mode, "redirect") {
+        send_all(conn, "HTTP/1.1 302 Found\r\nLocation: ");
+        send_all(conn, arg);
+        send_all(conn, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    } else if bytes.equal(mode, "bighead") {
+        send_all(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nX-Pad: ");
+        region r {
+            let block = alloc_slice[r](1024, byte_of(97));
+            var sent = 0;
+            while sent < 100 {
+                send_all(conn, block);
+                sent = sent + 1;
+            }
+        }
+        send_all(conn, "\r\nContent-Length: 2\r\n\r\nok");
+    } else if bytes.equal(mode, "trickle") {
+        let reply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        var k = 0;
+        while k < len(reply) {
+            send_all(conn, reply[k..k + 1]);
+            pause(clock, number(arg));
+            k = k + 1;
+        }
+    }
+    return 0;
+}
+
+fn serve[&i, &n, &k, &m, &a](io: &!i Io, net: &n Net(""), clock: &k Clock, port: int, count: int, mode: &m [byte], arg: &a [byte]) -> [io_write, net_in(""), conn_accept, conn_read, conn_write, poll, clock] int {
+    match tcp_listen(net, port, 16, 0) {
+        Listening::Failed(e) => {
+            io.write_all(io, "listen failed errno ");
+            io.print_int(io, e);
+            io.newline(io);
+            return 1;
+        }
+        Listening::Ok(opened) => {
+            var listener = opened;
+            io.write_all(io, "listening ");
+            io.print_int(io, port);
+            io.newline(io);
+            var served = 0;
+            while served < count {
+                borrow mut listener as &!l in {
+                    match tcp_accept(l) {
+                        Accepted::Ok(accepted) => {
+                            var conn = accepted;
+                            borrow mut conn as &!cc in {
+                                serve_one(cc, clock, mode, arg);
+                            }
+                            conn_close(conn);
+                            served = served + 1;
+                        }
+                        Accepted::Again => {
+                            served = served + 0;
+                        }
+                        Accepted::Failed(e) => {
+                            served = count;
+                        }
+                    }
+                }
+            }
+            listener_close(listener);
+            io.write_all(io, "served ");
+            io.print_int(io, served);
+            io.newline(io);
+            return 0;
+        }
+    }
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(heap);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var code = 2;
+    borrow net as &n in {
+        borrow clock as &c in {
+            borrow args as &g in {
+                borrow mut console as &!i in {
+                    if arg_count(g) >= 4 && number(arg(g, 1)) > 0 && number(arg(g, 2)) > 0 {
+                        var extra = arg(g, 3)[0..0];
+                        if arg_count(g) >= 5 {
+                            extra = arg(g, 4);
+                        }
+                        code = serve(i, n, c, number(arg(g, 1)), number(arg(g, 2)), arg(g, 3), extra);
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(clock);
+    release(console);
+    release(args);
+    return code;
+}
