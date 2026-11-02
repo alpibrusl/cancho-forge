@@ -1,0 +1,10 @@
+{
+  "name": "Lanternwatch",
+  "slug": "lanternwatch",
+  "status": "provisional",
+  "legal_entity": "Alpibru SL",
+  "domain": null,
+  "domain_candidates": ["lanternwatch.dev", "lanternwatch.io", "lanternwatch.app", "lanternwatch.eu", "lanternwatch.es"],
+  "chosen": "2026-11-02",
+  "note": "The only place the brand is written. Every identifier (company id, step ids, repository names, file names) is brand-free; user-facing text takes the name from here. The domain is NOT bought until something solid exists (docs/pilot.md section 11). Check the Spanish and EU trademark registers before the name is used in public."
+}

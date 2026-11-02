@@ -13,6 +13,8 @@
 > README and `platform/README.md`, through the GitHub API; **no source of it was run**). **Not read:** the other cancho packages named in section 7
 > (`cancho-web`, `cancho-schema`, `cancho-ui`, `cancho-mqtt`, `cancho-gateway`), anything about hosting providers or payment providers beyond general knowledge.
 
+See also [`pilot-s1.md`](pilot-s1.md) (the design of stage 1: brief, contract, held-out audit, spikes) and [`pilot-results.md`](pilot-results.md) (the scoreboard and the log).
+
 ## 1. Why a pilot, and what it must answer
 
 Forge has been built in the order of its design documents: the company layer, work on an existing repository, change requests, flows, a publish of a patch, the day and
@@ -26,7 +28,7 @@ Forge do correctly, at what cost, and what stops it doing more"**. Its output is
 
 ## 2. The company
 
-**Working name: `upcheck`.** It sells availability monitoring to small software teams, in four stages, each of which adds state and functions. The stages are the
+**The company's name is written in one file, `pilot/brand.json` (today **Lanternwatch**, provisional); this document says "the company" so that a new name is a change to that file.** It sells availability monitoring to small software teams, in four stages, each of which adds state and functions. The stages are the
 growth path: a company that cannot run stage 1 unattended is not ready for stage 2.
 
 | Stage | Product | New things it forces | Exit criterion (measured, section 6) |
@@ -48,7 +50,7 @@ A function is a set of recurring work with an owner, inputs, outputs and a judge
 roles** (builder, qa, analyst, reviewer, writer, product: what authority a worker has) rather than six new roles. Which function runs which flow is the company
 manifest's business. *(Open question 1 asks whether that is enough.)*
 
-| Function | What it does for `upcheck` | Forge mechanism it would use | What it needs that Forge lacks | What stays a person's |
+| Function | What it does for the company | Forge mechanism it would use | What it needs that Forge lacks | What stays a person's |
 |---|---|---|---|---|
 | **CEO / strategy** | weekly review: read the numbers, propose the quarter's goals, split the budget between functions, decide pricing experiments | an Intent per goal (`intents.md`), `goals.json` (lifecycle 6.3), a weekly flow of analyst and product steps | the strategy loop (roadmap M7), goals and signals (lifecycle slices 7 and 12) | admitting goals and budget; the board is a person |
 | **Product** | turn feedback and numbers into briefs, contracts and audit cases; own the backlog | product role steps, `change add`, `admit:` | issue intake (slice 7); audit growth (slice 3) | the brief for anything new; the contract and the audit are a person's file today |
@@ -129,7 +131,7 @@ HTTP**, with a stored-at time on every reading, device keys shown once, **EdDSA 
 erasure, a live stream of readings, an ingest from the broker, an operator console in `cancho-ui`, a catalogue of refusal rules with stable names and repairs
 (`GET /introspect`), and a mutant suite and an authority report kept in the gate. It persists to a state directory as snapshots, and it is bounded per table.
 
-| `upcheck` needs (S3 and S4) | `platform` has |
+| The company needs (S3 and S4) | `platform` has |
 |---|---|
 | customers | tenants |
 | a monitor, and a probe | devices |
@@ -144,7 +146,7 @@ erasure, a live stream of readings, an ingest from the broker, an operator conso
 key; status-page rendering; durable storage beyond a snapshot (its own README calls it a proof of concept); anything deployed. The licence is EUPL-1.2 (copyleft),
 which constrains how its code may be reused in a product (open question 6).
 
-**Proposal:** S1 does not need it (stateless). From S3 the platform is the backend `upcheck` starts from, as a repository the company owns (a fork or a vendored copy, open
+**Proposal:** S1 does not need it (stateless). From S3 the platform is the backend the company starts from, as a repository the company owns (a fork or a vendored copy, open
 question 6), and its first changes are the company's first `repo.change` work on a real stateful codebase, judged by its own mutant suite, which is a held-out oracle of the
 kind Forge wants. This also gives the pilot its first test of the "stateful service" kind that the lifecycle design refuses today (`stateless: true`, section 5.6 there):
 the pilot is where that refusal gets argued.
@@ -224,10 +226,11 @@ The pilot reorders the roadmap by what a scenario needs. The first column is the
 | Board | **the maintainer**, one person; the decisions of section 4 are theirs |
 | Payments | **prepared and not executed**; the alpha uses **free-trial subscriptions**; test mode only (section 8) |
 | Hosting | **Hetzner or OVH**; this document proposes Hetzner first (section 8, item 6); the choice is confirmed before the first deploy |
+| Name | **Lanternwatch**, provisional, written only in `pilot/brand.json`; domain not bought |
 | Keep going without demand | **yes**: it is an experiment; the scoreboard and the measures of section 6 are what is judged, and revenue is not |
 
 **Still open:**
-1. **The name and the domain.** `upcheck` is taken: its name servers answer on `.com`, `.dev`, `.io` and `.app` (a DNS lookup on 2026-11-02, which shows registration, not trademark rights).
+1. **The domain** is **not bought** until something solid exists (the board, 2026-11-02). **The name** is provisionally **Lanternwatch** (`pilot/brand.json`). The working name `upcheck` was taken: its name servers answer on `.com`, `.dev`, `.io` and `.app` (a DNS lookup on 2026-11-02, which shows registration, not trademark rights).
    Candidates whose lookups found **no name servers** on the endings listed (suggesting they are unregistered; confirm with a registrar, and search the Spanish and EU trademark registers before using any):
    | Candidate | Free on (lookup) | Note |
    |---|---|---|
@@ -244,6 +247,6 @@ The pilot reorders the roadmap by what a scenario needs. The first column is the
 
 ## 12. What this document does not do
 
-It does not show that anyone would pay for `upcheck`, choose a price, pick a payment or hosting provider, or settle the legal form. It does not widen any authority: every capability it
+It does not show that anyone would pay for the company's product, choose a price, pick a payment or hosting provider, or settle the legal form. It does not widen any authority: every capability it
 names is built, if at all, by a slice that reports it. It does not say Forge can run any function today: section 5 says which can, and the answer is mostly no. It exists so that the
 next piece of Forge is chosen by a scenario that fails, and so that "how far are we from an autonomous company" has a table for an answer.
