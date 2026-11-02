@@ -1059,3 +1059,25 @@ unchanged.
 re-run, and the person decides (the change goes back to `building` by a `retry:` as any held step does). (2) The provenance is one file per **step**
 (`docs/provenance/<step id>.md`; a derived step's id starts with its change id), not per change. (3) Publication is by the existing verb and the branch
 name the person gives, not `forge/<change id>` by rule. (4) A patch that deletes a file is not published.
+
+## 22. The day: `now=` and `company.clock.set` (slice 4, part A, of [`company-lifecycle.md`](company-lifecycle.md))
+
+**Status: built and tested, no model** (`tests/company_time_test.cho`, `tests/company_change_test.cho`, the `now=` cases of `tests/conformance/company_change_add.sh`
+and `company_change.sh`). Nothing reads a limit from the day yet: the rolling and per-change budget and the intake limits (slice 4, parts B and C) will.
+
+Forge reads no clock (`intents.md` section 5): a journal replays as a pure function of its file, so a verb that needs the date is **given** it. `forge company
+run <dir> <operator-file> [now=YYYY-MM-DD]`, `forge company change add <dir> repo=.. kind=.. justification=.. title=.. file=.. [now=YYYY-MM-DD]` and `forge
+company decide <dir> <gate> <verdict> [now=YYYY-MM-DD] <reason...>` take it (for `decide` right after the verdict, so a reason is never mistaken for it: a
+word `now=...` there is always the day, and a day with no reason is usage, exit 2). A date is `YYYY-MM-DD` of the calendar, years 2000 to 9999 (`company_time.day_of`;
+a day number is never 0, so 0 means "no date"); anything else is `clock-invalid`, exit 1, nothing written.
+
+When `now=` is **later** than the last day the journal holds, the verb writes one `company.clock.set` record (`task` "clock", `at` the date) **before** its own
+record(s), in the same write for `change add` and `decide`, and as a write of its own at the start of a `run` (`company_clock.mark`, the lock held). The same day
+again writes nothing; an **earlier** one is `clock-went-back`, exit 1, nothing written. Replay keeps the last day (`company_state.last_day`); a clock record whose date
+is not one of the calendar or is earlier than the last is `event-malformed`. `status format=json` shows `"clock"` when the journal holds a day. Records written before
+this feature, or by a verb not given `now=`, belong to the day of the record before them, or to no day at all: they count in no window.
+
+**Where the design and the code differ.** The design (section 2.2) writes the day as `at` **into every record** an invocation appends. Here one `company.clock.set` record
+says what day it is for the records after it. The information is the same (replay knows the day of every record), and no record builder or runner function had to be
+changed: the runner appends records from some thirty places. A consequence: two invocations on the same day leave one marker, not one `at` each. Whether Forge may read the
+clock itself is still open question 6, and this keeps the answer no.

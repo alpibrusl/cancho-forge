@@ -98,5 +98,37 @@ check "that wrote nothing" sh -c "[ ! -e '$co2/company.journal' ] && [ -z \"\$(l
 "$F" company change add "$co2" repo=diff kind=bug justification=defect "title=t" "file=$w/req1.txt" > "$w/out" 2>&1; echo $? > "$w/rc"
 expect "the kind that has its flow is taken: chg-0001 admitted" 0 "change chg-0001: admitted"
 
+# the day (docs/company.md section 22): `now=YYYY-MM-DD` puts a company.clock.set record before the verb's own, only when the day is later
+co3="$w/co3"
+mkdir -p "$co3/changes" || exit 1
+cp "$co/company.json" "$co3/company.json"
+cl() { grep -c 'company.clock.set' "$co3/company.journal" 2> /dev/null | tr -d ' '; }
+"$F" company change add "$co3" repo=diff kind=bug justification=defect "title=t" "file=$w/req1.txt" now=2026-13-01 > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "now= that is not a date is clock-invalid, exit 1" 1 "refusal: clock-invalid"
+check "that wrote nothing" sh -c "[ ! -e '$co3/company.journal' ] && [ -z \"\$(ls '$co3/changes')\" ]"
+"$F" company change add "$co3" repo=diff kind=bug justification=defect "title=t" "file=$w/req1.txt" now=2026-11-02 > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "a change with now= is taken" 0 "change chg-0001: admitted"
+check "the journal holds the day first, then the change" sh -c "[ \"\$(sed -n 1p '$co3/company.journal' | grep -c company.clock.set)\" = 1 ] && sed -n 1p '$co3/company.journal' | grep -q '\"at\":\"2026-11-02\"' && sed -n 2p '$co3/company.journal' | grep -q company.change.proposed"
+check "status shows the day" sh -c "'$F' company status '$co3' format=json | grep -q '\"clock\":\"2026-11-02\"'"
+"$F" company change add "$co3" repo=diff kind=feature justification=operator "title=t2" "file=$w/req2.txt" now=2026-11-02 > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "the same day again" 0 "change chg-0002: proposed"
+check "writes no second day record" sh -c "[ \"$(cl)\" = 1 ]"
+"$F" company change add "$co3" repo=diff kind=bug justification=defect "title=t3" "file=$w/req1.txt" now=2026-11-01 > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "an earlier day is clock-went-back, exit 1" 1 "refusal: clock-went-back"
+check "that wrote nothing: still 2 changes and their files" sh -c "[ \"\$(ls '$co3/changes' | wc -l | tr -d ' ')\" = 2 ] && [ \"\$(wc -l < '$co3/company.journal' | tr -d ' ')\" = 4 ]"
+"$F" company decide "$co3" admit:chg-0002 approved now=2026-11-03 "worth it" > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "decide with now= right after the verdict" 0 "gate admit:chg-0002: approved"
+check "the day record comes first and the reason does not hold the now= word" sh -c "tail -2 '$co3/company.journal' | head -1 | grep -q '\"at\":\"2026-11-03\"' && tail -1 '$co3/company.journal' | grep -q '\"reason\":\"worth it\"'"
+"$F" company decide "$co3" retry:nothing approved now=2026-11-02 "back in time" > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "decide with an earlier day is clock-went-back (the gate is also unknown, but the day is judged first or the gate: either way exit 1)" 1 "refusal: "
+"$F" company decide "$co3" admit:chg-0001 approved now=2026-02-30 "why" > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "decide with now= that is not a date is clock-invalid" 1 "refusal: clock-invalid"
+"$F" company decide "$co3" admit:chg-0001 approved now=2026-11-04 > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "decide with now= and no reason is usage, exit 2" 2 ""
+"$F" company run "$co3" "$w/none.json" now=2026-99-99 > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "run with now= that is not a date is clock-invalid" 1 "refusal: clock-invalid"
+"$F" company run "$co3" "$w/none.json" later=2026-11-04 > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "run with a sixth word that is not now= is usage, exit 2" 2 ""
+
 if [ "$fail" -eq 0 ]; then echo "ok   company change add: done"; fi
 exit "$fail"

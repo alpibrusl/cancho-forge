@@ -17,6 +17,7 @@ fn manifest_text() -> [] &static [byte] {
 }
 
 struct Probe {
+    day: int,
     rule: int,
     all: int,
     proposed: int,
@@ -40,13 +41,13 @@ fn proposed[&h](heap: &!h Heap, seq: int, id: &static [byte]) -> [heap] buffer.B
 }
 
 fn probe_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] Probe {
-    var p = Probe { rule: 0 - 1, all: 0, proposed: 0, admitted: 0, rejected: 0, first: 0, second: 0 };
+    var p = Probe { day: 0, rule: 0 - 1, all: 0, proposed: 0, admitted: 0, rejected: 0, first: 0, second: 0 };
     match company_manifest.parse(heap, manifest_text()) {
         company_manifest.ManifestResult::Held(m) => {
             borrow m as &mr in {
                 let s = company_state.replay(heap, text, mr);
                 borrow s as &sr in {
-                    p = Probe { rule: company_state.report_of(sr).rule, all: company_state.change_count(sr, 0), proposed: company_state.change_count(sr, 1), admitted: company_state.change_count(sr, 2), rejected: company_state.change_count(sr, 3), first: company_state.change_state(sr, "chg-0001"), second: company_state.change_state(sr, "chg-0002") };
+                    p = Probe { day: company_state.last_day(sr), rule: company_state.report_of(sr).rule, all: company_state.change_count(sr, 0), proposed: company_state.change_count(sr, 1), admitted: company_state.change_count(sr, 2), rejected: company_state.change_count(sr, 3), first: company_state.change_state(sr, "chg-0001"), second: company_state.change_state(sr, "chg-0002") };
                 }
                 company_state.drop(heap, s);
             }
@@ -60,7 +61,7 @@ fn probe_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] Probe {
 }
 
 fn probe_journal[&h](heap: &!h Heap, j: buffer.Buffer) -> [heap] Probe {
-    var p = Probe { rule: 0 - 1, all: 0, proposed: 0, admitted: 0, rejected: 0, first: 0, second: 0 };
+    var p = Probe { day: 0, rule: 0 - 1, all: 0, proposed: 0, admitted: 0, rejected: 0, first: 0, second: 0 };
     borrow j as &jb in {
         p = probe_of(heap, buffer.bytes(jb));
     }
@@ -300,5 +301,49 @@ fn test_a_proposed_record_with_a_title_over_200_bytes_or_a_short_hash_is_event_m
     var short = buffer.empty(heap, 256);
     short = add(heap, short, company_state.change_proposed(heap, 1, "chg-0001", "diff", "bug", "operator", "ana", "t", "00", 1, "defect"));
     test.assert_eq(probe_journal(heap, short).rule, task.rule_code(task.Rule::EventMalformed));
+    return 0;
+}
+
+fn test_a_clock_record_sets_the_day[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.clock_set(heap, 1, "2026-11-02"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, 0);
+    test.assert_eq(p.day, 20759);
+    return 0;
+}
+
+fn test_a_later_day_replaces_the_day_and_the_same_day_is_fine[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.clock_set(heap, 1, "2026-11-02"));
+    j = add(heap, j, company_state.clock_set(heap, 2, "2026-11-02"));
+    j = add(heap, j, company_state.clock_set(heap, 3, "2026-12-01"));
+    let p = probe_journal(heap, j);
+    test.assert_eq(p.rule, 0);
+    test.assert_eq(p.day, 20759 + 29);
+    return 0;
+}
+
+fn test_a_day_before_the_last_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.clock_set(heap, 1, "2026-11-02"));
+    j = add(heap, j, company_state.clock_set(heap, 2, "2026-11-01"));
+    test.assert_eq(probe_journal(heap, j).rule, task.rule_code(task.Rule::EventMalformed));
+    return 0;
+}
+
+fn test_a_clock_record_that_is_not_a_date_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, company_state.clock_set(heap, 1, "2026-02-30"));
+    test.assert_eq(probe_journal(heap, j).rule, task.rule_code(task.Rule::EventMalformed));
+    let p = probe_of(heap, "{\"v\":1,\"seq\":1,\"kind\":\"company.clock.set\",\"task\":\"clock\"}\n");
+    test.assert_eq(p.rule, task.rule_code(task.Rule::EventMalformed));
+    return 0;
+}
+
+fn test_a_journal_with_no_clock_record_has_no_day[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 256);
+    j = add(heap, j, proposed(heap, 1, "chg-0001"));
+    test.assert_eq(probe_journal(heap, j).day, 0);
     return 0;
 }

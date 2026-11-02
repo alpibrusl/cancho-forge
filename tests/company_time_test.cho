@@ -1,0 +1,76 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.company_time;
+
+// Unit tests for src/company_time.cho (docs/company.md section 22): `YYYY-MM-DD` as a day number and back. Run with `cancho test`.
+
+fn round[&h](heap: &!h Heap, text: &static [byte]) -> [heap] bool {
+    let day = company_time.day_of(text);
+    if day <= 0 {
+        return false;
+    }
+    let back = company_time.date_of(heap, day);
+    var same = false;
+    borrow back as &bb in {
+        same = bytes.equal(buffer.bytes(bb), text);
+    }
+    buffer.drop(heap, back);
+    return same;
+}
+
+fn test_a_date_is_a_day_number_and_back[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(round(heap, "2026-11-02"));
+    test.assert(round(heap, "2000-01-01"));
+    test.assert(round(heap, "2024-02-29"));
+    test.assert(round(heap, "2028-12-31"));
+    test.assert(round(heap, "2100-03-01"));
+    test.assert(round(heap, "9999-12-31"));
+    return 0;
+}
+
+fn test_consecutive_days_differ_by_one() -> [] int {
+    test.assert_eq(company_time.day_of("2026-11-02") - company_time.day_of("2026-11-01"), 1);
+    test.assert_eq(company_time.day_of("2026-03-01") - company_time.day_of("2026-02-28"), 1);
+    test.assert_eq(company_time.day_of("2028-03-01") - company_time.day_of("2028-02-29"), 1);
+    test.assert_eq(company_time.day_of("2027-01-01") - company_time.day_of("2026-12-31"), 1);
+    test.assert_eq(company_time.day_of("2026-11-02") - company_time.day_of("2026-10-03"), 30);
+    return 0;
+}
+
+fn test_a_known_day_number() -> [] int {
+    test.assert_eq(company_time.day_of("2000-01-01"), 10957);
+    test.assert_eq(company_time.day_of("2026-11-02"), 20759);
+    return 0;
+}
+
+fn test_what_is_not_a_date_of_the_calendar_is_minus_one() -> [] int {
+    test.assert_eq(company_time.day_of("2026-02-29"), 0 - 1);
+    test.assert_eq(company_time.day_of("2026-02-30"), 0 - 1);
+    test.assert_eq(company_time.day_of("2026-04-31"), 0 - 1);
+    test.assert_eq(company_time.day_of("2026-13-01"), 0 - 1);
+    test.assert_eq(company_time.day_of("2026-00-10"), 0 - 1);
+    test.assert_eq(company_time.day_of("2026-01-00"), 0 - 1);
+    test.assert_eq(company_time.day_of("1999-12-31"), 0 - 1);
+    test.assert_eq(company_time.day_of("2026-1-1"), 0 - 1);
+    test.assert_eq(company_time.day_of("2026/11/02"), 0 - 1);
+    test.assert_eq(company_time.day_of("2026-11-02 "), 0 - 1);
+    test.assert_eq(company_time.day_of("20261102"), 0 - 1);
+    test.assert_eq(company_time.day_of(""), 0 - 1);
+    test.assert_eq(company_time.day_of("2026-11-0x"), 0 - 1);
+    return 0;
+}
+
+fn test_a_century_year_is_a_leap_year_only_every_400() -> [] int {
+    test.assert(company_time.day_of("2100-02-29") < 0);
+    test.assert(company_time.day_of("2400-02-29") > 0);
+    return 0;
+}
+
+fn test_the_tags_are_the_documented_ones() -> [] int {
+    test.assert(bytes.equal(company_time.rule_invalid(), "clock-invalid"));
+    test.assert(bytes.equal(company_time.rule_went_back(), "clock-went-back"));
+    return 0;
+}
