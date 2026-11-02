@@ -88,7 +88,7 @@ fn act_past[&h, &t](heap: &!h Heap, manifest: &static [byte], text: &t [byte], c
                 }
                 borrow s as &sr in {
                     borrow failed as &fr in {
-                        code = code_of(company_run.next_action(mr, sr, limits(), cost, max_cost, contents(fr)));
+                        code = code_of(company_run.next_action(heap, mr, sr, limits(), cost, max_cost, company_run.no_caps(), contents(fr)));
                     }
                 }
                 unbox_slice(heap, failed);

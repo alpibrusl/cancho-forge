@@ -400,6 +400,15 @@ fn run_loop[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &z](heap: &!h Heap, fs: &f F
     return code;
 }
 
+// The caps of the manifest's budget that are not the lifetime ones, with the day the journal is at (`company_run.Caps`).
+fn caps_of[&m, &s](hm: &m company_manifest.Manifest, st: &s company_state.CompanyState) -> [] company_run.Caps {
+    var each = 0 - 1;
+    if company_manifest.budget_change_cost(hm) >= 0 {
+        each = company_budget.dollars_to_micro(company_manifest.budget_change_cost(hm));
+    }
+    return company_run.Caps { today: company_state.last_day(st), rolling_days: company_manifest.budget_rolling_days(hm), rolling_micro: company_budget.dollars_to_micro(company_manifest.budget_rolling_cost(hm)), change_micro: each, attempts: company_manifest.budget_change_attempts(hm) };
+}
+
 fn limits_of[&m](hm: &m company_manifest.Manifest) -> [] company_budget.Limits {
     return company_budget.Limits { input: company_manifest.budget_input(hm), output: company_manifest.budget_output(hm), cache_write: company_manifest.budget_cache_write(hm), cache_read: company_manifest.budget_cache_read(hm) };
 }
@@ -435,7 +444,7 @@ fn one_round[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &l, &z](heap: &!h Heap, fs:
                 cut = journal.recovery_cut(rep);
                 seq = rep.records + 1;
                 let spent = company_state.spent_cost_micro(sr, prices);
-                action = company_run.next_action(hm, sr, limits_of(hm), spent, company_budget.dollars_to_micro(company_manifest.budget_max_cost(hm)), failed);
+                action = company_run.next_action(heap, hm, sr, limits_of(hm), spent, company_budget.dollars_to_micro(company_manifest.budget_max_cost(hm)), caps_of(hm, sr), failed);
                 match action {
                     company_run.Action::Start(k) => {
                         before = company_state.step_recorded(sr, k);
@@ -527,6 +536,12 @@ fn one_round[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &l, &z](heap: &!h Heap, fs:
         }
         company_run.Action::Stop(tag) => {
             refuse(io, company_run.stop_name(tag));
+            if len(company_run.stop_window(tag)) > 0 {
+                say(io, "window: ", company_run.stop_window(tag));
+            }
+            if company_run.stop_step(tag) >= 0 {
+                say(io, "change: ", change_id_of(hm, company_run.stop_step(tag)));
+            }
             return (company_step.exit_budget(), 0 - 1);
         }
         company_run.Action::Done => {
@@ -561,6 +576,16 @@ fn one_round[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &l, &z](heap: &!h Heap, fs:
 }
 
 // `gate: <name>` (when `with_gate`) and `step: <id>` of step `k`.
+// The change id of derived step number `k` (its id up to the first dot).
+fn change_id_of[&m](hm: &m company_manifest.Manifest, k: int) -> [] &m [byte] {
+    let id = company_manifest.step_id(hm, company_manifest.step_at(hm, k));
+    var e = 0;
+    while e < len(id) && int_of(id[e]) != 46 {
+        e = e + 1;
+    }
+    return id[0..e];
+}
+
 fn name_step[&i, &m](io: &!i Io, hm: &m company_manifest.Manifest, k: int, with_gate: bool) -> [io_write] int {
     let step = company_manifest.step_at(hm, k);
     if with_gate {

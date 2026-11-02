@@ -815,6 +815,9 @@ must be reported that way, as `company.md` reports every number.
 > flows: section 18; derived steps and the runner: section 19; the provisioner: section 20, which uses `dir_mkdir` and not the `Exec /bin/mkdir` this
 > document proposed in section 3; the patch publish: section 21, the patch applied in cancho and not by `patch`). **Not built from slice 2:** issue
 > intake from files, the re-derivation of a stale base, `change-duplicate`, `change-rate-limited`, `base` and `at` on the change record.
+>
+> **Slice 4, parts A and B built** (the day: [`company.md`](company.md) section 22; the rolling and per-change budget: section 23). Part C (`intake` limits,
+> `change-rate-limited`) is not.
 
 ### 8.2 The order of the rest
 
