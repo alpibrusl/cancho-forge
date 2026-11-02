@@ -1,0 +1,266 @@
+edition 9;
+
+import std.bytes;
+import std.io;
+import dns;
+
+// Spike P1 (docs/pilot-s1.md section 6): can a cancho program resolve a name over UDP itself, with a time limit, and report the addresses and how long it took?
+//
+//   p1_resolve resolve <resolver-ip> <port> <name> <timeout-ms>   ask one resolver for the A records of <name>
+//   p1_resolve stub <port> <queries>                              a stub resolver on loopback: answers <queries> queries, every name -> 192.0.2.7 (TTL 60), then exits
+//   p1_resolve silent <port> <seconds>                            a stub that reads queries and never answers, for <seconds> (the timeout case)
+//
+// The checker must resolve the name itself, judge the addresses (a private one is refused), and then connect to the ADDRESS and not to the name, or a hostile DNS answer
+// could pass the check and be connected to anyway (docs/pilot-s1.md section 2). `tcp_connect` resolves a name inside the builtin, so the resolution has to be ours.
+
+fn say_int[&i](io: &!i Io, label: &i [byte], n: int) -> [io_write] int {
+    io.write_all(io, label);
+    io.print_int(io, n);
+    io.newline(io);
+    return 0;
+}
+
+// Ask `host:port` for the A records of `name`; wait at most `timeout_ms`. Prints the addresses and the milliseconds, or why not.
+fn resolve[&i, &n, &c, &h](io: &!i Io, net: &n Net(""), clock: &c Clock, host: &h [byte], port: int, name: &h [byte], timeout_ms: int) -> [io_write, net_out(""), udp_send, udp_recv, poll, clock] int {
+    let started = clock_ms(clock);
+    match udp_connect(net, host, port) {
+        UdpOpened::Failed(e) => {
+            return say_int(io, "connect failed errno ", e);
+        }
+        UdpOpened::Ok(opened) => {
+            var sock = opened;
+            var code = 0 - 9;
+            region r {
+                let query = alloc_slice[r](512, byte_of(0));
+                let answer = alloc_slice[r](512, byte_of(0));
+                let addrs = alloc_slice[r](dns.addrs_size(), 0);
+                let id = 4242;
+                let len_q = dns.build_query(name, id, query, 0);
+                if len_q < 0 {
+                    code = 0 - 1;
+                } else {
+                    borrow mut sock as &!s in {
+                        match udp_send(s, query[0..len_q]) {
+                            Sent::Wrote(sent) => {
+                                code = wait_answer(clock, s, answer, started + timeout_ms);
+                            }
+                            Sent::Again => {
+                                code = 0 - 2;
+                            }
+                            Sent::Failed(e) => {
+                                code = 0 - 3;
+                            }
+                        }
+                    }
+                }
+                if code > 0 {
+                    let count = dns.parse(answer, code, id, addrs);
+                    if count < 0 {
+                        say_int(io, "answer refused: ", count);
+                    } else {
+                        var k = 0;
+                        while k < count {
+                            let text = alloc_slice[r](16, byte_of(0));
+                            let l = dns.put_dotted(text, 0, addrs[k]);
+                            io.write_all(io, "address ");
+                            io.write_all(io, text[0..l]);
+                            io.newline(io);
+                            k = k + 1;
+                        }
+                        say_int(io, "ttl ", addrs[dns.max_addrs()]);
+                    }
+                }
+            }
+            udp_close(sock);
+            say_int(io, "code ", code);
+            say_int(io, "ms ", clock_ms(clock) - started);
+            return 0;
+        }
+    }
+}
+
+// Wait for one datagram: its length, 0 - 4 for the deadline, a negative for a failure.
+fn wait_answer[&c, &u, &b](clock: &c Clock, sock: &!u Udp, into: &!b [byte], deadline: int) -> [udp_recv, poll, clock] int {
+    udp_nonblocking(sock);
+    match poller_new() {
+        Polling::Failed(e) => {
+            return 0 - 5;
+        }
+        Polling::Ok(poller) => {
+            var pw = poller;
+            var result = 0 - 4;
+            var done = false;
+            borrow mut pw as &!pm in {
+                poller_add_udp(pm, sock, 1, 1);
+                region r {
+                    let events = alloc_slice[r](8, 0);
+                    while done == false {
+                        let left = deadline - clock_ms(clock);
+                        if left <= 0 {
+                            done = true;
+                        } else {
+                            let ready = poller_wait(pm, events, left);
+                            if ready > 0 {
+                                match udp_recv(sock, into) {
+                                    Datagram::Got(n) => {
+                                        result = n;
+                                        done = true;
+                                    }
+                                    Datagram::Truncated(n) => {
+                                        result = n;
+                                        done = true;
+                                    }
+                                    Datagram::Again => {
+                                        result = 0 - 4;
+                                    }
+                                    Datagram::Failed(e) => {
+                                        result = 0 - 6;
+                                        done = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            poller_close(pw);
+            return result;
+        }
+    }
+}
+
+// The end of the question section of a query in `q[0..n]`: past its name and the four bytes of type and class, or -1.
+fn question_end[&q](q: &q [byte], n: int) -> [] int {
+    var at = 12;
+    while at < n && int_of(q[at]) != 0 {
+        at = at + int_of(q[at]) + 1;
+    }
+    if at + 5 > n {
+        return 0 - 1;
+    }
+    return at + 5;
+}
+
+// Answer `queries` queries on loopback port `port` with one A record, 192.0.2.7, TTL 60 (`answer` false: read them and stay silent). Prints what it served.
+fn stub[&i, &n](io: &!i Io, net: &n Net(""), port: int, queries: int, answer: bool) -> [io_write, net_in(""), udp_send, udp_recv] int {
+    match udp_bind(net, port, 0) {
+        UdpOpened::Failed(e) => {
+            return say_int(io, "bind failed errno ", e);
+        }
+        UdpOpened::Ok(opened) => {
+            var sock = opened;
+            var served = 0;
+            region r {
+                let dg = alloc_slice[r](512, byte_of(0));
+                let reply = alloc_slice[r](512, byte_of(0));
+                let who = alloc_slice[r](4, 0);
+                while served < queries {
+                    borrow mut sock as &!s in {
+                        match udp_recv_from(s, dg, who) {
+                            Datagram::Got(len) => {
+                                let qe = question_end(dg, len);
+                                if qe > 0 && answer {
+                                    var k = 0;
+                                    while k < qe {
+                                        reply[k] = dg[k];
+                                        k = k + 1;
+                                    }
+                                    reply[2] = byte_of(129);
+                                    reply[3] = byte_of(128);
+                                    reply[6] = byte_of(0);
+                                    reply[7] = byte_of(1);
+                                    reply[8] = byte_of(0);
+                                    reply[9] = byte_of(0);
+                                    reply[10] = byte_of(0);
+                                    reply[11] = byte_of(0);
+                                    // name pointer to offset 12, type A, class IN, TTL 60, rdlength 4, 192.0.2.7
+                                    reply[qe] = byte_of(192);
+                                    reply[qe + 1] = byte_of(12);
+                                    reply[qe + 2] = byte_of(0);
+                                    reply[qe + 3] = byte_of(1);
+                                    reply[qe + 4] = byte_of(0);
+                                    reply[qe + 5] = byte_of(1);
+                                    reply[qe + 6] = byte_of(0);
+                                    reply[qe + 7] = byte_of(0);
+                                    reply[qe + 8] = byte_of(0);
+                                    reply[qe + 9] = byte_of(60);
+                                    reply[qe + 10] = byte_of(0);
+                                    reply[qe + 11] = byte_of(4);
+                                    reply[qe + 12] = byte_of(192);
+                                    reply[qe + 13] = byte_of(0);
+                                    reply[qe + 14] = byte_of(2);
+                                    reply[qe + 15] = byte_of(7);
+                                    udp_send_to(s, reply[0..qe + 16], who[0]);
+                                }
+                                served = served + 1;
+                            }
+                            Datagram::Truncated(len) => {
+                                served = served + 1;
+                            }
+                            Datagram::Again => {
+                                served = served + 0;
+                            }
+                            Datagram::Failed(e) => {
+                                served = queries;
+                            }
+                        }
+                    }
+                }
+            }
+            udp_close(sock);
+            return say_int(io, "served ", served);
+        }
+    }
+}
+
+// A non-negative decimal number, or -1.
+fn number[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + c - 48;
+        k = k + 1;
+    }
+    return n;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(heap);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var code = 2;
+    borrow net as &n in {
+        borrow clock as &c in {
+            borrow args as &g in {
+                borrow mut console as &!i in {
+                    if arg_count(g) >= 6 && bytes.equal(arg(g, 1), "resolve") {
+                        code = resolve(i, n, c, arg(g, 2), number(arg(g, 3)), arg(g, 4), number(arg(g, 5)));
+                    }
+                    if arg_count(g) >= 4 && bytes.equal(arg(g, 1), "stub") {
+                        code = stub(i, n, number(arg(g, 2)), number(arg(g, 3)), true);
+                    }
+                    if arg_count(g) >= 4 && bytes.equal(arg(g, 1), "silent") {
+                        code = stub(i, n, number(arg(g, 2)), number(arg(g, 3)), false);
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(clock);
+    release(console);
+    release(args);
+    return code;
+}
