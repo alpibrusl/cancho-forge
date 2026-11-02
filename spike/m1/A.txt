@@ -1,0 +1,3 @@
+Building a project from a plan fails for a unit whose tests need a module the project file already imports. The unit's generated tests file imports the module again, so the compiler refuses the tests file with "`option` is already bound to another import here" (it was seen on the unit `get` of a sorted map: both attempts failed with the same message at tests-get.cho:3:1, and a model that added `import std.option as opt` was refused again).
+
+The tool should leave out of a unit's tests file any import that file already binds, and keep the ones it does not. Add a fixture and a case for it to the project test script.
