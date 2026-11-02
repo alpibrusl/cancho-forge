@@ -35,6 +35,8 @@ if $C build src/*.cho --std -o "$scratch/forge"; then
   run "check: a file that is not there is a manifest-malformed" 1 "refusal: manifest-malformed" "$F" company check "$scratch/nowhere.json"
   : > "$scratch/empty.json"
   run "check: an empty file" 1 "refusal: manifest-malformed" "$F" company check "$scratch/empty.json"
+  run "check: the pilot company (pilot/company.json, docs/pilot-s1.md) is a valid manifest" 0 "valid: pilot-s1, 6 steps" "$F" company check "$root/pilot/company.json"
+  run "check: the brand is written in one file only (pilot/brand.json), and no identifier of the pilot manifest holds it" 0 "" sh -c "! grep -qi \"\$(sed -n 's/.*\"slug\": *\"\\([^\"]*\\)\".*/\\1/p' \"$root/pilot/brand.json\")\" \"$root/pilot/company.json\""
   run "check: a relative path is path-invalid, exit 2" 2 "refusal: path-invalid" "$F" company check tests/fixtures/company/good.json
   run "check: no path is usage, exit 2" 2 "" "$F" company check
   run "check: two paths is usage, exit 2" 2 "" "$F" company check "$fx/good.json" "$fx/cycle.json"

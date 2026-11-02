@@ -1,0 +1,17 @@
+{
+  "id": "pilot-s1",
+  "mission": "Run a small company that sells availability monitoring to small software teams. Stage 1 is a free, stateless checker: give it a URL, it answers with status, redirects, latency, TLS certificate expiry and DNS answers. The point of the experiment is how much of a real company's weekly work Forge does correctly, not revenue (docs/pilot.md).",
+  "model": { "provider": "anthropic", "name": "claude-haiku-5-5" },
+  "budget": { "input": 40000000, "output": 8000000, "cache_write": 8000000, "cache_read": 40000000, "max_cost": 10, "price_table": "prices.json" },
+  "human_gates": ["brief", "contract", "audit", "demo"],
+  "roles": ["builder", "qa", "analyst", "reviewer", "writer", "product"],
+  "repos": [ { "id": "checker", "kind": "service" } ],
+  "steps": [
+    { "id": "brief", "role": "product", "task_type": "none", "needs": [], "input": "Approve the checker's brief (docs/pilot-s1.md section 2): what it answers, what it refuses, its limits.", "gate": "brief" },
+    { "id": "contract", "role": "product", "task_type": "none", "needs": ["brief"], "input": "Approve the checker's contract file: the signatures the build must implement (docs/pilot-s1.md section 3).", "gate": "contract" },
+    { "id": "audit", "role": "product", "task_type": "none", "needs": ["contract"], "input": "Approve the held-out audit: the test world and its cases (docs/pilot-s1.md section 4). The builder never sees it.", "gate": "audit" },
+    { "id": "build", "role": "builder", "task_type": "project.build", "needs": ["audit"], "input": "Build the checker from the approved brief and contract.", "check": "audit_checker.sh", "contract": "contract.cho" },
+    { "id": "gate", "role": "qa", "task_type": "repo.gate", "needs": ["build"], "input": "Run the checker's repository gate." },
+    { "id": "demo", "role": "product", "task_type": "none", "needs": ["gate"], "input": "Judge the demo of the first release of the checker.", "gate": "demo" }
+  ]
+}
