@@ -72,23 +72,21 @@ Target: about 60 cases before the first build, each with the exact expected JSON
 
 The manifest is `pilot/company.json`: six steps (three gates, the build, the gate, the demo), valid under `forge company check`. It grows as functions appear; each growth is its own commit.
 
-## 6. Spikes first (cheap, no model, in cancho)
+## 6. Spikes (done, 2026-11-02; results in `spike/RESULTS.md`)
 
-The audit needs the world; the checker needs the same capabilities; so four spikes come before the contract is written, each a small cancho program that answers one question and is recorded in
-`spike/RESULTS.md` with what failed:
-
-| Spike | Question | Done when |
+| Spike | Question | Answer |
 |---|---|---|
-| P1 | Can a cancho program resolve a name over UDP and report the addresses and the time it took? | a program resolves a name against a local stub and a real resolver, with a timeout |
-| P2 | Can it connect, handshake and read the peer certificate's `notAfter` and verify the chain for a name? | against the fixtures of section 4 |
-| P3 | Can it fetch with a bounded body, count redirects and time each phase? | against the world's plain cases |
-| P4 | Can it serve HTTP and TLS on several ports with per-connection behaviours (slow, reset, lie)? | the world's cases serve and a probe sees each |
+| P1 | Can a cancho program resolve a name over UDP and report the addresses and the time? | **Yes**: against a stub and once against a real resolver, with a deadline (`spike/p1_check.sh`, in the gate) |
+| P2 | Can it connect, handshake, read the peer certificate's expiry and verify the chain for a name? | **Yes, with a gap**: verification, name and issuer failures each have their own tag; the engine does not publish `notAfter`, so expiry is measured by a shifted-clock probe (right to the day, 15 handshakes; one or two for the 14-day rule) until a one-line accessor is added to `packages/tls` |
+| P3 | Can it fetch with a bounded body, count redirects and time each phase? | **Mostly**: cancho's client connects to an IP and verifies against the name; redirects, phase times, the 64 KiB cap and the specific TLS tags are the checker's to add |
+| P4 | Can it serve HTTP and TLS cases with hostile behaviours? | **Yes for HTTP** (13 modes, 17 cases seen from outside by curl, in the gate); TLS cases wait for certificate fixtures |
 
-If P1 or P2 fails, the product changes (for example, a resolver address is a deployment setting, or certificate expiry waits) and this document is corrected in place.
+Consequences recorded in this document: the checker holds an unnarrowed `Net` and judges addresses itself, after resolution, then connects to the literal address; the resolver address is a deployment setting;
+`days_left` is the integer the probe gives; the world's TLS cases are `https_hello`'s valid chain plus the shifted clock until fixtures exist.
 
 ## 7. The first week
 
-1. The board approves this document; the spikes P1 to P4 run; the contract is edited from what they found.
+1. The board approves this document and edits the contract from what the spikes found (section 6).
 2. The test world is built; its first cases are checked by a hand-written reference checker, so the oracle is shown to pass a correct one and fail a broken one (the repository's way: each gate failing once on a broken variant).
 3. The brief, contract and audit are approved at the three gates; `build` runs with a real model under the budget of `pilot/company.json` ($10, tokens only).
 4. Whatever the build leaves is judged by the audit; the demo is the board's.

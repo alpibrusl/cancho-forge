@@ -1040,6 +1040,40 @@ ENOTDIR (20)   no
 ENOENT (2)     yes
 ```
 
+## Pilot spikes P1 to P4 (docs/pilot-s1.md section 6), 2026-11-02, macOS arm64, compiler `f4ead824`
+
+Four questions asked before the checker's contract is fixed. Three are answered by programs in this repository (P1, P4) or by a copy of cancho's own (P2); P3 is answered by running
+cancho's client example. **Every number is a loopback measurement on one machine; none is a performance claim.**
+
+**P1: can a cancho program resolve a name over UDP itself, with a deadline? Yes.** `spike/p1_resolve.cho` (with the vendored pure DNS codec `spike/lib/dns.cho`) asks one resolver and waits on a `Poller`.
+`spike/p1_check.sh` (in the gate): against its own stub it gets the address and TTL in 1 ms; a resolver that never answers is the deadline, 601 ms for 600 asked; nothing listening is `code -6` in 1 ms
+(the kernel's ICMP refusal reaches the program); an empty name is refused before anything is sent. Once against this machine's real resolver: two A records, TTL 162, 7 ms. Found on the way:
+UDP port 5353 is taken on macOS (mDNS), so a stub must not use it. `Net` has no per-call destination check beyond a literal prefix, so the checker holds the unnarrowed `Net("")`, which the authority
+report states as unbounded (`net-bounds.md`); the private-address rule is the program's, not the capability's.
+
+**P2: can it connect, handshake, verify the chain for a name and know the certificate's expiry? Yes, with one gap.** `spike/vendor/p2_tls.cho` is cancho's `tests/programs/tls_many.cho` with one change (a `shift=<days>` argument
+that moves the "now" the chain is checked against). Against cancho's `https_hello` and its test chain (`tests/vectors/tls/echo`, name `echo.lex-sys.test`, valid until 2125): the right name is `ok`; another name is
+`x509-name-mismatch`; roots that do not contain the CA are `x509-unknown-issuer`; a closed port is `socket`. **Gap: the engine does not publish the server certificate's `notAfter`** (it keeps it internally, as
+`i_not_after`, for ticket lifetimes). The workaround measured: handshake with the clock shifted and bisect for the day the answer flips to `x509-expired`. It found valid at +35973 days and expired at +35974, against an
+independent `openssl` notAfter of 35973.39 days away: right to the day, in 15 handshakes. For the checker's actual rule ("under 14 days") one or two extra handshakes suffice. **Recommended:** a one-line accessor in
+`packages/tls` (cancho is ours), and until then the shifted-clock probe; the contract states `days_left` as the integer the probe gives.
+
+**P3: can it fetch with a bounded body and the redirects, connecting to the address it checked? Mostly yes.** cancho's `http_fetch_nb` (not copied: built from the pinned tree) takes the name and an IP
+(`--resolve name=ip`), connects to the IP and verifies the chain against the name, as the design needs. Against `https_hello`: a 200 with its length and SHA-256; a 404; a 5,000,000-byte body streamed and hashed;
+a wrong name as `client.tls`. **Not there, and the checker must add:** it does not follow redirects (the `Location` header is the checker's to read and re-judge), it prints no per-phase times (the checker takes them at the
+state changes it drives), it reads a whole body (the checker stops at 64 KiB and closes), and its failure tag for a bad certificate is the coarse `client.tls`, not P2's specific tags (the checker needs those, so it drives the engine and
+asks `tls.failure`).
+
+**P4: can cancho serve the hostile cases the audit needs? Yes.** `spike/p4_world.cho` is a raw TCP server, one mode a process: ok, status, slow, hang, close, abort, reset, lie, chunked, big, redirect, bighead,
+trickle. `spike/p4_check.sh` (in the gate) has `curl` observe each from outside: a 404 and a 500 as such; a first byte after 1.5 s for a patient client and a timeout (exit 28) for an impatient one; an accepted
+and never answered connection a timeout; a read-and-closed one an empty reply (52); an unread-and-closed one a reset (56); half a status line a failure and not a timeout; a Content-Length of 100 over ten bytes a partial
+transfer (18); a chunked answer decoded; a 300,000-byte body whole; a 100 KiB header refused by a client with a limit; a one-byte-at-a-time answer completing; a redirect to itself stopping at the limit (47); a redirect to
+another port followed once; a refused port (7). 17 of 17. **Not yet in the world:** TLS cases (an expired chain, a self-signed one, one for another name: the fixtures need certificates this repository does not have; `https_hello`'s
+test chain gives the valid case and the shifted clock gives the expired one) and the private-address redirect shapes (they need the checker).
+
+**What the spikes change in the design** (`pilot-s1.md` is corrected in the same commit): the checker drives the TLS engine itself and reads `ints`-level failure tags; expiry is measured by the shifted-clock probe until an accessor
+exists; the resolver is a deployment setting (a UDP address); a private address is judged after resolution and the connection is made to the literal address, never the name.
+
 ## M-1 (docs/company-lifecycle.md section 9): can a Haiku-class builder write a patch against an existing repository? -- harness built, NOT RUN with a model
 
 **Status, 2026-11-02:** no model has been called and no money spent. What was measured is what stands between the question and an answer. Harness: `spike/m1/`

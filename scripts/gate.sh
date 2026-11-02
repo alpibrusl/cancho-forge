@@ -37,7 +37,10 @@ echo "== cancho check"
 # each spike program is its own root. Tests are checked by `cancho test`.
 $C check src/*.cho --std || fail=1
 for f in spike/*.cho; do
-  $C check "$f" --std || fail=1
+  case "$f" in
+    spike/p[0-9]*) $C check "$f" spike/lib/*.cho --std || fail=1 ;;   # the pilot's spikes import the vendored libraries of spike/lib
+    *) $C check "$f" --std || fail=1 ;;
+  esac
 done
 
 echo "== cancho test"
@@ -204,6 +207,18 @@ mkdir "$scratch/company-change" || exit 1
 CANCHO="$C" sh tests/conformance/company_change.sh "$scratch/company-change" > "$scratch/company-change.out" || fail=1
 cat "$scratch/company-change.out"
 if grep -q '^FAIL ' "$scratch/company-change.out"; then fail=1; fi
+
+echo "== spike P1 (the pilot: a cancho program resolves a name over UDP with a deadline; spike/p1_check.sh)"
+mkdir "$scratch/p1" || exit 1
+CANCHO="$C" sh spike/p1_check.sh "$scratch/p1" > "$scratch/p1.out" || fail=1
+cat "$scratch/p1.out"
+if grep -q '^FAIL ' "$scratch/p1.out"; then fail=1; fi
+
+echo "== spike P4 (the pilot's test world: a scripted hostile HTTP server seen from outside by curl; spike/p4_check.sh)"
+mkdir "$scratch/p4" || exit 1
+CANCHO="$C" sh spike/p4_check.sh "$scratch/p4" > "$scratch/p4.out" || fail=1
+cat "$scratch/p4.out"
+if grep -q '^FAIL ' "$scratch/p4.out"; then fail=1; fi
 
 echo "== forge company change add (the operator's change requests and the admit: gate; tests/conformance/company_change_add.sh)"
 mkdir "$scratch/company-change-add" || exit 1
