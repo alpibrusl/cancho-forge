@@ -59,7 +59,7 @@ if $C build src/*.cho --std -o "$br/forge" && $C build workers/cancho_code.cho $
   printf 'A:/opt/cancho/bin/cancho\nA:%s/opts/ev/brief.txt\nA:%s/opts/ev\nA:stand-in-agent --x\nA:--provider\nA:stand\nA:--model\nA:m1\nA:--guide\nA:/opt/guides/plan.md\nA:--attempts\nA:7\nA:--agent-seconds\nA:31\nA:--rounds\nA:2\nA:--plan-seconds\nA:901\nA:--jobs\nA:5\n' "$br" "$br" > "$br/want_opts"
   check "options: exit 0 and the tool got the operator's checker, agent (as ONE argument), provider, model, guide and ceilings in order" sh -c "[ '$(rc opts)' = 0 ] && cmp -s '$br/opts/ev/args.txt' '$br/want_opts'"
   mkws defaults; brief defaults args; build defaults "$br/defaults.brief" 20000
-  check "defaults: without options the tool got the tool's own defaults" sh -c "grep -q '^A:--attempts\$' '$br/defaults/ev/args.txt' && [ \"\$(sed -n '/--attempts/{n;p}' '$br/defaults/ev/args.txt')\" = A:4 ] && [ \"\$(sed -n '/--jobs/{n;p}' '$br/defaults/ev/args.txt')\" = A:4 ] && ! grep -q 'guide' '$br/defaults/ev/args.txt'"
+  check "defaults: without options the tool got the tool's own defaults" sh -c "grep -q '^A:--attempts\$' '$br/defaults/ev/args.txt' && [ \"\$(sed -n '/--attempts/{n;p;}' '$br/defaults/ev/args.txt')\" = A:4 ] && [ \"\$(sed -n '/--jobs/{n;p;}' '$br/defaults/ev/args.txt')\" = A:4 ] && ! grep -q 'guide' '$br/defaults/ev/args.txt'"
 
   # ---- how a build can fail to succeed: blocked, never retried by itself (a build writes)
   mkws stuck; brief stuck stuck; build stuck "$br/stuck.brief" 20000

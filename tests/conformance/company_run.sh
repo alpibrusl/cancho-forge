@@ -26,6 +26,7 @@
 set -u
 C="${CANCHO:-cancho}"
 cd "$(dirname "$0")/../.." || exit 1
+. scripts/portable.sh
 scratch=$1
 fail=0
 libs=$(ls src/*.cho | grep -v '/main\.cho$')
