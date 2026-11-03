@@ -22,7 +22,7 @@ libs=$(ls src/*.cho | grep -v '/main\.cho$')
 w="$scratch/cc"
 mkdir "$w" "$w/workers" "$w/tools" || exit 1
 cp scripts/standin_cancho_change.sh "$w/tools/cancho-build" && chmod +x "$w/tools/cancho-build" || exit 1
-if ! { $C build src/*.cho --std -o "$w/forge" && $C build workers/repo_change.cho $libs --std -o "$w/workers/repo_change" && $C build workers/check_guard.cho $libs --std -o "$w/workers/check_guard" && $C build workers/repo_publish.cho $libs --std -o "$w/workers/repo_publish"; }; then
+if ! { $C build src/*.cho --std -o "$w/forge" && $C build workers/repo_change.cho $libs --std -o "$w/workers/repo_change" && $C build workers/check_guard.cho $libs --std -o "$w/workers/check_guard" && $C build workers/repo_publish.cho $libs --std -o "$w/workers/repo_publish" && $C build workers/authority_review.cho $libs --std -o "$w/workers/authority_review"; }; then
   echo "FAIL company change: a program did not build"
   exit 1
 fi
@@ -39,7 +39,7 @@ mkrepo() { # name: a library with a gate that a BROKEN word in src/a.cho fails
   d="$w/$1"
   mkdir -p "$d/src/secret" "$d/tests" "$d/docs" "$d/scripts" || exit 1
   printf 'one\ntwo\nthree\n' > "$d/src/a.cho"; printf 'secret\n' > "$d/src/secret/k.cho"; printf 'test\n' > "$d/tests/a_test.cho"
-  printf 'readme\n' > "$d/README.md"; printf 'doc\n' > "$d/docs/x.md"; printf '%s\n' "$REV" > "$d/.cancho-rev"
+  printf 'readme\n' > "$d/README.md"; printf 'doc\n' > "$d/docs/x.md"; printf 'performs\n    clock\nnever touches\n    the network\n' > "$d/docs/authority.txt"; printf '%s\n' "$REV" > "$d/.cancho-rev"
   printf '#!/bin/sh\n! grep -q BROKEN src/a.cho\n' > "$d/scripts/gate.sh"; chmod +x "$d/scripts/gate.sh"
   git init -q "$d" && git_in "$d" add -A && git_in "$d" commit -q -m first || exit 1
 }
@@ -265,6 +265,24 @@ check "publish: the checkout is back on its branch, clean, and its file is the o
 check "publish: steps/chg/pr.md is written and nothing was pushed" sh -c "[ -s '$w/co1/steps/chg/pr.md' ] && [ -z \"\$(git -C '$w/ck1' for-each-ref refs/remotes)\" ]"
 "$F" company publish "$w/co1" "$w/op-pub.json" chg forge/chg > "$w/out" 2> /dev/null; echo $? > "$w/rc"
 check "publish: the same branch again is publish-branch-exists, exit 1" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: publish-branch-exists' '$w/out'"
+
+# ---- the authority reviewer on the published commit (docs/reviewer.md section 2, docs/company.md section 25): `forge company authority`
+printf '#!/bin/sh\nprintf "performs\\n    clock\\nnever touches\\n    the network\\n"\n' > "$w/stubc" && chmod +x "$w/stubc"
+pubop op-auth1 ",\"compiler\":\"$w/stubc\",\"authority\":[{\"programs\":[\"src/*.cho\"],\"std\":true,\"ceiling\":\"docs/authority.txt\"}]"
+pubop op-auth2 ",\"compiler\":\"$w/stubc\",\"authority\":[{\"programs\":[\"src/*.cho\"],\"ceiling\":\"docs/authority.txt\"},{\"programs\":[\"src/*.cho\"],\"ceiling\":\"README.md\"}]"
+pubcommit=$(git -C "$w/ck1" rev-parse forge/chg)
+"$F" company authority "$w/co1" "$w/op-auth1.json" chg "$pubcommit" > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "authority: a published commit within its ceiling is equal: exit 0, the verdict and the task in verification" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'authority: docs/authority.txt' '$w/out' && grep -qx 'verdict: equal' '$w/out' && grep -qx 'state: verification' '$w/out'"
+check "authority: the evidence is beneath the step: ceiling.txt, head.txt and report.json in steps/chg/authority-0" sh -c "[ -s '$w/co1/steps/chg/authority-0/ceiling.txt' ] && [ -s '$w/co1/steps/chg/authority-0/head.txt' ] && grep -q '\"verdict\":\"equal\"' '$w/co1/steps/chg/authority-0/report.json'"
+check "authority: the checkout is untouched (still on its branch, clean) and no tree is left behind" sh -c "[ \"\$(git -C '$w/ck1' symbolic-ref --short HEAD)\" = '$home' ] && [ -z \"\$(git -C '$w/ck1' status --porcelain --untracked-files=all)\" ] && [ ! -e '$w/co1/steps/chg/authority-0/tree' ]"
+"$F" company authority "$w/co1" "$w/op-auth2.json" chg "$pubcommit" > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "authority: two entries, the second with no ceiling at the base: ceiling-missing, exit 5, the rule tag printed" sh -c "[ \$(cat '$w/rc') = 5 ] && grep -qx 'authority: README.md' '$w/out' && grep -qx 'rule: authority-ceiling-missing' '$w/out' && grep -qx 'verdict: equal' '$w/out'"
+"$F" company authority "$w/co1" "$w/op-auth1.json" chg not-a-commit > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "authority: a commit that is not 40 hex is authority-commit-invalid, exit 1" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: authority-commit-invalid' '$w/out'"
+"$F" company authority "$w/co1" "$w/op-pub.json" chg "$pubcommit" > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "authority: a repos row with no authority is authority-not-configured, exit 1" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: authority-not-configured' '$w/out'"
+"$F" company authority "$w/co1" "$w/op-auth1.json" nosuch "$pubcommit" > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "authority: a step that is not an accepted repo.change step is publish-step-not-accepted, exit 1" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: publish-step-not-accepted' '$w/out'"
 pubop op-noslug ""
 sed 's/"slug":"alpibrusl\/cancho-diff",//' "$w/op-noslug.json" > "$w/op-noslug2.json"
 "$F" company publish "$w/co1" "$w/op-noslug2.json" chg forge/other > "$w/out" 2> /dev/null; echo $? > "$w/rc"

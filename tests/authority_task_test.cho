@@ -49,6 +49,13 @@ fn test_each_refusal_is_reached_and_named() -> [] int {
     return 0;
 }
 
+fn test_the_repositories_are_the_publish_list() -> [] int {
+    test.assert(authority_task.repo_known("alpibrusl/cancho-forge"));
+    test.assert(authority_task.repo_known("alpibrusl/cancho-diff"));
+    test.assert(!authority_task.repo_known("someone/else"));
+    return 0;
+}
+
 fn test_the_first_fault_of_the_order_is_the_one_named() -> [] int {
     test.assert(bytes.equal(judged("repo.gate", "someone/else", "x", "y", "w", "c", "../x", 1), "task-type-invalid"));
     test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", "x", rev(), "w", "c", "../x", 1), "revision-invalid"));
