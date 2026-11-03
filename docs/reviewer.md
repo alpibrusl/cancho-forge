@@ -72,7 +72,7 @@ R-0 needs no model. R-1 spends money and waits for the M-1 budget decision.
 ## 6. Order
 
 1. R-0 and the pure `compare`, in cancho, with unit tests for every verdict (no worker yet). **Done** (`src/authority_review.cho`, `tests/authority_review_test.cho`, `spike/r0_check.sh`; result in `spike/RESULTS.md`). The tags are not yet in the gate's docs-tag list: they enter it with the worker that emits them.
-2. The worker, with a stand-in compiler script, then the real compiler, in the gate. **Built with the stand-in** (`workers/authority_review.cho`, `docs/worker-contract.md` section 13); the real compiler against two real commits is not run yet.
+2. The worker, with a stand-in compiler script, then the real compiler, in the gate. **Built with the stand-in; it reads the head from a commit (`git archive`), not from a working tree, so it can review a published branch commit without touching the checkout** (`workers/authority_review.cho`, `docs/worker-contract.md` section 13); the real compiler against two real commits is not run yet.
 3. The registry field, in the operator file's checks. **Done** (`src/repo_row.cho`, `tests/repo_row_test.cho`); the step that builds the task from it is next.
 4. The review step (needs M-1's tool decisions), recorded and shown only.
 

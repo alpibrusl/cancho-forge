@@ -157,19 +157,47 @@ pub fn ceiling_script[&h, &w, &b, &c](heap: &!h Heap, workspace: &w [byte], base
     return buffer.append(heap, s, "; exit $?");
 }
 
-// The shell text that asks the compiler for the head's authority: `<compiler> authority <programs> [--std]`, run in the workspace, both streams
-// to standard output. `programs` is `programs_text`, `compiler` an absolute path that has passed `path_ok`.
-pub fn authority_script[&h, &w, &c, &p](heap: &!h Heap, workspace: &w [byte], compiler: &c [byte], programs: &p [byte], std: bool) -> [heap] buffer.Buffer {
-    var s = buffer.append(heap, buffer.empty(heap, 128), "exec 2>&1; cd ");
+// The shell text that exports the head commit's tree: `git archive` of `revision` from the repository at `workspace` into `<exec_dir>/tree`, through a tar
+// file beside it that is removed again. The repository's checkout is read, never written (its working tree and its HEAD are whatever they are: a
+// commit is content-addressed, so the tree is exactly the commit's). A non-zero status is a commit the repository does not have, or a tree that
+// could not be written. `workspace`, `revision` and `exec_dir` have passed `check`.
+pub fn export_script[&h, &w, &v, &e](heap: &!h Heap, workspace: &w [byte], revision: &v [byte], exec_dir: &e [byte]) -> [heap] buffer.Buffer {
+    var s = buffer.append(heap, buffer.empty(heap, 192), "exec 2>&1; rm -rf ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree && git -C ");
     s = buffer.append(heap, s, workspace);
-    s = buffer.append(heap, s, " && ");
+    s = buffer.append(heap, s, " archive -o ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree.tar ");
+    s = buffer.append(heap, s, revision);
+    s = buffer.append(heap, s, " && mkdir ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree && tar -xf ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree.tar -C ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree; s=$?; rm -f ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree.tar; exit $s");
+    return s;
+}
+
+// The shell text that asks the compiler for the head's authority: `<compiler> authority <programs> [--std]`, run in the exported tree
+// `<exec_dir>/tree`, both streams to standard output, and the tree removed again. `programs` is `programs_text`, `compiler` an absolute path that has
+// passed `path_ok`.
+pub fn authority_script[&h, &e, &c, &p](heap: &!h Heap, exec_dir: &e [byte], compiler: &c [byte], programs: &p [byte], std: bool) -> [heap] buffer.Buffer {
+    var s = buffer.append(heap, buffer.empty(heap, 192), "exec 2>&1; cd ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree && ");
     s = buffer.append(heap, s, compiler);
     s = buffer.append(heap, s, " authority ");
     s = buffer.append(heap, s, programs);
     if std {
         s = buffer.append(heap, s, " --std");
     }
-    return buffer.append(heap, s, "; exit $?");
+    s = buffer.append(heap, s, "; s=$?; cd / ; rm -rf ");
+    s = buffer.append(heap, s, exec_dir);
+    return buffer.append(heap, s, "/tree; exit $s");
 }
 
 // The name of a verdict code, as the report writes it.
