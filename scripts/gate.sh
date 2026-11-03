@@ -39,6 +39,7 @@ $C check src/*.cho --std || fail=1
 for f in spike/*.cho; do
   case "$f" in
     spike/p[0-9]*) $C check "$f" spike/lib/*.cho --std || fail=1 ;;   # the pilot's spikes import the vendored libraries of spike/lib
+    spike/r0*) $C check "$f" $(ls src/*.cho | grep -v '/main\.cho$') --std || fail=1 ;;   # R-0 drives forge.authority_review
     *) $C check "$f" --std || fail=1 ;;
   esac
 done
@@ -213,6 +214,12 @@ mkdir "$scratch/p1" || exit 1
 CANCHO="$C" sh spike/p1_check.sh "$scratch/p1" > "$scratch/p1.out" || fail=1
 cat "$scratch/p1.out"
 if grep -q '^FAIL ' "$scratch/p1.out"; then fail=1; fi
+
+echo "== spike R-0 (the reviewer's authority comparison on this repository's real reports; spike/r0_check.sh)"
+mkdir "$scratch/r0" || exit 1
+CANCHO="$C" sh spike/r0_check.sh "$scratch/r0" > "$scratch/r0.out" || fail=1
+cat "$scratch/r0.out"
+if grep -q '^FAIL ' "$scratch/r0.out"; then fail=1; fi
 
 echo "== spike P4 (the pilot's test world: a scripted hostile HTTP server seen from outside by curl; spike/p4_check.sh)"
 mkdir "$scratch/p4" || exit 1
