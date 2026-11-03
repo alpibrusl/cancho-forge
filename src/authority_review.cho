@@ -77,7 +77,7 @@ fn line_at[&t](text: &t [byte], i: int) -> [] Line {
     return Line { a: a, b: b, next: e + 1 };
 }
 
-// 1 under `performs`, 2 under `never touches`, 0 elsewhere (before the block, and from `provably` on), for a trimmed line that opens a section;
+// 1 under `performs`, 2 under `never touches`, 3 under `unbounded by` (read as none), 0 elsewhere (before the block, and from `provably` on), for a trimmed line that opens a section;
 // -1 when the line does not open one.
 fn opens[&l](line: &l [byte]) -> [] int {
     if bytes.equal(line, "performs") {
@@ -85,6 +85,10 @@ fn opens[&l](line: &l [byte]) -> [] int {
     }
     if bytes.equal(line, "never touches") {
         return 2;
+    }
+    // The compiler's note of which labels are unbounded: the same labels are already in `performs`, so the section is read as none.
+    if bytes.equal(line, "unbounded by") {
+        return 3;
     }
     if len(line) >= 8 && bytes.equal(line[0..8], "provably") {
         return 0;

@@ -1120,3 +1120,23 @@ reported as one. Price used by `replay.sh` for the ceiling: Haiku 5.5, $0.10 / $
 
 17 checks, 17 ok. What this does not show: a bound text the compiler prints in a form other than `name("...")`, or any program whose report differs in a way these three do not
 exercise (`signals("INT,TERM")` appears in `docs/authority.txt` and is equal). The worker's own run against two real commits is step 2 of the reviewer's order.
+
+## R-2: the authority worker with the real compiler (2026-11-03)
+
+`spike/r2_check.sh` clones this repository, makes four real commits in the clone and asks `workers/authority_review.cho`, with the real compiler at the pin (`f4ead824`) and no
+stand-in, about each. Seven checks, seven ok on the first run.
+
+| commit | what it is | base | verdict |
+|---|---|---|---|
+| benign | a comment added to `src/main.cho` | the clone's HEAD | equal |
+| widen | `src/main.cho` opens a UDP socket | the clone's HEAD | **wider** (the report names `net_in("")` and the `the network` guarantee is gone) |
+| cheat | the same, and `docs/authority.txt` rewritten to the compiler's own report, in one patch | the clone's HEAD | **wider**: the base's ceiling is the one read |
+| narrow | the ceiling gains a label the program does not use | the commit that added it | narrower |
+
+Also: the exported tree and its tar are removed; the clone's HEAD and working tree are the same after four reviews.
+
+**Found by running it for real, and fixed (R-0 had not seen it):** the real report of a program with an unbounded label marks the label (`net_in("")    <- unbounded`) and
+ends with a section `unbounded by` that lists it again. The comparison read the section's lines as guarantees; it now reads that section as none (`authority_review.opens`,
+a unit test with the compiler's own text). The marked label already differed as a line, so the verdict was `wider` either way; the fix removes a spurious "narrower" bit.
+
+Not shown: a program set other than `src/*.cho`; a compiler other than the pin; a repository that is not this one.
