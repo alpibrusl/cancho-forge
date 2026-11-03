@@ -13,6 +13,7 @@ import forge.company_graph;
 import forge.company_manifest;
 import forge.company_provision;
 import forge.company_publish;
+import forge.company_review;
 import forge.company_state;
 import forge.company_step;
 import forge.journal_io;
@@ -124,6 +125,9 @@ fn is_change(r: company_step.Runner) -> [] bool {
         company_step.Runner::Change => {
             return true;
         }
+        company_step.Runner::Authority => {
+            return false;
+        }
         company_step.Runner::Build => {
             return false;
         }
@@ -216,44 +220,11 @@ fn with_row[&h, &f, &x, &c, &i, &m, &d, &o, &t, &s, &b, &k](heap: &!h Heap, fs: 
     }
     let stepdir = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/steps/"), step);
     var worst = 0;
-    var j = 0;
-    while j < n {
-        let sub = buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 16), "authority-"), j);
-        borrow stepdir as &sd in {
-            borrow sub as &sb in {
-                let entry = repo_row.authority_entry(src, tp, row, j);
-                company_cmd.line(io, "authority: ", json.string_view(src, tp, json.get(src, tp, entry, "ceiling")));
-                if company_provision.make_sub(fs, buffer.bytes(sd), buffer.bytes(sb)) == false {
-                    company_cmd.line(io, "error: ", "cannot make the execution directory of the entry");
-                    worst = worse(worst, company_step.exit_io());
-                } else {
-                    let evdir = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(sd)), "/"), buffer.bytes(sb));
-                    borrow evdir as &ed in {
-                        let (ran, worker_code) = authority_call.run_step(heap, fs, exec, clock, io, authority_deadline_ms(), buffer.bytes(sd), company_step.op_text(src, tp, "workers"), slug, commit, base, src, tp, entry, compiler, repo_row.field_text(src, tp, row, "checkout"), buffer.bytes(ed));
-                        worst = worse(worst, ran);
-                    }
-                    buffer.drop(heap, evdir);
-                }
-            }
-        }
-        buffer.drop(heap, sub);
-        j = j + 1;
+    borrow stepdir as &sd in {
+        let (w, summary) = company_review.run_entries(heap, fs, exec, clock, io, src, tp, row, buffer.bytes(sd), slug, commit, base, company_step.op_text(src, tp, "workers"));
+        worst = w;
+        buffer.drop(heap, summary);
     }
     buffer.drop(heap, stepdir);
     return worst;
-}
-
-fn authority_deadline_ms() -> [] int {
-    return 300000;
-}
-
-// The worse of two statuses: 5 (a refusing verdict) over the rest, then the larger.
-fn worse(a: int, b: int) -> [] int {
-    if a == 5 || b == 5 {
-        return 5;
-    }
-    if b > a {
-        return b;
-    }
-    return a;
 }

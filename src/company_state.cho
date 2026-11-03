@@ -107,6 +107,12 @@ pub fn kind_change() -> [] &static [byte] {
     return "company.step.change";
 }
 
+// A publish of an accepted step (docs/company.md section 26): `forge company publish` made the commit `commit` on `branch` for the step (task = the step id). Replay checks
+// its shape (a branch, a commit of 40 characters) and nothing else; a `repo.authority` step reads the last one for the step it reviews (`published_commit`).
+pub fn kind_published() -> [] &static [byte] {
+    return "company.step.published";
+}
+
 // The date (docs/company.md section 22): `company.clock.set` (task = "clock"; `at` = `YYYY-MM-DD`) says what day it is for the records after it, until
 // the next one. A verb given `now=` appends one when the day is later than the last. Replay keeps the last day (`last_day`), and a date that is not
 // one of the calendar or is earlier than the last is `event-malformed`.
@@ -220,6 +226,48 @@ pub fn change_files[&h, &s, &r, &b, &t, &p](heap: &!h Heap, seq: int, step: &s [
     w = json.put_key(heap, w, "added");
     w = json.put_int(heap, w, added);
     return closed(heap, w);
+}
+
+// Step `step` was published as the commit `commit` on the branch `branch`.
+pub fn published[&h, &s, &b, &c](heap: &!h Heap, seq: int, step: &s [byte], branch: &b [byte], commit: &c [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_published(), step);
+    w = json.put_key(heap, w, "branch");
+    w = json.put_string(heap, w, branch);
+    w = json.put_key(heap, w, "commit");
+    w = json.put_string(heap, w, commit);
+    return closed(heap, w);
+}
+
+// The commit the last `company.step.published` record of `step` names: 40 characters, or empty when the step was never published. Read from the journal's own
+// lines, as `company_publish.change_base` reads the base: a line that does not parse or has no 40-character commit is passed over.
+pub fn published_commit[&h, &j, &s](heap: &!h Heap, journal: &j [byte], step: &s [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 48);
+    var pos = 0;
+    while pos < len(journal) {
+        var e = pos;
+        while e < len(journal) && int_of(journal[e]) != 10 {
+            e = e + 1;
+        }
+        let line = journal[pos..e];
+        if bytes.find(line, "company.step.published") >= 0 {
+            let tape = box_slice(heap, json.tape_len(line), 0);
+            borrow mut tape as &!tw in {
+                if json.parse(line, contents(tw)) > 0 {
+                    let tp = contents(tw);
+                    let kind = json.get(line, tp, 0, "kind");
+                    let task = json.get(line, tp, 0, "task");
+                    let commit = json.get(line, tp, 0, "commit");
+                    if json.is_string(tp, kind) && json.is_string(tp, task) && json.is_string(tp, commit) && bytes.equal(json.string_view(line, tp, kind), kind_published()) && bytes.equal(json.string_view(line, tp, task), step) && len(json.string_view(line, tp, commit)) == 40 {
+                        buffer.drop(heap, out);
+                        out = buffer.append(heap, buffer.empty(heap, 48), json.string_view(line, tp, commit));
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+        pos = e + 1;
+    }
+    return out;
 }
 
 // Step `step`'s check could not judge it (`reason`: the rule tag printed, `check-unavailable` or `artifact-invalid`).
@@ -582,6 +630,11 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &x](heap: &!h Heap, line: &l [byte], expect
                 } else if bytes.equal(kind, kind_change()) {
                     let strings = json.is_string(tp, json.get(line, tp, 0, "repo")) && json.is_string(tp, json.get(line, tp, 0, "base")) && json.is_string(tp, json.get(line, tp, 0, "tree")) && json.is_string(tp, json.get(line, tp, 0, "patch_sha256"));
                     if named == false || strings == false || field(line, tp, 0, "files") < 0 || field(line, tp, 0, "added") < 0 {
+                        rule = bad;
+                    }
+                } else if bytes.equal(kind, kind_published()) {
+                    let commit = json.get(line, tp, 0, "commit");
+                    if named == false || json.is_string(tp, json.get(line, tp, 0, "branch")) == false || json.is_string(tp, commit) == false || len(json.string_view(line, tp, commit)) != 40 {
                         rule = bad;
                     }
                 } else if bytes.equal(kind, kind_change_proposed()) {

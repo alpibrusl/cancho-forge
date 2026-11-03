@@ -977,6 +977,45 @@ fn test_a_change_record_without_its_fields_is_event_malformed[&h](heap: &!h Heap
     return 0;
 }
 
+fn test_a_published_record_replays_and_names_the_last_commit[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = add(heap, j, company_state.published(heap, 2, "a", "forge/a", "0123456789012345678901234567890123456789"));
+    j = add(heap, j, company_state.published(heap, 3, "a", "forge/a2", "9876543210987654321098765432109876543210"));
+    j = add(heap, j, company_state.published(heap, 4, "b", "forge/b", "1111111111111111111111111111111111111111"));
+    borrow j as &jb in {
+        test.assert_eq(probe_of(heap, buffer.bytes(jb)).rule, 0);
+        let last = company_state.published_commit(heap, buffer.bytes(jb), "a");
+        borrow last as &lb in {
+            test.assert(bytes.equal(buffer.bytes(lb), "9876543210987654321098765432109876543210"));
+        }
+        buffer.drop(heap, last);
+        let none = company_state.published_commit(heap, buffer.bytes(jb), "c");
+        borrow none as &nb in {
+            test.assert_eq(len(buffer.bytes(nb)), 0);
+        }
+        buffer.drop(heap, none);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_published_record_with_a_short_commit_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.admitted(heap, 1, "a", "t-1"));
+    j = add(heap, j, company_state.published(heap, 2, "a", "forge/a", "0123"));
+    borrow j as &jb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(jb)), "event-malformed"));
+        let none = company_state.published_commit(heap, buffer.bytes(jb), "a");
+        borrow none as &nb in {
+            test.assert_eq(len(buffer.bytes(nb)), 0);
+        }
+        buffer.drop(heap, none);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
 // A repository or patch refusal (`repo-...`, `patch-...`) is held code 5, `change-refused`; a reason that merely resembles one is not.
 fn test_a_repo_or_patch_refusal_holds_the_step_as_change_refused[&h](heap: &!h Heap) -> [heap] int {
     var j = buffer.empty(heap, 512);

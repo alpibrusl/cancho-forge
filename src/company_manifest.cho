@@ -205,6 +205,8 @@ pub enum TaskType {
     ToolRun,
     None,
     RepoChange,
+    // A reviewer's step that compares the authority of the commit a `repo.change` step was published as with the ceiling (docs/reviewer.md).
+    RepoAuthority,
 }
 
 // The kind of a repository (docs/company-lifecycle.md section 2.1): a closed set. `Library` is a module other programs import, `Program` an
@@ -527,7 +529,7 @@ fn role_code[&v](name: &v [byte]) -> [] int {
     return 0 - 1;
 }
 
-// A task type name as a number 0 to 4, or -1.
+// A task type name as a number 0 to 5, or -1.
 fn type_code[&v](name: &v [byte]) -> [] int {
     if bytes.equal(name, "project.build") {
         return 0;
@@ -543,6 +545,9 @@ fn type_code[&v](name: &v [byte]) -> [] int {
     }
     if bytes.equal(name, "repo.change") {
         return 4;
+    }
+    if bytes.equal(name, "repo.authority") {
+        return 5;
     }
     return 0 - 1;
 }
@@ -584,6 +589,9 @@ fn role_of(code: int) -> [] Role {
 fn type_of(code: int) -> [] TaskType {
     if code == 4 {
         return TaskType::RepoChange;
+    }
+    if code == 5 {
+        return TaskType::RepoAuthority;
     }
     if code == 0 {
         return TaskType::ProjectBuild;
@@ -930,7 +938,7 @@ fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, 
         return 6;
     }
     let tcode = type_code(json.string_view(src, tp, json.get(src, tp, step, "task_type")));
-    if tcode < 0 || tcode != type_of_role(role) && !(tcode == 4 && role == 0) {
+    if tcode < 0 || tcode != type_of_role(role) && !(tcode == 4 && role == 0) && !(tcode == 5 && role == 3) {
         return 7;
     }
     let check = json.get(src, tp, step, "check");
@@ -1654,6 +1662,9 @@ pub fn step_task_name(s: Step) -> [] &static [byte] {
         TaskType::RepoChange => {
             return "repo.change";
         }
+        TaskType::RepoAuthority => {
+            return "repo.authority";
+        }
     }
 }
 
@@ -1718,6 +1729,33 @@ pub fn is_repo_change(s: Step) -> [] bool {
     match s.task_type {
         TaskType::RepoChange => {
             return true;
+        }
+        TaskType::ProjectBuild => {
+            return false;
+        }
+        TaskType::RepoGate => {
+            return false;
+        }
+        TaskType::ToolRun => {
+            return false;
+        }
+        TaskType::None => {
+            return false;
+        }
+        TaskType::RepoAuthority => {
+            return false;
+        }
+    }
+}
+
+// Does the step run as a `repo.authority` task (a reviewer's comparison of a published commit with the ceiling)?
+pub fn is_repo_authority(s: Step) -> [] bool {
+    match s.task_type {
+        TaskType::RepoAuthority => {
+            return true;
+        }
+        TaskType::RepoChange => {
+            return false;
         }
         TaskType::ProjectBuild => {
             return false;

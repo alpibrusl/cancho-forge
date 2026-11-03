@@ -583,6 +583,16 @@ fn test_a_repo_change_step_without_a_repo_is_refused[&h](heap: &!h Heap) -> [hea
     return 0;
 }
 
+fn test_a_reviewer_repo_authority_step_is_accepted_and_names_no_repo[&h](heap: &!h Heap) -> [heap] int {
+    let s = "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\"},{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.authority\",\"needs\":[\"c\"],\"input\":\"x\"}";
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"library\"}]", s), ""));
+    let named = "{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.authority\",\"needs\":[],\"input\":\"x\",\"repo\":\"diff\"}";
+    test.assert(bytes.equal(repos_rule(heap, "[{\"id\":\"diff\",\"kind\":\"library\"}]", named), "repo-task-invalid"));
+    let qa = "{\"id\":\"r\",\"role\":\"qa\",\"task_type\":\"repo.authority\",\"needs\":[],\"input\":\"x\"}";
+    test.assert(bytes.equal(steps_rule(heap, qa), "task-type-unsupported"));
+    return 0;
+}
+
 fn test_a_repo_change_step_with_a_repo_is_held_and_reads_back[&h](heap: &!h Heap) -> [heap] int {
     let s = "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\",\"change_kind\":\"bug\"}";
     var extra = "\"repos\":[{\"id\":\"diff\",\"kind\":\"service\"}],";
