@@ -26,6 +26,7 @@
 set -u
 C="${CANCHO:-cancho}"
 cd "$(dirname "$0")/../.." || exit 1
+. scripts/portable.sh
 . scripts/procs.sh
 scratch=$1
 fail=0
@@ -101,7 +102,7 @@ start() { # company, tag
 kill_group() { # company, tag, signal
   kill -s "$3" -- "-$runpid" 2> /dev/null
   _n=0
-  while [ "$_n" -lt 300 ] && kill -0 "$runpid" 2> /dev/null && [ "$(sed 's/^.*) //' "/proc/$runpid/stat" 2> /dev/null | cut -c1)" != Z ]; do sleep 0.1; _n=$((_n + 1)); done
+  while [ "$_n" -lt 300 ] && kill -0 "$runpid" 2> /dev/null && [ "$(proc_state "$runpid")" != Z ]; do sleep 0.1; _n=$((_n + 1)); done
   if [ "$_n" -ge 300 ]; then bad "$1: forge did not end within 30 s of SIG$3 (killed now)"; kill -s KILL -- "-$runpid" 2> /dev/null; fi
   wait "$runpid"; echo $? > "$w/$1.$2.rc"
 }

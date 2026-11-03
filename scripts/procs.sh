@@ -10,7 +10,17 @@
 #                        is one. A zombie (state Z) is a process that has ended and is waiting for its parent to collect it:
 #                        it runs nothing, and a killed child can stay one for as long as the parent is slow to wait.
 #
-# `leftover -x gate_runner`, `leftover -f '^sleep 79$'`, `leftover -f 'git rev-parse HEAD'`. No `ps`: /proc/PID/stat.
+# `leftover -x gate_runner`, `leftover -f '^sleep 79$'`, `leftover -f 'git rev-parse HEAD'`. Where there is a /proc (Linux) it is read; where there
+# is not (macOS) `ps` answers the same two questions, the state and the parent of a pid (`proc_state`, `proc_parent`).
+
+proc_info() { # pid: "state parent" on one line, nothing when there is no such process
+  if [ -r /proc/self/stat ]; then
+    sed 's/^.*) //' "/proc/$1/stat" 2> /dev/null | cut -d' ' -f1,2
+  else
+    ps -o stat= -o ppid= -p "$1" 2> /dev/null | awk 'NF { print substr($1, 1, 1), $2 }'
+  fi
+}
+proc_state() { proc_info "$1" | cut -d' ' -f1; }
 
 ancestors() {
   _pid=$$
@@ -20,13 +30,13 @@ ancestors() {
     _depth=$((_depth + 1))
     echo "$_pid"
     # the fields after the command name, which is in parentheses and may hold spaces: state, then the parent's pid
-    _pid=$(sed 's/^.*) //' "/proc/$_pid/stat" 2> /dev/null | cut -d' ' -f2)
+    _pid=$(proc_info "$_pid" | cut -d' ' -f2)
   done
 }
 
 leftover() {
   pgrep "$@" | grep -vxF "$(ancestors)" | while read -r _p; do
-    _state=$(sed 's/^.*) //' "/proc/$_p/stat" 2> /dev/null | cut -c1)
+    _state=$(proc_state "$_p")
     if [ -n "$_state" ] && [ "$_state" != Z ]; then
       echo "$_p"
     fi
