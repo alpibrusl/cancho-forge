@@ -32,8 +32,7 @@ The result is one of `equal`, `narrower` (a label gone: allowed, and the ceiling
 ceiling file in the same patch does not change the result: the base file is the one compared; the edit makes the patch touch a protected path (`publish_deny`), and a patch that touches one is not mergeable
 by policy (`autonomy.md` section 4), only by the board, with the authority diff shown at the demo (lifecycle section 5.2). That is exactly the rule of `CLAUDE.md`: a widening says so, and a person decides.
 
-**Where the list comes from.** The operator's registry row gains `authority`: `[{ "programs": ["src/*.cho"], "std": true, "ceiling": "docs/authority.txt" }, ...]` *(designed)*, one entry per program set. The
-manifest names none of it (`company.md` section 3).
+**Where the list comes from** *(built)*. The operator's registry row (`repos.<id>`, `company.md` section 16) gains two keys that go together: `authority`, 1 to 4 entries `{"programs": [1 to 8 relative patterns, `*` allowed], "ceiling": "<relative path>", "std"?: true}`, one per program set, and `compiler`, the absolute path of the compiler binary that matches the row's `compiler_rev`. A row with one and not the other is `operator-invalid`, as is a pattern, ceiling or path of the wrong shape (`repo_row.rows_reason`). The manifest names none of it (`company.md` section 3). `repo_row.authority_count` and `authority_entry` read the entries; `authority_task.request` turns an entry into the `execute` request of a `repo.authority` task (built, with a round-trip test that the worker's own checks accept it); the call that journals the task and starts the worker, and the step in a flow, are not built.
 
 **The comparison is a pure function** *(built, R-0)* `authority_review.compare(ceiling_text, head_text) -> verdict code` over two reports, each a `performs` list of labels with their bounds and a `never touches` list of guarantees. It is parsed, not diffed: a reordering is `equal`. Codes: `equal` 0, `narrower` 1, `wider` 2, `ceiling-missing` 3, `unreadable` 4. A head label the ceiling lacks is wider, unless it is the same label with a bound where the ceiling's is the empty one (`fs_read("")`, unbounded), which is narrower; a different non-empty bound is wider. A `never touches` line the head lacks is wider (an assurance lost); one the head adds is narrower. Wider wins.
 
@@ -42,8 +41,7 @@ mechanism (a throw-away checkout; it never writes the operator's), runs the comp
 the verdict and the two blocks as evidence (`report.json`). **External programs it starts: the compiler (it is the authority oracle) and `git` for the checkouts (as the gate runner does); nothing else.** Its
 own authority report is checked in (`docs/authority-authority-review.txt`), as every worker's is.
 
-**Tags** *(designed)*: `authority-widened`, `authority-ceiling-missing`, `authority-unreadable` (the compiler's report cannot be parsed), `authority-program-missing` (a listed program has no file at the head),
-`authority-compiler-failed`. Each reached by a test.
+**Tags** *(designed)*: `authority-widened`, `authority-ceiling-missing`, `authority-unreadable` (the compiler's report cannot be parsed), `authority-compiler-failed` (the compiler exited non-zero, which includes a listed program with no file at the head: *corrected on building the worker, the separate `authority-program-missing` was dropped*). Each reached by a test.
 
 ## 3. The review verdict *(designed)*
 
@@ -74,8 +72,8 @@ R-0 needs no model. R-1 spends money and waits for the M-1 budget decision.
 ## 6. Order
 
 1. R-0 and the pure `compare`, in cancho, with unit tests for every verdict (no worker yet). **Done** (`src/authority_review.cho`, `tests/authority_review_test.cho`, `spike/r0_check.sh`; result in `spike/RESULTS.md`). The tags are not yet in the gate's docs-tag list: they enter it with the worker that emits them.
-2. The worker, with a stand-in compiler script, then the real compiler, in the gate.
-3. The registry field, in the operator file's checks.
+2. The worker, with a stand-in compiler script, then the real compiler, in the gate. **Built with the stand-in** (`workers/authority_review.cho`, `docs/worker-contract.md` section 13); the real compiler against two real commits is not run yet.
+3. The registry field, in the operator file's checks. **Done** (`src/repo_row.cho`, `tests/repo_row_test.cho`); the step that builds the task from it is next.
 4. The review step (needs M-1's tool decisions), recorded and shown only.
 
 ## 7. Open questions

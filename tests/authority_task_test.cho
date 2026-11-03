@@ -1,0 +1,184 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.test;
+import forge.authority_task;
+
+// Unit tests for src/authority_task.cho (docs/reviewer.md section 2): what a `repo.authority` task may name, the refusals and their rule tags,
+// the shell text and the verdict names. Run with `cancho test`.
+
+fn rev() -> [] &static [byte] {
+    return "0123456789abcdef0123456789abcdef01234567";
+}
+
+fn refusal(c: authority_task.Checked) -> [] &static [byte] {
+    match c {
+        authority_task.Checked::Held => {
+            return "";
+        }
+        authority_task.Checked::Refused(r) => {
+            return authority_task.rule_name(r);
+        }
+    }
+}
+
+fn judged[&y, &r, &v, &b, &w, &c, &f](kind: &y [byte], repo: &r [byte], revision: &v [byte], base: &b [byte], workspace: &w [byte], compiler: &c [byte], ceiling: &f [byte], timeout_ms: int) -> [] &static [byte] {
+    return refusal(authority_task.check(kind, repo, revision, base, workspace, "/work/exec/e-1", compiler, ceiling, timeout_ms));
+}
+
+fn good() -> [] &static [byte] {
+    return judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "/work/forge", "/opt/cancho/bin/cancho", "docs/authority.txt", 600000);
+}
+
+fn test_a_task_naming_everything_well_is_held() -> [] int {
+    test.assert(bytes.equal(good(), ""));
+    return 0;
+}
+
+fn test_each_refusal_is_reached_and_named() -> [] int {
+    test.assert(bytes.equal(judged("repo.gate", "alpibrusl/cancho-forge", rev(), rev(), "/work/forge", "/c", "docs/a.txt", 600000), "task-type-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "someone/else", rev(), rev(), "/work/forge", "/c", "docs/a.txt", 600000), "scope-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", "abc", rev(), "/work/forge", "/c", "docs/a.txt", 600000), "revision-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), "ABCDEF", "/work/forge", "/c", "docs/a.txt", 600000), "revision-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "work/forge", "/c", "docs/a.txt", 600000), "path-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "/work/forge", "cancho", "docs/a.txt", 600000), "path-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "/work/forge", "/c", "/etc/passwd", 600000), "path-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "/work/forge", "/c", "docs/a.txt", 100), "limits-invalid"));
+    return 0;
+}
+
+fn test_the_first_fault_of_the_order_is_the_one_named() -> [] int {
+    test.assert(bytes.equal(judged("repo.gate", "someone/else", "x", "y", "w", "c", "../x", 1), "task-type-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", "x", rev(), "w", "c", "../x", 1), "revision-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "w", "c", "../x", 1), "path-invalid"));
+    return 0;
+}
+
+fn test_a_relative_path_has_no_way_out_of_the_repository_and_no_shell_syntax() -> [] int {
+    test.assert(authority_task.rel_ok("docs/authority.txt", false));
+    test.assert(authority_task.rel_ok("docs/authority-repo-publish.txt", false));
+    test.assert(!authority_task.rel_ok("", false));
+    test.assert(!authority_task.rel_ok("/docs/a.txt", false));
+    test.assert(!authority_task.rel_ok("../a.txt", false));
+    test.assert(!authority_task.rel_ok("docs/../a.txt", false));
+    test.assert(!authority_task.rel_ok("docs//a.txt", false));
+    test.assert(!authority_task.rel_ok(".hidden/a.txt", false));
+    test.assert(!authority_task.rel_ok("docs/-rf", false));
+    test.assert(!authority_task.rel_ok("docs/", false));
+    test.assert(!authority_task.rel_ok("docs/a b.txt", false));
+    test.assert(!authority_task.rel_ok("docs/a;b", false));
+    test.assert(!authority_task.rel_ok("docs/$(x)", false));
+    test.assert(!authority_task.rel_ok("src/*.cho", false));
+    test.assert(authority_task.rel_ok("src/*.cho", true));
+    test.assert(!authority_task.rel_ok("src/*.cho; rm x", true));
+    return 0;
+}
+
+fn with_programs[&h](heap: &!h Heap, text: &static [byte], want_ok: bool, want_text: &static [byte]) -> [heap] int {
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    var seen = false;
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(text, tp) > 0 {
+            seen = authority_task.programs_ok(text, tp, 0);
+            if seen && want_ok {
+                let joined = authority_task.programs_text(heap, text, tp, 0);
+                borrow joined as &jb in {
+                    test.assert(bytes.equal(buffer.bytes(jb), want_text));
+                }
+                buffer.drop(heap, joined);
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    test.assert(seen == want_ok);
+    return 0;
+}
+
+fn test_the_programs_are_a_short_list_of_patterns_joined_by_a_space[&h](heap: &!h Heap) -> [heap] int {
+    with_programs(heap, "[\"src/*.cho\"]", true, "src/*.cho");
+    with_programs(heap, "[\"workers/repo_publish.cho\",\"src/*.cho\"]", true, "workers/repo_publish.cho src/*.cho");
+    with_programs(heap, "[]", false, "");
+    with_programs(heap, "\"src/*.cho\"", false, "");
+    with_programs(heap, "[1]", false, "");
+    with_programs(heap, "[\"src/a.cho; x\"]", false, "");
+    with_programs(heap, "[\"/etc/passwd\"]", false, "");
+    with_programs(heap, "[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]", false, "");
+    return 0;
+}
+
+fn test_the_shell_text_is_exactly_the_documented_commands[&h](heap: &!h Heap) -> [heap] int {
+    let c = authority_task.ceiling_script(heap, "/work/forge", rev(), "docs/authority.txt");
+    borrow c as &cb in {
+        test.assert(bytes.equal(buffer.bytes(cb), "exec 2>/dev/null; cd /work/forge && git show 0123456789abcdef0123456789abcdef01234567:docs/authority.txt; exit $?"));
+    }
+    buffer.drop(heap, c);
+    let a = authority_task.authority_script(heap, "/work/forge", "/opt/cancho/bin/cancho", "src/*.cho", true);
+    borrow a as &ab in {
+        test.assert(bytes.equal(buffer.bytes(ab), "exec 2>&1; cd /work/forge && /opt/cancho/bin/cancho authority src/*.cho --std; exit $?"));
+    }
+    buffer.drop(heap, a);
+    let n = authority_task.authority_script(heap, "/work/forge", "/opt/cancho/bin/cancho", "a.cho b.cho", false);
+    borrow n as &nb in {
+        test.assert(bytes.equal(buffer.bytes(nb), "exec 2>&1; cd /work/forge && /opt/cancho/bin/cancho authority a.cho b.cho; exit $?"));
+    }
+    buffer.drop(heap, n);
+    return 0;
+}
+
+fn test_the_verdicts_have_their_names() -> [] int {
+    test.assert(bytes.equal(authority_task.verdict_name(0), "equal"));
+    test.assert(bytes.equal(authority_task.verdict_name(1), "narrower"));
+    test.assert(bytes.equal(authority_task.verdict_name(2), "wider"));
+    test.assert(bytes.equal(authority_task.verdict_name(3), "ceiling-missing"));
+    test.assert(bytes.equal(authority_task.verdict_name(4), "unreadable"));
+    return 0;
+}
+
+// The operator file's row, the request built from its first entry, and the checks the worker will make of it.
+fn test_a_request_built_from_a_row_entry_is_one_the_worker_accepts[&h](heap: &!h Heap) -> [heap] int {
+    let op = "{\"authority\":[{\"programs\":[\"workers/repo_publish.cho\",\"src/*.cho\"],\"std\":true,\"ceiling\":\"docs/authority.txt\"},{\"programs\":[\"a.cho\"],\"ceiling\":\"docs/b.txt\"}]}";
+    let otape = box_slice(heap, json.tape_len(op), 0);
+    borrow mut otape as &!ow in {
+        let otp = contents(ow);
+        test.assert(json.parse(op, otp) > 0);
+        let entries = json.get(op, otp, 0, "authority");
+        let first = json.at(otp, entries, 0);
+        let second = json.at(otp, entries, 1);
+        let req = authority_task.request(heap, "r-1", 1, "t-1", "alpibrusl/cancho-forge", rev(), rev(), op, otp, first, "/opt/cancho/bin/cancho", "/work/forge", "/work/exec/e-1", 600000);
+        borrow req as &qb in {
+            let rtape = box_slice(heap, json.tape_len(buffer.bytes(qb)), 0);
+            borrow mut rtape as &!rw in {
+                let rtp = contents(rw);
+                let q = buffer.bytes(qb);
+                test.assert(json.parse(q, rtp) > 0);
+                let task = json.get(q, rtp, 0, "task");
+                let input = json.get(q, rtp, task, "input");
+                let grants = json.get(q, rtp, 0, "grants");
+                test.assert(json.string_equals(q, rtp, json.get(q, rtp, task, "type"), "repo.authority"));
+                test.assert(json.string_equals(q, rtp, json.get(q, rtp, input, "ceiling"), "docs/authority.txt"));
+                test.assert(authority_task.programs_ok(q, rtp, json.get(q, rtp, input, "programs")));
+                let joined = authority_task.programs_text(heap, q, rtp, json.get(q, rtp, input, "programs"));
+                borrow joined as &jb in {
+                    test.assert(bytes.equal(buffer.bytes(jb), "workers/repo_publish.cho src/*.cho"));
+                }
+                buffer.drop(heap, joined);
+                test.assert(json.to_bool(rtp, json.get(q, rtp, input, "std")));
+                let verdict = authority_task.check(json.string_view(q, rtp, json.get(q, rtp, task, "type")), json.string_view(q, rtp, json.get(q, rtp, input, "repo")), json.string_view(q, rtp, json.get(q, rtp, input, "revision")), json.string_view(q, rtp, json.get(q, rtp, input, "base")), json.string_view(q, rtp, json.get(q, rtp, grants, "workspace")), json.string_view(q, rtp, json.get(q, rtp, grants, "execution_dir")), json.string_view(q, rtp, json.get(q, rtp, grants, "compiler")), json.string_view(q, rtp, json.get(q, rtp, input, "ceiling")), 600000);
+                test.assert(bytes.equal(refusal(verdict), ""));
+            }
+            unbox_slice(heap, rtape);
+        }
+        buffer.drop(heap, req);
+        // an entry without `std` asks for no `--std`
+        let req2 = authority_task.request(heap, "r-2", 1, "t-2", "alpibrusl/cancho-forge", rev(), rev(), op, otp, second, "/c", "/w", "/e", 600000);
+        borrow req2 as &q2 in {
+            test.assert(bytes.find(buffer.bytes(q2), "\"std\":true") < 0);
+        }
+        buffer.drop(heap, req2);
+    }
+    unbox_slice(heap, otape);
+    return 0;
+}

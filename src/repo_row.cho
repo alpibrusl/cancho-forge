@@ -3,6 +3,7 @@ module forge.repo_row;
 
 import std.bytes;
 import std.json;
+import forge.authority_task;
 import forge.gate_task;
 
 // The operator file's `repos` (docs/company-lifecycle.md sections 2.1 and 8.1, docs/company.md section 16): one row per repository the
@@ -10,14 +11,14 @@ import forge.gate_task;
 // change may touch. This module is pure: it reads a parsed operator file (`src` and its tape `tp`) and opens nothing.
 //
 //   "repos": { "<id>": { "kind", "checkout", "compiler_rev", "publish_allow", "max_patch_files", "max_patch_lines",
-//                        "slug"?, "branch"?, "pins"?, "publish_deny"? } ... }
+//                        "slug"?, "branch"?, "pins"?, "publish_deny"?, "authority"?, "compiler"? } ... }
 //
 // The slice reads the rows it needs and rejects every other key of the autonomy registry (`gate`, `policy`: docs/autonomy.md section 3)
 // as `operator-invalid`, with the `reason:` that `rows_reason` gives. The values are checked again where they are used (the patch
 // bounds by `patch_check`, the paths by `repo_task`, the pin by the change worker), so a row grants nothing a user of it does not allow.
 
 fn row_keys() -> [] &static [byte] {
-    return " slug branch checkout kind compiler_rev pins publish_allow publish_deny max_patch_files max_patch_lines ";
+    return " slug branch checkout kind compiler_rev pins publish_allow publish_deny max_patch_files max_patch_lines authority compiler ";
 }
 
 // The most rows, patterns in a list, and bytes of a pattern.
@@ -388,8 +389,63 @@ pub fn kind_ok[&k](kind: &k [byte]) -> [] bool {
     return bytes.equal(kind, "library") || bytes.equal(kind, "program") || bytes.equal(kind, "service");
 }
 
+// The most authority entries of a row.
+pub fn max_authority() -> [] int {
+    return 4;
+}
+
+// The `authority` of a row (docs/reviewer.md section 2): 1 to 4 entries `{"programs": [1 to 8 relative patterns], "ceiling": a relative path,
+// "std"?: a boolean}`, each program set the reviewer compares against the ceiling file it names, as that file is at the base commit.
+fn authority_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if !json.is_array(tp, node) {
+        return false;
+    }
+    let n = json.count(tp, node);
+    if n < 1 || n > max_authority() {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        let e = json.at(tp, node, i);
+        if !json.is_object(tp, e) || !keys_ok(src, tp, e, " programs ceiling std ") {
+            return false;
+        }
+        let c = json.get(src, tp, e, "ceiling");
+        if !plain(tp, c) || !authority_task.rel_ok(json.string_view(src, tp, c), false) {
+            return false;
+        }
+        if !authority_task.programs_ok(src, tp, json.get(src, tp, e, "programs")) {
+            return false;
+        }
+        let std = json.get(src, tp, e, "std");
+        if std >= 0 && !json.is_bool(tp, std) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The number of authority entries of the row at `row`, 0 when it has none.
+pub fn authority_count[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] int {
+    let a = json.get(src, tp, row, "authority");
+    if a < 0 || !json.is_array(tp, a) {
+        return 0;
+    }
+    return json.count(tp, a);
+}
+
+// The node of entry `i` of the row's `authority`, or -1.
+pub fn authority_entry[&s, &t](src: &s [byte], tp: &t [int], row: int, i: int) -> [] int {
+    let a = json.get(src, tp, row, "authority");
+    if a < 0 || !json.is_array(tp, a) || i < 0 || i >= json.count(tp, a) {
+        return 0 - 1;
+    }
+    return json.at(tp, a, i);
+}
+
 // Why the row at node `row` is refused, or "" (the first fault, in this order: keys, kind, checkout, compiler_rev, publish_allow,
-// publish_deny, the two bounds, pins, slug, branch).
+// publish_deny, the two bounds, pins, authority and compiler, slug, branch).
 fn row_reason[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] &static [byte] {
     if !json.is_object(tp, row) || !keys_ok(src, tp, row, row_keys()) {
         return "repos: a row is not an object of the keys kind, checkout, compiler_rev, publish_allow, max_patch_files, max_patch_lines and optionally slug, branch, pins, publish_deny";
@@ -422,6 +478,14 @@ fn row_reason[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] &static [byt
     let pins = json.get(src, tp, row, "pins");
     if pins >= 0 && !pins_ok(src, tp, pins) {
         return "repos: pins is not 1 to 4 of .cancho-rev, cancho.toml";
+    }
+    let authority = json.get(src, tp, row, "authority");
+    let compiler = json.get(src, tp, row, "compiler");
+    if authority >= 0 && !authority_ok(src, tp, authority) {
+        return "repos: authority is not 1 to 4 of {programs: 1 to 8 relative patterns, ceiling: a relative path, std?: a boolean}";
+    }
+    if authority >= 0 != compiler >= 0 || compiler >= 0 && (!plain(tp, compiler) || !gate_task.path_ok(json.string_view(src, tp, compiler))) {
+        return "repos: authority and compiler go together, and compiler is an absolute path of letters, digits and ._/- with no .. and no hidden component";
     }
     let slug = json.get(src, tp, row, "slug");
     if slug >= 0 && (!plain(tp, slug) || !slug_ok(json.string_view(src, tp, slug))) {
