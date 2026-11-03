@@ -271,7 +271,7 @@ fn on_the_way[&h, &t](heap: &!h Heap, out: buffer.Buffer, path: &t [byte]) -> [h
 // Step 1, as a script. Exits: 11 the checkout is not a directory, not the toplevel of a repository, or has no commit; 13 `origin` is not
 // the allow-listed repository on github.com; 14 something is modified or untracked; 15 the branch exists; 16 a link or a directory is where a
 // file goes. On success it prints the branch the checkout is on (or, detached, the commit).
-fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte]) -> [heap] buffer.Buffer {
+fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte], adopting: bool) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 1024), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " 2>/dev/null || exit 11\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 11\nhere=$(pwd -P)\n[ \"$root\" = \"$here\" ] || exit 11\n");
@@ -290,9 +290,11 @@ fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte]
         s = put(heap, s, "' ] || exit 23\n");
     }
     s = put(heap, s, "mod=$(git status --porcelain --untracked-files=all 2>/dev/null) || exit 11\n[ -z \"$mod\" ] || exit 14\n");
-    s = put(heap, s, "if git rev-parse --verify --quiet 'refs/heads/");
-    s = put(heap, s, branch);
-    s = put(heap, s, "' >/dev/null 2>&1; then exit 15; fi\n");
+    if adopting == false {
+        s = put(heap, s, "if git rev-parse --verify --quiet 'refs/heads/");
+        s = put(heap, s, branch);
+        s = put(heap, s, "' >/dev/null 2>&1; then exit 15; fi\n");
+    }
     var at = 0;
     while at < len(dest) {
         let e = line_end(dest, at);
@@ -307,12 +309,15 @@ fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte]
 }
 
 // Step 3a: make the branch and the directories. Exit 18 when either fails (the caller then undoes).
-fn branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte]) -> [heap] buffer.Buffer {
+fn branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], make_branch: bool) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 512), "cd ");
     s = q(heap, s, checkout);
-    s = put(heap, s, " || exit 11\ngit checkout -q -b ");
-    s = q(heap, s, branch);
-    s = put(heap, s, " || exit 18\n");
+    s = put(heap, s, " || exit 11\n");
+    if make_branch {
+        s = put(heap, s, "git checkout -q -b ");
+        s = q(heap, s, branch);
+        s = put(heap, s, " || exit 18\n");
+    }
     let pd = dir_of(prov);
     var at = 0;
     while at < len(dest) {
@@ -347,6 +352,34 @@ fn commit_script[&h, &c, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], dest: 
     return s;
 }
 
+// Does a branch of that name exist in the checkout? Status 0 when it does.
+fn exists_script[&h, &c, &b](heap: &!h Heap, checkout: &c [byte], branch: &b [byte]) -> [heap] buffer.Buffer {
+    var s = put(heap, buffer.empty(heap, 256), "cd ");
+    s = q(heap, s, checkout);
+    s = put(heap, s, " || exit 11\ngit rev-parse --verify --quiet 'refs/heads/");
+    s = put(heap, s, branch);
+    s = put(heap, s, "' >/dev/null 2>&1\n");
+    return s;
+}
+
+// Adoption (docs/auto-publish.md section 4): the files of this publish are in the working tree of a checkout at `base`. Stage them and
+// ask whether the branch is what the publish would have made: one commit above `base`, the very tree the index now holds, the very message
+// (on standard input). Exit 21 when it is not; else print the branch's commit. Nothing is committed and no ref is touched.
+fn adopt_script[&h, &c, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte]) -> [heap] buffer.Buffer {
+    var s = put(heap, buffer.empty(heap, 768), "cd ");
+    s = q(heap, s, checkout);
+    s = put(heap, s, " || exit 11\ngit add -- ");
+    s = quoted_lines(heap, s, dest);
+    s = q(heap, s, prov);
+    s = put(heap, s, " || exit 19\nb='refs/heads/");
+    s = put(heap, s, branch);
+    s = put(heap, s, "'\n[ \"$(git rev-parse --verify --quiet \"$b^\")\" = '");
+    s = put(heap, s, base);
+    s = put(heap, s, "' ] || exit 21\n[ \"$(git write-tree)\" = \"$(git rev-parse --verify --quiet \"$b^{tree}\")\" ] || exit 21\n");
+    s = put(heap, s, "want=$(git stripspace)\ngot=$(git log -1 --format=%B \"$b\" | git stripspace)\n[ \"$want\" = \"$got\" ] || exit 21\ngit rev-parse --verify \"$b\" || exit 21\n");
+    return s;
+}
+
 // The undo of a publish that failed after the branch was made. The checkout was clean when it began, so a reset loses nothing of the
 // operator's; a file this publish added that git does not track is removed.
 fn undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
@@ -357,9 +390,12 @@ fn undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], bran
     s = q(heap, s, prov);
     s = put(heap, s, "; do git ls-files --error-unmatch \"$f\" >/dev/null 2>&1 || rm -f \"$f\"; done\ngit checkout -q ");
     s = q(heap, s, orig);
-    s = put(heap, s, "\ngit branch -D -q ");
-    s = q(heap, s, branch);
     s = put(heap, s, "\n");
+    if len(branch) > 0 {
+        s = put(heap, s, "git branch -D -q ");
+        s = q(heap, s, branch);
+        s = put(heap, s, "\n");
+    }
     return s;
 }
 
@@ -492,6 +528,11 @@ fn publish[&h, &i, &f, &c, &x, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs("")
             }
         }
     }
+    var adopt = false;
+    let adopt_at = json.get(src, tp, 0, "adopt");
+    if adopt_at >= 0 {
+        adopt = patching && json.to_bool(tp, adopt_at);
+    }
     var code = 0;
     if more_ok == false {
         code = answer_failed(heap, io, publish_plan.rule_dest_invalid(), "an extra file is not a plain accepted artifact with a plain destination");
@@ -502,7 +543,7 @@ fn publish[&h, &i, &f, &c, &x, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs("")
             borrow message_text as &mg in {
                 borrow alld as &ab2 in {
                     borrow extras as &xb in {
-                        code = publish_texts(heap, io, fs, clock, exec, checkout, repo, branch, src_dir, src_name, dest, sha, prov_dest, buffer.bytes(pv), buffer.bytes(mg), buffer.bytes(ab2), buffer.bytes(xb), patch_base);
+                        code = publish_texts(heap, io, fs, clock, exec, checkout, repo, branch, src_dir, src_name, dest, sha, prov_dest, buffer.bytes(pv), buffer.bytes(mg), buffer.bytes(ab2), buffer.bytes(xb), patch_base, adopt);
                     }
                 }
             }
@@ -516,14 +557,25 @@ fn publish[&h, &i, &f, &c, &x, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs("")
 }
 
 // The texts are decoded: the rest of the checks, then the publish.
-fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a, &t, &u](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], repo: &r [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], alld: &a [byte], extras: &t [byte], base: &u [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
+fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a, &t, &u](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], repo: &r [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], alld: &a [byte], extras: &t [byte], base: &u [byte], adopt: bool) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
     if hex64(sha) == false || len(prov) > publish_plan.text_cap() || len(message) > publish_plan.text_cap() || len(message) == 0 {
         return answer_failed(heap, io, publish_plan.rule_worker_failed(), "the request is malformed");
     }
     // Step 1: the checkout.
     var orig = buffer.empty(heap, 1);
     var refused = 0;
-    let check = checks_script(heap, checkout, repo, branch, alld, prov_dest, base);
+    // A request to adopt takes the branch that is there; with none, it publishes as any request does.
+    var adopting = false;
+    if adopt {
+        let probe = exists_script(heap, checkout, branch);
+        borrow probe as &pr in {
+            let (found, shown) = run_sh(heap, exec, clock, buffer.bytes(pr), "");
+            adopting = found == 0;
+            buffer.drop(heap, shown);
+        }
+        buffer.drop(heap, probe);
+    }
+    let check = checks_script(heap, checkout, repo, branch, alld, prov_dest, base, adopting);
     borrow check as &cb in {
         let (status, out) = run_sh(heap, exec, clock, buffer.bytes(cb), "");
         refused = status;
@@ -558,7 +610,7 @@ fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a,
         if script_name(buffer.bytes(og)) == false {
             code = answer_failed(heap, io, publish_plan.rule_checkout_invalid(), "the checkout is on a branch whose name is not a plain name");
         } else {
-            code = publish_checked(heap, io, fs, clock, exec, checkout, branch, src_dir, src_name, dest, sha, prov_dest, prov, message, buffer.bytes(og), alld, extras, base);
+            code = publish_checked(heap, io, fs, clock, exec, checkout, branch, src_dir, src_name, dest, sha, prov_dest, prov, message, buffer.bytes(og), alld, extras, base, adopting);
         }
     }
     buffer.drop(heap, orig);
@@ -754,7 +806,13 @@ fn text_in[&s, &t](src: &s [byte], tape: &t [int], node: int, name: &static [byt
 }
 
 // The checkout is as it should be: step 2 (the artifact) and step 3 (the branch, the files, the commit).
-fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &a, &t, &u](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], orig: &o [byte], alld: &a [byte], extras: &t [byte], base: &u [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
+fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &a, &t, &u](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), checkout: &k [byte], branch: &b [byte], src_dir: &d [byte], src_name: &n [byte], dest: &y [byte], sha: &z [byte], prov_dest: &p [byte], prov: &v [byte], message: &m [byte], orig: &o [byte], alld: &a [byte], extras: &t [byte], base: &u [byte], adopting: bool) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
+    // An undo never deletes a branch that was there before this publish: adopting names none to delete.
+    var keep = len(branch);
+    if adopting {
+        keep = 0;
+    }
+    let undo_to = branch[0..keep];
     let (data, why) = company_files.read_artifact(heap, fs, src_dir, src_name);
     var same = false;
     if why == 0 {
@@ -771,7 +829,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
         return answer_failed(heap, io, publish_plan.rule_artifact_changed(), "the artifact is not the one that was accepted");
     }
     var status = 0;
-    let made = branch_script(heap, checkout, branch, alld, prov_dest);
+    let made = branch_script(heap, checkout, branch, alld, prov_dest, adopting == false);
     borrow made as &mb in {
         let (st, out) = run_sh(heap, exec, clock, buffer.bytes(mb), "");
         status = st;
@@ -780,7 +838,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
     buffer.drop(heap, made);
     if status != 0 {
         buffer.drop(heap, data);
-        return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "the branch or its directories could not be made");
+        return undo_and_fail(heap, io, exec, clock, checkout, undo_to, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "the branch or its directories could not be made");
     }
     var rc = 0 - 1;
     if len(base) > 0 {
@@ -791,10 +849,10 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
         }
         buffer.drop(heap, data);
         if applied == 1 {
-            return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_patch_not_applicable(), "the patch does not apply to the files of the checkout");
+            return undo_and_fail(heap, io, exec, clock, checkout, undo_to, alld, prov_dest, orig, publish_plan.rule_patch_not_applicable(), "the patch does not apply to the files of the checkout");
         }
         if applied == 3 {
-            return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_patch_not_applicable(), "the patch touches files other than the ones the request names, or deletes one");
+            return undo_and_fail(heap, io, exec, clock, checkout, undo_to, alld, prov_dest, orig, publish_plan.rule_patch_not_applicable(), "the patch touches files other than the ones the request names, or deletes one");
         }
         rc = applied;
     } else {
@@ -810,7 +868,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
     if rc == 0 && len(base) == 0 {
         let more = write_extras(heap, fs, checkout, extras);
         if more == 1 {
-            return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_artifact_changed(), "an artifact is not the one that was accepted");
+            return undo_and_fail(heap, io, exec, clock, checkout, undo_to, alld, prov_dest, orig, publish_plan.rule_artifact_changed(), "an artifact is not the one that was accepted");
         }
         rc = more;
     }
@@ -822,7 +880,10 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
         buffer.drop(heap, ppath);
     }
     if rc != 0 {
-        return undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "a file could not be written in the checkout");
+        return undo_and_fail(heap, io, exec, clock, checkout, undo_to, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "a file could not be written in the checkout");
+    }
+    if adopting {
+        return adopt_branch(heap, io, exec, clock, checkout, branch, alld, prov_dest, message, orig, base);
     }
     let commit = commit_script(heap, checkout, alld, prov_dest, orig);
     var hash = buffer.empty(heap, 1);
@@ -841,7 +902,41 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
         if status == 0 && hex64_40(buffer.bytes(hb)) {
             code = answer_ok(heap, io, buffer.bytes(hb));
         } else {
-            code = undo_and_fail(heap, io, exec, clock, checkout, branch, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "git could not stage or commit (no identity, an ignored path, or a hook)");
+            code = undo_and_fail(heap, io, exec, clock, checkout, undo_to, alld, prov_dest, orig, publish_plan.rule_commit_failed(), "git could not stage or commit (no identity, an ignored path, or a hook)");
+        }
+    }
+    buffer.drop(heap, hash);
+    return code;
+}
+
+// The files of the publish are in the working tree; ask whether the branch that is there is what they would have made. Either way the
+// working tree goes back to the checkout's own state and the branch is left as it was.
+fn adopt_branch[&h, &i, &x, &c, &k, &b, &d, &e, &m, &o, &a](heap: &!h Heap, io: &!i Io, exec: &x Exec("/bin/sh"), clock: &c Clock, checkout: &k [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], message: &m [byte], orig: &o [byte], base: &a [byte]) -> [heap, io_write, exec("/bin/sh"), clock, poll] int {
+    let script = adopt_script(heap, checkout, branch, dest, prov, base);
+    var status = 0 - 1;
+    var hash = buffer.empty(heap, 1);
+    borrow script as &sb in {
+        let (st, out) = run_sh(heap, exec, clock, buffer.bytes(sb), message);
+        status = st;
+        borrow out as &ob in {
+            buffer.drop(heap, hash);
+            hash = buffer.append(heap, buffer.empty(heap, 64), first_line(buffer.bytes(ob)));
+        }
+        buffer.drop(heap, out);
+    }
+    buffer.drop(heap, script);
+    var code = 0;
+    borrow hash as &hb in {
+        if status == 0 && hex64_40(buffer.bytes(hb)) {
+            let back = undo_script(heap, checkout, dest[0..0], dest, prov, orig);
+            borrow back as &bk in {
+                let (rs, shown) = run_sh(heap, exec, clock, buffer.bytes(bk), "");
+                buffer.drop(heap, shown);
+            }
+            buffer.drop(heap, back);
+            code = answer_ok(heap, io, buffer.bytes(hb));
+        } else {
+            code = undo_and_fail(heap, io, exec, clock, checkout, branch[0..0], dest, prov, orig, publish_plan.rule_branch_exists(), "a branch of that name exists and is not what this publish would make");
         }
     }
     buffer.drop(heap, hash);

@@ -309,7 +309,7 @@ mkrepo ckap
 git -C "$w/ckap" remote add origin https://github.com/alpibrusl/cancho-diff.git
 git -C "$w/ckap" config user.email forge@example.invalid; git -C "$w/ckap" config user.name forge
 aprow() { # name, extra top-level fields
-  printf '{"workers":"%s","tools":"%s","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent"%s,"repos":{"diff":{"kind":"library","slug":"alpibrusl/cancho-diff","checkout":"%s","compiler_rev":"%s","publish_allow":["src/**"],"max_patch_files":3,"max_patch_lines":9,"compiler":"%s","authority":[{"programs":["src/*.cho"],"std":true,"ceiling":"docs/authority.txt"}]}}}' "$w/workers" "$w/tools" "$2" "$w/ckap" "$REV" "$w/stubc" > "$w/$1.json"
+  printf '{"workers":"%s","tools":"%s","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent"%s,"repos":{"diff":{"kind":"library","slug":"alpibrusl/cancho-diff","checkout":"%s","compiler_rev":"%s","publish_allow":["src/**"],"max_patch_files":3,"max_patch_lines":9,"compiler":"%s","authority":[{"programs":["src/*.cho"],"std":true,"ceiling":"docs/authority.txt"}]}}}' "$w/workers" "$w/tools" "$2" "${3:-$w/ckap}" "$REV" "$w/stubc" > "$w/$1.json"
 }
 aprow op-ap-no ""
 aprow op-ap ",\"auto_publish\":{\"diff\":{\"branch_prefix\":\"forge/\"}}"
@@ -330,6 +330,43 @@ check "autopub: publish.txt names the branch and the commit, and Forge hashed it
 check "autopub: the checkout is on its branch, clean, nothing was pushed (no remote refs)" sh -c "[ -z \"\$(git -C '$w/ckap' status --porcelain --untracked-files=all)\" ] && [ -z \"\$(git -C '$w/ckap' for-each-ref refs/remotes)\" ]"
 run "$w/coap" "$w/op-ap.json"
 check "autopub: a second run does nothing: pub admitted once and published once" sh -c "[ \$(grep -c '\"task\":\"pub\"' '$w/coap/company.journal' | tr -d ' ') = 2 ] && [ \$(grep -c 'company.step.published' '$w/coap/company.journal' | tr -d ' ') = 1 ]"
+# ---- a crash between the commit and the journal record (docs/auto-publish.md section 4): the branch is adopted when it is what the publish would make
+apsteps=',{"id":"pub","role":"system","task_type":"repo.publish","needs":["chg"],"input":"publish"},{"id":"rev","role":"reviewer","task_type":"repo.authority","needs":["chg","pub"],"input":"review"}'
+mkcr() { # n: checkout ckar<n> and company coar<n>, the change accepted, the publish refused for want of a grant
+  mkrepo ckar$1
+  git -C "$w/ckar$1" remote add origin https://github.com/alpibrusl/cancho-diff.git
+  git -C "$w/ckar$1" config user.email forge@example.invalid; git -C "$w/ckar$1" config user.name forge
+  aprow op-ar$1 ",\"auto_publish\":{\"diff\":{\"branch_prefix\":\"forge/\"}}" "$w/ckar$1"
+  aprow op-arno$1 "" "$w/ckar$1"
+  mkco coar$1 good "$apsteps"
+  sed 's/"roles":\["builder"\]/"roles":["builder","reviewer"]/' "$w/coar$1/company.json" > "$w/coar$1/company.json.new" && mv "$w/coar$1/company.json.new" "$w/coar$1/company.json"
+  mkdir -p "$w/coar$1/steps/pub/ev" "$w/coar$1/steps/rev/ev"
+  run "$w/coar$1" "$w/op-arno$1.json"
+  home=$(git -C "$w/ckar$1" symbolic-ref --short HEAD)
+}
+lose_record() { sed '$d' "$w/$1/company.journal" > "$w/j.tmp" && mv "$w/j.tmp" "$w/$1/company.journal"; }
+mkcr 1
+"$F" company publish "$w/coar1" "$w/op-ar1.json" chg forge/co-chg > "$w/out" 2> /dev/null
+crashc=$(sed -n 's/^commit: //p' "$w/out")
+lose_record coar1
+check "crash: the branch has the commit and the journal has lost its published record" sh -c "[ \"\$(git -C '$w/ckar1' rev-parse refs/heads/forge/co-chg)\" = '$crashc' ] && ! grep -q company.step.published '$w/coar1/company.journal'"
+run "$w/coar1" "$w/op-ar1.json"
+check "crash: a branch that is what the publish would make is adopted: pub and rev accepted, done" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: pub' '$w/out' && grep -qx 'accepted: rev' '$w/out' && grep -qx 'done: steps accepted 3' '$w/out'"
+check "crash: the journal records the branch and the commit it already had, once; publish.txt names them" sh -c "[ \$(grep -c company.step.published '$w/coar1/company.journal' | tr -d ' ') = 1 ] && grep company.step.published '$w/coar1/company.journal' | grep -q '\"branch\":\"forge/co-chg\",\"commit\":\"$crashc\"' && grep -qx 'commit $crashc' '$w/coar1/steps/pub/ev/publish.txt'"
+check "crash: no second commit and no second branch; the checkout is where it was and clean" sh -c "[ \"\$(git -C '$w/ckar1' rev-parse refs/heads/forge/co-chg)\" = '$crashc' ] && [ \"\$(git -C '$w/ckar1' branch | wc -l | tr -d ' ')\" = 2 ] && [ \"\$(git -C '$w/ckar1' symbolic-ref --short HEAD)\" = '$home' ] && [ -z \"\$(git -C '$w/ckar1' status --porcelain --untracked-files=all)\" ]"
+mkcr 2
+git_in "$w/ckar2" checkout -q -b forge/co-chg; printf 'other\n' >> "$w/ckar2/README.md"; git_in "$w/ckar2" commit -q -a -m other; git_in "$w/ckar2" checkout -q "$home"
+strangec=$(git -C "$w/ckar2" rev-parse refs/heads/forge/co-chg)
+run "$w/coar2" "$w/op-ar2.json"
+check "crash: a branch of the same name that is not ours is not adopted: held, exit 14, publish-refused" sh -c "[ \$(cat '$w/rc') = 14 ] && grep -qx 'refusal: publish-branch-exists' '$w/out' && grep -q '\"kind\":\"company.step.check_unavailable\",\"task\":\"pub\",\"reason\":\"publish-refused\"' '$w/coar2/company.journal' && ! grep -q company.step.published '$w/coar2/company.journal'"
+check "crash: and it is left alone: same tip, checkout where it was, clean" sh -c "[ \"\$(git -C '$w/ckar2' rev-parse refs/heads/forge/co-chg)\" = '$strangec' ] && [ \"\$(git -C '$w/ckar2' symbolic-ref --short HEAD)\" = '$home' ] && [ -z \"\$(git -C '$w/ckar2' status --porcelain --untracked-files=all)\" ]"
+mkcr 3
+"$F" company publish "$w/coar3" "$w/op-ar3.json" chg forge/co-chg > "$w/out" 2> /dev/null
+lose_record coar3
+git_in "$w/ckar3" checkout -q forge/co-chg; git_in "$w/ckar3" commit -q --amend -m "a message of someone else's"; git_in "$w/ckar3" checkout -q "$home"
+strange3=$(git -C "$w/ckar3" rev-parse refs/heads/forge/co-chg)
+run "$w/coar3" "$w/op-ar3.json"
+check "crash: the right tree under another message is not adopted: held, exit 14, the branch untouched" sh -c "[ \$(cat '$w/rc') = 14 ] && [ \"\$(git -C '$w/ckar3' rev-parse refs/heads/forge/co-chg)\" = '$strange3' ] && ! grep -q company.step.published '$w/coar3/company.journal' && [ -z \"\$(git -C '$w/ckar3' status --porcelain --untracked-files=all)\" ]"
 pubop op-noslug ""
 sed 's/"slug":"alpibrusl\/cancho-diff",//' "$w/op-noslug.json" > "$w/op-noslug2.json"
 "$F" company publish "$w/co1" "$w/op-noslug2.json" chg forge/other > "$w/out" 2> /dev/null; echo $? > "$w/rc"

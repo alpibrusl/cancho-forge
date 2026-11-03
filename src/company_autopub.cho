@@ -93,7 +93,7 @@ pub fn run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &e](heap: &!h Heap, fs: &f Fs
                                 company_cmd.refuse(io, publish_plan.rule_branch_invalid());
                                 code = company_step.exit_refused();
                             } else {
-                                code = company_publish.patch_row(heap, fs, exec, clock, io, hm, st, buffer.bytes(jb), at, dir, op, tp, need, buffer.bytes(bb));
+                                code = company_publish.patch_row(heap, fs, exec, clock, io, hm, st, buffer.bytes(jb), at, dir, op, tp, need, buffer.bytes(bb), true);
                                 if code == 0 {
                                     appended = 1;
                                 }
