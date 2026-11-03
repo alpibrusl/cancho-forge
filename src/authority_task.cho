@@ -254,3 +254,58 @@ pub fn request[&h, &r, &k, &i, &v, &b, &s, &t, &c, &w, &e](heap: &!h Heap, reque
     w = json.end_object(heap, w);
     return json.finish(w);
 }
+
+// The id of the `n`th authority task of a workspace: `authority-n`.
+pub fn task_id[&h](heap: &!h Heap, n: int) -> [heap] buffer.Buffer {
+    return buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 16), "authority-"), n);
+}
+
+// The worker's own `error.code` when it is one it has, else "": the reply is a worker's, untrusted text.
+pub fn known_code[&c](code: &c [byte]) -> [] &static [byte] {
+    if bytes.equal(code, "task-type-invalid") {
+        return "task-type-invalid";
+    }
+    if bytes.equal(code, "scope-invalid") {
+        return "scope-invalid";
+    }
+    if bytes.equal(code, "revision-invalid") {
+        return "revision-invalid";
+    }
+    if bytes.equal(code, "path-invalid") {
+        return "path-invalid";
+    }
+    if bytes.equal(code, "limits-invalid") {
+        return "limits-invalid";
+    }
+    if bytes.equal(code, "env-invalid") {
+        return "env-invalid";
+    }
+    if bytes.equal(code, "revision-mismatch") {
+        return "revision-mismatch";
+    }
+    if bytes.equal(code, "workspace-unusable") {
+        return "workspace-unusable";
+    }
+    if bytes.equal(code, "head-timeout") {
+        return "head-timeout";
+    }
+    if bytes.equal(code, "gate-unavailable") {
+        return "gate-unavailable";
+    }
+    if bytes.equal(code, "authority-compiler-failed") {
+        return "authority-compiler-failed";
+    }
+    if bytes.equal(code, "authority-timeout") {
+        return "authority-timeout";
+    }
+    if bytes.equal(code, "authority-output-overflow") {
+        return "authority-output-overflow";
+    }
+    if bytes.equal(code, "authority-unavailable") {
+        return "authority-unavailable";
+    }
+    if bytes.equal(code, "evidence-unwritable") {
+        return "evidence-unwritable";
+    }
+    return "";
+}

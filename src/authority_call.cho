@@ -1,0 +1,324 @@
+edition 9;
+module forge.authority_call;
+
+import std.buffer;
+import std.io;
+import std.json;
+import std.map;
+import forge.authority_review;
+import forge.authority_task;
+import forge.dispatch;
+import forge.gate_run;
+import forge.journal;
+import forge.journal_io;
+import forge.lock;
+import forge.retry;
+import forge.task;
+import forge.worker;
+
+// Forge's side of a `repo.authority` task (docs/reviewer.md section 2, docs/worker-contract.md section 13): one call takes a task from nothing
+// to a state in the journal of a workspace, as `forge.repo_call.run` does for `repo.change`, with the authority worker
+// (`workers/authority_review.cho`) as the worker:
+//
+//   task.proposed, task.approved   (human: the operator, whose file named the repository, the compiler and the ceiling)
+//   the task is checked            (forge.authority_task.check: a refusal is a `refusal` record and the task stays `approved`)
+//   task.ready, task.running, execution.started
+//   the worker is started          (forge.worker.execute: a real child process, a deadline, an output cap, the evidence recomputed)
+//   a refusal record               (when the ending is one: its rule tag; and the worker's own `error.code`, one of `authority_task.known_code`)
+//   the verdict, **recomputed**    (from ceiling.txt and head.txt as Forge reads them, not from the report: its tag is a record when it is
+//                                   not `equal` or `narrower`)
+//   execution.finished             (worker, basis "claimed")
+//   task.verification | ready | blocked
+//
+// The check reads and compares; it writes nothing a model touched, so a failed attempt may be retried (`forge.retry`), unlike a change. What the
+// worker claims about the verdict is not used: the two files it recorded are hashed against the reply's evidence by `worker.settle_run`, and the
+// pure `authority_review.compare` is run on them here. A `wider` is a verdict, not a failure: the task still goes to verification, and the
+// step that asked decides (a person, by the autonomy rules).
+
+pub enum Outcome {
+    Refused(authority_task.Refusal),
+    Journal(int),
+    // The run ended; the recomputed verdict code (`authority_review`), or -1 when the run had none.
+    Ended(dispatch.Ending, int),
+}
+
+pub struct Finished {
+    outcome: Outcome,
+    state: int,
+    number: int,
+    attempts: int,
+    worker_code: &static [byte],
+}
+
+fn code_of[&h, &o](heap: &!h Heap, out: &o [byte]) -> [heap] &static [byte] {
+    var code = "";
+    let tape = box_slice(heap, json.tape_len(out), 0);
+    borrow mut tape as &!t in {
+        let tp = contents(t);
+        if json.parse(out, tp) > 0 && json.is_object(tp, 0) {
+            let c = json.get(out, tp, json.get(out, tp, 0, "error"), "code");
+            if json.is_string(tp, c) && json.string_plain(tp, c) {
+                code = authority_task.known_code(json.string_view(out, tp, c));
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return code;
+}
+
+fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of(47));
+    return buffer.append(heap, b, name);
+}
+
+// The verdict code of the two files the worker recorded, read here: -1 when either cannot be read.
+fn recompute[&h, &f, &e](heap: &!h Heap, fs: &f Fs(""), execution_dir: &e [byte]) -> [heap, fs_read(""), file_read] int {
+    var verdict = 0 - 1;
+    let cp = under(heap, execution_dir, "ceiling.txt");
+    let hp = under(heap, execution_dir, "head.txt");
+    borrow cp as &cb in {
+        borrow hp as &hb in {
+            let (c, ce) = journal_io.read_all(heap, fs, buffer.bytes(cb));
+            let (hd, he) = journal_io.read_all(heap, fs, buffer.bytes(hb));
+            if ce == 0 && he == 0 {
+                borrow c as &cc in {
+                    borrow hd as &hh in {
+                        verdict = authority_review.compare(buffer.bytes(cc), buffer.bytes(hh));
+                    }
+                }
+            }
+            buffer.drop(heap, c);
+            buffer.drop(heap, hd);
+        }
+    }
+    buffer.drop(heap, cp);
+    buffer.drop(heap, hp);
+    return verdict;
+}
+
+// Run the task. `journal_path` is the workspace's journal (the caller holds its lock); `workers` the directory holding `authority_review`.
+// `entry` is a node of the operator file `src` (tape `tp`): the registry row's authority entry; `compiler` the row's.
+pub fn run[&h, &f, &x, &w, &c, &j, &r, &v, &b, &s, &u, &k, &o, &e, &i](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], repo: &r [byte], revision: &v [byte], base: &b [byte], src: &s [byte], tp: &u [int], entry: int, compiler: &k [byte], workspace: &o [byte], execution_dir: &e [byte], timeout_ms: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write] Finished {
+    let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
+    if report.rule != 0 || recovered.errno != 0 {
+        map.drop(heap, existing);
+        var rule = report.rule;
+        if rule == 0 {
+            rule = 0 - 1;
+        }
+        return Finished { outcome: Outcome::Journal(rule), state: 0, number: 0, attempts: 0, worker_code: "" };
+    }
+    let id = authority_task.task_id(heap, report.tasks + 1);
+    var state = 0;
+    var attempts = 0;
+    var outcome = Outcome::Journal(0 - 1);
+    var worker_code = "";
+    let ceiling = json.string_view(src, tp, json.get(src, tp, entry, "ceiling"));
+    borrow id as &ib in {
+        let tid = buffer.bytes(ib);
+        let fresh = report.records == 0;
+        var seq = report.records + 1;
+        var tasks = existing;
+        let (t1, s1) = gate_run.move_to(heap, fs, journal_path, tasks, seq, tid, task.State::Proposed, task.Actor::Human, fresh);
+        let (t2, s2) = gate_run.move_to(heap, fs, journal_path, t1, s1, tid, task.State::Approved, task.Actor::Human, false);
+        tasks = t2;
+        seq = s2;
+        var checked = authority_task.check(authority_task.task_type(), repo, revision, base, workspace, execution_dir, compiler, ceiling, timeout_ms);
+        match checked {
+            authority_task.Checked::Held => {
+                if !authority_task.programs_ok(src, tp, json.get(src, tp, entry, "programs")) {
+                    checked = authority_task.Checked::Refused(authority_task.Refusal::PathInvalid);
+                }
+            }
+            authority_task.Checked::Refused(why) => {
+            }
+        }
+        match checked {
+            authority_task.Checked::Refused(why) => {
+                seq = gate_run.note(heap, fs, journal_path, seq, tid, authority_task.rule_name(why), false);
+                outcome = Outcome::Refused(why);
+            }
+            authority_task.Checked::Held => {
+                let (t3, s3) = gate_run.move_to(heap, fs, journal_path, tasks, seq, tid, task.State::Ready, task.Actor::Forge, false);
+                let (t4, s4) = gate_run.move_to(heap, fs, journal_path, t3, s3, tid, task.State::Running, task.Actor::Forge, false);
+                tasks = t4;
+                seq = gate_run.note_execution(heap, fs, journal_path, s4, "execution.started", tid, "");
+                if seq < 0 {
+                    outcome = Outcome::Journal(0 - 1);
+                } else {
+                    attempts = 1;
+                    let request_id = gate_run.request_id_of(heap, tid, attempts);
+                    borrow request_id as &rb in {
+                        let req = authority_task.request(heap, buffer.bytes(rb), attempts, tid, repo, revision, base, src, tp, entry, compiler, workspace, execution_dir, timeout_ms);
+                        borrow req as &qb in {
+                            let (out, ran) = worker.run(heap, exec, workers, clock, "authority_review", buffer.bytes(qb), 1048576, timeout_ms);
+                            var ending = dispatch.Ending::Timeout;
+                            borrow out as &ob in {
+                                ending = worker.settle_run(heap, fs, ran, buffer.bytes(ob), buffer.bytes(rb), tid, execution_dir, false);
+                                if !gate_run.succeeded(ending) {
+                                    worker_code = code_of(heap, buffer.bytes(ob));
+                                }
+                            }
+                            buffer.drop(heap, out);
+                            let consequence = dispatch.consequence(ending);
+                            let decision = retry.decide(consequence, attempts, true);
+                            let tag = dispatch.rule_tag(ending);
+                            if len(tag) > 0 {
+                                seq = gate_run.note(heap, fs, journal_path, seq, tid, tag, false);
+                            }
+                            if len(worker_code) > 0 {
+                                seq = gate_run.note(heap, fs, journal_path, seq, tid, worker_code, false);
+                            }
+                            var verdict = 0 - 1;
+                            match decision {
+                                retry.Decision::NotRetryable => {
+                                    if gate_run.succeeded(ending) {
+                                        verdict = recompute(heap, fs, execution_dir);
+                                        if verdict >= 0 && len(authority_review.rule_name(verdict)) > 0 {
+                                            seq = gate_run.note(heap, fs, journal_path, seq, tid, authority_review.rule_name(verdict), false);
+                                        }
+                                        seq = gate_run.note_execution(heap, fs, journal_path, seq, "execution.finished", tid, "done");
+                                    }
+                                }
+                                retry.Decision::Again => {
+                                    seq = gate_run.note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);
+                                }
+                                retry.Decision::Exhausted => {
+                                    seq = gate_run.note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);
+                                }
+                                retry.Decision::WriteRefused => {
+                                    seq = gate_run.note(heap, fs, journal_path, seq, tid, retry.rule_tag(decision), false);
+                                }
+                            }
+                            let (t5, s5) = gate_run.move_to(heap, fs, journal_path, tasks, seq, tid, retry.target_after(consequence, decision), task.Actor::Forge, false);
+                            tasks = t5;
+                            seq = s5;
+                            outcome = Outcome::Ended(ending, verdict);
+                        }
+                        buffer.drop(heap, req);
+                    }
+                    buffer.drop(heap, request_id);
+                }
+            }
+        }
+        if seq < 0 {
+            outcome = Outcome::Journal(0 - 1);
+        }
+        borrow tasks as &tb in {
+            state = journal.state_of(tb, tid);
+        }
+        map.drop(heap, tasks);
+    }
+    buffer.drop(heap, id);
+    return Finished { outcome: outcome, state: state, number: report.tasks + 1, attempts: attempts, worker_code: worker_code };
+}
+
+fn line[&i, &l, &v](io: &!i Io, label: &l [byte], value: &v [byte]) -> [io_write] int {
+    io.write_all(io, label);
+    io.write_all(io, value);
+    io.newline(io);
+    return 0;
+}
+
+// What a run came to, printed, and the exit status: 0 a verdict of `equal` or `narrower`, 1 refused (the journal, or the task), 3 the journal
+// could not be read or written, 4 the run ended without a verdict, 5 a verdict that is a refusal (`wider`, `ceiling-missing`, `unreadable`).
+fn show[&h, &i](heap: &!h Heap, io: &!i Io, done: Finished) -> [heap, io_write, err_write] int {
+    var code = 4;
+    var id = authority_task.task_id(heap, done.number);
+    borrow id as &ib in {
+        if done.number > 0 {
+            line(io, "task: ", buffer.bytes(ib));
+            line(io, "state: ", task.code_name(done.state));
+        }
+        match done.outcome {
+            Outcome::Journal(rule) => {
+                if rule > 0 {
+                    io.error_all(io, "forge: the journal is refused: ");
+                    io.error_all(io, task.rule_code_name(rule));
+                    io.error_all(io, "\n");
+                    code = 1;
+                } else {
+                    io.error_all(io, "forge: the journal cannot be read or written\n");
+                    code = 3;
+                }
+            }
+            Outcome::Refused(why) => {
+                line(io, "refused: ", authority_task.rule_name(why));
+                code = 1;
+            }
+            Outcome::Ended(ending, verdict) => {
+                let tag = dispatch.rule_tag(ending);
+                if len(tag) > 0 {
+                    line(io, "refusal: ", tag);
+                }
+                line(io, "ending: ", dispatch.consequence_name(dispatch.consequence(ending)));
+                if len(done.worker_code) > 0 {
+                    line(io, "worker-error: ", done.worker_code);
+                }
+                if verdict >= 0 {
+                    line(io, "verdict: ", authority_task.verdict_name(verdict));
+                    if len(authority_review.rule_name(verdict)) > 0 {
+                        line(io, "rule: ", authority_review.rule_name(verdict));
+                        code = 5;
+                    } else {
+                        code = 0;
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, id);
+    return code;
+}
+
+// One `repo.authority` task in the workspace `dir` (its journal and lock), its worker beneath `workers`: the lock, the run, the printing. The
+// exit status as `show` has it and the worker's own code ("" when it gave none).
+pub fn run_step[&h, &f, &x, &c, &i, &d, &w, &r, &v, &b, &s, &u, &k, &o, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, timeout_ms: int, dir: &d [byte], workers: &w [byte], repo: &r [byte], revision: &v [byte], base: &b [byte], src: &s [byte], tp: &u [int], entry: int, compiler: &k [byte], workspace: &o [byte], execution_dir: &e [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] (int, &static [byte]) {
+    let jpath = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/journal.jsonl");
+    let lpath = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/lock");
+    var code = 0;
+    var worker_code = "";
+    borrow jpath as &jb in {
+        borrow lpath as &lb in {
+            if journal_io.path_ok(fs, buffer.bytes(jb)) == false || journal_io.path_ok(fs, workers) == false {
+                io.error_all(io, "forge: path-invalid: <dir> and <workers> must be absolute, with no .. component\n");
+                code = 2;
+            } else {
+                match lock.acquire(fs, buffer.bytes(lb)) {
+                    lock.Lock::Refused(rule) => {
+                        io.error_all(io, "forge: ");
+                        io.error_all(io, task.rule_code_name(rule));
+                        io.error_all(io, ": the workspace cannot be written\n");
+                        code = 3;
+                    }
+                    lock.Lock::Failed(errno) => {
+                        io.error_all(io, "forge: the lock of the workspace could not be taken\n");
+                        code = 3;
+                    }
+                    lock.Lock::Held(held) => {
+                        match open_dir(fs, workers) {
+                            DirOpened::Failed(errno) => {
+                                io.error_all(io, "forge: cannot open the workers directory\n");
+                                code = 3;
+                            }
+                            DirOpened::Ok(opened) => {
+                                var wdir = opened;
+                                borrow wdir as &wd in {
+                                    let done = run(heap, fs, exec, wd, clock, buffer.bytes(jb), repo, revision, base, src, tp, entry, compiler, workspace, execution_dir, timeout_ms);
+                                    worker_code = done.worker_code;
+                                    code = show(heap, io, done);
+                                }
+                                dir_close(wdir);
+                            }
+                        }
+                        lock.let_go(held);
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, lpath);
+    return (code, worker_code);
+}

@@ -182,3 +182,17 @@ fn test_a_request_built_from_a_row_entry_is_one_the_worker_accepts[&h](heap: &!h
     unbox_slice(heap, otape);
     return 0;
 }
+
+fn test_the_task_ids_count_and_only_the_workers_own_codes_are_known[&h](heap: &!h Heap) -> [heap] int {
+    let id = authority_task.task_id(heap, 7);
+    borrow id as &ib in {
+        test.assert(bytes.equal(buffer.bytes(ib), "authority-7"));
+    }
+    buffer.drop(heap, id);
+    test.assert(bytes.equal(authority_task.known_code("authority-compiler-failed"), "authority-compiler-failed"));
+    test.assert(bytes.equal(authority_task.known_code("revision-mismatch"), "revision-mismatch"));
+    test.assert(bytes.equal(authority_task.known_code("evidence-unwritable"), "evidence-unwritable"));
+    test.assert(bytes.equal(authority_task.known_code("anything; else"), ""));
+    test.assert(bytes.equal(authority_task.known_code("authority-widened"), ""));
+    return 0;
+}
