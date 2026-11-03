@@ -530,7 +530,7 @@ pub fn request[&h, &c, &r, &b, &s, &n, &d, &x, &p, &g, &z](heap: &!h Heap, check
 // The request for a PATCH publish (docs/company.md section 21): the artifact is `src_name` beneath `src_dir`, accepted with `sha`; `dests` are the
 // files the patch touches (one per line); `base` is the commit the patch was made against (40 hex); the provenance goes to `prov_dest`. The worker
 // applies the patch itself, in cancho, to the checkout at `base`.
-pub fn request_patch[&h, &c, &r, &b, &s, &n, &d, &x, &y, &q, &p, &g](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], src_dir: &s [byte], src_name: &n [byte], dests: &d [byte], sha: &x [byte], base: &y [byte], prov_dest: &q [byte], prov: &p [byte], message: &g [byte]) -> [heap] buffer.Buffer {
+pub fn request_patch[&h, &c, &r, &b, &s, &n, &d, &x, &y, &q, &p, &g](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], src_dir: &s [byte], src_name: &n [byte], dests: &d [byte], sha: &x [byte], base: &y [byte], prov_dest: &q [byte], prov: &p [byte], message: &g [byte], adopt: bool) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 1024);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "checkout");
@@ -547,6 +547,10 @@ pub fn request_patch[&h, &c, &r, &b, &s, &n, &d, &x, &y, &q, &p, &g](heap: &!h H
     w = json.put_string(heap, w, dests);
     w = json.put_key(heap, w, "sha256");
     w = json.put_string(heap, w, sha);
+    if adopt {
+        w = json.put_key(heap, w, "adopt");
+        w = json.put_bool(heap, w, true);
+    }
     w = json.put_key(heap, w, "patch_base");
     w = json.put_string(heap, w, base);
     w = json.put_key(heap, w, "provenance_dest");

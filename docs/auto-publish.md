@@ -1,6 +1,6 @@
 # Publishing inside the flow: `repo.publish` as a step
 
-**Status: slices A1 and A2 built (docs/company.md section 27); A3 (adoption after a crash) is not.** Written before the code (`CONTRIBUTING.md`); every claim marked *measure* is checked by a case named below before this document says it is true. Where the code differs from this text, section 27 of `company.md` lists it, and the text below is corrected in place.
+**Status: slices A1, A2 and A3 built (docs/company.md section 27).** Written before the code (`CONTRIBUTING.md`); every claim marked *measure* is checked by a case named below before this document says it is true. Where the code differs from this text, section 27 of `company.md` lists it, and the text below is corrected in place.
 
 ## 1. The gap
 
@@ -54,11 +54,15 @@ The existing exit contract holds: 0 accepted, 1 refused, 13 held, 14 unavailable
 
 * **Rerun after success.** The step is accepted; `run` does not start it again. A publish a person already made (the journal holds the record) is
   taken as the step's own: accepted with that commit, no second branch.
-* **Crash between the commit and the journal record** (today: the verb exits 4, the commit exists). A rerun finds the branch
-  (`publish-branch-exists`) and no record. The step **adopts** the branch only when its tip commit's provenance trailer names this
-  company and this step *and* its tree equals what the verb would write now; then it appends the record and accepts. Anything else
-  stays `publish-branch-exists`, held for a person. *Measure:* conformance cases `a crash after the commit is adopted` and
-  `a branch of the same name that is not ours is not adopted`.
+* **Crash between the commit and the journal record** (the verb exits 4, the commit exists). A rerun finds the branch and no record. The step
+  **adopts** the branch only when the worker, which holds the checkout, finds it is what the publish would make *now*: the branch's tip is
+  one commit above the change's base commit, its tree is the tree of the base with the patch and the provenance file applied (the provenance
+  file names the company, the step, the patch digest and the decisions recorded, so a tree that matches names them), and its message is the
+  message the publish would write. Then the step appends the record and accepts, with the commit the branch already has: no second commit.
+  Anything else is `publish-branch-exists`, which the step holds as `check-unavailable` (`publish-refused`, exit 14), the branch untouched.
+  The worker answers an adopt request by looking at the checkout only through a staged index that it resets afterwards: nothing is committed
+  and no ref moves. *Measure:* `company_change.sh` cases `crash: a branch that is what the publish would make is adopted`, `... of the
+  same name that is not ours is not adopted`, `... the right tree under another message is not adopted`.
 * **A publish refused after admission** (a dirty or moved checkout, `publish-checkout-dirty` and the like) is **held**: `check-unavailable`, exit 14,
   not retried; the operator cleans the checkout and `decide retry:<id>`.
 * **The publish step is never retried by `run` itself.** One attempt per run, as for a check.
@@ -85,7 +89,7 @@ operator file keeps the second key in a different hand from the first (company a
 |---|---|---|
 | **A1** | `repo.publish` task type, `system` role, `Runner::Publish`, the operator `auto_publish` field and its form check, refusals `publish-step-invalid`, `publish-auto-not-granted`; the runner calls the verb's code | unit (manifest rules, operator form); `company_change.sh` `autopub:` cases: not granted → refused and not admitted; granted → branch `forge/<company>-<step>`, journal record, step accepted |
 | **A2** | a whole flow `fix → qa → publish → ceiling` to `done` with **no person command between**, then the branch is the only thing in the checkout that changed | `company_change.sh` `autopub: flow to done`; checkout `git status` clean, `git branch` shows exactly the one new branch, remote refs unchanged |
-| **A3** | adoption after a crash (section 4) | the two cases named there |
+| **A3** | adoption after a crash (section 4) | the `crash:` cases of `company_change.sh` (adopted; another branch of the name; the right tree under another message); `test_a_patch_request_asks_to_adopt_only_when_it_says_so` |
 
 ## 8. Open questions
 

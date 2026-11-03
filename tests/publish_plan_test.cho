@@ -276,3 +276,21 @@ pub fn test_the_request_carries_more_files_only_when_there_are_some[&h](heap: &!
     buffer.drop(heap, two);
     return 0;
 }
+
+pub fn test_a_patch_request_asks_to_adopt_only_when_it_says_so[&h](heap: &!h Heap) -> [heap] int {
+    let plain = publish_plan.request_patch(heap, "/c", "o/r", "forge/b", "/e", "change.patch", "src/a.cho", "ab", "1111111111111111111111111111111111111111", "docs/provenance.md", "p", "m", false);
+    let adopt = publish_plan.request_patch(heap, "/c", "o/r", "forge/b", "/e", "change.patch", "src/a.cho", "ab", "1111111111111111111111111111111111111111", "docs/provenance.md", "p", "m", true);
+    var plain_has = 0;
+    var adopt_has = 0;
+    borrow plain as &pb in {
+        plain_has = flag(bytes.find(buffer.bytes(pb), "\"adopt\":true") >= 0);
+    }
+    borrow adopt as &ab in {
+        adopt_has = flag(bytes.find(buffer.bytes(ab), "\"adopt\":true") >= 0);
+    }
+    buffer.drop(heap, plain);
+    buffer.drop(heap, adopt);
+    test.assert_eq(plain_has, 0);
+    test.assert_eq(adopt_has, 1);
+    return 0;
+}
