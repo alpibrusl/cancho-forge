@@ -42,8 +42,7 @@ mechanism (a throw-away checkout; it never writes the operator's), runs the comp
 the verdict and the two blocks as evidence (`report.json`). **External programs it starts: the compiler (it is the authority oracle) and `git` for the checkouts (as the gate runner does); nothing else.** Its
 own authority report is checked in (`docs/authority-authority-review.txt`), as every worker's is.
 
-**Tags** *(designed)*: `authority-widened`, `authority-ceiling-missing`, `authority-unreadable` (the compiler's report cannot be parsed), `authority-program-missing` (a listed program has no file at the head),
-`authority-compiler-failed`. Each reached by a test.
+**Tags** *(designed)*: `authority-widened`, `authority-ceiling-missing`, `authority-unreadable` (the compiler's report cannot be parsed), `authority-compiler-failed` (the compiler exited non-zero, which includes a listed program with no file at the head: *corrected on building the worker, the separate `authority-program-missing` was dropped*). Each reached by a test.
 
 ## 3. The review verdict *(designed)*
 
@@ -74,7 +73,7 @@ R-0 needs no model. R-1 spends money and waits for the M-1 budget decision.
 ## 6. Order
 
 1. R-0 and the pure `compare`, in cancho, with unit tests for every verdict (no worker yet). **Done** (`src/authority_review.cho`, `tests/authority_review_test.cho`, `spike/r0_check.sh`; result in `spike/RESULTS.md`). The tags are not yet in the gate's docs-tag list: they enter it with the worker that emits them.
-2. The worker, with a stand-in compiler script, then the real compiler, in the gate.
+2. The worker, with a stand-in compiler script, then the real compiler, in the gate. **Built with the stand-in** (`workers/authority_review.cho`, `docs/worker-contract.md` section 13); the real compiler against two real commits is not run yet.
 3. The registry field, in the operator file's checks.
 4. The review step (needs M-1's tool decisions), recorded and shown only.
 

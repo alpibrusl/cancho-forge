@@ -136,6 +136,12 @@ echo "== gate runner (workers/gate_runner.cho against real git checkouts, real c
 mkdir "$scratch/gate-runner" || exit 1
 CANCHO="$C" sh scripts/check_gate_runner.sh "$scratch/gate-runner" || fail=1
 
+echo "== authority review (workers/authority_review.cho, repo.authority: git checkouts, a stand-in compiler, real child processes; the pure comparison is measured by spike R-0)"
+mkdir "$scratch/authority-review" || exit 1
+CANCHO="$C" sh scripts/check_authority_review.sh "$scratch/authority-review" > "$scratch/authority-review.out" || fail=1
+cat "$scratch/authority-review.out"
+if grep -q '^FAIL ' "$scratch/authority-review.out"; then fail=1; fi
+
 echo "== cancho code adapter (workers/cancho_code.cho against a stand-in build tool, real child processes, the build's group killed at its deadline)"
 mkdir "$scratch/cancho-code" || exit 1
 CANCHO="$C" sh scripts/check_cancho_code.sh "$scratch/cancho-code" || fail=1

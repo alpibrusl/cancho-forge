@@ -1,0 +1,190 @@
+edition 9;
+module forge.authority_task;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import forge.authority_review;
+import forge.gate_task;
+
+// The `repo.authority` task (docs/reviewer.md section 2): given a repository of the allow-list, the head revision the checkout is at, and the
+// base revision the ceiling is read from, report whether the head's authority is within the ceiling. This module is the pure half: what a task
+// may name, the refusals with their rule tags, the shell text the worker starts, and the names of the verdicts. `workers/authority_review.cho`
+// is the process half; the comparison itself is `forge.authority_review`.
+//
+// What runs is never text from a task: the compiler is the operator's absolute path (`grants.compiler`), the programs and the ceiling file are
+// the operator's registry row copied into the task by Forge, and each is held to the narrow shapes below before it reaches a shell.
+
+pub fn task_type() -> [] &static [byte] {
+    return "repo.authority";
+}
+
+pub fn max_programs() -> [] int {
+    return 8;
+}
+
+pub fn max_report_bytes() -> [] int {
+    return 1048576;
+}
+
+// What a task is refused for. Each has a rule tag and a test that reaches it.
+pub enum Refusal {
+    TaskTypeInvalid,
+    ScopeInvalid,
+    // `input.revision` or `input.base` is not exactly 40 lower-case hexadecimal digits.
+    RevisionInvalid,
+    // A workspace, execution directory, compiler, ceiling file or program is not a path the worker will put in a shell command.
+    PathInvalid,
+    LimitsInvalid,
+}
+
+pub enum Checked {
+    Held,
+    Refused(Refusal),
+}
+
+pub fn rule_name(r: Refusal) -> [] &static [byte] {
+    match r {
+        Refusal::TaskTypeInvalid => {
+            return "task-type-invalid";
+        }
+        Refusal::ScopeInvalid => {
+            return "scope-invalid";
+        }
+        Refusal::RevisionInvalid => {
+            return "revision-invalid";
+        }
+        Refusal::PathInvalid => {
+            return "path-invalid";
+        }
+        Refusal::LimitsInvalid => {
+            return "limits-invalid";
+        }
+    }
+}
+
+// A path inside the repository: 1 to 200 bytes of letters, digits and `._/-`, and `*` when `star` (a program pattern the shell expands in the
+// workspace); no leading `/`, `.` or `-`, no `..`, no `//`, no component that starts with a dot or a dash, no trailing slash.
+pub fn rel_ok[&p](path: &p [byte], star: bool) -> [] bool {
+    if len(path) < 1 || len(path) > 200 {
+        return false;
+    }
+    var i = 0;
+    while i < len(path) {
+        let c = int_of(path[i]);
+        let letter = c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        let punct = c == 46 || c == 47 || c == 45 || c == 95;
+        let glob = star && c == 42;
+        if !letter && !digit && !punct && !glob {
+            return false;
+        }
+        let first = i == 0 || int_of(path[i - 1]) == 47;
+        if first && (c == 46 || c == 45 || c == 47) {
+            return false;
+        }
+        if c == 46 && i > 0 && int_of(path[i - 1]) == 46 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return int_of(path[len(path) - 1]) != 47;
+}
+
+// The first thing wrong with a task, in a fixed order: type, scope, revisions, paths, limits.
+pub fn check[&y, &r, &v, &b, &w, &e, &c, &f](task_type_text: &y [byte], repo: &r [byte], revision: &v [byte], base: &b [byte], workspace: &w [byte], execution_dir: &e [byte], compiler: &c [byte], ceiling: &f [byte], timeout_ms: int) -> [] Checked {
+    if !bytes.equal(task_type_text, task_type()) {
+        return Checked::Refused(Refusal::TaskTypeInvalid);
+    }
+    if !gate_task.repo_known(repo) {
+        return Checked::Refused(Refusal::ScopeInvalid);
+    }
+    if !gate_task.revision_ok(revision) || !gate_task.revision_ok(base) {
+        return Checked::Refused(Refusal::RevisionInvalid);
+    }
+    if !gate_task.path_ok(workspace) || !gate_task.path_ok(execution_dir) || !gate_task.path_ok(compiler) || !rel_ok(ceiling, false) {
+        return Checked::Refused(Refusal::PathInvalid);
+    }
+    if timeout_ms < gate_task.min_timeout_ms() || timeout_ms > gate_task.max_timeout_ms() {
+        return Checked::Refused(Refusal::LimitsInvalid);
+    }
+    return Checked::Held;
+}
+
+// Whether `node` is a non-empty array of at most `max_programs()` strings that are each a `rel_ok` pattern.
+pub fn programs_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if node < 0 || !json.is_array(tp, node) {
+        return false;
+    }
+    let n = json.count(tp, node);
+    if n < 1 || n > max_programs() {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        let p = json.at(tp, node, i);
+        if !json.is_string(tp, p) || !json.string_plain(tp, p) || !rel_ok(json.string_view(src, tp, p), true) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// The programs, space separated, for the compiler's command line; only after `programs_ok`.
+pub fn programs_text[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], node: int) -> [heap] buffer.Buffer {
+    var b = buffer.empty(heap, 64);
+    var i = 0;
+    while i < json.count(tp, node) {
+        if i > 0 {
+            b = buffer.push(heap, b, byte_of(32));
+        }
+        b = buffer.append(heap, b, json.string_view(src, tp, json.at(tp, node, i)));
+        i = i + 1;
+    }
+    return b;
+}
+
+// The shell text that prints the ceiling file as it is at the base commit: `git show <base>:<ceiling>`. A failure (no such commit or file) is the
+// shell's non-zero status, which is a missing ceiling. Standard error is dropped. `workspace`, `base` and `ceiling` have passed `check`.
+pub fn ceiling_script[&h, &w, &b, &c](heap: &!h Heap, workspace: &w [byte], base: &b [byte], ceiling: &c [byte]) -> [heap] buffer.Buffer {
+    var s = buffer.append(heap, buffer.empty(heap, 128), "exec 2>/dev/null; cd ");
+    s = buffer.append(heap, s, workspace);
+    s = buffer.append(heap, s, " && git show ");
+    s = buffer.append(heap, s, base);
+    s = buffer.push(heap, s, byte_of(58));
+    s = buffer.append(heap, s, ceiling);
+    return buffer.append(heap, s, "; exit $?");
+}
+
+// The shell text that asks the compiler for the head's authority: `<compiler> authority <programs> [--std]`, run in the workspace, both streams
+// to standard output. `programs` is `programs_text`, `compiler` an absolute path that has passed `path_ok`.
+pub fn authority_script[&h, &w, &c, &p](heap: &!h Heap, workspace: &w [byte], compiler: &c [byte], programs: &p [byte], std: bool) -> [heap] buffer.Buffer {
+    var s = buffer.append(heap, buffer.empty(heap, 128), "exec 2>&1; cd ");
+    s = buffer.append(heap, s, workspace);
+    s = buffer.append(heap, s, " && ");
+    s = buffer.append(heap, s, compiler);
+    s = buffer.append(heap, s, " authority ");
+    s = buffer.append(heap, s, programs);
+    if std {
+        s = buffer.append(heap, s, " --std");
+    }
+    return buffer.append(heap, s, "; exit $?");
+}
+
+// The name of a verdict code, as the report writes it.
+pub fn verdict_name(code: int) -> [] &static [byte] {
+    if code == authority_review.equal() {
+        return "equal";
+    }
+    if code == authority_review.narrower() {
+        return "narrower";
+    }
+    if code == authority_review.wider() {
+        return "wider";
+    }
+    if code == authority_review.ceiling_missing() {
+        return "ceiling-missing";
+    }
+    return "unreadable";
+}

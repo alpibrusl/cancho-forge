@@ -196,3 +196,8 @@ std = true
 name = "authority_review"
 sources = ["tests/authority_review_test.cho", "src/authority_review.cho"]
 std = true
+
+[[test]]
+name = "authority_task"
+sources = ["tests/authority_task_test.cho", "src/authority_task.cho", "src/authority_review.cho", "src/gate_task.cho", "src/gate_env.cho"]
+std = true
