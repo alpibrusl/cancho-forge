@@ -143,6 +143,8 @@ pub enum Runner {
     Change,
     // A reviewer's `repo.authority` step (docs/company.md section 26): the authority worker over the commit its `repo.change` need was published as.
     Authority,
+    // A `system` step's `repo.publish` (docs/auto-publish.md): Forge makes the local branch and commit; its artifact `publish.txt` names them.
+    Publish,
 }
 
 // The runner of a step: `Change` for a `repo.change` step, else the role's (`runner_of`).
@@ -152,6 +154,9 @@ pub fn runner_for(step: company_manifest.Step) -> [] Runner {
     }
     if company_manifest.is_repo_authority(step) {
         return Runner::Authority;
+    }
+    if company_manifest.is_repo_publish(step) {
+        return Runner::Publish;
     }
     return runner_of(step.role);
 }
@@ -175,6 +180,9 @@ pub fn runner_of(role: company_manifest.Role) -> [] Runner {
         }
         company_manifest.Role::Analyst => {
             return Runner::Tool;
+        }
+        company_manifest.Role::System => {
+            return Runner::Publish;
         }
     }
 }
@@ -205,6 +213,9 @@ pub fn artifact_name(r: Runner) -> [] &static [byte] {
         Runner::Authority => {
             return "authority.txt";
         }
+        Runner::Publish => {
+            return "publish.txt";
+        }
     }
 }
 
@@ -233,6 +244,9 @@ pub fn artifact_rel[&h, &i](heap: &!h Heap, id: &i [byte], r: Runner) -> [heap] 
             out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
         }
         Runner::Authority => {
+            out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
+        }
+        Runner::Publish => {
             out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
         }
     }
@@ -272,6 +286,9 @@ fn is_person(r: Runner) -> [] bool {
             return false;
         }
         Runner::Authority => {
+            return false;
+        }
+        Runner::Publish => {
             return false;
         }
     }
@@ -740,7 +757,7 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 // again by what uses it (`journal_io.path_ok`, `gate_task.check`, `build_task`), so the file grants nothing.
 
 fn root_keys() -> [] &static [byte] {
-    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs publish commit_trailer repos ";
+    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs publish commit_trailer repos auto_publish ";
 }
 
 fn analyst_keys() -> [] &static [byte] {
@@ -865,7 +882,7 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
     if len(limit_reason(src, tp)) > 0 || len(repo_row.rows_reason(src, tp)) > 0 {
         return false;
     }
-    if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false || publish_ok(src, tp) == false {
+    if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false || publish_ok(src, tp) == false || auto_publish_ok(src, tp) == false {
         return false;
     }
     let agent = json.get(src, tp, 0, "agent");
@@ -1042,6 +1059,63 @@ fn publish_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
         j = j + 1;
     }
     return ok;
+}
+
+// `auto_publish` (docs/auto-publish.md): an object of repository ids, each an object of exactly `branch_prefix`, a plain string `prefix_ok` accepts.
+fn auto_publish_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
+    let all = json.get(src, tp, 0, "auto_publish");
+    if all < 0 {
+        return true;
+    }
+    if json.is_object(tp, all) == false || keys_plain(tp, all) == false || json.count(tp, all) > 64 {
+        return false;
+    }
+    let n = json.count(tp, all);
+    var k = all + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        let v = k + 1;
+        if json.is_object(tp, v) == false || keys_ok(src, tp, v, " branch_prefix ") == false || json.count(tp, v) != 1 {
+            ok = false;
+        } else if plain_string(tp, json.get(src, tp, v, "branch_prefix")) == false || prefix_ok(json.string_view(src, tp, json.get(src, tp, v, "branch_prefix"))) == false {
+            ok = false;
+        }
+        k = json.skip(tp, v);
+        j = j + 1;
+    }
+    return ok;
+}
+
+// A branch prefix: 2 to 40 bytes of `A-Za-z0-9._-/` ending in `/`, no component empty or starting with a dot or a dash, no `..`, no `.lock` component
+// (the rules of a branch name, `publish_plan.branch_ok`, which the publish applies again to the whole name).
+pub fn prefix_ok[&p](prefix: &p [byte]) -> [] bool {
+    if len(prefix) < 2 || len(prefix) > 40 || int_of(prefix[len(prefix) - 1]) != 47 {
+        return false;
+    }
+    var i = 0;
+    var start = true;
+    while i < len(prefix) {
+        let c = int_of(prefix[i]);
+        let plain = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 46 || c == 45 || c == 95 || c == 47;
+        if plain == false || start && (c == 46 || c == 45 || c == 47) {
+            return false;
+        }
+        start = c == 47;
+        i = i + 1;
+    }
+    return bytes.find(prefix, "..") < 0 && bytes.find(prefix, ".lock/") < 0;
+}
+
+// The `branch_prefix` the operator granted to repository `repo`, empty when there is none.
+pub fn op_auto_prefix[&s, &t, &r](src: &s [byte], tp: &t [int], repo: &r [byte]) -> [] &s [byte] {
+    let all = json.get(src, tp, 0, "auto_publish");
+    let entry = json.get(src, tp, all, repo);
+    let node = json.get(src, tp, entry, "branch_prefix");
+    if json.is_string(tp, node) == false {
+        return src[0..0];
+    }
+    return json.string_view(src, tp, node);
 }
 
 // `files` of a publish entry: an object of one to eight entries, every value a plain string.

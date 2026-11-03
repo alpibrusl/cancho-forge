@@ -1,7 +1,6 @@
 # Publishing inside the flow: `repo.publish` as a step
 
-**Status: design, not built.** Written before the code (`CONTRIBUTING.md`); every claim marked *measure* is checked by a case named below
-before this document says it is true.
+**Status: slices A1 and A2 built (docs/company.md section 27); A3 (adoption after a crash) is not.** Written before the code (`CONTRIBUTING.md`); every claim marked *measure* is checked by a case named below before this document says it is true. Where the code differs from this text, section 27 of `company.md` lists it, and the text below is corrected in place.
 
 ## 1. The gap
 
@@ -23,12 +22,12 @@ so `step_rules_code` accepts it only with `"role": "system"` (a new fixed role, 
 {"id": "publish", "role": "system", "task_type": "repo.publish", "needs": ["fix"]}
 ```
 
-* `needs` is exactly one `repo.change` step (or a builder or library step), else `publish-step-invalid`,
+* `needs` is exactly one `repo.change` step (a builder or library step still needs the verb), else `publish-step-invalid`,
   exit 1, nothing written.
 * It is *ready* when the step it needs is accepted **and every other step that needs it for review (`qa`) is accepted**: the flow
   author orders it with `needs` on the review step too, as for any step. Forge adds no hidden ordering.
-* The reviewer's `repo.authority` step then `needs` the publish step. Its precondition (`authority-unpublished`) is satisfied by the
-  journal record the publish step writes, so the step it reads does not change.
+* The reviewer's `repo.authority` step then `needs` the change step **and** the publish step. Its precondition (`authority-unpublished`) is satisfied by the
+  journal record the publish step writes, so what it reads does not change.
 
 ## 3. The grant
 
@@ -41,7 +40,7 @@ others (`operator-invalid` with a `reason:`):
 
 * No entry for the step's repository: the step is **refused** `publish-auto-not-granted`, exit 1, not admitted. The company file cannot
   grant itself publication.
-* The branch is **not chosen by the company**: `<branch_prefix><company id>-<step id>`, checked by the same branch rules as the verb
+* The branch is **not chosen by the company**: `<branch_prefix><company id>-<id of the repo.change step>`, checked by the same branch rules as the verb
   (`publish-branch-invalid`). It is therefore the same on every run, which is what makes the step idempotent (section 4).
 * `branch_prefix` is 1 to 40 bytes of `A-Za-z0-9._-/` ending in `/`. Nothing else is configurable: no push, no remote, no force, no
   file list beyond what the person's verb already takes from the `publish` / `repos` rows.
@@ -53,13 +52,14 @@ not a second implementation, so every `publish-*` tag of section 12 applies unch
 
 The existing exit contract holds: 0 accepted, 1 refused, 13 held, 14 unavailable, 4 I/O.
 
-* **Rerun after success.** The step is accepted; `run` does not start it again.
+* **Rerun after success.** The step is accepted; `run` does not start it again. A publish a person already made (the journal holds the record) is
+  taken as the step's own: accepted with that commit, no second branch.
 * **Crash between the commit and the journal record** (today: the verb exits 4, the commit exists). A rerun finds the branch
   (`publish-branch-exists`) and no record. The step **adopts** the branch only when its tip commit's provenance trailer names this
   company and this step *and* its tree equals what the verb would write now; then it appends the record and accepts. Anything else
   stays `publish-branch-exists`, held for a person. *Measure:* conformance cases `a crash after the commit is adopted` and
   `a branch of the same name that is not ours is not adopted`.
-* **A dirty or moved checkout** is `publish-checkout-dirty` / `publish-checkout-invalid` as today, and is **held** (exit 13, a reason),
+* **A publish refused after admission** (a dirty or moved checkout, `publish-checkout-dirty` and the like) is **held**: `check-unavailable`, exit 14,
   not retried; the operator cleans the checkout and `decide retry:<id>`.
 * **The publish step is never retried by `run` itself.** One attempt per run, as for a check.
 

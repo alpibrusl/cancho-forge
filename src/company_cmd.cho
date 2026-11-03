@@ -200,6 +200,9 @@ pub fn role_name(r: company_manifest.Role) -> [] &static [byte] {
         company_manifest.Role::Product => {
             return "product";
         }
+        company_manifest.Role::System => {
+            return "system";
+        }
     }
 }
 

@@ -63,6 +63,9 @@ fn runner_code(r: company_step.Runner) -> [] int {
         company_step.Runner::Authority => {
             return 7;
         }
+        company_step.Runner::Publish => {
+            return 8;
+        }
     }
 }
 
@@ -80,6 +83,8 @@ fn test_each_role_has_its_runner_and_artifact() -> [] int {
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Tool), "tool.out"));
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Authority), "authority.txt"));
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Change), "change.patch"));
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Publish), "publish.txt"));
+    test.assert_eq(runner_code(company_step.runner_of(company_manifest.Role::System)), 8);
     return 0;
 }
 
@@ -661,5 +666,32 @@ fn test_an_operator_file_with_a_good_repos_row_is_taken_and_a_bad_one_is_not[&h]
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"repos\":{\"diff\":{\"kind\":\"library\",\"checkout\":\"/co/diff\",\"compiler_rev\":\"f4ead824f33b291a0ad7620a34a0c1346a7abe4f\",\"publish_allow\":[\"src/**\"],\"max_patch_files\":20,\"max_patch_lines\":800}}}"));
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"repos\":{\"diff\":{\"kind\":\"library\",\"checkout\":\"/co/diff\",\"compiler_rev\":\"f4ead82\",\"publish_allow\":[\"src/**\"],\"max_patch_files\":20,\"max_patch_lines\":800}}}") == false);
     test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"repos\":[]}") == false);
+    return 0;
+}
+
+fn test_an_auto_publish_row_is_a_prefix_per_repository_and_nothing_else[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"auto_publish\":{\"diff\":{\"branch_prefix\":\"forge/\"}}}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"auto_publish\":{}}"));
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"auto_publish\":{\"diff\":{\"branch_prefix\":\"forge/\",\"push\":true}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"auto_publish\":{\"diff\":{}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"auto_publish\":{\"diff\":{\"branch_prefix\":\"forge\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"auto_publish\":{\"diff\":{\"branch_prefix\":\"../x/\"}}}") == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"auto_publish\":[]}") == false);
+    return 0;
+}
+
+fn test_a_branch_prefix_follows_the_rules_of_a_branch_name() -> [] int {
+    test.assert(company_step.prefix_ok("forge/"));
+    test.assert(company_step.prefix_ok("bots/forge-1/"));
+    test.assert(company_step.prefix_ok("a/") == true);
+    test.assert(company_step.prefix_ok("/") == false);
+    test.assert(company_step.prefix_ok("forge") == false);
+    test.assert(company_step.prefix_ok(".x/") == false);
+    test.assert(company_step.prefix_ok("-x/") == false);
+    test.assert(company_step.prefix_ok("a//b/") == false);
+    test.assert(company_step.prefix_ok("a..b/") == false);
+    test.assert(company_step.prefix_ok("a b/") == false);
+    test.assert(company_step.prefix_ok("a.lock/") == false);
+    test.assert(company_step.prefix_ok("0123456789012345678901234567890123456789/") == false);
     return 0;
 }

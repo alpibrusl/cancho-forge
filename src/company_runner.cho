@@ -11,6 +11,7 @@ import std.option;
 import std.process;
 import forge.await_run;
 import forge.await_task;
+import forge.company_autopub;
 import forge.company_budget;
 import forge.company_clock;
 import forge.company_cmd;
@@ -703,6 +704,9 @@ fn run_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n, &z](heap: &!h Heap, fs: 
         company_step.Runner::Authority => {
             return authority_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, k, seq, existed);
         }
+        company_step.Runner::Publish => {
+            return publish_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, k, seq, existed);
+        }
     }
 }
 
@@ -726,10 +730,15 @@ fn authority_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f
     let step = company_manifest.step_at(hm, k);
     let id = company_manifest.step_id(hm, step);
     let at = company_graph.index_of(hm, company_manifest.step_need(hm, step, 0));
-    if company_manifest.step_needs_count(hm, step) != 1 || at < 0 || company_manifest.is_repo_change(company_manifest.step_at(hm, at)) == false {
+    let n_needs = company_manifest.step_needs_count(hm, step);
+    var second = n_needs == 1;
+    if n_needs == 2 {
+        second = company_manifest.is_repo_publish(company_manifest.step_at(hm, company_graph.index_of(hm, company_manifest.step_need(hm, step, 1))));
+    }
+    if second == false || at < 0 || company_manifest.is_repo_change(company_manifest.step_at(hm, at)) == false {
         refuse(io, rule_authority_unconfigured());
         say(io, "step: ", id);
-        say(io, "reason: ", "a repo.authority step needs exactly one step, a repo.change step");
+        say(io, "reason: ", "a repo.authority step needs a repo.change step, and may need the repo.publish step that publishes it");
         return company_step.exit_refused();
     }
     let need = company_manifest.step_id(hm, company_manifest.step_at(hm, at));
@@ -851,6 +860,72 @@ fn authority_decide[&h, &f, &x, &c, &i, &j, &s, &t, &n, &e, &g, &k, &b](heap: &!
         }
     }
     buffer.drop(heap, summary);
+    return code;
+}
+
+// A `system` step's `repo.publish` (docs/auto-publish.md): the local branch and commit of the `repo.change` step it needs, made by Forge to the branch the operator's
+// `auto_publish` row names the prefix of, by the code of `forge company publish` (`company_autopub.run`). Refused, nothing written, the step not admitted:
+// `publish-step-invalid` (it does not need exactly one repo.change step), `publish-auto-not-granted` (no row for the repository). Admitted, the publish records
+// `company.step.published`, `publish.txt` names the branch and the commit and is the artifact; a publish that was refused is a check that could not run
+// (`check-unavailable`, exit 14, the step held; `decide retry:<id>` frees it).
+fn publish_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], k: int, seq: int, existed: bool) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write] int {
+    let id = company_manifest.step_id(hm, company_manifest.step_at(hm, k));
+    let gate = company_autopub.preflight(hm, op, tp, k);
+    if gate != 0 {
+        if gate == 1 {
+            refuse(io, company_autopub.rule_invalid());
+        } else {
+            refuse(io, company_autopub.rule_not_granted());
+        }
+        say(io, "step: ", id);
+        return company_step.exit_refused();
+    }
+    let rel = glue(heap, "steps/", id);
+    var code = 0;
+    borrow rel as &rb in {
+        let stepdir = company_cmd.under(heap, dir, buffer.bytes(rb));
+        borrow stepdir as &sb in {
+            let evdir = glue(heap, buffer.bytes(sb), "/ev");
+            borrow evdir as &eb in {
+                if ev_ready(heap, fs, dir, id, k >= company_manifest.own_step_count(hm), buffer.bytes(eb)) == false {
+                    refuse(io, rule_step_dir_missing());
+                    say(io, "step: ", id);
+                    code = company_step.exit_refused();
+                } else {
+                    code = record_buffer(heap, fs, io, jpath, company_state.admitted(heap, seq, id, buffer.bytes(rb)), existed == false);
+                    if code == 0 {
+                        let (rc, appended, sha) = company_autopub.run(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, k, buffer.bytes(eb));
+                        if rc == 0 {
+                            let shown = company_step.artifact_rel(heap, id, company_step.Runner::Publish);
+                            borrow shown as &wb in {
+                                borrow sha as &hb in {
+                                    code = record_buffer(heap, fs, io, jpath, company_state.accepted(heap, seq + 1 + appended, id, buffer.bytes(wb), buffer.bytes(hb)), false);
+                                }
+                            }
+                            buffer.drop(heap, shown);
+                            if code == 0 {
+                                say(io, "accepted: ", id);
+                                code = 0 - 1;
+                            }
+                        } else if rc == company_step.exit_io() {
+                            code = rc;
+                        } else {
+                            code = record_buffer(heap, fs, io, jpath, company_state.check_unavailable(heap, seq + 1, id, "publish-refused"), false);
+                            if code == 0 {
+                                refuse(io, "check-unavailable");
+                                say(io, "step: ", id);
+                                code = company_step.exit_check_unavailable();
+                            }
+                        }
+                        buffer.drop(heap, sha);
+                    }
+                }
+            }
+            buffer.drop(heap, evdir);
+        }
+        buffer.drop(heap, stepdir);
+    }
+    buffer.drop(heap, rel);
     return code;
 }
 

@@ -61,6 +61,9 @@ fn is_build(r: company_step.Runner) -> [] bool {
         company_step.Runner::Authority => {
             return false;
         }
+        company_step.Runner::Publish => {
+            return false;
+        }
     }
 }
 
@@ -70,6 +73,9 @@ fn is_change(r: company_step.Runner) -> [] bool {
             return true;
         }
         company_step.Runner::Authority => {
+            return false;
+        }
+        company_step.Runner::Publish => {
             return false;
         }
         company_step.Runner::Build => {
@@ -772,7 +778,7 @@ fn patch_publish[&h, &f, &x, &c, &i, &m, &s, &j, &d, &o, &p, &b](heap: &!h Heap,
 
 // The row of the step's repository: its slug (the origin the worker holds the checkout to), its checkout, its patterns and bounds. The patch is read,
 // hashed again against the journal and bounded again against the row, as at acceptance: the worker is not the only one who looks.
-fn patch_row[&h, &f, &x, &c, &i, &m, &s, &j, &d, &o, &t, &p, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], src: &o [byte], tp: &t [int], step: &p [byte], branch: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write] int {
+pub fn patch_row[&h, &f, &x, &c, &i, &m, &s, &j, &d, &o, &t, &p, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], src: &o [byte], tp: &t [int], step: &p [byte], branch: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write] int {
     let repo_id = company_manifest.step_repo(hm, company_manifest.step_at(hm, at));
     let row = repo_row.row_of(src, tp, repo_id);
     if row < 0 {

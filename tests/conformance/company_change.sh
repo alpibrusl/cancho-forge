@@ -304,6 +304,32 @@ run "$w/cob" "$w/op-wide.json"
 check "step: a published commit wider than its ceiling holds the step: check-failed, exit 13, the verdict printed, not accepted" sh -c "[ \$(cat '$w/rc') = 13 ] && grep -qx 'verdict: wider' '$w/out' && grep -qx 'refusal: check-failed' '$w/out' && ! grep -q 'accepted\",\"task\":\"rev' '$w/cob/company.journal'"
 run "$w/cob" "$w/op-wide.json"
 check "step: the next run does not start it again by itself: held, exit 13, admitted once" sh -c "[ \$(cat '$w/rc') = 13 ] && [ \$(grep -c '\"task\":\"rev\"' '$w/cob/company.journal' | tr -d ' ') = 2 ]"
+# ---- repo.publish as a step of the company (docs/auto-publish.md): Forge makes the local branch itself, where the operator granted a prefix
+mkrepo ckap
+git -C "$w/ckap" remote add origin https://github.com/alpibrusl/cancho-diff.git
+git -C "$w/ckap" config user.email forge@example.invalid; git -C "$w/ckap" config user.name forge
+aprow() { # name, extra top-level fields
+  printf '{"workers":"%s","tools":"%s","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent"%s,"repos":{"diff":{"kind":"library","slug":"alpibrusl/cancho-diff","checkout":"%s","compiler_rev":"%s","publish_allow":["src/**"],"max_patch_files":3,"max_patch_lines":9,"compiler":"%s","authority":[{"programs":["src/*.cho"],"std":true,"ceiling":"docs/authority.txt"}]}}}' "$w/workers" "$w/tools" "$2" "$w/ckap" "$REV" "$w/stubc" > "$w/$1.json"
+}
+aprow op-ap-no ""
+aprow op-ap ",\"auto_publish\":{\"diff\":{\"branch_prefix\":\"forge/\"}}"
+mkco coap good ',{"id":"pub","role":"system","task_type":"repo.publish","needs":["chg"],"input":"publish"},{"id":"rev","role":"reviewer","task_type":"repo.authority","needs":["chg","pub"],"input":"review"}'
+sed 's/"roles":\["builder"\]/"roles":["builder","reviewer"]/' "$w/coap/company.json" > "$w/coap/company.json.new" && mv "$w/coap/company.json.new" "$w/coap/company.json"
+mkdir -p "$w/coap/steps/pub/ev" "$w/coap/steps/rev/ev"
+run "$w/coap" "$w/op-ap-no.json"
+check "autopub: no auto_publish row for the repository: publish-auto-not-granted, exit 1, the step not admitted, no branch" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'accepted: chg' '$w/out' && grep -qx 'refusal: publish-auto-not-granted' '$w/out' && ! grep -q '\"task\":\"pub\"' '$w/coap/company.journal' && [ \"\$(git -C '$w/ckap' branch | wc -l | tr -d ' ')\" = 1 ]"
+cp -R "$w/coap" "$w/coaq"
+"$F" company publish "$w/coaq" "$w/op-ap.json" chg forge/person > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+personc=$(sed -n 's/^commit: //p' "$w/out")
+run "$w/coaq" "$w/op-ap.json"
+check "autopub: a publish a person already made is adopted: the step is accepted with that commit, no second branch" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: pub' '$w/out' && grep -qx 'commit $personc' '$w/coaq/steps/pub/ev/publish.txt' && ! git -C '$w/ckap' rev-parse --verify --quiet refs/heads/forge/co-chg > /dev/null && [ \$(grep -c 'company.step.published' '$w/coaq/company.journal' | tr -d ' ') = 1 ]"
+run "$w/coap" "$w/op-ap.json"
+check "autopub: granted, the flow runs to its end with no person command between: pub and rev accepted, done" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: pub' '$w/out' && grep -qx 'accepted: rev' '$w/out' && grep -qx 'done: steps accepted 3' '$w/out'"
+check "autopub: the branch is the operator's prefix, the company and the step, and the journal records it" sh -c "git -C '$w/ckap' rev-parse --verify --quiet refs/heads/forge/co-chg > /dev/null && grep 'company.step.published' '$w/coap/company.journal' | grep -q '\"task\":\"chg\",\"branch\":\"forge/co-chg\"'"
+check "autopub: publish.txt names the branch and the commit, and Forge hashed it" sh -c "grep -qx 'branch forge/co-chg' '$w/coap/steps/pub/ev/publish.txt' && grep -q 'commit ' '$w/coap/steps/pub/ev/publish.txt' && grep 'company.step.accepted' '$w/coap/company.journal' | grep -q '\"task\":\"pub\",\"artifact\":\"steps/pub/ev/publish.txt\"'"
+check "autopub: the checkout is on its branch, clean, nothing was pushed (no remote refs)" sh -c "[ -z \"\$(git -C '$w/ckap' status --porcelain --untracked-files=all)\" ] && [ -z \"\$(git -C '$w/ckap' for-each-ref refs/remotes)\" ]"
+run "$w/coap" "$w/op-ap.json"
+check "autopub: a second run does nothing: pub admitted once and published once" sh -c "[ \$(grep -c '\"task\":\"pub\"' '$w/coap/company.journal' | tr -d ' ') = 2 ] && [ \$(grep -c 'company.step.published' '$w/coap/company.journal' | tr -d ' ') = 1 ]"
 pubop op-noslug ""
 sed 's/"slug":"alpibrusl\/cancho-diff",//' "$w/op-noslug.json" > "$w/op-noslug2.json"
 "$F" company publish "$w/co1" "$w/op-noslug2.json" chg forge/other > "$w/out" 2> /dev/null; echo $? > "$w/rc"
