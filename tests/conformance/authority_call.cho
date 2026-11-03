@@ -1,0 +1,75 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import std.json;
+import forge.authority_call;
+import forge.journal_io;
+import forge.repo_row;
+
+// Forge's call of the authority worker (src/authority_call.cho) against the real worker binary, real git checkouts and a stand-in compiler:
+// `scripts/check_authority_review.sh` makes the fixtures and is the oracle (the journal, the evidence and the printed lines); this program is
+// what Forge would run, once.
+//
+// Usage: authority_call <workspace dir> <workers dir> <operator file> <row id> <repo> <revision> <base> <checkout> <execution dir>
+// Exit status as `authority_call.run_step` has it (0 equal or narrower, 1 refused, 3 journal or lock, 4 no verdict, 5 a refusing verdict).
+
+fn go[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] int {
+    let (text, errno) = journal_io.read_all(heap, fs, arg(args, 3));
+    var status = 2;
+    if errno == 0 {
+        borrow text as &tb in {
+            let src = buffer.bytes(tb);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            borrow mut tape as &!t in {
+                let tp = contents(t);
+                if json.parse(src, tp) > 0 && len(repo_row.rows_reason(src, tp)) == 0 {
+                    let row = repo_row.row_of(src, tp, arg(args, 4));
+                    let entry = repo_row.authority_entry(src, tp, row, 0);
+                    if row >= 0 && entry >= 0 {
+                        let (code, worker_code) = authority_call.run_step(heap, fs, exec, clock, io, 60000, arg(args, 1), arg(args, 2), arg(args, 5), arg(args, 6), arg(args, 7), src, tp, entry, repo_row.field_text(src, tp, row, "compiler"), arg(args, 8), arg(args, 9));
+                        status = code;
+                    }
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+    }
+    buffer.drop(heap, text);
+    return status;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow fs as &f in {
+        borrow exec as &x in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        borrow args as &g in {
+                            if arg_count(g) == 10 {
+                                status = go(h, f, x, c, i, g);
+                            } else {
+                                io.error_all(i, "usage: authority_call <workspace dir> <workers dir> <operator file> <row id> <repo> <revision> <base> <checkout> <execution dir>\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(exec);
+    release(clock);
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

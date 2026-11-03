@@ -89,4 +89,29 @@ done
 # the capabilities verb
 printf '{"contract":"forge-worker/1","verb":"capabilities","request_id":"c-1"}' | "$ar/worker" > "$ar/reply_caps"
 check caps "task type repo.authority, level sync" reply_caps 'repo.authority'
+
+# ---- Forge's call (src/authority_call.cho): the journal, the recomputed verdict and the printed lines -------------------------------------------
+$C check tests/conformance/authority_call.cho $libs --std || fail=1
+if ! $C build tests/conformance/authority_call.cho $libs --std -o "$ar/call"; then echo "FAIL authority review: the call driver did not build"; exit 1; fi
+mkdir "$ar/workers" && cp "$ar/worker" "$ar/workers/authority_review" || exit 1
+printf '{"workers":"/w","repos":{"forge":{"kind":"library","checkout":"/abs/forge","compiler_rev":"f4ead824f33b291a0ad7620a34a0c1346a7abe4f","publish_allow":["src/**"],"max_patch_files":20,"max_patch_lines":800,"compiler":"%s","authority":[{"programs":["src/*.cho"],"std":true,"ceiling":"docs/authority.txt"}]}}}' "$ar/stubc" > "$ar/operator.json"
+call() { # fixture name: run the call in a fresh workspace and execution directory; output in call_<name>.out, status in call_<name>.rc
+  d="$ar/$1"; mkdir "$ar/ws_$1" "$ar/cev_$1" || exit 1
+  "$ar/call" "$ar/ws_$1" "$ar/workers" "$ar/operator.json" forge alpibrusl/cancho-forge "$(git -C "$d" rev-parse HEAD)" "$(git -C "$d" rev-parse HEAD~1)" "$d" "$ar/cev_$1" > "$ar/call_$1.out" 2> "$ar/call_$1.err"; echo $? > "$ar/call_$1.rc"
+}
+for n in equal narrower wider edited failing; do call $n; done
+cc() { # name, expected status, description
+  if [ "$(cat "$ar/call_$1.rc")" = "$2" ]; then ok "call $1: $3 (status $2)"; else bad "call $1: $3 (status $(cat "$ar/call_$1.rc"), wanted $2)"; fi
+}
+cc equal 0 "equal verdict"
+cc narrower 0 "narrower verdict"
+cc wider 5 "wider verdict is a refusing verdict"
+cc edited 5 "a patch that edits its own ceiling is still wider"
+cc failing 4 "a compiler that fails is a run without a verdict"
+grep -q '^verdict: equal$' "$ar/call_equal.out" && ok "call equal: prints the recomputed verdict" || bad "call equal: no verdict line"
+grep -q '^state: verification$' "$ar/call_equal.out" && ok "call equal: the task is in verification" || bad "call equal: not in verification: $(cat "$ar/call_equal.out")"
+grep -q '^rule: authority-widened$' "$ar/call_wider.out" && ok "call wider: prints the rule tag" || bad "call wider: no rule line"
+grep -q 'authority-widened' "$ar/ws_wider/journal.jsonl" && ok "call wider: the journal has the rule tag" || bad "call wider: the tag is not in the journal"
+grep -q 'authority-widened' "$ar/ws_equal/journal.jsonl" && bad "call equal: a rule tag in the journal" || ok "call equal: no rule tag in the journal"
+grep -q '^worker-error: authority-compiler-failed$' "$ar/call_failing.out" && ok "call failing: the worker's own code is shown" || bad "call failing: no worker-error line"
 exit $fail

@@ -708,4 +708,6 @@ The design is [`reviewer.md`](reviewer.md) section 2. The worker answers one que
 
 Evidence: `ceiling.txt` (kind `file`: the ceiling at the base, empty when there is none), `head.txt` (kind `file`: what the compiler printed), `report.json` (kind `report`). Forge recomputes the verdict from the two files with the same pure function; the report is a claim. A patch that edits the ceiling file moves nothing: the file read is the base's (conformance case `edited`).
 
-**Not done.** The registry field and the step that builds this task from the operator's row; the real compiler against two real commits; a glob that matches no file is the compiler's refusal (`authority-compiler-failed`), not a tag of its own (the design's `authority-program-missing` is folded into it).
+Forge's side is `src/authority_call.cho` (reviewer.md section 2).
+
+**Not done.** The step in a flow that calls it; the real compiler against two real commits; a glob that matches no file is the compiler's refusal (`authority-compiler-failed`), not a tag of its own (the design's `authority-program-missing` is folded into it).
