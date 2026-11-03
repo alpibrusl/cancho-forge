@@ -21,3 +21,9 @@ if ! command -v setsid > /dev/null 2>&1; then
     perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or exit 127' -- "$@"
   }
 fi
+if ! command -v flock > /dev/null 2>&1; then
+  flock() { # -n file command...: the command while this process holds an exclusive lock on file (perl's flock; the lock is kept across exec)
+    shift
+    perl -e 'use Fcntl qw(:flock); $^F = 255; open(my $f, ">>", shift) or exit 1; flock($f, LOCK_EX | LOCK_NB) or exit 1; exec @ARGV or exit 127' -- "$@"
+  }
+fi
