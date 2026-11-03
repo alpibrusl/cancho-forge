@@ -41,8 +41,8 @@ fixture() {
   git_in "$d" add -A && git_in "$d" commit -q --allow-empty -m head || exit 1
   mkdir "$ar/ev_$1"
 }
-request() { # name, [revision override], [ceiling override]
-  d="$ar/$1"; head=$(git -C "$d" rev-parse HEAD); base=$(git -C "$d" rev-parse HEAD~1)
+request() { # name, [revision override], [ceiling override], [base override]
+  d="$ar/$1"; head=$(git -C "$d" rev-parse HEAD); base=${4:-$(git -C "$d" rev-parse HEAD~1)}
   printf '{"contract":"forge-worker/1","verb":"execute","request_id":"r-%s","task":{"id":"t-%s","type":"repo.authority","input":{"repo":"alpibrusl/cancho-forge","revision":"%s","base":"%s","ceiling":"%s","programs":["src/*.cho"],"std":true}},"grants":{"workspace":"%s","execution_dir":"%s","compiler":"%s"},"limits":{"timeout_ms":60000}}' \
     "$1" "$1" "${2:-$head}" "$base" "${3:-docs/authority.txt}" "$d" "$ar/ev_$1" "$ar/stubc"
 }
@@ -59,8 +59,12 @@ fixture edited 'performs\n    clock\n    exec("/bin/sh")\n    fs_read("")\n    h
 fixture failing "$same" 1
 fixture noceiling "$same"
 fixture mismatch "$same"
+fixture behind 'performs\n    clock\n    exec("/bin/sh")\n    fs_read("")\n    heap\n    net\nnever touches\n    the network\n    foreign code\n'
 fixture refused "$same"
+behind_head=$(git -C "$ar/behind" rev-parse HEAD); behind_base=$(git -C "$ar/behind" rev-parse HEAD~1)
+git -C "$ar/behind" -c advice.detachedHead=false checkout -q HEAD~1
 for n in equal wider narrower edited; do run $n; done
+request behind "$behind_head" "" "$behind_base" | "$ar/worker" > "$ar/reply_behind"
 check equal "succeeded, verdict equal, no rule" reply_equal '"state":"succeeded"'
 check equal "the report says equal" ev_equal/report.json '"verdict":"equal","rule":""'
 check wider "succeeded: a widening is a report, not a worker error" reply_wider '"state":"succeeded"'
@@ -71,6 +75,10 @@ printf "$ceiling_text" > "$ar/want_ceiling"
 if cmp -s "$ar/want_ceiling" "$ar/ev_edited/ceiling.txt"; then ok "edited: ceiling.txt is the base commit's file, not the edited one"; else bad "edited: ceiling.txt is not the base commit's file"; fi
 if cmp -s "$ar/edited/stub_out.txt" "$ar/ev_edited/head.txt"; then ok "edited: head.txt is what the compiler printed"; else bad "edited: head.txt differs from the compiler's output"; fi
 if [ "$(grep -o '"evidence":\[[^]]*\]' "$ar/reply_wider" | grep -o '"id"' | wc -l)" -eq 3 ]; then ok "wider: three evidence entries"; else bad "wider: not three evidence entries"; fi
+# the head commit is exported, not the working tree: the checkout is at the BASE (detached), the head commit is only in its history
+check behind "a checkout left on the base still reports the head commit's authority" ev_behind/report.json '"verdict":"wider"'
+if [ "$(git -C "$ar/behind" rev-parse HEAD)" = "$behind_base" ] && [ -z "$(git -C "$ar/behind" status --porcelain)" ]; then ok "behind: the repository's working tree is untouched"; else bad "behind: the repository was changed"; fi
+if [ ! -e "$ar/ev_wider/tree" ] && [ ! -e "$ar/ev_wider/tree.tar" ]; then ok "wider: the exported tree and its tar are removed"; else bad "wider: the exported tree is left behind"; fi
 # a compiler that exits non-zero: failed, with its words kept
 run failing
 check failing "failed with authority-compiler-failed" reply_failing '"code":"authority-compiler-failed"'

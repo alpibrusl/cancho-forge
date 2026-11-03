@@ -1131,3 +1131,17 @@ which and nothing written, when
 `change add` now derives the steps of the admitted changes (as `status` and `run` do) to tell an open change from a finished one, so it also refuses, as they do, with
 `change-body-missing` when an admitted change's request file is not there. **Where the design and the code differ:** the design's "terminal" states (`abandoned`, `superseded`, `reverted`, `released`,
 `deployed`) do not exist yet; "finished" stands in for them. The refusal does not "leave the file in `intake/`": there is no `intake/` directory until issue intake exists.
+
+---
+
+## 25. The authority review of a published commit: `forge company authority` (docs/reviewer.md)
+
+**Status: built and tested** (`tests/conformance/company_change.sh`, the `authority:` cases, with the real worker, a stand-in compiler and a throw-away git repository; the worker and the call have their own checks in `scripts/check_authority_review.sh`). Not run with the real compiler against two real commits, and not a step of a flow: see below.
+
+`forge company authority <company-dir> <operator-file> <step id> <commit>` asks whether the authority of a **commit** is within the ceiling, for an **accepted `repo.change` step**. The commit is the one `forge company publish` printed; the base is the base commit the change worker recorded for the step; the operator file's `repos.<id>` row names the repository (`slug`, `checkout`), the compiler (`compiler`, an absolute path) and the program sets with their ceiling files (`authority`: 1 to 4 entries `{programs, ceiling, std?}`). For each entry it runs the authority worker (worker-contract section 13) through `authority_call.run_step` in `steps/<id>/authority-<n>`, which it makes (one `mkdirat`), and prints `authority: <ceiling>`, then what the call prints: the task and its state, the **verdict recomputed from `ceiling.txt` and `head.txt`**, and the rule tag of a refusing verdict. The repository is only read: the head is exported from the commit with `git archive`, so the checkout's HEAD and working tree are not touched and the commit need not be checked out.
+
+Exit status: 0 when every entry is `equal` or `narrower`; **5 when any is a refusing verdict** (`wider`, `ceiling-missing`, `unreadable`: the hold); else the worst status of a call that ended otherwise (1 refused, 3 journal or lock, 4 no verdict). The verb merges and publishes nothing: a widening is a person's decision, taken with the two reports in `steps/<id>/authority-<n>/`.
+
+Refusals before anything runs (exit 1, nothing written): `authority-commit-invalid` (not 40 lower-case hex), `publish-step-not-accepted` (the step is not an accepted `repo.change` step), `authority-not-configured` (the row has no `authority`, `compiler` or `slug`, or the journal records no base commit for the step), `operator-invalid`. The company directory is locked for the whole verb; each call takes the lock of the step's own workspace, `steps/<id>/`.
+
+**Where the design and the code differ.** The design (reviewer.md section 4) puts the ceiling in a change's flow, between the gate and the demo. Here it is a verb run after `publish`, because the patch is not in a git tree until `publish` commits it, and a step of `run` does not know the commit. It therefore cannot hold a step by itself; the exit status 5 is what a script or a person acts on. Making it a step needs the commit recorded in the company journal by `publish`, which it does not do.

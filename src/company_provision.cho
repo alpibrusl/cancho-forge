@@ -74,3 +74,22 @@ pub fn make_ev[&f, &s, &i](fs: &f Fs(""), steps: &s [byte], id: &i [byte]) -> [f
     }
     return ok;
 }
+
+// `name` beneath the directory `parent` (an absolute path), made if missing: true when it is a directory afterwards, as `make_ev` has it. `forge
+// company authority` makes `steps/<id>/authority-<n>` with it.
+pub fn make_sub[&f, &p, &n](fs: &f Fs(""), parent: &p [byte], name: &n [byte]) -> [fs_read(""), dir_write] bool {
+    var ok = false;
+    match open_dir(fs, parent) {
+        DirOpened::Failed(e) => {
+            ok = false;
+        }
+        DirOpened::Ok(held) => {
+            var d = held;
+            borrow d as &dr in {
+                ok = make_in(dr, name);
+            }
+            dir_close(d);
+        }
+    }
+    return ok;
+}

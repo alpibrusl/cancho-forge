@@ -691,7 +691,7 @@ fn written[&h, &f, &i, &m, &s, &d, &p, &b, &y, &a, &k](heap: &!h Heap, fs: &f Fs
 // ---- a patch publish (docs/company.md section 21) --------------------------------------------------------------------------------------
 
 // The base commit the change worker recorded for `step` (the last `company.step.change` record): 40 characters, or empty.
-fn change_base[&h, &j, &s](heap: &!h Heap, journal: &j [byte], step: &s [byte]) -> [heap] buffer.Buffer {
+pub fn change_base[&h, &j, &s](heap: &!h Heap, journal: &j [byte], step: &s [byte]) -> [heap] buffer.Buffer {
     var out = buffer.empty(heap, 48);
     var pos = 0;
     while pos < len(journal) {

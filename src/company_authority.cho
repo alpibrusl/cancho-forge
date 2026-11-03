@@ -1,0 +1,259 @@
+edition 9;
+module forge.company_authority;
+
+import std.buffer;
+import std.bytes;
+import std.dirs;
+import std.io;
+import std.json;
+import forge.authority_call;
+import forge.authority_task;
+import forge.company_cmd;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_provision;
+import forge.company_publish;
+import forge.company_state;
+import forge.company_step;
+import forge.journal_io;
+import forge.lock;
+import forge.publish_plan;
+import forge.repo_row;
+import forge.task;
+
+// `forge company authority <company-dir> <operator-file> <step id> <commit>` (docs/reviewer.md section 2, docs/company.md section 25): ask the authority
+// reviewer whether the authority of a COMMIT is within the ceiling, for an ACCEPTED `repo.change` step. The commit is the one `forge company publish`
+// printed; the base is the base commit the change worker recorded for the step; the repository, the checkout, the compiler and the program sets with
+// their ceiling files are the operator file's `repos.<id>` row (`authority`, `compiler`). The worker reads the repository and never writes it.
+//
+// For each entry of the row's `authority` it runs `authority_call.run_step` in `steps/<id>/authority-<n>` (made here, one `mkdirat`), and prints the
+// entry's ceiling and the lines the call prints (the task, its state, the verdict recomputed from the evidence, the rule tag). The exit status is 0
+// when every entry is `equal` or `narrower`, 5 when any is a refusing verdict (`wider`, `ceiling-missing`, `unreadable`), and else the worst status of
+// a call that ended otherwise (1 refused, 3 journal or lock, 4 no verdict). **A 5 is the hold**: this verb merges nothing and publishes nothing, and a
+// widening is a person's decision, with the diff of the two reports, which is in `steps/<id>/authority-<n>/` (`ceiling.txt`, `head.txt`, `report.json`).
+//
+// Refusals before anything runs (exit 1): `authority-commit-invalid` (not 40 lower-case hex), `publish-step-not-accepted` (the step is not an accepted
+// `repo.change` step), `authority-not-configured` (the row has no `authority`/`compiler`, no `slug` or no base commit is recorded), `operator-invalid`.
+// The company directory is locked for the whole verb, as `publish` locks it; each call takes the lock of the step's own workspace.
+
+fn rule_commit_invalid() -> [] &static [byte] {
+    return "authority-commit-invalid";
+}
+
+fn rule_not_configured() -> [] &static [byte] {
+    return "authority-not-configured";
+}
+
+fn journal_cap() -> [] int {
+    return 67108864;
+}
+
+pub fn authority_cmd[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [args, heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    if arg_count(args) != 7 {
+        return company_step.exit_usage();
+    }
+    let dir = arg(args, 3);
+    let opath = arg(args, 4);
+    let step = arg(args, 5);
+    let commit = arg(args, 6);
+    let mpath = company_cmd.under(heap, dir, "company.json");
+    let jpath = company_cmd.under(heap, dir, "company.journal");
+    let lpath = company_cmd.under(heap, dir, "lock");
+    var code = company_step.exit_refused();
+    borrow mpath as &mp in {
+        borrow jpath as &jp in {
+            borrow lpath as &lp in {
+                if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false || journal_io.path_ok(fs, buffer.bytes(lp)) == false || journal_io.path_ok(fs, opath) == false {
+                    company_cmd.refuse(io, task.rule_name(task.Rule::PathInvalid));
+                    code = company_step.exit_usage();
+                } else if authority_task.hex40(commit) == false {
+                    company_cmd.refuse(io, rule_commit_invalid());
+                } else if company_step.inside(dir, opath) {
+                    company_cmd.refuse(io, "operator-invalid");
+                    company_cmd.line(io, "reason: ", "the operator file is inside the company directory");
+                } else {
+                    match lock.acquire(fs, buffer.bytes(lp)) {
+                        lock.Lock::Refused(rule) => {
+                            company_cmd.refuse(io, task.rule_code_name(rule));
+                        }
+                        lock.Lock::Failed(errno) => {
+                            company_cmd.line(io, "error: ", "cannot take the lock of the company directory");
+                            code = company_step.exit_io();
+                        }
+                        lock.Lock::Held(held) => {
+                            code = with_manifest(heap, fs, exec, clock, io, dir, buffer.bytes(mp), buffer.bytes(jp), opath, step, commit);
+                            lock.let_go(held);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, mpath);
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, lpath);
+    return code;
+}
+
+fn with_manifest[&h, &f, &x, &c, &i, &d, &m, &j, &o, &s, &k](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], opath: &o [byte], step: &s [byte], commit: &k [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
+    var code = company_step.exit_refused();
+    if errno != 0 {
+        company_cmd.refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(why) => {
+                    company_cmd.refuse(io, company_manifest.rule_name(why));
+                }
+                company_manifest.ManifestResult::Held(held) => {
+                    borrow held as &hm in {
+                        code = with_journal(heap, fs, exec, clock, io, hm, dir, jpath, opath, step, commit);
+                    }
+                    company_manifest.drop(heap, held);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+fn is_change(r: company_step.Runner) -> [] bool {
+    match r {
+        company_step.Runner::Change => {
+            return true;
+        }
+        company_step.Runner::Build => {
+            return false;
+        }
+        company_step.Runner::Gate => {
+            return false;
+        }
+        company_step.Runner::Person => {
+            return false;
+        }
+        company_step.Runner::Unsupported => {
+            return false;
+        }
+        company_step.Runner::Tool => {
+            return false;
+        }
+    }
+}
+
+fn with_journal[&h, &f, &x, &c, &i, &m, &d, &j, &o, &s, &k](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], opath: &o [byte], step: &s [byte], commit: &k [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let (journal, errno) = company_cmd.read_limited(heap, fs, jpath, journal_cap());
+    var code = company_step.exit_refused();
+    if errno != 0 {
+        company_cmd.refuse(io, publish_plan.rule_journal_unreadable());
+    } else {
+        borrow journal as &jb in {
+            let state = company_state.replay(heap, buffer.bytes(jb), hm);
+            borrow state as &st in {
+                let report = company_state.report_of(st);
+                let at = company_graph.index_of(hm, step);
+                if report.rule != 0 {
+                    company_cmd.refuse(io, task.rule_code_name(report.rule));
+                    company_cmd.line(io, "reason: ", "the company journal is refused; authority reads only a journal that replays");
+                } else if at < 0 || company_state.accepted_at(st, at) == false || is_change(company_step.runner_for(company_manifest.step_at(hm, at))) == false {
+                    company_cmd.refuse(io, publish_plan.rule_not_accepted());
+                    company_cmd.line(io, "reason: ", "only an accepted repo.change step has a change to review");
+                } else {
+                    let base = company_publish.change_base(heap, buffer.bytes(jb), step);
+                    borrow base as &bb in {
+                        code = with_operator(heap, fs, exec, clock, io, hm, at, dir, opath, step, buffer.bytes(bb), commit);
+                    }
+                    buffer.drop(heap, base);
+                }
+            }
+            company_state.drop(heap, state);
+        }
+    }
+    buffer.drop(heap, journal);
+    return code;
+}
+
+fn with_operator[&h, &f, &x, &c, &i, &m, &d, &o, &s, &b, &k](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, at: int, dir: &d [byte], opath: &o [byte], step: &s [byte], base: &b [byte], commit: &k [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, opath, 65536);
+    var code = company_step.exit_refused();
+    if errno != 0 {
+        company_cmd.refuse(io, "operator-invalid");
+    } else {
+        borrow text as &tb in {
+            let src = buffer.bytes(tb);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            var parsed = false;
+            borrow mut tape as &!tw in {
+                parsed = json.parse(src, contents(tw)) > 0;
+            }
+            borrow tape as &tr in {
+                let tp = contents(tr);
+                if parsed == false || company_step.operator_ok(src, tp) == false {
+                    company_cmd.refuse(io, "operator-invalid");
+                } else {
+                    code = with_row(heap, fs, exec, clock, io, hm, at, dir, src, tp, step, base, commit);
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The row of the step's repository and its authority entries, then one call per entry.
+fn with_row[&h, &f, &x, &c, &i, &m, &d, &o, &t, &s, &b, &k](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, at: int, dir: &d [byte], src: &o [byte], tp: &t [int], step: &s [byte], base: &b [byte], commit: &k [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let repo_id = company_manifest.step_repo(hm, company_manifest.step_at(hm, at));
+    let row = repo_row.row_of(src, tp, repo_id);
+    let slug = repo_row.field_text(src, tp, row, "slug");
+    let compiler = repo_row.field_text(src, tp, row, "compiler");
+    let n = repo_row.authority_count(src, tp, row);
+    if row < 0 || len(slug) == 0 || len(compiler) == 0 || n < 1 || len(base) != 40 {
+        company_cmd.refuse(io, rule_not_configured());
+        company_cmd.line(io, "reason: ", "the repos row needs slug, compiler and authority, and the journal a base commit for the step");
+        return company_step.exit_refused();
+    }
+    let stepdir = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/steps/"), step);
+    var worst = 0;
+    var j = 0;
+    while j < n {
+        let sub = buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 16), "authority-"), j);
+        borrow stepdir as &sd in {
+            borrow sub as &sb in {
+                let entry = repo_row.authority_entry(src, tp, row, j);
+                company_cmd.line(io, "authority: ", json.string_view(src, tp, json.get(src, tp, entry, "ceiling")));
+                if company_provision.make_sub(fs, buffer.bytes(sd), buffer.bytes(sb)) == false {
+                    company_cmd.line(io, "error: ", "cannot make the execution directory of the entry");
+                    worst = worse(worst, company_step.exit_io());
+                } else {
+                    let evdir = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(sd)), "/"), buffer.bytes(sb));
+                    borrow evdir as &ed in {
+                        let (ran, worker_code) = authority_call.run_step(heap, fs, exec, clock, io, authority_deadline_ms(), buffer.bytes(sd), company_step.op_text(src, tp, "workers"), slug, commit, base, src, tp, entry, compiler, repo_row.field_text(src, tp, row, "checkout"), buffer.bytes(ed));
+                        worst = worse(worst, ran);
+                    }
+                    buffer.drop(heap, evdir);
+                }
+            }
+        }
+        buffer.drop(heap, sub);
+        j = j + 1;
+    }
+    buffer.drop(heap, stepdir);
+    return worst;
+}
+
+fn authority_deadline_ms() -> [] int {
+    return 300000;
+}
+
+// The worse of two statuses: 5 (a refusing verdict) over the rest, then the larger.
+fn worse(a: int, b: int) -> [] int {
+    if a == 5 || b == 5 {
+        return 5;
+    }
+    if b > a {
+        return b;
+    }
+    return a;
+}

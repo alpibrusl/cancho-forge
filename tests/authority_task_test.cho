@@ -49,6 +49,13 @@ fn test_each_refusal_is_reached_and_named() -> [] int {
     return 0;
 }
 
+fn test_the_repositories_are_the_publish_list() -> [] int {
+    test.assert(authority_task.repo_known("alpibrusl/cancho-forge"));
+    test.assert(authority_task.repo_known("alpibrusl/cancho-diff"));
+    test.assert(!authority_task.repo_known("someone/else"));
+    return 0;
+}
+
 fn test_the_first_fault_of_the_order_is_the_one_named() -> [] int {
     test.assert(bytes.equal(judged("repo.gate", "someone/else", "x", "y", "w", "c", "../x", 1), "task-type-invalid"));
     test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", "x", rev(), "w", "c", "../x", 1), "revision-invalid"));
@@ -115,14 +122,19 @@ fn test_the_shell_text_is_exactly_the_documented_commands[&h](heap: &!h Heap) ->
         test.assert(bytes.equal(buffer.bytes(cb), "exec 2>/dev/null; cd /work/forge && git show 0123456789abcdef0123456789abcdef01234567:docs/authority.txt; exit $?"));
     }
     buffer.drop(heap, c);
-    let a = authority_task.authority_script(heap, "/work/forge", "/opt/cancho/bin/cancho", "src/*.cho", true);
+    let x = authority_task.export_script(heap, "/work/forge", rev(), "/work/exec/e-1");
+    borrow x as &xb in {
+        test.assert(bytes.equal(buffer.bytes(xb), "exec 2>&1; rm -rf /work/exec/e-1/tree && git -C /work/forge archive -o /work/exec/e-1/tree.tar 0123456789abcdef0123456789abcdef01234567 && mkdir /work/exec/e-1/tree && tar -xf /work/exec/e-1/tree.tar -C /work/exec/e-1/tree; s=$?; rm -f /work/exec/e-1/tree.tar; exit $s"));
+    }
+    buffer.drop(heap, x);
+    let a = authority_task.authority_script(heap, "/work/exec/e-1", "/opt/cancho/bin/cancho", "src/*.cho", true);
     borrow a as &ab in {
-        test.assert(bytes.equal(buffer.bytes(ab), "exec 2>&1; cd /work/forge && /opt/cancho/bin/cancho authority src/*.cho --std; exit $?"));
+        test.assert(bytes.equal(buffer.bytes(ab), "exec 2>&1; cd /work/exec/e-1/tree && /opt/cancho/bin/cancho authority src/*.cho --std; s=$?; cd / ; rm -rf /work/exec/e-1/tree; exit $s"));
     }
     buffer.drop(heap, a);
-    let n = authority_task.authority_script(heap, "/work/forge", "/opt/cancho/bin/cancho", "a.cho b.cho", false);
+    let n = authority_task.authority_script(heap, "/work/exec/e-1", "/opt/cancho/bin/cancho", "a.cho b.cho", false);
     borrow n as &nb in {
-        test.assert(bytes.equal(buffer.bytes(nb), "exec 2>&1; cd /work/forge && /opt/cancho/bin/cancho authority a.cho b.cho; exit $?"));
+        test.assert(bytes.equal(buffer.bytes(nb), "exec 2>&1; cd /work/exec/e-1/tree && /opt/cancho/bin/cancho authority a.cho b.cho; s=$?; cd / ; rm -rf /work/exec/e-1/tree; exit $s"));
     }
     buffer.drop(heap, n);
     return 0;
