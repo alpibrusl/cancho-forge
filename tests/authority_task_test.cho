@@ -136,3 +136,49 @@ fn test_the_verdicts_have_their_names() -> [] int {
     test.assert(bytes.equal(authority_task.verdict_name(4), "unreadable"));
     return 0;
 }
+
+// The operator file's row, the request built from its first entry, and the checks the worker will make of it.
+fn test_a_request_built_from_a_row_entry_is_one_the_worker_accepts[&h](heap: &!h Heap) -> [heap] int {
+    let op = "{\"authority\":[{\"programs\":[\"workers/repo_publish.cho\",\"src/*.cho\"],\"std\":true,\"ceiling\":\"docs/authority.txt\"},{\"programs\":[\"a.cho\"],\"ceiling\":\"docs/b.txt\"}]}";
+    let otape = box_slice(heap, json.tape_len(op), 0);
+    borrow mut otape as &!ow in {
+        let otp = contents(ow);
+        test.assert(json.parse(op, otp) > 0);
+        let entries = json.get(op, otp, 0, "authority");
+        let first = json.at(otp, entries, 0);
+        let second = json.at(otp, entries, 1);
+        let req = authority_task.request(heap, "r-1", 1, "t-1", "alpibrusl/cancho-forge", rev(), rev(), op, otp, first, "/opt/cancho/bin/cancho", "/work/forge", "/work/exec/e-1", 600000);
+        borrow req as &qb in {
+            let rtape = box_slice(heap, json.tape_len(buffer.bytes(qb)), 0);
+            borrow mut rtape as &!rw in {
+                let rtp = contents(rw);
+                let q = buffer.bytes(qb);
+                test.assert(json.parse(q, rtp) > 0);
+                let task = json.get(q, rtp, 0, "task");
+                let input = json.get(q, rtp, task, "input");
+                let grants = json.get(q, rtp, 0, "grants");
+                test.assert(json.string_equals(q, rtp, json.get(q, rtp, task, "type"), "repo.authority"));
+                test.assert(json.string_equals(q, rtp, json.get(q, rtp, input, "ceiling"), "docs/authority.txt"));
+                test.assert(authority_task.programs_ok(q, rtp, json.get(q, rtp, input, "programs")));
+                let joined = authority_task.programs_text(heap, q, rtp, json.get(q, rtp, input, "programs"));
+                borrow joined as &jb in {
+                    test.assert(bytes.equal(buffer.bytes(jb), "workers/repo_publish.cho src/*.cho"));
+                }
+                buffer.drop(heap, joined);
+                test.assert(json.to_bool(rtp, json.get(q, rtp, input, "std")));
+                let verdict = authority_task.check(json.string_view(q, rtp, json.get(q, rtp, task, "type")), json.string_view(q, rtp, json.get(q, rtp, input, "repo")), json.string_view(q, rtp, json.get(q, rtp, input, "revision")), json.string_view(q, rtp, json.get(q, rtp, input, "base")), json.string_view(q, rtp, json.get(q, rtp, grants, "workspace")), json.string_view(q, rtp, json.get(q, rtp, grants, "execution_dir")), json.string_view(q, rtp, json.get(q, rtp, grants, "compiler")), json.string_view(q, rtp, json.get(q, rtp, input, "ceiling")), 600000);
+                test.assert(bytes.equal(refusal(verdict), ""));
+            }
+            unbox_slice(heap, rtape);
+        }
+        buffer.drop(heap, req);
+        // an entry without `std` asks for no `--std`
+        let req2 = authority_task.request(heap, "r-2", 1, "t-2", "alpibrusl/cancho-forge", rev(), rev(), op, otp, second, "/c", "/w", "/e", 600000);
+        borrow req2 as &q2 in {
+            test.assert(bytes.find(buffer.bytes(q2), "\"std\":true") < 0);
+        }
+        buffer.drop(heap, req2);
+    }
+    unbox_slice(heap, otape);
+    return 0;
+}
