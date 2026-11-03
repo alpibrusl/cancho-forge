@@ -1,0 +1,197 @@
+edition 9;
+module forge.authority_review;
+
+import std.bytes;
+
+// The comparison of the authority reviewer (docs/reviewer.md section 2): the ceiling the operator keeps, read from the base commit, against what the
+// compiler reports for the head tree. Both are the `performs ... never touches ...` block of `cancho authority` (the lines from `performs` up to
+// `provably`, as `scripts/gate.sh` extracts it). This module is pure; it runs no compiler and reads no file.
+//
+// The text is parsed, not diffed, so a reordering is `equal`. A line under `performs` is a label with an optional bound: `exec("/bin/sh")`,
+// `fs_read("")` (the empty bound is unbounded), `heap`. A line under `never touches` is a guarantee. A head line is:
+//   - in the ceiling as it is: no change;
+//   - a label whose bound is narrower than an unbounded ceiling line of the same label: narrower;
+//   - any other label: wider (a label added, or a bound that is not narrower than the ceiling's);
+// a ceiling label the head lacks is narrower; a ceiling guarantee the head lacks is wider (an assurance lost), a guarantee only the head has is narrower.
+// Wider wins over narrower. The verdict code is `equal` 0, `narrower` 1, `wider` 2, `ceiling-missing` 3 (the ceiling has no `performs` block),
+// `unreadable` 4 (the head report has none).
+
+pub fn equal() -> [] int {
+    return 0;
+}
+
+pub fn narrower() -> [] int {
+    return 1;
+}
+
+pub fn wider() -> [] int {
+    return 2;
+}
+
+pub fn ceiling_missing() -> [] int {
+    return 3;
+}
+
+pub fn unreadable() -> [] int {
+    return 4;
+}
+
+// The rule tag of a verdict code; "" for equal and narrower, which are not refusals.
+pub fn rule_name(code: int) -> [] &static [byte] {
+    if code == 2 {
+        return "authority-widened";
+    }
+    if code == 3 {
+        return "authority-ceiling-missing";
+    }
+    if code == 4 {
+        return "authority-unreadable";
+    }
+    return "";
+}
+
+// One trimmed line: bytes `a..b` of the text, `next` the index of the following line.
+struct Line {
+    a: int,
+    b: int,
+    next: int,
+}
+
+fn blank(c: int) -> [] bool {
+    return c == 32 || c == 9 || c == 13;
+}
+
+fn line_at[&t](text: &t [byte], i: int) -> [] Line {
+    var e = i;
+    while e < len(text) && int_of(text[e]) != 10 {
+        e = e + 1;
+    }
+    var a = i;
+    var b = e;
+    while a < b && blank(int_of(text[a])) {
+        a = a + 1;
+    }
+    while b > a && blank(int_of(text[b - 1])) {
+        b = b - 1;
+    }
+    return Line { a: a, b: b, next: e + 1 };
+}
+
+// 1 under `performs`, 2 under `never touches`, 0 elsewhere (before the block, and from `provably` on), for a trimmed line that opens a section;
+// -1 when the line does not open one.
+fn opens[&l](line: &l [byte]) -> [] int {
+    if bytes.equal(line, "performs") {
+        return 1;
+    }
+    if bytes.equal(line, "never touches") {
+        return 2;
+    }
+    if len(line) >= 8 && bytes.equal(line[0..8], "provably") {
+        return 0;
+    }
+    return 0 - 1;
+}
+
+// Whether the text has a `performs` line.
+fn has_block[&t](text: &t [byte]) -> [] bool {
+    var i = 0;
+    while i < len(text) {
+        let l = line_at(text, i);
+        if bytes.equal(text[l.a..l.b], "performs") {
+            return true;
+        }
+        i = l.next;
+    }
+    return false;
+}
+
+fn name_end[&l](line: &l [byte]) -> [] int {
+    var k = 0;
+    while k < len(line) && int_of(line[k]) != 40 {
+        k = k + 1;
+    }
+    return k;
+}
+
+// Whether `line` has a bound that is not the empty one.
+fn bounded[&l](line: &l [byte]) -> [] bool {
+    let n = name_end(line);
+    return n < len(line) && !bytes.equal(line[n..len(line)], "(\"\")");
+}
+
+// Whether section `sect` of `text` has `line`; with `loose` the line is a label name and the match is that label with the empty bound.
+fn section_has[&t, &l](text: &t [byte], sect: int, line: &l [byte], loose: bool) -> [] bool {
+    var cur = 0;
+    var i = 0;
+    while i < len(text) {
+        let l = line_at(text, i);
+        i = l.next;
+        let one = text[l.a..l.b];
+        let o = opens(one);
+        if l.a == l.b {
+            cur = cur;
+        } else if o >= 0 {
+            cur = o;
+        } else if cur == sect {
+            if loose {
+                let n = name_end(one);
+                if bytes.equal(one[0..n], line) && bytes.equal(one[n..len(one)], "(\"\")") {
+                    return true;
+                }
+            } else if bytes.equal(one, line) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// What section `sect` of `from` says against the same section of `other`: the number of its lines `other` lacks (a label with a narrower bound counts
+// as `narrow`, not as lacking, when `loose_ok`).
+fn lacking[&f, &o](from: &f [byte], other: &o [byte], sect: int, loose_ok: bool) -> [] (int, int) {
+    var absent = 0;
+    var narrow = 0;
+    var cur = 0;
+    var i = 0;
+    while i < len(from) {
+        let l = line_at(from, i);
+        i = l.next;
+        let one = from[l.a..l.b];
+        let op = opens(one);
+        if l.a == l.b {
+            cur = cur;
+        } else if op >= 0 {
+            cur = op;
+        } else if cur == sect && !section_has(other, sect, one, false) {
+            if loose_ok && bounded(one) && section_has(other, sect, one[0..name_end(one)], true) {
+                narrow = narrow + 1;
+            } else {
+                absent = absent + 1;
+            }
+        }
+    }
+    return (absent, narrow);
+}
+
+// The verdict code of the head report against the ceiling.
+pub fn compare[&c, &h](ceiling_text: &c [byte], head_text: &h [byte]) -> [] int {
+    if !has_block(ceiling_text) {
+        return 3;
+    }
+    if !has_block(head_text) {
+        return 4;
+    }
+    // Labels: the head's that the ceiling lacks are wider, bar a narrower bound; the ceiling's that the head lacks are narrower.
+    let h1 = lacking(head_text, ceiling_text, 1, true);
+    let c1 = lacking(ceiling_text, head_text, 1, false);
+    // Guarantees: the ceiling's that the head lacks are wider; the head's that the ceiling lacks are narrower.
+    let h2 = lacking(head_text, ceiling_text, 2, false);
+    let c2 = lacking(ceiling_text, head_text, 2, false);
+    if h1.0 > 0 || c2.0 > 0 {
+        return 2;
+    }
+    if h1.1 > 0 || c1.0 > 0 || h2.0 > 0 {
+        return 1;
+    }
+    return 0;
+}

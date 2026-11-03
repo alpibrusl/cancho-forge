@@ -35,7 +35,7 @@ by policy (`autonomy.md` section 4), only by the board, with the authority diff 
 **Where the list comes from.** The operator's registry row gains `authority`: `[{ "programs": ["src/*.cho"], "std": true, "ceiling": "docs/authority.txt" }, ...]` *(designed)*, one entry per program set. The
 manifest names none of it (`company.md` section 3).
 
-**The comparison is a pure function** `authority_review.compare(ceiling_text, head_text) -> verdict` over two `performs` blocks, a set of labels with their bounds. It is parsed, not diffed: a reordering is `equal`.
+**The comparison is a pure function** *(built, R-0)* `authority_review.compare(ceiling_text, head_text) -> verdict code` over two reports, each a `performs` list of labels with their bounds and a `never touches` list of guarantees. It is parsed, not diffed: a reordering is `equal`. Codes: `equal` 0, `narrower` 1, `wider` 2, `ceiling-missing` 3, `unreadable` 4. A head label the ceiling lacks is wider, unless it is the same label with a bound where the ceiling's is the empty one (`fs_read("")`, unbounded), which is narrower; a different non-empty bound is wider. A `never touches` line the head lacks is wider (an assurance lost); one the head adds is narrower. Wider wins.
 
 **The worker** `workers/authority_review.cho` *(designed)*: one JSON request on standard input, one line out, as every worker (`worker-contract.md`). It materialises the two trees by the gate runner's
 mechanism (a throw-away checkout; it never writes the operator's), runs the compiler the operator names (`checker` of the operator file, an absolute path), reads the ceiling from the base tree, and answers
@@ -73,7 +73,7 @@ R-0 needs no model. R-1 spends money and waits for the M-1 budget decision.
 
 ## 6. Order
 
-1. R-0 and the pure `compare`, in cancho, with unit tests for every verdict (no worker yet).
+1. R-0 and the pure `compare`, in cancho, with unit tests for every verdict (no worker yet). **Done** (`src/authority_review.cho`, `tests/authority_review_test.cho`, `spike/r0_check.sh`; result in `spike/RESULTS.md`). The tags are not yet in the gate's docs-tag list: they enter it with the worker that emits them.
 2. The worker, with a stand-in compiler script, then the real compiler, in the gate.
 3. The registry field, in the operator file's checks.
 4. The review step (needs M-1's tool decisions), recorded and shown only.

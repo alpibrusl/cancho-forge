@@ -1,0 +1,87 @@
+edition 9;
+
+import std.bytes;
+import std.test;
+import forge.authority_review;
+
+// Unit tests for src/authority_review.cho: the pure comparison of a ceiling and a head authority report (docs/reviewer.md section 2, R-0).
+// Run with `cancho test`.
+
+fn ceiling() -> [] &static [byte] {
+    return "performs\n    clock\n    exec(\"/bin/sh\")\n    fs_read(\"\")\n    heap\nnever touches\n    the network\n    foreign code\n";
+}
+
+fn verdict(head: &static [byte]) -> [] int {
+    return authority_review.compare(ceiling(), head);
+}
+
+fn test_the_same_report_is_equal() -> [] int {
+    test.assert_eq(verdict(ceiling()), 0);
+    return 0;
+}
+
+fn test_a_reordering_and_blank_lines_are_equal() -> [] int {
+    test.assert_eq(verdict("performs\r\n  heap\n\n  fs_read(\"\")\n  exec(\"/bin/sh\")\n  clock\nnever touches\n  foreign code\n  the network\nprovably\n"), 0);
+    return 0;
+}
+
+fn test_a_label_added_is_wider() -> [] int {
+    test.assert_eq(verdict("performs\n    clock\n    exec(\"/bin/sh\")\n    fs_read(\"\")\n    heap\n    net\nnever touches\n    the network\n    foreign code\n"), 2);
+    return 0;
+}
+
+fn test_a_label_removed_is_narrower() -> [] int {
+    test.assert_eq(verdict("performs\n    clock\n    fs_read(\"\")\n    heap\nnever touches\n    the network\n    foreign code\n"), 1);
+    return 0;
+}
+
+fn test_a_different_bound_is_wider() -> [] int {
+    test.assert_eq(verdict("performs\n    clock\n    exec(\"/usr/bin/git\")\n    fs_read(\"\")\n    heap\nnever touches\n    the network\n    foreign code\n"), 2);
+    return 0;
+}
+
+fn test_a_bound_on_an_unbounded_label_is_narrower() -> [] int {
+    test.assert_eq(verdict("performs\n    clock\n    exec(\"/bin/sh\")\n    fs_read(\"/repo\")\n    heap\nnever touches\n    the network\n    foreign code\n"), 1);
+    return 0;
+}
+
+fn test_a_bound_removed_is_wider() -> [] int {
+    test.assert_eq(verdict("performs\n    clock\n    exec(\"\")\n    fs_read(\"\")\n    heap\nnever touches\n    the network\n    foreign code\n"), 2);
+    return 0;
+}
+
+fn test_a_guarantee_lost_is_wider() -> [] int {
+    test.assert_eq(verdict("performs\n    clock\n    exec(\"/bin/sh\")\n    fs_read(\"\")\n    heap\nnever touches\n    the network\n"), 2);
+    return 0;
+}
+
+fn test_a_guarantee_gained_is_narrower() -> [] int {
+    test.assert_eq(verdict("performs\n    clock\n    exec(\"/bin/sh\")\n    fs_read(\"\")\n    heap\nnever touches\n    the network\n    foreign code\n    signals\n"), 1);
+    return 0;
+}
+
+fn test_wider_wins_over_narrower() -> [] int {
+    test.assert_eq(verdict("performs\n    clock\n    fs_read(\"\")\n    heap\n    net\nnever touches\n    the network\n    foreign code\n"), 2);
+    return 0;
+}
+
+fn test_a_missing_ceiling_is_refused_before_anything_else() -> [] int {
+    test.assert_eq(authority_review.compare("", ceiling()), 3);
+    test.assert_eq(authority_review.compare("no such report", ""), 3);
+    return 0;
+}
+
+fn test_an_unreadable_head_is_refused() -> [] int {
+    test.assert_eq(verdict(""), 4);
+    test.assert_eq(verdict("error: no such file"), 4);
+    return 0;
+}
+
+fn test_the_tags_are_named() -> [] int {
+    test.assert(bytes.equal(authority_review.rule_name(2), "authority-widened"));
+    test.assert(bytes.equal(authority_review.rule_name(3), "authority-ceiling-missing"));
+    test.assert(bytes.equal(authority_review.rule_name(4), "authority-unreadable"));
+    test.assert(bytes.equal(authority_review.rule_name(0), ""));
+    test.assert(bytes.equal(authority_review.rule_name(1), ""));
+    return 0;
+}

@@ -1102,3 +1102,21 @@ the fix touched and what they import, under 400 KB) can be run for the cost of a
 reported as one. Price used by `replay.sh` for the ceiling: Haiku 5.5, $0.10 / $0.50 per million input / output tokens up to a 100K-token prompt, $0.50 / $2.50 above
 (Anthropic's price list as of the skill cache of 2026-10-06; cache read and write rates are assumed, see the script header).
 
+
+## R-0: the authority comparison on real reports (2026-11-03)
+
+`spike/r0_check.sh` (compiler at the pin `f4ead824`) builds `spike/r0_compare.cho`, a driver for `authority_review.compare`, and runs it on this repository's three checked-in ceilings
+(`docs/authority.txt`, `docs/authority-repo-publish.txt`, `docs/authority-check-guard.txt`) against what the compiler reports for the same programs now. The mutations are made by
+`sed` and `awk`, not by the code under test.
+
+| case | wanted | result (per ceiling, 3 ceilings) |
+|---|---|---|
+| the compiler's report now | equal | 3 of 3 |
+| a label added | wider | 3 of 3 |
+| the first label removed | narrower | 3 of 3 |
+| the last guarantee line removed | wider | 3 of 3 |
+| 20 random reorderings of each section's lines | equal | 60 of 60, no false `wider` |
+| an empty ceiling / an empty head | ceiling-missing / unreadable | 2 of 2 |
+
+17 checks, 17 ok. What this does not show: a bound text the compiler prints in a form other than `name("...")`, or any program whose report differs in a way these three do not
+exercise (`signals("INT,TERM")` appears in `docs/authority.txt` and is equal). The worker's own run against two real commits is step 2 of the reviewer's order.

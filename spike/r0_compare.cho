@@ -1,0 +1,57 @@
+edition 9;
+
+import std.buffer;
+import std.io;
+import forge.journal_io;
+import forge.authority_review;
+
+// Spike R-0 (docs/reviewer.md section 6): print the verdict code of `authority_review.compare` for a ceiling file and a head report file.
+// Usage: r0_compare <ceiling file> <head file>.
+
+fn verdict[&h, &f, &a, &b](heap: &!h Heap, fs: &f Fs(""), ceiling_path: &a [byte], head_path: &b [byte]) -> [heap, fs_read(""), file_read] int {
+    let (c, ce) = journal_io.read_all(heap, fs, ceiling_path);
+    let (h, he) = journal_io.read_all(heap, fs, head_path);
+    var code = 0 - 1;
+    if ce == 0 && he == 0 {
+        borrow c as &cb in {
+            borrow h as &hb in {
+                code = authority_review.compare(buffer.bytes(cb), buffer.bytes(hb));
+            }
+        }
+    }
+    buffer.drop(heap, c);
+    buffer.drop(heap, h);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var hp = heap;
+    var code = 2;
+    borrow mut hp as &!h in {
+        borrow fs as &f in {
+            borrow args as &g in {
+                borrow mut console as &!i in {
+                    if arg_count(g) >= 3 {
+                        let v = verdict(h, f, arg(g, 1), arg(g, 2));
+                        io.print_int(i, v);
+                        io.newline(i);
+                        code = 0;
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(hp);
+    release(console);
+    release(args);
+    return code;
+}
