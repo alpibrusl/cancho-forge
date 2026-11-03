@@ -1140,3 +1140,34 @@ ends with a section `unbounded by` that lists it again. The comparison read the 
 a unit test with the compiler's own text). The marked label already differed as a line, so the verdict was `wider` either way; the fix removes a spurious "narrower" bit.
 
 Not shown: a program set other than `src/*.cho`; a compiler other than the pin; a repository that is not this one.
+
+## R-1 (docs/reviewer.md section 5, 9): does a model reviewer tell a correct change from a faulty one? (2026-11-03, macOS arm64, compiler `f4ead824`)
+
+**Setup.** 20 seeded changes against `04edac8` (`spike/r1/seeds.py`): 10 correct, 10 with a planted fault. The fate of every seed is *measured*, not declared: the
+patch is applied to a copy of the tree and `cancho check` and the unit tests of the two files run; a correct seed passes, a faulty one is caught by an existing test
+(`seeds.py` fails if a seed's measured fate is not its declared one; it caught five of my first ten faults as not caught, see below). The reviewer (`spike/r1/review.sh`
+over `spike/r1/ask.cho`, built with cancho-code's transport) is given the change request and the diff and nothing else, one call per seed, no retries, no thinking,
+2048 tokens, answers `{"verdict","items"}`. Spent $0.21 (Haiku 5.5) and $0.10 (Sonnet 5.5), priced at a deliberately high $3 / $15 per million tokens; the ceiling was $2.
+
+| model | agreement | false approvals (faulty approved) | false concerns (correct flagged) |
+|---|---|---|---|
+| claude-haiku-5-5 | 14/20 | 2/10 | 4/10 |
+| claude-sonnet-5-5 | 16/20 | 4/10 | 0/10 |
+
+**Read as the protocol pre-registered it** (a false approval over 10% keeps `review` advisory for good): both models are over, so `review` stays advisory. That reading
+stands for this seed set and this prompt; it is **not** a measure of how well a model reviews a builder's change, for two reasons found on reading the misses:
+
+1. **Every miss is a seed whose change request asks for the faulty behaviour.** Haiku approved f04 and f09, Sonnet f01, f04, f06 and f09: "drop `cancho.toml`", "a component
+   may carry two stars", "a branch may start with a dot", "ready when not accepted *or* its needs are met". The diff does what was asked; the tests say what was asked is wrong.
+   A reviewer given only the request and the diff cannot know that, and approving a diff that matches its request is not the failure R-1 means to measure. The seeds where the
+   diff *deviates* from, or rests on a false premise about, the code (f02, f05, f10) were all caught by both models; that is 3 seeds, too few to read anything from.
+2. **One pass, ten per class.** A difference of two seeds is inside the noise; no repeat was run.
+
+Haiku's four false concerns were over-caution about things the diff does not show (that `&&` short-circuits, that `step_count` exists), the failure a person finds cheap to
+dismiss; Sonnet had none in this run.
+
+**Found on the way.** `branch_ok` and `slug_ok` of `src/repo_row.cho` are not pinned at their boundaries: five planted faults there (length 64 vs 65, more than one slash, a
+leading dot, a trailing slash, a doubled slash) all passed the repository's own tests. That is a finding about the tests, separate from the reviewer.
+
+**Next, if R-1 is to be read:** a second seed set in which every faulty change request asks for something harmless and the diff does something else or something more (the
+case a reviewer exists for), at least 20 per class, each model run three times. That costs cents; it was not run because it is a different experiment, not a repeat.
