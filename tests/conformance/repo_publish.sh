@@ -63,7 +63,7 @@ operator "$w/op1.json" "$w/ck1" alpibrusl/cancho-diff "$FILES" "$w/workers" "$TR
 check "setup: the first run stops at the open gate (exit 10) with lib accepted" sh -c "[ \$(sed -n 's/^//p' /dev/null; echo 0) = 0 ] && grep -qx 'gate: ship' '$w/run1.out' && grep -q 'company.step.accepted' '$co/company.journal'"
 "$F" company decide "$co" ship approved "looks right" > /dev/null
 sha=$(sha256sum "$co/steps/lib/ev/project.cho" | cut -c1-64)
-before=$(cksum < "$co/company.journal")
+before=$(cksum < "$co/company.journal"); before_n=$(grep -c '' "$co/company.journal")
 orig=$(git -C "$w/ck1" rev-parse --abbrev-ref HEAD)
 
 # ---- the good path
@@ -77,7 +77,7 @@ check "good: the provenance names the artifact digest, the tokens, the cost and 
 check "good: the commit message has the subject and the operator's trailer line, and the commit holds exactly the two files" sh -c "git -C '$w/ck1' log -1 --format=%B forge/lib | head -1 | grep -qx 'Add src/diff.cho, built by Forge' && git -C '$w/ck1' log -1 --format=%B forge/lib | grep -qx '$TRAILER' && [ \"\$(git -C '$w/ck1' show --name-only --format= forge/lib | sort | tr '\\n' ' ')\" = 'docs/provenance.md src/diff.cho ' ]"
 check "good: the checkout is back on its own branch, clean, with neither file in its tree" sh -c "[ \"\$(git -C '$w/ck1' rev-parse --abbrev-ref HEAD)\" = '$orig' ] && [ -z \"\$(git -C '$w/ck1' status --porcelain --untracked-files=all)\" ] && [ ! -e '$w/ck1/src/diff.cho' ]"
 check "good: steps/lib/pr.md has the title, the branch and the commit, and says nothing was pushed" sh -c "head -1 '$co/steps/lib/pr.md' | grep -qx 'Add src/diff.cho (step lib of the company co)' && grep -q 'forge/lib' '$co/steps/lib/pr.md' && grep -q '$commit' '$co/steps/lib/pr.md' && grep -q 'was not pushed' '$co/steps/lib/pr.md' && grep -q 'was not pushed' '$w/pub1.out'"
-check "good: nothing was pushed (no remote-tracking ref) and the company journal is byte for byte what it was" sh -c "[ -z \"\$(git -C '$w/ck1' branch -r)\" ] && [ \"\$(cksum < '$co/company.journal')\" = '$before' ]"
+check "good: nothing was pushed (no remote-tracking ref) and the company journal is what it was plus one company.step.published record" sh -c "[ -z \"\$(git -C '$w/ck1' branch -r)\" ] && [ \"\$(head -n $before_n '$co/company.journal' | cksum)\" = '$before' ] && [ \"\$(grep -c '' '$co/company.journal')\" = $((before_n + 1)) ] && tail -1 '$co/company.journal' | grep -q company.step.published"
 
 # ---- the same inputs give the same provenance, in another checkout
 mkrepo ck2 "$ORIGIN"

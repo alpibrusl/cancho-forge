@@ -55,6 +55,7 @@ object, `{"verdict":"approve"|"concerns","items":[{"file","line","claim"}]}`, at
 
 ## 4. How it fits the company
 
+- **Built (docs/company.md section 26):** the ceiling is a reviewer step of task type `repo.authority`, run over the commit `publish` recorded. What follows is the original design, kept for the model review (`repo.review`, not built).
 - The manifest gets no new task type: a reviewer step is `repo.gate` as now, and the **operator's `gates.<id>` entry names a different worker** (`authority_review`) instead of the gate runner. That keeps the manifest's closed
   shape and puts the choice where authority lives. The review verdict is a separate step of role `reviewer` and task type `repo.change`-like `repo.review` *(designed, one new task type, open question 2)*.
 - Both appear in a change's flow (`company-lifecycle.md` section 3): `fix` (builder) -> `gate` (qa) -> `ceiling` (reviewer) -> `review` (reviewer, model) -> `demo`.

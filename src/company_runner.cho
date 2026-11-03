@@ -20,6 +20,8 @@ import forge.company_graph;
 import forge.company_manifest;
 import forge.company_needs;
 import forge.company_provision;
+import forge.company_publish;
+import forge.company_review;
 import forge.company_run;
 import forge.company_state;
 import forge.company_time;
@@ -698,7 +700,158 @@ fn run_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &n, &z](heap: &!h Heap, fs: 
         company_step.Runner::Change => {
             return change_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, k, seq, existed, before, before_cost, needs);
         }
+        company_step.Runner::Authority => {
+            return authority_step(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, k, seq, existed);
+        }
     }
+}
+
+fn rule_authority_unpublished() -> [] &static [byte] {
+    return "authority-unpublished";
+}
+
+fn rule_authority_unconfigured() -> [] &static [byte] {
+    return "authority-not-configured";
+}
+
+// A reviewer's `repo.authority` step (docs/company.md section 26): the authority of the commit its one need, a `repo.change` step, was PUBLISHED as, against
+// the ceiling. The need is accepted (the step is ready), but only `forge company publish` makes the commit; until the journal holds a `company.step.published`
+// record for the need the step is refused (`authority-unpublished`, exit 1, nothing written, not admitted), and so is every step that needs it. The operator's
+// `repos.<id>` row (the need's repository) names the compiler and the program sets with their ceiling files, exactly as for `forge company authority`; no
+// model is used and no spend is recorded. Admitted, each entry of the row is run by the authority worker in `steps/<id>/ev/authority-<n>`, and the verdict
+// of each is recomputed by Forge from the evidence. When every entry is `equal` or `narrower` Forge writes `authority.txt` (one line per entry), hashes it and
+// accepts the step; a refusing verdict (`wider`, `ceiling-missing`, `unreadable`) is a failed check, the step held (`check-failed`, exit 13, the same retry
+// gate as any held step), and anything else a check that could not judge (`check-unavailable`).
+fn authority_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], k: int, seq: int, existed: bool) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let step = company_manifest.step_at(hm, k);
+    let id = company_manifest.step_id(hm, step);
+    let at = company_graph.index_of(hm, company_manifest.step_need(hm, step, 0));
+    if company_manifest.step_needs_count(hm, step) != 1 || at < 0 || company_manifest.is_repo_change(company_manifest.step_at(hm, at)) == false {
+        refuse(io, rule_authority_unconfigured());
+        say(io, "step: ", id);
+        say(io, "reason: ", "a repo.authority step needs exactly one step, a repo.change step");
+        return company_step.exit_refused();
+    }
+    let need = company_manifest.step_id(hm, company_manifest.step_at(hm, at));
+    let (journal, errno) = company_cmd.read_limited(heap, fs, jpath, 67108864);
+    var code = company_step.exit_refused();
+    if errno != 0 {
+        refuse(io, rule_operator_invalid());
+        say(io, "step: ", id);
+    } else {
+        borrow journal as &jb in {
+            let commit = company_state.published_commit(heap, buffer.bytes(jb), need);
+            let base = company_publish.change_base(heap, buffer.bytes(jb), need);
+            borrow commit as &cb in {
+                borrow base as &bb in {
+                    code = authority_row(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, k, at, seq, existed, buffer.bytes(cb), buffer.bytes(bb));
+                }
+            }
+            buffer.drop(heap, commit);
+            buffer.drop(heap, base);
+        }
+    }
+    buffer.drop(heap, journal);
+    return code;
+}
+
+// The commit and the base are known (empty when the journal holds none): the row, the execution directory, the admission, the entries, the verdict.
+fn authority_row[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &k, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], k: int, reviewed: int, seq: int, existed: bool, commit: &k [byte], base: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let step = company_manifest.step_at(hm, k);
+    let id = company_manifest.step_id(hm, step);
+    if len(commit) != 40 {
+        refuse(io, rule_authority_unpublished());
+        say(io, "step: ", id);
+        say(io, "reason: ", "the step it reviews was never published; run forge company publish for it first");
+        return company_step.exit_refused();
+    }
+    let repo = company_manifest.step_repo(hm, company_manifest.step_at(hm, reviewed));
+    let row = repo_row.row_of(op, tp, repo);
+    let slug = repo_row.field_text(op, tp, row, "slug");
+    if row < 0 || len(slug) == 0 || len(repo_row.field_text(op, tp, row, "compiler")) == 0 || repo_row.authority_count(op, tp, row) < 1 || len(base) != 40 || len(company_step.op_text(op, tp, "workers")) == 0 {
+        refuse(io, rule_authority_unconfigured());
+        say(io, "step: ", id);
+        say(io, "reason: ", "the repos row needs slug, compiler and authority, the operator file workers, and the journal a base commit for the reviewed step");
+        return company_step.exit_refused();
+    }
+    let rel = glue(heap, "steps/", id);
+    var stepdir = buffer.empty(heap, 1);
+    borrow rel as &rb in {
+        buffer.drop(heap, stepdir);
+        stepdir = company_cmd.under(heap, dir, buffer.bytes(rb));
+    }
+    var code = 0;
+    borrow rel as &rb in {
+        borrow stepdir as &sb in {
+            let evdir = glue(heap, buffer.bytes(sb), "/ev");
+            borrow evdir as &eb in {
+                if ev_ready(heap, fs, dir, id, k >= company_manifest.own_step_count(hm), buffer.bytes(eb)) == false {
+                    refuse(io, rule_step_dir_missing());
+                    say(io, "step: ", id);
+                    code = company_step.exit_refused();
+                } else {
+                    code = record_buffer(heap, fs, io, jpath, company_state.admitted(heap, seq, id, buffer.bytes(rb)), existed == false);
+                    if code == 0 {
+                        code = authority_decide(heap, fs, exec, clock, io, jpath, op, tp, row, id, seq + 1, buffer.bytes(eb), slug, commit, base);
+                    }
+                }
+            }
+            buffer.drop(heap, evdir);
+        }
+    }
+    buffer.drop(heap, rel);
+    buffer.drop(heap, stepdir);
+    return code;
+}
+
+// Admitted: run the entries, write `authority.txt` when none refuses, hash it and record the verdict (-1 when the step was accepted and the run goes on).
+fn authority_decide[&h, &f, &x, &c, &i, &j, &s, &t, &n, &e, &g, &k, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, jpath: &j [byte], op: &s [byte], tp: &t [int], row: int, id: &n [byte], seq: int, evdir: &e [byte], slug: &g [byte], commit: &k [byte], base: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
+    let (worst, summary) = company_review.run_entries(heap, fs, exec, clock, io, op, tp, row, evdir, slug, commit, base, company_step.op_text(op, tp, "workers"));
+    var code = company_step.exit_check_unavailable();
+    if worst == 0 {
+        var wrote = 0 - 1;
+        let path = glue(heap, evdir, "/authority.txt");
+        borrow path as &pb in {
+            borrow summary as &sb in {
+                wrote = write_file(fs, buffer.bytes(pb), buffer.bytes(sb));
+            }
+        }
+        buffer.drop(heap, path);
+        let (sha, why) = hash_artifact(heap, fs, evdir, "authority.txt");
+        let shown = company_step.artifact_rel(heap, id, company_step.Runner::Authority);
+        borrow shown as &wb in {
+            if wrote != 0 || why != 0 {
+                code = refuse_artifact(heap, fs, io, jpath, id, buffer.bytes(wb), 1, seq);
+            } else {
+                borrow sha as &hb in {
+                    code = record_buffer(heap, fs, io, jpath, company_state.accepted(heap, seq, id, buffer.bytes(wb), buffer.bytes(hb)), false);
+                }
+                if code == 0 {
+                    say(io, "accepted: ", id);
+                    code = 0 - 1;
+                }
+            }
+        }
+        buffer.drop(heap, shown);
+        buffer.drop(heap, sha);
+    } else if worst == 5 {
+        code = record_buffer(heap, fs, io, jpath, company_state.check_failed(heap, seq, id, 0, repo_row.authority_count(op, tp, row)), false);
+        if code == 0 {
+            refuse(io, "check-failed");
+            say(io, "step: ", id);
+            say(io, "reason: ", "the authority of the published commit is not within the ceiling; the verdict of each entry is above");
+            code = company_step.exit_check_failed();
+        }
+    } else {
+        code = record_buffer(heap, fs, io, jpath, company_state.check_unavailable(heap, seq, id, "check-unavailable"), false);
+        if code == 0 {
+            refuse(io, "check-unavailable");
+            say(io, "step: ", id);
+            code = company_step.exit_check_unavailable();
+        }
+    }
+    buffer.drop(heap, summary);
+    return code;
 }
 
 fn tool_timeout_default() -> [] int {

@@ -60,6 +60,9 @@ fn runner_code(r: company_step.Runner) -> [] int {
         company_step.Runner::Change => {
             return 6;
         }
+        company_step.Runner::Authority => {
+            return 7;
+        }
     }
 }
 
@@ -75,6 +78,7 @@ fn test_each_role_has_its_runner_and_artifact() -> [] int {
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Person), "company.json"));
     test.assert_eq(len(company_step.artifact_name(company_step.Runner::Unsupported)), 0);
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Tool), "tool.out"));
+    test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Authority), "authority.txt"));
     test.assert(bytes.equal(company_step.artifact_name(company_step.Runner::Change), "change.patch"));
     return 0;
 }
