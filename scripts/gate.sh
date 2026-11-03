@@ -227,6 +227,12 @@ CANCHO="$C" sh spike/r0_check.sh "$scratch/r0" > "$scratch/r0.out" || fail=1
 cat "$scratch/r0.out"
 if grep -q '^FAIL ' "$scratch/r0.out"; then fail=1; fi
 
+echo "== spike R-2 (the authority worker with the real compiler on real commits of a clone; spike/r2_check.sh)"
+mkdir "$scratch/r2" || exit 1
+CANCHO="$C" sh spike/r2_check.sh "$scratch/r2" > "$scratch/r2.out" || fail=1
+cat "$scratch/r2.out"
+if grep -q '^FAIL ' "$scratch/r2.out"; then fail=1; fi
+
 echo "== spike P4 (the pilot's test world: a scripted hostile HTTP server seen from outside by curl; spike/p4_check.sh)"
 mkdir "$scratch/p4" || exit 1
 CANCHO="$C" sh spike/p4_check.sh "$scratch/p4" > "$scratch/p4.out" || fail=1

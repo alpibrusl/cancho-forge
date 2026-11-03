@@ -85,3 +85,13 @@ fn test_the_tags_are_named() -> [] int {
     test.assert(bytes.equal(authority_review.rule_name(1), ""));
     return 0;
 }
+
+fn test_the_compilers_unbounded_by_section_and_its_marks_are_read_as_the_labels_they_are() -> [] int {
+    // the report of a program that opens a socket: a marked label, no `the network` guarantee, and the closing note
+    let widened = "performs\n    clock\n    exec(\"/bin/sh\")\n    fs_read(\"\")\n    heap\n    net_in(\"\")    <- unbounded\nnever touches\n    foreign code\nunbounded by\n    net_in(\"\")\n";
+    test.assert_eq(verdict(widened), 2);
+    // the same report as the ceiling and the head is equal, and the note alone changes nothing
+    test.assert_eq(authority_review.compare(widened, widened), 0);
+    test.assert_eq(authority_review.compare("performs\n    clock\nnever touches\n    the network\nunbounded by\n    x\n", "performs\n    clock\nnever touches\n    the network\n"), 0);
+    return 0;
+}
