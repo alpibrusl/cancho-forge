@@ -68,7 +68,7 @@ object, `{"verdict":"approve"|"concerns","items":[{"file","line","claim"}]}`, at
 | **R-0** | does the comparison tell equal, narrower and wider apart on real programs? | the compiler's report for this repository's programs at a commit, a patch that adds a label, one that removes one, one that reorders | each verdict as designed; no false `wider` on 20 reorderings |
 | **R-1** | does a model reviewer agree with an independent judge on seeded changes? | 20 seeded changes of known fate (10 correct, 10 with a planted fault the audit catches), reviewed with the diff and the brief only | agreement and false-approval rate; if a false approval is over 10%, `review` stays advisory for good |
 
-R-0 needs no model. R-1 spends money and waits for the M-1 budget decision.
+R-0 needs no model. R-1 spends money. **R-1 was run once on 2026-11-03 (section 9); its result does not yet decide the question.**
 
 ## 6. Order
 
@@ -86,3 +86,10 @@ R-0 needs no model. R-1 spends money and waits for the M-1 budget decision.
 ## 8. What this document does not do
 
 It does not build a worker, choose a model, or claim a reviewer catches anything. It makes "the reviewer is qa under another name" a precise, testable gap with an order of work.
+
+## 9. R-1, run once *(measured, `spike/RESULTS.md`)*
+
+20 seeded changes of measured fate (10 correct, 10 faulty, `spike/r1/seeds.py`), reviewed by Haiku 5.5 and Sonnet 5.5 from the change request and the diff alone
+(`spike/r1/review.sh`). False approvals: Haiku 2/10, Sonnet 4/10, so under the rule of section 5 `review` stays advisory. But every missed fault was one the change request
+itself asked for, so the run measured "does the diff match the request" more than "is the change right"; the seed set needs a second version in which the request is
+harmless and the diff deviates, before R-1 is read as an answer. Until then the policy is the one section 3 already states: the review is recorded and shown and **counts for nothing**.

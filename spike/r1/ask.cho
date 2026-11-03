@@ -1,0 +1,192 @@
+edition 7;
+
+// R-1 (docs/reviewer.md section 9): one question to a model, one answer. A spike program, built with cancho-code's transport (provider, anthropic, reply and
+// the TLS client, as scripts/build-agent.sh builds them); it is not a Forge worker.
+//
+//   ask --model <m> --key-file <path> --host <name> --ip <a.b.c.d> --roots <pem> --prompt <file> --out <file> --usage <file> [--max-tokens N]
+//
+// The prompt is the whole user message. The answer's text is written to --out, one line of usage (tokens in and out, stop reason) is appended to
+// --usage. The key is read here and goes to the provider's host only; it is never printed, logged or put in a file. Exit 0: an answer was written.
+// Exit 1: the provider could not be reached or did not answer 200 (nothing written). Exit 2: the command line was wrong.
+
+import anthropic;
+import provider;
+import reply;
+import std.buffer;
+import std.bytes;
+import std.io;
+
+fn opt[&g](g: &g Args, name: &static [byte]) -> [args] &static [byte] {
+    var found = "";
+    var i = 1;
+    while i + 1 < arg_count(g) {
+        if bytes.equal(arg(g, i), name) {
+            found = arg(g, i + 1);
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+fn number[&t](text: &t [byte]) -> [] int {
+    var n = 0;
+    var i = 0;
+    while i < len(text) {
+        n = n * 10 + int_of(text[i]) - 48;
+        i = i + 1;
+    }
+    return n;
+}
+
+fn say[&i, &m](io: &!i Io, message: &m [byte]) -> [err_write] int {
+    io.error_all(io, "ask: ");
+    io.error_all(io, message);
+    io.error_all(io, "\n");
+    return 0;
+}
+
+fn slurp[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], cap: int) -> [heap, fs_read("")] (buffer.Buffer, bool) {
+    let store = box_slice(heap, cap, byte_of(0));
+    var out = buffer.empty(heap, 16);
+    var ok = false;
+    borrow mut store as &!sw in {
+        let n = fs_read(fs, path, contents(sw));
+        if n >= 0 {
+            ok = true;
+            out = buffer.append(heap, out, contents(sw)[0..n]);
+        }
+    }
+    unbox_slice(heap, store);
+    return (out, ok);
+}
+
+fn trimmed[&t](text: &t [byte]) -> [] &t [byte] {
+    var a = 0;
+    var b = len(text);
+    while a < b && (int_of(text[a]) == 32 || int_of(text[a]) >= 9 && int_of(text[a]) <= 13) {
+        a = a + 1;
+    }
+    while b > a && (int_of(text[b - 1]) == 32 || int_of(text[b - 1]) >= 9 && int_of(text[b - 1]) <= 13) {
+        b = b - 1;
+    }
+    return text[a..b];
+}
+
+fn go[&h, &f, &n, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), net: &n Net(""), clock: &c Clock, io: &!i Io, args: &g Args) -> [heap, fs_read(""), fs_write(""), net_out(""), conn_read, conn_write, poll, clock, err_write, args] int {
+    let model = opt(args, "--model");
+    let key_file = opt(args, "--key-file");
+    let host = opt(args, "--host");
+    let ip = opt(args, "--ip");
+    let roots_file = opt(args, "--roots");
+    let prompt_file = opt(args, "--prompt");
+    let out_file = opt(args, "--out");
+    let usage_file = opt(args, "--usage");
+    var max_tokens = 4096;
+    if len(opt(args, "--max-tokens")) > 0 {
+        max_tokens = number(opt(args, "--max-tokens"));
+    }
+    if len(model) == 0 || len(key_file) == 0 || len(host) == 0 || len(ip) == 0 || len(roots_file) == 0 || len(prompt_file) == 0 || len(out_file) == 0 || len(usage_file) == 0 {
+        say(io, "every of --model --key-file --host --ip --roots --prompt --out --usage is required");
+        return 2;
+    }
+    let (prompt, have_prompt) = slurp(heap, fs, prompt_file, 1048576);
+    let (key_raw, have_key) = slurp(heap, fs, key_file, 4096);
+    let (roots, have_roots) = slurp(heap, fs, roots_file, 1048576);
+    var rc = 1;
+    if have_prompt == false || have_key == false || have_roots == false {
+        say(io, "a file could not be read (the prompt, the key file or the roots)");
+        rc = 2;
+    } else {
+        var entropy = box_slice(heap, 32, byte_of(0));
+        borrow mut entropy as &!ew in {
+            fs_read(fs, "/dev/urandom", contents(ew));
+        }
+        var headers = buffer.empty(heap, 16);
+        borrow key_raw as &kr in {
+            buffer.drop(heap, headers);
+            headers = anthropic.headers(heap, trimmed(buffer.bytes(kr)), "");
+        }
+        var body = buffer.empty(heap, 16);
+        borrow prompt as &pr in {
+            buffer.drop(heap, body);
+            body = anthropic.request_body(heap, model, max_tokens, "", buffer.bytes(pr), "", "");
+        }
+        borrow headers as &hb in {
+            borrow body as &bb in {
+                borrow roots as &rb in {
+                    borrow mut entropy as &!ew in {
+                        match provider.exchange(heap, net, clock, io, host, 443, true, "/v1/messages", buffer.bytes(hb), buffer.bytes(bb), buffer.bytes(rb), ip, contents(ew), 33554432, 600000) {
+                            provider.Answered::Failed(tag) => {
+                                say(io, "the provider could not be reached or trusted");
+                            }
+                            provider.Answered::Ok(st, out) => {
+                                borrow out as &or in {
+                                    if st == 200 {
+                                        let text = reply.text(heap, buffer.bytes(or));
+                                        let line = reply.usage_line(heap, buffer.bytes(or));
+                                        borrow text as &tb in {
+                                            fs_write(fs, out_file, buffer.bytes(tb));
+                                        }
+                                        borrow line as &lb in {
+                                            let (before, had) = slurp(heap, fs, usage_file, 1048576);
+                                            var joined = before;
+                                            joined = buffer.append(heap, joined, buffer.bytes(lb));
+                                            joined = buffer.append(heap, joined, "\n");
+                                            borrow joined as &jb in {
+                                                fs_write(fs, usage_file, buffer.bytes(jb));
+                                            }
+                                            buffer.drop(heap, joined);
+                                        }
+                                        buffer.drop(heap, text);
+                                        buffer.drop(heap, line);
+                                        rc = 0;
+                                    } else {
+                                        say(io, "the provider did not answer 200");
+                                    }
+                                }
+                                buffer.drop(heap, out);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        buffer.drop(heap, headers);
+        buffer.drop(heap, body);
+        unbox_slice(heap, entropy);
+    }
+    buffer.drop(heap, prompt);
+    buffer.drop(heap, key_raw);
+    buffer.drop(heap, roots);
+    return rc;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec } = split(world);
+    release(ffi);
+    release(signals);
+    release(exec);
+    var console = io;
+    var h = heap;
+    var rc = 1;
+    borrow args as &g in {
+        borrow net as &n in {
+            borrow clock as &c in {
+                borrow fs as &f in {
+                    borrow mut console as &!i in {
+                        borrow mut h as &!hh in {
+                            rc = go(hh, f, n, c, i, g);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(clock);
+    release(fs);
+    release(console);
+    release(h);
+    release(args);
+    return rc;
+}
