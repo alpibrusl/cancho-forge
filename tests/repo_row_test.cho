@@ -110,6 +110,49 @@ fn test_an_operator_repo_row_outside_the_shape_is_operator_invalid[&h](heap: &!h
     return 0;
 }
 
+fn test_the_authority_of_a_row_is_a_short_list_of_program_sets_with_a_ceiling_and_a_compiler[&h](heap: &!h Heap) -> [heap] int {
+    let anchor = "\"max_patch_lines\":800";
+    let ok = "\"max_patch_lines\":800,\"compiler\":\"/opt/cancho/bin/cancho\",\"authority\":[{\"programs\":[\"src/*.cho\"],\"std\":true,\"ceiling\":\"docs/authority.txt\"},{\"programs\":[\"workers/repo_publish.cho\",\"src/*.cho\"],\"ceiling\":\"docs/authority-repo-publish.txt\"}]";
+    test.assert_eq(len(replaced(heap, anchor, ok)), 0);
+    // a compiler without authority, and authority without a compiler
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/opt/cancho/bin/cancho\"")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"authority\":[{\"programs\":[\"src/*.cho\"],\"ceiling\":\"docs/a.txt\"}]")) > 0);
+    // the compiler is an absolute path of the plain alphabet
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"cancho\",\"authority\":[{\"programs\":[\"a.cho\"],\"ceiling\":\"docs/a.txt\"}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/opt/../x\",\"authority\":[{\"programs\":[\"a.cho\"],\"ceiling\":\"docs/a.txt\"}]")) > 0);
+    // each entry: closed keys, a relative ceiling, 1 to 8 plain programs, a boolean std, and 1 to 4 entries
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":{}")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"programs\":[\"a.cho\"]}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"ceiling\":\"docs/a.txt\"}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"programs\":[],\"ceiling\":\"docs/a.txt\"}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"programs\":[\"a;b\"],\"ceiling\":\"docs/a.txt\"}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"programs\":[\"a.cho\"],\"ceiling\":\"../a.txt\"}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"programs\":[\"a.cho\"],\"ceiling\":\"/etc/a.txt\"}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"programs\":[\"a.cho\"],\"ceiling\":\"docs/a.txt\",\"std\":\"yes\"}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"programs\":[\"a.cho\"],\"ceiling\":\"docs/a.txt\",\"cmd\":\"x\"}]")) > 0);
+    test.assert(len(replaced(heap, anchor, "\"max_patch_lines\":800,\"compiler\":\"/c\",\"authority\":[{\"programs\":[\"a.cho\"],\"ceiling\":\"d/1\"},{\"programs\":[\"a.cho\"],\"ceiling\":\"d/2\"},{\"programs\":[\"a.cho\"],\"ceiling\":\"d/3\"},{\"programs\":[\"a.cho\"],\"ceiling\":\"d/4\"},{\"programs\":[\"a.cho\"],\"ceiling\":\"d/5\"}]")) > 0);
+    return 0;
+}
+
+fn test_the_authority_entries_of_a_row_are_counted_and_found[&h](heap: &!h Heap) -> [heap] int {
+    let text = "{\"repos\":{\"d\":{\"authority\":[{\"programs\":[\"a.cho\"],\"ceiling\":\"x\"},{\"programs\":[\"b.cho\"],\"ceiling\":\"y\"}]},\"e\":{}}}";
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        test.assert(json.parse(text, tp) > 0);
+        let d = repo_row.row_of(text, tp, "d");
+        let e = repo_row.row_of(text, tp, "e");
+        test.assert_eq(repo_row.authority_count(text, tp, d), 2);
+        test.assert_eq(repo_row.authority_count(text, tp, e), 0);
+        test.assert(repo_row.authority_entry(text, tp, d, 1) > 0);
+        test.assert_eq(repo_row.authority_entry(text, tp, d, 2), 0 - 1);
+        test.assert_eq(repo_row.authority_entry(text, tp, e, 0), 0 - 1);
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
 fn test_deny_wins_over_allow[&h](heap: &!h Heap) -> [heap] int {
     let text = "{\"allow\":[\"src/**\",\"tests/**\",\"README.md\"],\"deny\":[\"src/secret/**\",\"tests/*.golden\"]}";
     let tape = box_slice(heap, json.tape_len(text), 0);
