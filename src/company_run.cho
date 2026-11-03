@@ -149,6 +149,9 @@ pub fn uses_model(role: company_manifest.Role) -> [] bool {
         company_manifest.Role::Product => {
             return false;
         }
+        company_manifest.Role::System => {
+            return false;
+        }
     }
 }
 

@@ -1,0 +1,153 @@
+edition 9;
+module forge.company_autopub;
+
+import std.buffer;
+import std.bytes;
+import forge.company_cmd;
+import forge.company_files;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_publish;
+import forge.company_state;
+import forge.company_step;
+import forge.journal_io;
+import forge.publish_plan;
+
+// A `repo.publish` step (docs/auto-publish.md): Forge itself makes the local branch and commit of the `repo.change` step it needs, by the code of
+// `forge company publish`, to a branch the operator's `auto_publish` row names the prefix of. It never pushes. The runner (company_runner.cho) does the
+// journal records of the step; this module does what is specific to it.
+
+pub fn rule_invalid() -> [] &static [byte] {
+    return "publish-step-invalid";
+}
+
+pub fn rule_not_granted() -> [] &static [byte] {
+    return "publish-auto-not-granted";
+}
+
+// Can step `k` run? 0 when it can; 1 when it does not need exactly one `repo.change` step (`publish-step-invalid`); 2 when the operator's `auto_publish` has no
+// prefix for the repository of the step it needs (`publish-auto-not-granted`).
+pub fn preflight[&m, &s, &t](hm: &m company_manifest.Manifest, op: &s [byte], tp: &t [int], k: int) -> [] int {
+    let step = company_manifest.step_at(hm, k);
+    let at = company_graph.index_of(hm, company_manifest.step_need(hm, step, 0));
+    if company_manifest.step_needs_count(hm, step) != 1 || at < 0 || company_manifest.is_repo_change(company_manifest.step_at(hm, at)) == false {
+        return 1;
+    }
+    if len(company_step.op_auto_prefix(op, tp, company_manifest.step_repo(hm, company_manifest.step_at(hm, at)))) == 0 {
+        return 2;
+    }
+    return 0;
+}
+
+// The branch: the operator's prefix, the company's id, `-`, and the id of the step published. The same on every run.
+pub fn branch_name[&h, &p, &c, &s](heap: &!h Heap, prefix: &p [byte], company: &c [byte], step: &s [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), prefix), company), "-"), step);
+}
+
+// Make the publish and leave `publish.txt` in `evdir`: `branch <name>` and `commit <40 hex>`. When the journal already holds a `company.step.published` for the
+// step (a person ran the verb) nothing is made and the file says only `commit <40 hex>`. Returns the exit status (0 done; what the publish refused or 4 for
+// the journal and the file), the number of records it appended (1 when it made the publish, 0 when it adopted one) and the SHA-256 of `publish.txt` as hex.
+fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
+    if journal_io.path_ok(fs, path) == false {
+        return 0 - 2;
+    }
+    match open_write(fs, path) {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, contents);
+            }
+            file_close(file);
+            return rc;
+        }
+    }
+}
+
+pub fn run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], k: int, evdir: &e [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write] (int, int, buffer.Buffer) {
+    let step = company_manifest.step_at(hm, k);
+    let at = company_graph.index_of(hm, company_manifest.step_need(hm, step, 0));
+    let need = company_manifest.step_id(hm, company_manifest.step_at(hm, at));
+    let (journal, errno) = company_cmd.read_limited(heap, fs, jpath, 67108864);
+    var code = company_step.exit_io();
+    var appended = 0;
+    var adopted = false;
+    var text = buffer.empty(heap, 96);
+    if errno == 0 {
+        borrow journal as &jb in {
+            let have = company_state.published_commit(heap, buffer.bytes(jb), need);
+            borrow have as &hv in {
+                if len(buffer.bytes(hv)) == 40 {
+                    text = buffer.append(heap, buffer.append(heap, text, "commit "), buffer.bytes(hv));
+                    adopted = true;
+                    code = 0;
+                } else {
+                    let state = company_state.replay(heap, buffer.bytes(jb), hm);
+                    borrow state as &st in {
+                        let branch = branch_name(heap, company_step.op_auto_prefix(op, tp, company_manifest.step_repo(hm, company_manifest.step_at(hm, at))), company_manifest.id_of(hm), need);
+                        borrow branch as &bb in {
+                            if publish_plan.branch_ok(buffer.bytes(bb)) == false {
+                                company_cmd.refuse(io, publish_plan.rule_branch_invalid());
+                                code = company_step.exit_refused();
+                            } else {
+                                code = company_publish.patch_row(heap, fs, exec, clock, io, hm, st, buffer.bytes(jb), at, dir, op, tp, need, buffer.bytes(bb));
+                                if code == 0 {
+                                    appended = 1;
+                                }
+                            }
+                            text = buffer.append(heap, buffer.append(heap, buffer.append(heap, text, "branch "), buffer.bytes(bb)), "\n");
+                        }
+                        buffer.drop(heap, branch);
+                    }
+                    company_state.drop(heap, state);
+                }
+            }
+            buffer.drop(heap, have);
+        }
+    }
+    buffer.drop(heap, journal);
+    var sha = buffer.empty(heap, 1);
+    if code == 0 {
+        let (after, why) = company_cmd.read_limited(heap, fs, jpath, 67108864);
+        borrow after as &ab in {
+            let commit = company_state.published_commit(heap, buffer.bytes(ab), need);
+            borrow commit as &cb in {
+                if why != 0 || len(buffer.bytes(cb)) != 40 {
+                    code = company_step.exit_io();
+                } else if adopted == false {
+                    text = buffer.append(heap, buffer.append(heap, text, "commit "), buffer.bytes(cb));
+                }
+            }
+            buffer.drop(heap, commit);
+        }
+        buffer.drop(heap, after);
+    }
+    if code == 0 {
+        let path = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), evdir), "/publish.txt");
+        borrow path as &pb in {
+            borrow text as &tb in {
+                if write_file(fs, buffer.bytes(pb), buffer.bytes(tb)) != 0 {
+                    code = company_step.exit_io();
+                }
+            }
+        }
+        buffer.drop(heap, path);
+        if code == 0 {
+            let (data, why) = company_files.read_artifact(heap, fs, evdir, "publish.txt");
+            borrow data as &db in {
+                if why != 0 {
+                    code = company_step.exit_io();
+                } else {
+                    buffer.drop(heap, sha);
+                    sha = company_files.hex_of(heap, buffer.bytes(db));
+                }
+            }
+            buffer.drop(heap, data);
+        }
+    }
+    buffer.drop(heap, text);
+    return (code, appended, sha);
+}
