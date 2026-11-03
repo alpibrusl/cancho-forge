@@ -56,7 +56,7 @@ check "setup: the run stops at the open gate with lib accepted and its library r
 "$F" company decide "$co" ship approved "looks right" > /dev/null
 shasrc=$(sha256sum "$co/steps/lib/ev/src/diff.cho" | cut -c1-64)
 shatests=$(sha256sum "$co/steps/lib/ev/tests/diff_test.cho" | cut -c1-64)
-before=$(cksum < "$co/company.journal")
+before=$(cksum < "$co/company.journal"); before_n=$(grep -c '' "$co/company.journal")
 
 # ---- the good path
 "$F" company publish "$co" "$w/op1.json" lib forge/lib > "$w/pub1.out" 2> "$w/pub1.err"; echo $? > "$w/pub1.rc"
@@ -65,7 +65,7 @@ check "good: both library files are on the branch, byte for byte" sh -c "git -C 
 check "good: the commit holds exactly the two files and the provenance" sh -c "[ \"\$(git -C '$w/ck1' show --name-only --format= forge/lib | sort | tr '\n' ' ')\" = 'docs/provenance.md src/diff.cho tests/diff_test.cho ' ]"
 git -C "$w/ck1" show forge/lib:docs/provenance.md > "$w/prov.md"
 check "good: the provenance lists each file with the digest Forge hashed" sh -c "grep -q '## Files' '$w/prov.md' && grep -q 'src/diff.cho.*$shasrc' '$w/prov.md' && grep -q 'tests/diff_test.cho.*$shatests' '$w/prov.md'"
-check "good: project.cho is not on the branch, the company journal is unchanged, nothing was pushed" sh -c "! git -C '$w/ck1' show forge/lib:project.cho > /dev/null 2>&1 && [ \"\$(cksum < '$co/company.journal')\" = '$before' ] && [ -z \"\$(git -C '$w/ck1' branch -r)\" ]"
+check "good: project.cho is not on the branch, the company journal is what it was plus one published record, nothing was pushed" sh -c "! git -C '$w/ck1' show forge/lib:project.cho > /dev/null 2>&1 && [ \"\$(head -n $before_n '$co/company.journal' | cksum)\" = '$before' ] && [ \"\$(grep -c '' '$co/company.journal')\" = $((before_n + 1)) ] && tail -1 '$co/company.journal' | grep -q company.step.published && [ -z \"\$(git -C '$w/ck1' branch -r)\" ]"
 check "good: the checkout is back on its branch and clean" sh -c "[ -z \"\$(git -C '$w/ck1' status --porcelain --untracked-files=all)\" ] && [ \"\$(git -C '$w/ck1' rev-parse --abbrev-ref HEAD)\" != forge/lib ]"
 
 # ---- the artifact together with the library files (three entries)
