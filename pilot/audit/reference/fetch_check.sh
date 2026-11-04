@@ -4,12 +4,13 @@
 set -u
 C="${CANCHO:-cancho}"
 cd "$(dirname "$0")/../../.." || exit 1
+. scripts/packages.sh
 w=$1
 fail=0
 ok() { echo "ok   reference fetch: $1"; }
 bad() { echo "FAIL reference fetch: $1"; fail=1; }
 R=pilot/audit/reference
-$C build pilot/audit/world.cho --std -o "$w/world" && $C build pilot/audit/resolver.cho --std -o "$w/resolver" && $C build $R/fetch_cli.cho $R/fetch.cho $R/checker.cho spike/lib/dns.cho --std -o "$w/fetch" || { echo "FAIL reference fetch: did not build"; exit 1; }
+$C build pilot/audit/world.cho --std -o "$w/world" && $C build pilot/audit/resolver.cho --std -o "$w/resolver" && $C build $R/fetch_cli.cho $R/fetch.cho $R/probe.cho $R/checker.cho spike/lib/dns.cho $PKG/tls/*.cho $PKG/x509/*.cho --std -o "$w/fetch" || { echo "FAIL reference fetch: did not build"; exit 1; }
 base=$((30000 + $$ % 20000)); n=0
 stop() { kill $pids 2> /dev/null; wait 2> /dev/null; pids=""; }
 # case <allow 0|1> <resolver table or ""> <url with @w1 @w2> -- <world 1 args> [-- <world 2 args>]  ->  $out, $rc
@@ -87,4 +88,49 @@ run_ 0 "pub.test=203.0.113.7" "http://pub.test/"
 chk "a public-looking address with nothing listening is down, not refused" '"verdict":"down"'
 run_ 1 "" "http://127.0.0.1:@w1/" 2 hang 20000
 if [ "$rc" = 1 ] && has 'refused check.timeout'; then ok "an answer that never comes is check.timeout at the hard limit"; else bad "hang ($out)"; fi
+
+# ---- TLS: the vendored cancho TLS server on the audit's fixtures, the checker's roots and its clock (--now) ----
+V=pilot/audit/vendor
+if $C build --std $V/hello.cho $V/loop.cho $V/app.cho $V/front.cho $V/identity.cho $PKG/http-server/server.cho \
+  $PKG/tls/tls.cho $PKG/tls/record.cho $PKG/tls/message.cho $PKG/tls/slot.cho $PKG/tls/cident.cho $PKG/tls/client12.cho $PKG/tls/client.cho $PKG/tls/hello.cho \
+  $PKG/tls/identity.cho $PKG/tls/clientauth.cho $PKG/tls/ticket.cho $PKG/tls/server.cho $PKG/tls/saved.cho \
+  $PKG/x509/verify.cho $PKG/x509/names.cho $PKG/x509/x509.cho $PKG/x509/key.cho -o "$w/tlsworld"; then
+  NOT_AFTER=2051222400   # 2035-01-01T00:00:00Z, the fixtures' notAfter
+  DAY=86400
+  # tlsrun <identity> <roots: ca|none> <now unix s> -> $out
+  tlsrun() {
+    n=$((n + 1)); p1=$((base + n * 4 + 1)); pr=$((p1 + 2))
+    "$w/tlsworld" --port "$p1" --dir "pilot/audit/tls/id_$1" > "$w/tls.$n.out" 2>&1 &
+    t1=$!
+    "$w/resolver" "$pr" 4 ok.test=127.0.0.1 > "$w/resolver.$n.out" 2>&1 &
+    t2=$!
+    i=0; while [ $i -lt 50 ] && ! { grep -q '^listening' "$w/tls.$n.out" && grep -q '^listening' "$w/resolver.$n.out"; }; do sleep 0.1; i=$((i + 1)); done
+    if [ "$2" = ca ]; then roots="pilot/audit/tls/ca.pem"; else roots="/dev/null"; fi
+    out=$("$w/fetch" 127.0.0.1 "$pr" 1 "https://ok.test:$p1/" "$roots" "$3" 2> /dev/null); rc=$?
+    kill $t1 $t2 2> /dev/null; wait 2> /dev/null
+  }
+  tlsrun valid ca $((NOT_AFTER - 1826 * DAY))
+  chk "a valid chain for ok.test verifies, with whole days left (1826 at five years before notAfter)" '"tls":{"verified":true,"days_left":1826}.*"verdict":"up"'
+  tlsrun valid ca $((NOT_AFTER - 14 * DAY))
+  chk "14 days left is up (the boundary)" '"days_left":14}.*"verdict":"up"'
+  tlsrun valid ca $((NOT_AFTER - 14 * DAY + 1))
+  chk "13 days and 23 hours left is 13 whole days and degraded" '"days_left":13}.*"verdict":"degraded"'
+  tlsrun valid ca $((NOT_AFTER - 10 * DAY))
+  chk "10 days left is degraded" '"days_left":10}.*"verdict":"degraded"'
+  tlsrun valid ca $((NOT_AFTER - DAY))
+  chk "1 day left is degraded with days_left 1" '"days_left":1}.*"verdict":"degraded"'
+  tlsrun valid ca $((NOT_AFTER + DAY))
+  chk "an expired chain is down, not verified" '"tls":{"verified":false,"days_left":0}.*"verdict":"down"'
+  tlsrun wrongname ca $((NOT_AFTER - 1826 * DAY))
+  chk "a certificate for another name is down, not verified" '"tls":{"verified":false.*"verdict":"down"'
+  tlsrun selfsigned ca $((NOT_AFTER - 1826 * DAY))
+  chk "a self-signed certificate is down, not verified" '"tls":{"verified":false.*"verdict":"down"'
+  tlsrun valid none $((NOT_AFTER - 1826 * DAY))
+  chk "a chain that no trusted root vouches for is down" '"tls":{"verified":false.*"verdict":"down"'
+  chk "and the reason names what the engine refused" 'x509'
+  tlsrun valid ca $((NOT_AFTER - 1826 * DAY))
+  chk "the tls phase is measured" '"timing_ms":{"dns":[0-9]*,"connect":[0-9]*,"tls":[0-9]*,'
+else
+  bad "the TLS world did not build"
+fi
 exit "$fail"
