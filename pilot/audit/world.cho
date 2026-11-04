@@ -3,7 +3,7 @@ edition 9;
 import std.bytes;
 import std.io;
 
-// Spike P4 (docs/pilot-s1.md sections 4 and 6): the held-out audit's test world, in cancho. A scripted HTTP/1.1 server that misbehaves on purpose, one mode a process, at the byte
+// The held-out audit's test world (docs/pilot-audit.md section 3; first the spike P4 of docs/pilot-s1.md section 6), in cancho. A scripted HTTP/1.1 server that misbehaves on purpose, one mode a process, at the byte
 // level, on loopback. A raw TCP server, not an HTTP library, because the cases the audit needs (a connection that never answers, a reset after the headers, a Content-Length that lies,
 // a header block over the limit) are the ones a library refuses to produce.
 //
@@ -16,6 +16,7 @@ import std.io;
 //   lie                  Content-Length 100, ten bytes, close    chunked             a valid chunked answer: `hello`
 //   big <n>              Content-Length n, n bytes of `a`        redirect <url>      302 to <url> (to itself: a loop; to another port: a chain)
 //   bighead              a header block of 100 KiB               trickle <n>         a valid answer, one byte at a time, <n> ms apart
+//   redirect301 <url>    301 to <url>                            location <kind>     a 302 whose Location is empty (`empty`), `/next` (`relative`) or 8 KiB long (`long`)
 //
 // It serves <connections> connections, one after the other, then exits. The audit starts one process a case; a case that needs a chain starts several.
 
@@ -172,6 +173,26 @@ fn serve_one[&c, &k, &m, &a](conn: &!c Conn, clock: &k Clock, mode: &m [byte], a
     } else if bytes.equal(mode, "redirect") {
         send_all(conn, "HTTP/1.1 302 Found\r\nLocation: ");
         send_all(conn, arg);
+        send_all(conn, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    } else if bytes.equal(mode, "redirect301") {
+        send_all(conn, "HTTP/1.1 301 Moved Permanently\r\nLocation: ");
+        send_all(conn, arg);
+        send_all(conn, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    } else if bytes.equal(mode, "location") {
+        send_all(conn, "HTTP/1.1 302 Found\r\nLocation: ");
+        if bytes.equal(arg, "relative") {
+            send_all(conn, "/next");
+        } else if bytes.equal(arg, "long") {
+            send_all(conn, "http://example.test/");
+            region r {
+                let block = alloc_slice[r](1024, byte_of(97));
+                var sent = 0;
+                while sent < 8 {
+                    send_all(conn, block);
+                    sent = sent + 1;
+                }
+            }
+        }
         send_all(conn, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     } else if bytes.equal(mode, "bighead") {
         send_all(conn, "HTTP/1.1 200 OK\r\nConnection: close\r\nX-Pad: ");

@@ -59,7 +59,7 @@ So the world can serve a valid chain and a wrong-name chain from cancho's server
 
 **Built in T1** (`pilot/audit/tls_check.sh`, in the gate): the server is cancho's `examples/https_hello`, **vendored verbatim** from the pinned compiler revision into `pilot/audit/vendor/` (the compiler's `examples/` are not available to the gate, only its `packages/`), built with the compiler's `http-server`, `tls` and `x509`; the fixtures are `pilot/audit/tls/` (made once by `make.sh`, checked in, throw-away keys). Seen from outside: a valid chain for `ok.test` verifies and answers 200; a TLS 1.2-only client is refused; plain HTTP on the TLS port is not answered; a certificate for `other.test` is served and fails with a hostname mismatch; a self-signed leaf is served and fails verification. 5 of 5.
 
-Not yet built, so T1 is not done: the P4 world's promotion, the redirect-to modes and the stub resolver (T2 needs them).
+**Also built in T1:** the P4 world is promoted to `pilot/audit/world.cho` (with `redirect301 <url>` and `location empty|relative|long`; `redirect <url>` already took any target, a private one included) and `pilot/audit/resolver.cho` is the stub resolver: `resolver <port> <queries> <name=a.b.c.d[,a.b.c.d]|NX|SILENT>...`, up to four A records, NXDOMAIN for a name not in the table, silence on request. `pilot/audit/world_check.sh` (the 17 P4 cases, 4 new redirect cases, 7 resolver cases, seen from outside by `curl` and by the P1 client) is in the gate: 28 of 28. **T1 is done.**
 
 ## 4. The cases and the driver *(designed)*
 

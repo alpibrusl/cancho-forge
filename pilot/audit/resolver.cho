@@ -1,0 +1,312 @@
+edition 9;
+
+import std.bytes;
+import std.io;
+
+// The audit's stub resolver (docs/pilot-audit.md section 3): a DNS server on loopback that answers A queries from a table given on the command line, so no case depends on
+// the internet and a name can resolve to exactly the address a refusal case needs.
+//
+//     resolver <port> <queries> <name=answer>...
+//
+//   answer   a.b.c.d[,a.b.c.d...]  up to four A records, TTL 60      NX  NXDOMAIN (rcode 3)      SILENT  the query is read and not answered
+//
+// A name not in the table is NXDOMAIN. It serves <queries> queries, one after the other, then exits. Names compare case-insensitively, without a final dot. Prints `served <n>` when it ends.
+
+fn say_int[&i](io: &!i Io, label: &i [byte], n: int) -> [io_write] int {
+    io.write_all(io, label);
+    io.print_int(io, n);
+    io.newline(io);
+    return 0;
+}
+
+fn lower(c: int) -> [] int {
+    if c >= 65 && c <= 90 {
+        return c + 32;
+    }
+    return c;
+}
+
+// A non-negative decimal number of at most 3 digits, or -1.
+fn octet[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 3 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + c - 48;
+        k = k + 1;
+    }
+    if n > 255 {
+        return 0 - 1;
+    }
+    return n;
+}
+
+// A non-negative decimal number, or -1.
+fn number[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + c - 48;
+        k = k + 1;
+    }
+    return n;
+}
+
+// The end of the question section of a query in `q[0..n]`: past its name and the four bytes of type and class, or -1.
+fn question_end[&q](q: &q [byte], n: int) -> [] int {
+    var at = 12;
+    while at < n && int_of(q[at]) != 0 {
+        at = at + int_of(q[at]) + 1;
+    }
+    if at + 5 > n {
+        return 0 - 1;
+    }
+    return at + 5;
+}
+
+// Does the query name in `q` (labels from offset 12) equal `want`, ignoring case and a final dot in `want`?
+fn name_is[&q, &w](q: &q [byte], n: int, want: &w [byte]) -> [] bool {
+    var at = 12;
+    var w = 0;
+    var end = len(want);
+    if end > 0 && int_of(want[end - 1]) == 46 {
+        end = end - 1;
+    }
+    var first = true;
+    while at < n && int_of(q[at]) != 0 {
+        let l = int_of(q[at]);
+        if at + l + 1 > n {
+            return false;
+        }
+        if first == false {
+            if w >= end || int_of(want[w]) != 46 {
+                return false;
+            }
+            w = w + 1;
+        }
+        first = false;
+        var k = 0;
+        while k < l {
+            if w >= end || lower(int_of(q[at + 1 + k])) != lower(int_of(want[w])) {
+                return false;
+            }
+            w = w + 1;
+            k = k + 1;
+        }
+        at = at + l + 1;
+    }
+    return w == end;
+}
+
+// The part of `arg` before its first `=`, and the part after.
+fn split_at[&a](arg: &a [byte]) -> [] (&a [byte], &a [byte]) {
+    var k = 0;
+    while k < len(arg) && int_of(arg[k]) != 61 {
+        k = k + 1;
+    }
+    if k >= len(arg) {
+        return (arg[0..len(arg)], arg[len(arg)..len(arg)]);
+    }
+    return (arg[0..k], arg[k + 1..len(arg)]);
+}
+
+// Write the answer records of `answer` (`a.b.c.d,...`) into `reply[at..]`; answers how many bytes, or -1 when an address is not an IPv4 literal; `count` receives how many.
+fn put_records[&r, &a, &c](reply: &!r [byte], at: int, answer: &a [byte], count: &!c [int]) -> [] int {
+    var out = at;
+    var n = 0;
+    var start = 0;
+    var k = 0;
+    while k <= len(answer) {
+        if k == len(answer) || int_of(answer[k]) == 44 {
+            let part = answer[start..k];
+            var o = 0;
+            var s = 0;
+            var j = 0;
+            var vals = 0;
+            var a0 = 0;
+            var a1 = 0;
+            var a2 = 0;
+            var a3 = 0;
+            while j <= len(part) {
+                if j == len(part) || int_of(part[j]) == 46 {
+                    let v = octet(part[s..j]);
+                    if v < 0 {
+                        return 0 - 1;
+                    }
+                    if vals == 0 {
+                        a0 = v;
+                    }
+                    if vals == 1 {
+                        a1 = v;
+                    }
+                    if vals == 2 {
+                        a2 = v;
+                    }
+                    if vals == 3 {
+                        a3 = v;
+                    }
+                    vals = vals + 1;
+                    s = j + 1;
+                }
+                j = j + 1;
+            }
+            if vals != 4 || n >= 4 {
+                return 0 - 1;
+            }
+            reply[out] = byte_of(192);
+            reply[out + 1] = byte_of(12);
+            reply[out + 2] = byte_of(0);
+            reply[out + 3] = byte_of(1);
+            reply[out + 4] = byte_of(0);
+            reply[out + 5] = byte_of(1);
+            reply[out + 6] = byte_of(0);
+            reply[out + 7] = byte_of(0);
+            reply[out + 8] = byte_of(0);
+            reply[out + 9] = byte_of(60);
+            reply[out + 10] = byte_of(0);
+            reply[out + 11] = byte_of(4);
+            reply[out + 12] = byte_of(a0);
+            reply[out + 13] = byte_of(a1);
+            reply[out + 14] = byte_of(a2);
+            reply[out + 15] = byte_of(a3);
+            out = out + 16;
+            n = n + 1;
+            o = o + 1;
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    count[0] = n;
+    return out - at;
+}
+
+// 0 answer from the table, 1 NXDOMAIN, 2 silence, for the query in `dg[0..len]`; `row` receives the index of the matching table entry.
+fn kind_of[&d, &g, &r](dg: &d [byte], len_dg: int, args: &g Args, first: int, row: &!r [int]) -> [args] int {
+    var i = first;
+    while i < arg_count(args) {
+        let (name, answer) = split_at(arg(args, i));
+        if name_is(dg, len_dg, name) {
+            row[0] = i;
+            if bytes.equal(answer, "NX") {
+                return 1;
+            }
+            if bytes.equal(answer, "SILENT") {
+                return 2;
+            }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn serve[&i, &n, &g](io: &!i Io, net: &n Net(""), args: &g Args, port: int, queries: int) -> [io_write, net_in(""), udp_send, udp_recv, args] int {
+    match udp_bind(net, port, 0) {
+        UdpOpened::Failed(e) => {
+            return say_int(io, "bind failed errno ", e);
+        }
+        UdpOpened::Ok(opened) => {
+            var sock = opened;
+            var served = 0;
+            region r {
+                let dg = alloc_slice[r](512, byte_of(0));
+                let reply = alloc_slice[r](512, byte_of(0));
+                let who = alloc_slice[r](4, 0);
+                let row = alloc_slice[r](1, 0);
+                let count = alloc_slice[r](1, 0);
+                while served < queries {
+                    borrow mut sock as &!s in {
+                        match udp_recv_from(s, dg, who) {
+                            Datagram::Got(got) => {
+                                let qe = question_end(dg, got);
+                                if qe > 0 {
+                                    let kind = kind_of(dg, got, args, 3, row);
+                                    if kind != 2 {
+                                        var k = 0;
+                                        while k < qe {
+                                            reply[k] = dg[k];
+                                            k = k + 1;
+                                        }
+                                        reply[2] = byte_of(129);
+                                        reply[3] = byte_of(128);
+                                        reply[6] = byte_of(0);
+                                        reply[7] = byte_of(0);
+                                        reply[8] = byte_of(0);
+                                        reply[9] = byte_of(0);
+                                        reply[10] = byte_of(0);
+                                        reply[11] = byte_of(0);
+                                        var total = qe;
+                                        if kind == 1 {
+                                            reply[3] = byte_of(131);
+                                        } else {
+                                            let (name, answer) = split_at(arg(args, row[0]));
+                                            let written = put_records(reply, qe, answer, count);
+                                            if written < 0 {
+                                                reply[3] = byte_of(130);
+                                            } else {
+                                                reply[7] = byte_of(count[0]);
+                                                total = qe + written;
+                                            }
+                                        }
+                                        udp_send_to(s, reply[0..total], who[0]);
+                                    }
+                                }
+                                served = served + 1;
+                            }
+                            Datagram::Truncated(got) => {
+                                served = served + 1;
+                            }
+                            Datagram::Again => {
+                                served = served + 0;
+                            }
+                            Datagram::Failed(e) => {
+                                served = queries;
+                            }
+                        }
+                    }
+                }
+            }
+            udp_close(sock);
+            return say_int(io, "served ", served);
+        }
+    }
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(fs);
+    release(heap);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var code = 2;
+    borrow net as &n in {
+        borrow args as &g in {
+            borrow mut console as &!i in {
+                if arg_count(g) >= 3 && number(arg(g, 1)) > 0 && number(arg(g, 2)) > 0 {
+                    code = serve(i, n, g, number(arg(g, 1)), number(arg(g, 2)));
+                }
+            }
+        }
+    }
+    release(net);
+    release(console);
+    release(args);
+    return code;
+}
