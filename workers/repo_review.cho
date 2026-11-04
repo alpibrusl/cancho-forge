@@ -1,0 +1,604 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import anthropic;
+import dns;
+import provider;
+import reply;
+import forge.gate_task;
+import forge.journal_io;
+import forge.review_net;
+import forge.review_prompt;
+import forge.snapshot;
+import forge.verbs;
+
+// The model reviewer's worker (docs/review-step.md section 5): a `sync` worker of the contract (docs/worker-contract.md). One `execute` request on stdin, one
+// response on stdout, exit 0. The task is `repo.review`. It reads `brief.txt` and `change.patch` from the execution directory, where Forge copied them and
+// nothing else, builds the one prompt of `forge.review_prompt` (the prompt R-1 measured), makes ONE call to the provider named by the grant (no retry, no tools, no
+// thinking), and writes beneath the execution directory:
+//
+//   reply.txt     kind `file`    the model's text, verbatim
+//   usage.jsonl   kind `file`    one line, `{"in":N,"out":N,"cache_write":N,"cache_read":N}` (the format `company.md` section 9 reads)
+//   report.json   kind `report`  the model, the prompt's SHA-256, the byte counts, the HTTP status; nothing secret
+//
+// It answers NO verdict: Forge parses `reply.txt` itself (`forge.review_verdict`). The grants are `execution_dir` and `review` (`key_file`, `host`, `model`,
+// `max_tokens`, `max_diff_bytes`). The key file is read here, inside this worker's authority, and goes to the provider's host in a request header; it is never
+// printed, logged, written to a file or put in an answer. The address of the host is resolved here, by a UDP query to the first IPv4 `nameserver` of the system
+// resolver file (`forge.review_net`), and the connection is made to that address. The certificate must carry the host's name and chain to a root of the system's CA
+// bundle (the first of /etc/ssl/cert.pem, /etc/ssl/certs/ca-certificates.crt, /etc/pki/tls/certs/ca-bundle.crt).
+//
+// External programs it starts: none. Authority: the report is docs/authority-repo-review.txt (the network is `net_out`, TCP to the provider and UDP to the
+// resolver; the key file, the CA bundle, the resolver file and /dev/urandom are read, and the execution directory is written).
+
+fn deadline_ms(timeout_ms: int) -> [] int {
+    return timeout_ms / 5 * 4;
+}
+
+fn dns_wait_ms() -> [] int {
+    return 5000;
+}
+
+fn read_request[&h, &i](heap: &!h Heap, io: &!i Io) -> [heap, io_read] (buffer.Buffer, bool) {
+    var all = buffer.empty(heap, 1024);
+    var c = getchar(io);
+    var n = 0;
+    while c >= 0 {
+        if n >= 1048576 {
+            return (all, false);
+        }
+        all = buffer.push(heap, all, byte_of(c));
+        n = n + 1;
+        c = getchar(io);
+    }
+    return (all, true);
+}
+
+fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -> [fs_write(""), file_write] int {
+    if journal_io.path_ok(fs, path) == false {
+        return 0 - 2;
+    }
+    match open_write(fs, path) {
+        Opened::Failed(e) => {
+            return e;
+        }
+        Opened::Ok(opened) => {
+            var file = opened;
+            var rc = 0;
+            borrow mut file as &!x in {
+                rc = journal_io.write_all(x, contents);
+            }
+            file_close(file);
+            return rc;
+        }
+    }
+}
+
+fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 64), dir);
+    b = buffer.push(heap, b, byte_of(47));
+    return buffer.append(heap, b, name);
+}
+
+fn entry[&h, &p, &s](heap: &!h Heap, w: json.Writer, id: &static [byte], kind: &static [byte], path: &p [byte], sha: &s [byte], size: int) -> [heap] json.Writer {
+    var x = json.begin_object(heap, w);
+    x = json.put_key(heap, x, "id");
+    x = json.put_string(heap, x, id);
+    x = json.put_key(heap, x, "kind");
+    x = json.put_string(heap, x, kind);
+    x = json.put_key(heap, x, "ref");
+    x = json.put_string(heap, x, path);
+    x = json.put_key(heap, x, "sha256");
+    x = json.put_string(heap, x, sha);
+    x = json.put_key(heap, x, "bytes");
+    x = json.put_int(heap, x, size);
+    return json.end_object(heap, x);
+}
+
+// The text of a field when it is a string, else empty (`gate_task.check` then refuses it).
+fn text_of[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] &s [byte] {
+    if node >= 0 && json.is_string(tape, node) && json.string_plain(tape, node) {
+        return json.string_view(src, tape, node);
+    }
+    return "";
+}
+
+fn is[&s, &t](src: &s [byte], tape: &t [int], node: int, text: &static [byte]) -> [] bool {
+    return node >= 0 && json.is_string(tape, node) && json.string_equals(src, tape, node, text);
+}
+
+// The response. `code` empty means `succeeded`; otherwise `failed` with that error code. The three evidence entries are present when `evidence` is true.
+fn answer[&h, &i, &r, &k, &a, &b, &c](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], code: &static [byte], message: &static [byte], evidence: bool, reply_sha: &a [byte], reply_size: int, usage_sha: &b [byte], usage_size: int, report_sha: &c [byte], report_size: int) -> [heap, io_write] int {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "contract");
+    w = json.put_string(heap, w, "forge-worker/1");
+    w = json.put_key(heap, w, "request_id");
+    w = json.put_string(heap, w, request_id);
+    w = json.put_key(heap, w, "state");
+    if len(code) == 0 {
+        w = json.put_string(heap, w, "succeeded");
+    } else {
+        w = json.put_string(heap, w, "failed");
+    }
+    w = json.put_key(heap, w, "task_id");
+    w = json.put_string(heap, w, task_id);
+    w = json.put_key(heap, w, "summary");
+    if len(code) == 0 {
+        w = json.put_string(heap, w, "model review; the reply is in reply.txt, Forge reads the verdict from it");
+    } else {
+        w = json.put_string(heap, w, message);
+    }
+    w = json.put_key(heap, w, "evidence");
+    w = json.begin_array(heap, w);
+    if evidence {
+        w = entry(heap, w, "ev-1", "file", "reply.txt", reply_sha, reply_size);
+        w = entry(heap, w, "ev-2", "file", "usage.jsonl", usage_sha, usage_size);
+        w = entry(heap, w, "ev-3", "report", "report.json", report_sha, report_size);
+    }
+    w = json.end_array(heap, w);
+    w = json.put_key(heap, w, "error");
+    if len(code) == 0 {
+        w = json.put_null(heap, w);
+    } else {
+        w = json.begin_object(heap, w);
+        w = json.put_key(heap, w, "code");
+        w = json.put_string(heap, w, code);
+        w = json.put_key(heap, w, "message");
+        w = json.put_string(heap, w, message);
+        w = json.put_key(heap, w, "retryable");
+        w = json.put_bool(heap, w, false);
+        w = json.end_object(heap, w);
+    }
+    w = json.end_object(heap, w);
+    let out = json.finish(w);
+    borrow out as &o in {
+        buffer.write(io, o);
+    }
+    io.newline(io);
+    buffer.drop(heap, out);
+    return 0;
+}
+
+fn fail[&h, &i, &r, &k](heap: &!h Heap, io: &!i Io, request_id: &r [byte], task_id: &k [byte], code: &static [byte], message: &static [byte]) -> [heap, io_write] int {
+    return answer(heap, io, request_id, task_id, code, message, false, "", 0, "", 0, "", 0);
+}
+
+// The file `path` read whole under `cap` bytes: the contents and their length, or -1 when it was not read (a file longer than `cap` is not read).
+fn slurp[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], cap: int) -> [heap, fs_read("")] (buffer.Buffer, int) {
+    let store = box_slice(heap, cap + 1, byte_of(0));
+    var out = buffer.empty(heap, 16);
+    var size = 0 - 1;
+    borrow mut store as &!sw in {
+        let n = fs_read(fs, path, contents(sw));
+        if n >= 0 && n <= cap {
+            size = n;
+            out = buffer.append(heap, out, contents(sw)[0..n]);
+        }
+    }
+    unbox_slice(heap, store);
+    return (out, size);
+}
+
+fn trimmed[&t](text: &t [byte]) -> [] &t [byte] {
+    var a = 0;
+    var b = len(text);
+    while a < b && (int_of(text[a]) == 32 || int_of(text[a]) >= 9 && int_of(text[a]) <= 13) {
+        a = a + 1;
+    }
+    while b > a && (int_of(text[b - 1]) == 32 || int_of(text[b - 1]) >= 9 && int_of(text[b - 1]) <= 13) {
+        b = b - 1;
+    }
+    return text[a..b];
+}
+
+// Wait for one datagram: its length, 0 - 4 for the deadline, a negative for a failure.
+fn wait_answer[&c, &u, &b](clock: &c Clock, sock: &!u Udp, into: &!b [byte], deadline: int) -> [udp_recv, poll, clock] int {
+    udp_nonblocking(sock);
+    match poller_new() {
+        Polling::Failed(e) => {
+            return 0 - 5;
+        }
+        Polling::Ok(poller) => {
+            var pw = poller;
+            var result = 0 - 4;
+            var done = false;
+            borrow mut pw as &!pm in {
+                poller_add_udp(pm, sock, 1, 1);
+                region r {
+                    let events = alloc_slice[r](8, 0);
+                    while done == false {
+                        let left = deadline - clock_ms(clock);
+                        if left <= 0 {
+                            done = true;
+                        } else {
+                            let ready = poller_wait(pm, events, left);
+                            if ready > 0 {
+                                match udp_recv(sock, into) {
+                                    Datagram::Got(n) => {
+                                        result = n;
+                                        done = true;
+                                    }
+                                    Datagram::Truncated(n) => {
+                                        result = n;
+                                        done = true;
+                                    }
+                                    Datagram::Again => {
+                                        result = 0 - 4;
+                                    }
+                                    Datagram::Failed(e) => {
+                                        result = 0 - 6;
+                                        done = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            poller_close(pw);
+            return result;
+        }
+    }
+}
+
+// The first A record of `name`, asked of the resolver `server` (an IPv4 literal) on port 53 with `id` as the query's id, waiting at most `wait_ms`: the dotted
+// address as a buffer, empty when there is none.
+fn resolve[&h, &n, &c, &s, &m](heap: &!h Heap, net: &n Net(""), clock: &c Clock, server: &s [byte], name: &m [byte], id: int, wait_ms: int) -> [heap, net_out(""), udp_send, udp_recv, poll, clock] (buffer.Buffer, int) {
+    var found = buffer.empty(heap, 16);
+    var found_n = 0;
+    let started = clock_ms(clock);
+    match udp_connect(net, server, 53) {
+        UdpOpened::Failed(e) => {
+            return (found, 0);
+        }
+        UdpOpened::Ok(opened) => {
+            var sock = opened;
+            region r {
+                let query = alloc_slice[r](512, byte_of(0));
+                let datagram = alloc_slice[r](512, byte_of(0));
+                let addrs = alloc_slice[r](dns.addrs_size(), 0);
+                let sent_len = dns.build_query(name, id, query, 0);
+                var got = 0 - 9;
+                if sent_len > 0 {
+                    borrow mut sock as &!u in {
+                        match udp_send(u, query[0..sent_len]) {
+                            Sent::Wrote(n) => {
+                                got = wait_answer(clock, u, datagram, started + wait_ms);
+                            }
+                            Sent::Again => {
+                                got = 0 - 2;
+                            }
+                            Sent::Failed(e) => {
+                                got = 0 - 3;
+                            }
+                        }
+                    }
+                }
+                if got > 0 && dns.parse(datagram, got, id, addrs) > 0 {
+                    let text = alloc_slice[r](16, byte_of(0));
+                    let l = dns.put_dotted(text, 0, addrs[0]);
+                    found = buffer.append(heap, found, text[0..l]);
+                    found_n = l;
+                }
+            }
+            udp_close(sock);
+            return (found, found_n);
+        }
+    }
+}
+
+fn root_path(k: int) -> [] &static [byte] {
+    if k == 0 {
+        return "/etc/ssl/cert.pem";
+    }
+    if k == 1 {
+        return "/etc/ssl/certs/ca-certificates.crt";
+    }
+    return "/etc/pki/tls/certs/ca-bundle.crt";
+}
+
+// The first CA bundle that is there, under a megabyte; empty when there is none.
+fn roots[&h, &f](heap: &!h Heap, fs: &f Fs("")) -> [heap, fs_read("")] (buffer.Buffer, int) {
+    var k = 0;
+    while k < 3 {
+        let (pem, n) = slurp(heap, fs, root_path(k), 1048576);
+        if n > 0 {
+            return (pem, n);
+        }
+        buffer.drop(heap, pem);
+        k = k + 1;
+    }
+    return (buffer.empty(heap, 1), 0);
+}
+
+// Write the reply, the usage line and the report beneath `exec_dir` and answer.
+fn keep[&h, &i, &f, &r, &k, &p, &m, &x, &y, &z](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), request_id: &r [byte], task_id: &k [byte], exec_dir: &p [byte], model: &m [byte], prompt_sha: &x [byte], brief_bytes: int, patch_bytes: int, text: &y [byte], usage: &z [byte], status: int) -> [heap, io_write, fs_write(""), file_write] int {
+    let report = review_prompt.report_json(heap, model, prompt_sha, brief_bytes, patch_bytes, len(text), status);
+    let reply_file = under(heap, exec_dir, "reply.txt");
+    let usage_file = under(heap, exec_dir, "usage.jsonl");
+    let report_file = under(heap, exec_dir, "report.json");
+    let reply_sha = snapshot.hex_digest(heap, text);
+    let usage_sha = snapshot.hex_digest(heap, usage);
+    borrow report as &rb in {
+        let report_sha = snapshot.hex_digest(heap, buffer.bytes(rb));
+        var rc = 0;
+        borrow reply_file as &rf in {
+            rc = write_file(fs, buffer.bytes(rf), text);
+        }
+        if rc == 0 {
+            borrow usage_file as &uf in {
+                rc = write_file(fs, buffer.bytes(uf), usage);
+            }
+        }
+        if rc == 0 {
+            borrow report_file as &pf in {
+                rc = write_file(fs, buffer.bytes(pf), buffer.bytes(rb));
+            }
+        }
+        if rc == 0 {
+            borrow reply_sha as &rs in {
+                borrow usage_sha as &us in {
+                    borrow report_sha as &ps in {
+                        answer(heap, io, request_id, task_id, "", "", true, buffer.bytes(rs), len(text), buffer.bytes(us), len(usage), buffer.bytes(ps), buffer.size(rb));
+                    }
+                }
+            }
+        } else {
+            fail(heap, io, request_id, task_id, "evidence-unwritable", "the evidence could not be written in the execution directory");
+        }
+        buffer.drop(heap, report_sha);
+    }
+    buffer.drop(heap, reply_sha);
+    buffer.drop(heap, usage_sha);
+    buffer.drop(heap, reply_file);
+    buffer.drop(heap, usage_file);
+    buffer.drop(heap, report_file);
+    buffer.drop(heap, report);
+    return 0;
+}
+
+// The review of the task whose parts were already checked: read the two inputs and the key, resolve, call once, keep the answer.
+fn review[&h, &i, &f, &n, &c, &r, &k, &e, &y, &m, &o](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), net: &n Net(""), clock: &c Clock, request_id: &r [byte], task_id: &k [byte], exec_dir: &e [byte], key_file: &y [byte], host: &o [byte], model: &m [byte], max_tokens: int, max_diff_bytes: int, timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), file_write, net_out(""), udp_send, udp_recv, conn_read, conn_write, poll, clock] int {
+    let brief_file = under(heap, exec_dir, "brief.txt");
+    let patch_file = under(heap, exec_dir, "change.patch");
+    var brief = buffer.empty(heap, 1);
+    var patch = buffer.empty(heap, 1);
+    var brief_n = 0 - 1;
+    var patch_n = 0 - 1;
+    borrow brief_file as &bf in {
+        let (b, n) = slurp(heap, fs, buffer.bytes(bf), review_prompt.max_brief_bytes());
+        buffer.drop(heap, brief);
+        brief = b;
+        brief_n = n;
+    }
+    borrow patch_file as &pf in {
+        let (p, n) = slurp(heap, fs, buffer.bytes(pf), max_diff_bytes);
+        buffer.drop(heap, patch);
+        patch = p;
+        patch_n = n;
+    }
+    buffer.drop(heap, brief_file);
+    buffer.drop(heap, patch_file);
+    var rc = 0;
+    if brief_n < 1 || patch_n < 1 {
+        rc = fail(heap, io, request_id, task_id, "input-unreadable", "brief.txt or change.patch is missing, empty or over its bound");
+    } else {
+        let (key_raw, key_n) = slurp(heap, fs, key_file, 4096);
+        let (pem, pem_n) = roots(heap, fs);
+        var entropy = box_slice(heap, 32, byte_of(0));
+        borrow mut entropy as &!ew in {
+            fs_read(fs, "/dev/urandom", contents(ew));
+        }
+        let (resolv, resolv_n) = slurp(heap, fs, "/etc/resolv.conf", 65536);
+        if key_n < 1 {
+            rc = fail(heap, io, request_id, task_id, "review-unavailable", "the key file could not be read");
+        } else if pem_n == 0 {
+            rc = fail(heap, io, request_id, task_id, "review-unavailable", "no CA bundle was found");
+        } else if resolv_n < 0 {
+            rc = fail(heap, io, request_id, task_id, "review-unavailable", "the resolver file could not be read");
+        } else {
+            var ip = buffer.empty(heap, 16);
+            var ip_n = 0;
+            borrow resolv as &vb in {
+                let server = review_net.nameserver(buffer.bytes(vb));
+                if len(server) > 0 {
+                    borrow entropy as &ev in {
+                        let id = int_of(contents(ev)[0]) * 256 + int_of(contents(ev)[1]);
+                        buffer.drop(heap, ip);
+                        let (found, found_n) = resolve(heap, net, clock, server, host, id, dns_wait_ms());
+                        ip = found;
+                        ip_n = found_n;
+                    }
+                }
+            }
+            if ip_n == 0 {
+                rc = fail(heap, io, request_id, task_id, "review-unavailable", "the host could not be resolved");
+            } else {
+                var message = buffer.empty(heap, 1);
+                borrow brief as &bb in {
+                    borrow patch as &pp in {
+                        buffer.drop(heap, message);
+                        message = review_prompt.prompt(heap, buffer.bytes(bb), buffer.bytes(pp));
+                    }
+                }
+                var prompt_sha = buffer.empty(heap, 1);
+                borrow message as &mm in {
+                    buffer.drop(heap, prompt_sha);
+                    prompt_sha = snapshot.hex_digest(heap, buffer.bytes(mm));
+                }
+                var headers = buffer.empty(heap, 16);
+                borrow key_raw as &kr in {
+                    buffer.drop(heap, headers);
+                    headers = anthropic.headers(heap, trimmed(buffer.bytes(kr)), "");
+                }
+                var body = buffer.empty(heap, 1);
+                borrow message as &mm in {
+                    buffer.drop(heap, body);
+                    body = anthropic.request_body(heap, model, max_tokens, "", buffer.bytes(mm), "", "");
+                }
+                var answered = false;
+                var status = 0;
+                var text = buffer.empty(heap, 1);
+                var usage = buffer.empty(heap, 1);
+                var cut = false;
+                var text_n = 0;
+                borrow headers as &hb in {
+                    borrow body as &bb in {
+                        borrow pem as &rb in {
+                            borrow ip as &ib in {
+                                borrow mut entropy as &!ew in {
+                                    match provider.exchange(heap, net, clock, io, host, 443, true, "/v1/messages", buffer.bytes(hb), buffer.bytes(bb), buffer.bytes(rb), buffer.bytes(ib), contents(ew), 33554432, deadline_ms(timeout_ms)) {
+                                        provider.Answered::Failed(tag) => {
+                                            answered = false;
+                                        }
+                                        provider.Answered::Ok(st, out) => {
+                                            answered = true;
+                                            status = st;
+                                            borrow out as &or in {
+                                                if st == 200 {
+                                                    buffer.drop(heap, text);
+                                                    text = reply.text(heap, buffer.bytes(or));
+                                                    borrow text as &tx in {
+                                                        text_n = len(buffer.bytes(tx));
+                                                    }
+                                                    cut = reply.stop_reason_is(heap, buffer.bytes(or), "max_tokens");
+                                                    buffer.drop(heap, usage);
+                                                    usage = review_prompt.usage_line(heap, reply.usage_count(heap, buffer.bytes(or), "input_tokens"), reply.usage_count(heap, buffer.bytes(or), "output_tokens"), reply.usage_count(heap, buffer.bytes(or), "cache_creation_input_tokens"), reply.usage_count(heap, buffer.bytes(or), "cache_read_input_tokens"));
+                                                }
+                                            }
+                                            buffer.drop(heap, out);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if answered == false {
+                    rc = fail(heap, io, request_id, task_id, "review-unavailable", "the provider could not be reached or trusted");
+                } else if len(review_prompt.answer_failure(status, cut, text_n)) > 0 {
+                    rc = fail(heap, io, request_id, task_id, review_prompt.answer_failure(status, cut, text_n), review_prompt.answer_message(status, cut, text_n));
+                } else {
+                    borrow prompt_sha as &ps in {
+                        borrow text as &tb in {
+                            borrow usage as &ub in {
+                                rc = keep(heap, io, fs, request_id, task_id, exec_dir, model, buffer.bytes(ps), brief_n, patch_n, buffer.bytes(tb), buffer.bytes(ub), status);
+                            }
+                        }
+                    }
+                }
+                buffer.drop(heap, headers);
+                buffer.drop(heap, body);
+                buffer.drop(heap, text);
+                buffer.drop(heap, usage);
+                buffer.drop(heap, prompt_sha);
+                buffer.drop(heap, message);
+            }
+            buffer.drop(heap, ip);
+        }
+        buffer.drop(heap, key_raw);
+        buffer.drop(heap, pem);
+        buffer.drop(heap, resolv);
+        unbox_slice(heap, entropy);
+    }
+    buffer.drop(heap, brief);
+    buffer.drop(heap, patch);
+    return rc;
+}
+
+fn serve[&h, &i, &f, &n, &c](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), net: &n Net(""), clock: &c Clock) -> [heap, io_read, io_write, fs_read(""), fs_write(""), file_write, net_out(""), udp_send, udp_recv, conn_read, conn_write, poll, clock] int {
+    let (request, complete) = read_request(heap, io);
+    var code = 0;
+    if !complete {
+        code = 4;
+    }
+    borrow request as &rb in {
+        let src = buffer.bytes(rb);
+        let tape = box_slice(heap, json.tape_len(src), 0);
+        borrow mut tape as &!t in {
+            let tp = contents(t);
+            if complete && json.parse(src, tp) > 0 && json.is_object(tp, 0) {
+                let task = json.get(src, tp, 0, "task");
+                let limits = json.get(src, tp, 0, "limits");
+                let grants = json.get(src, tp, 0, "grants");
+                let grant = json.get(src, tp, grants, "review");
+                let rid = json.get(src, tp, 0, "request_id");
+                let tid = json.get(src, tp, task, "id");
+                var timeout_ms = 0;
+                let timeout = json.get(src, tp, limits, "timeout_ms");
+                if timeout >= 0 && json.is_int(tp, timeout) && json.fits_int(src, tp, timeout) {
+                    timeout_ms = json.to_int(src, tp, timeout);
+                }
+                var max_tokens = 0;
+                let tokens = json.get(src, tp, grant, "max_tokens");
+                if tokens >= 0 && json.is_int(tp, tokens) && json.fits_int(src, tp, tokens) {
+                    max_tokens = json.to_int(src, tp, tokens);
+                }
+                var max_diff = 0;
+                let diff = json.get(src, tp, grant, "max_diff_bytes");
+                if diff >= 0 && json.is_int(tp, diff) && json.fits_int(src, tp, diff) {
+                    max_diff = json.to_int(src, tp, diff);
+                }
+                if is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") && is(src, tp, json.get(src, tp, 0, "verb"), "capabilities") && len(text_of(src, tp, rid)) > 0 {
+                    let reply_text = verbs.capabilities_reply(heap, text_of(src, tp, rid), "repo-review", "0.1.0", "sync", review_prompt.task_type(), gate_task.max_timeout_ms(), 1048576);
+                    borrow reply_text as &yb in {
+                        io.write_all(io, buffer.bytes(yb));
+                    }
+                    io.newline(io);
+                    buffer.drop(heap, reply_text);
+                } else if !is(src, tp, json.get(src, tp, 0, "contract"), "forge-worker/1") || !is(src, tp, json.get(src, tp, 0, "verb"), "execute") || len(text_of(src, tp, rid)) == 0 || len(text_of(src, tp, tid)) == 0 {
+                    code = 4;
+                } else {
+                    let exec_dir = text_of(src, tp, json.get(src, tp, grants, "execution_dir"));
+                    let key_file = text_of(src, tp, json.get(src, tp, grant, "key_file"));
+                    let host = text_of(src, tp, json.get(src, tp, grant, "host"));
+                    let model = text_of(src, tp, json.get(src, tp, grant, "model"));
+                    let kind = text_of(src, tp, json.get(src, tp, task, "type"));
+                    let refused = review_prompt.check(kind, exec_dir, key_file, model, host, max_tokens, max_diff, timeout_ms);
+                    if len(refused) > 0 {
+                        fail(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), refused, "the task was refused before anything ran");
+                    } else {
+                        review(heap, io, fs, net, clock, text_of(src, tp, rid), text_of(src, tp, tid), exec_dir, key_file, host, model, max_tokens, max_diff, timeout_ms);
+                    }
+                }
+            } else {
+                code = 4;
+            }
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, request);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(signals);
+    release(tty);
+    release(args);
+    release(exec);
+    var console = io;
+    var memory = heap;
+    var code = 0;
+    borrow fs as &f in {
+        borrow net as &n in {
+            borrow clock as &c in {
+                borrow mut console as &!i in {
+                    borrow mut memory as &!h in {
+                        code = serve(h, i, f, n, c);
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(net);
+    release(clock);
+    release(console);
+    release(memory);
+    return code;
+}
