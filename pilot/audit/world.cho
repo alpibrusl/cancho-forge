@@ -16,7 +16,7 @@ import std.io;
 //   lie                  Content-Length 100, ten bytes, close    chunked             a valid chunked answer: `hello`
 //   big <n>              Content-Length n, n bytes of `a`        redirect <url>      302 to <url> (to itself: a loop; to another port: a chain)
 //   bighead              a header block of 100 KiB               trickle <n>         a valid answer, one byte at a time, <n> ms apart
-//   redirect301 <url>    301 to <url>                            location <kind>     a 302 whose Location is empty (`empty`), `/next` (`relative`) or 8 KiB long (`long`)
+//   reply <status>:<json> a canned JSON answer                 redirect301 <url>    301 to <url>                            location <kind>     a 302 whose Location is empty (`empty`), `/next` (`relative`) or 8 KiB long (`long`)
 //
 // It serves <connections> connections, one after the other, then exits. The audit starts one process a case; a case that needs a chain starts several.
 
@@ -174,6 +174,16 @@ fn serve_one[&c, &k, &m, &a](conn: &!c Conn, clock: &k Clock, mode: &m [byte], a
         send_all(conn, "HTTP/1.1 302 Found\r\nLocation: ");
         send_all(conn, arg);
         send_all(conn, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    } else if bytes.equal(mode, "reply") {
+        // `reply <status>:<json>`: a canned JSON answer, for the stand-in candidates of the audit's self-check
+        var colon = bytes.find(arg, ":");
+        if colon < 0 {
+            colon = 0;
+        }
+        send_all(conn, "HTTP/1.1 ");
+        send_all(conn, arg[0..colon]);
+        send_all(conn, " X\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n");
+        send_all(conn, arg[colon + 1..len(arg)]);
     } else if bytes.equal(mode, "redirect301") {
         send_all(conn, "HTTP/1.1 301 Moved Permanently\r\nLocation: ");
         send_all(conn, arg);

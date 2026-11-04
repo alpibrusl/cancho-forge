@@ -1,0 +1,102 @@
+edition 9;
+
+import std.test;
+import audit_expect;
+
+// Unit tests for pilot/audit/expect.cho (docs/pilot-audit.md section 4): what the audit's driver checks an answer against. Run with `cancho test`.
+
+fn body() -> [] &static [byte] {
+    return "{\"verdict\":\"up\",\"status\":200,\"final_url\":\"http://x.test/a\",\"redirects\":[{\"url\":\"u1\",\"status\":301}],\"tls\":null,\"timing_ms\":{\"total\":42,\"dns\":0},\"ok\":true,\"neg\":-5,\"rule\":\"url.port\"}";
+}
+
+fn pass[&h](heap: &!h Heap, spec: &static [byte]) -> [heap] bool {
+    return audit_expect.check(heap, 200, body(), spec) == 0;
+}
+
+fn fails_at[&h](heap: &!h Heap, spec: &static [byte]) -> [heap] int {
+    return audit_expect.check(heap, 200, body(), spec);
+}
+
+fn test_a_status_and_string_int_bool_and_null_fields_are_compared_exactly[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(pass(heap, "status=200"));
+    test.assert(pass(heap, "status=200;verdict=up"));
+    test.assert(pass(heap, "status=200; verdict=up ; status=200"));
+    test.assert(pass(heap, "status=200;status=200;timing_ms.total=42;ok=true;tls=null;neg=-5"));
+    test.assert(pass(heap, "ok=false") == false);
+    test.assert(pass(heap, "verdict=down") == false);
+    test.assert(pass(heap, "verdict=u") == false);
+    test.assert(pass(heap, "verdict=upp") == false);
+    test.assert(pass(heap, "status=404") == false);
+    test.assert(pass(heap, "timing_ms.total=43") == false);
+    test.assert(pass(heap, "neg=5") == false);
+    test.assert(pass(heap, "tls=up") == false);
+    test.assert(pass(heap, "status=200=1") == false);
+    return 0;
+}
+
+fn test_the_number_of_the_first_failing_check_is_answered[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(fails_at(heap, "verdict=down"), 1);
+    test.assert_eq(fails_at(heap, "status=200;verdict=down"), 2);
+    test.assert_eq(fails_at(heap, "status=200;verdict=up;ok=false;verdict=down"), 3);
+    test.assert_eq(audit_expect.check(heap, 500, body(), "verdict=up;status=200"), 2);
+    return 0;
+}
+
+fn test_contains_ranges_lengths_presence_and_absence[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(pass(heap, "final_url~x.test"));
+    test.assert(pass(heap, "final_url~http://"));
+    test.assert(pass(heap, "final_url~zzz") == false);
+    test.assert(pass(heap, "ok~true") == false);
+    test.assert(pass(heap, "timing_ms.total>=42"));
+    test.assert(pass(heap, "timing_ms.total>=43") == false);
+    test.assert(pass(heap, "timing_ms.total<=42"));
+    test.assert(pass(heap, "timing_ms.total<=41") == false);
+    test.assert(pass(heap, "verdict>=1") == false);
+    test.assert(pass(heap, "redirects#1"));
+    test.assert(pass(heap, "redirects#0") == false);
+    test.assert(pass(heap, "verdict#1") == false);
+    test.assert(pass(heap, "verdict?"));
+    test.assert(pass(heap, "timing_ms.dns?"));
+    test.assert(pass(heap, "tls?") == false);
+    test.assert(pass(heap, "missing?") == false);
+    test.assert(pass(heap, "tls-"));
+    test.assert(pass(heap, "missing-"));
+    test.assert(pass(heap, "a.b.c-"));
+    test.assert(pass(heap, "verdict-") == false);
+    return 0;
+}
+
+fn test_a_path_through_a_non_object_is_absent_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(pass(heap, "verdict.x=up") == false);
+    test.assert(pass(heap, "verdict.x-"));
+    test.assert(pass(heap, "redirects.url=u1") == false);
+    test.assert(pass(heap, "timing_ms.total.x-"));
+    test.assert(pass(heap, ".x-") == false);
+    test.assert_eq(fails_at(heap, ".x-"), 0 - 1);
+    return 0;
+}
+
+fn test_a_spec_of_no_known_shape_is_minus_one_and_a_body_that_is_not_json_is_minus_two[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(fails_at(heap, ""), 0 - 1);
+    test.assert_eq(fails_at(heap, "verdict"), 0 - 1);
+    test.assert_eq(fails_at(heap, "status=200;;verdict=up"), 0 - 1);
+    test.assert_eq(fails_at(heap, "status=x"), 0 - 1);
+    test.assert_eq(fails_at(heap, "ok>5"), 0 - 1);
+    test.assert_eq(fails_at(heap, "ok>=x"), 0 - 1);
+    test.assert_eq(audit_expect.check(heap, 200, "not json", "verdict=up"), 0 - 2);
+    test.assert_eq(audit_expect.check(heap, 200, "", "verdict=up"), 0 - 2);
+    test.assert_eq(audit_expect.check(heap, 200, "[1]", "verdict=up"), 0 - 2);
+    test.assert_eq(audit_expect.check(heap, 200, "", "status=200"), 0);
+    test.assert_eq(audit_expect.check(heap, 503, "", "status=200"), 1);
+    return 0;
+}
+
+fn test_a_status_class_is_a_range_of_two_checks[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(pass(heap, "status>=200;status<=299"));
+    test.assert(pass(heap, "status>=200;status<=200"));
+    test.assert(pass(heap, "status>=201") == false);
+    test.assert(pass(heap, "status<=199") == false);
+    test.assert_eq(fails_at(heap, "status>=100;status<=199"), 2);
+    test.assert_eq(fails_at(heap, "status>=x"), 0 - 1);
+    return 0;
+}

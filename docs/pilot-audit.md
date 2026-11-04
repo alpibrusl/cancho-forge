@@ -19,13 +19,13 @@ broken one is shown to be an oracle; that is the repository's way (`CONTRIBUTING
 `pilot/contract.cho` pins the pure functions. The audit also has to *start* the checker, so the process interface is part of the contract and the board edits it with the file:
 
 ```
-checker serve --port <n> --resolver <a.b.c.d> [--roots <pem>] [--allow-private] [--now <unix seconds>]
+checker serve --port <n> --resolver <a.b.c.d> [--roots <pem>] [--allow-loopback] [--now <unix seconds>]
 ```
 
 * It serves `GET /health` and `GET /check?url=<url>` of `pilot-s1.md` section 3 on `127.0.0.1:<port>` and runs until it is killed; it prints its listening line to its own standard error, never to the check's.
 * `--now` fixes the checker's clock for certificate expiry (section 3.1); off by default.
 * `--resolver` is the UDP resolver it asks (port 53 unless `<a.b.c.d:p>`); the audit runs a stub resolver (the P1 stub) that answers the names of the cases, so no case depends on the internet.
-* `--roots` is the PEM bundle the TLS cases trust (the world's test CA); without it the system's are used. `--allow-private` is the single setting that lets the checker reach loopback; it is **off by default**, and the audit runs the refusal group with it off.
+* `--roots` is the PEM bundle the TLS cases trust (the world's test CA); without it the system's are used. `--allow-loopback` is the setting that lets the checker reach 127.0.0.0/8 and nothing else private (section 4.1); it is **off by default**, and the audit runs the refusal group with it off.
 * The artifact is the one executable file. If the build leaves a directory or a source tree instead, `audit_checker.sh` builds it itself with the compiler of the operator's `checker` setting; this is decided with the first `project.build`, not guessed here.
 
 ## 3. The world *(designed)*
@@ -55,7 +55,7 @@ I built cancho's `examples/https_hello` (`scripts/https_hello_test.py`'s recipe)
 So the world can serve a valid chain and a wrong-name chain from cancho's server unchanged. Two consequences, corrected in this document (the first revision of this section proposed a forked server loop; the better answer needs none):
 
 1. **No expired fixture is served.** The server checks `notAfter` against its own clock when it loads an identity, so an expired certificate cannot be served. It does not need to be: every leaf is valid from 2026-01-01 to 2035-01-01, and *expired* is the checker's view when it is run with `--now` past `notAfter`.
-2. **A static fixture cannot keep a "10 days left" or "14 days left" certificate true**, because the checker's `days_left` depends on the real date. So the contract gets an operator setting, **`--now <unix seconds>`**, off by default like `--allow-private`, that fixes the checker's clock (the deploy preflight refuses a production configuration with either). With it, `t02` (expired), `t05` (10 days) and `t06` (14 days) all use the same valid leaf: the audit sets `--now` to `notAfter` plus a day, minus 10 days and minus 14 days, deterministic on any day of the year. Without it the cases would rot. The board edits this into `pilot/contract.cho` with the process interface of section 2.
+2. **A static fixture cannot keep a "10 days left" or "14 days left" certificate true**, because the checker's `days_left` depends on the real date. So the contract gets an operator setting, **`--now <unix seconds>`**, off by default like `--allow-loopback`, that fixes the checker's clock (the deploy preflight refuses a production configuration with either). With it, `t02` (expired), `t05` (10 days) and `t06` (14 days) all use the same valid leaf: the audit sets `--now` to `notAfter` plus a day, minus 10 days and minus 14 days, deterministic on any day of the year. Without it the cases would rot. The board edits this into `pilot/contract.cho` with the process interface of section 2.
 
 **Built in T1** (`pilot/audit/tls_check.sh`, in the gate): the server is cancho's `examples/https_hello`, **vendored verbatim** from the pinned compiler revision into `pilot/audit/vendor/` (the compiler's `examples/` are not available to the gate, only its `packages/`), built with the compiler's `http-server`, `tls` and `x509`; the fixtures are `pilot/audit/tls/` (made once by `make.sh`, checked in, throw-away keys). Seen from outside: a valid chain for `ok.test` verifies and answers 200; a TLS 1.2-only client is refused; plain HTTP on the TLS port is not answered; a certificate for `other.test` is served and fails with a hostname mismatch; a self-signed leaf is served and fails verification. 5 of 5.
 
@@ -75,6 +75,16 @@ answer and on its HTTP status; a case fails on any check, and a case that cannot
 | **tls** (8) | `t01` valid chain, right name → `tls.verified=true`, `days_left` large; `t02` expired → `down`, `verified=false`; `t03` self-signed → `down`; `t04` a certificate for another name → `down`; `t05` 10 days left → `degraded`, `days_left=10`; `t06` 14 days left → `up` (the boundary); `t07` a TLS port that speaks plain HTTP → `down`; `t08` an `https` redirect to an `http` target and back |
 
 *Measure (T2):* the driver is run against a **stand-in candidate** (a canned-answer HTTP server) that is right for one case and wrong for the rest: it passes exactly that case, so the comparison logic is shown to say pass when it should and fail when it should.
+
+### 4.1 As built in T2 *(measured)*
+
+* `pilot/audit/expect.cho` (pure; `tests/audit_expect_test.cho`, 6 tests): the checks of a case, `status=N`, `status>=N`, `status<=N`, `path=V`, `path~S`, `path>=N`, `path<=N`, `path#N`, `path?`, `path-`; the answer of a spec that has no known shape is a number, never a trap.
+* `pilot/audit/driver.cho`: one request to a candidate on loopback, one answer read under a deadline, one comparison; prints `ok` or `fail <why>`; exit 0 pass, 1 fail, 2 usage, 3 no answer to check.
+* `pilot/audit/cases.txt`: the case format (header of the file) and a **starter set of 21 cases** (`p00 p06 v01 v02 v03 v04 v05 v07 v10 l09 r01` to `r11`). The groups and the format are final; **the rest of the 60 are written with the reference checker (T3)**, because a case nothing has been able to pass cannot be told from a case that is wrong. This corrects the table above, which read as if the whole table came in T2.
+* `pilot/audit/audit_checker.sh <artifact> <execution dir>`: per case, the world processes, the stub resolver and a fresh candidate (`<artifact> serve --port <n> --resolver 127.0.0.1:<n> <flags>`), the driver; one `pass <id>` / `fail <id> (<why>)` line per case on **standard error**, and `TOTAL a/b` **last on standard output**; the candidate's output goes to a file in the execution directory.
+* **The setting is `--allow-loopback`, not `--allow-private`.** It lets the checker reach 127.0.0.0/8 and **nothing else private**. With it the audit can run a case whose first hop is the world on loopback and whose redirect goes to `169.254.169.254` (`r11`), which `--allow-private` would have made untestable (section 8, question 2, answered). The refusal cases `r07` to `r10` run without it. The board edits the name into the contract.
+* **Self-check** (`pilot/audit/self_check_standins.sh`, in the gate): a stand-in that answers one canned "up" JSON to everything passes **exactly** `p00 v02 v03` of the 21 (`TOTAL 3/21`) and fails the other 18; a candidate that never listens scores `TOTAL 0/21` with all 21 reported failed, none skipped; a candidate that prints `TOTAL 99/99` itself leaves the audit's last standard-output line `TOTAL 0/21`. About 43 seconds on this machine, three audits and the builds; the dead candidate's waits dominate.
+* **Not yet measured:** a stand-in right for each single case (this one is right for three); the per-case wall time with a real candidate (T3); the TLS cases (they need the contract's `--roots` and `--now`); the rate-limit case (it needs 31 requests to one candidate, which the one-request-per-case format does not express yet: a `requests <n>` key, added with it).
 
 ## 5. The reference checker and the broken variants *(designed)*
 
@@ -101,7 +111,7 @@ are small, reviewable text and not 40 copies of a program.
 | Slice | Content | Measured by |
 |---|---|---|
 | **T1** | the world promoted to `pilot/audit/`, the TLS fixtures, the new modes, the stub resolver; a spike answers whether cancho can serve TLS with a given certificate | `world_check.sh` in the gate (the P4 cases plus the new ones, seen from outside) |
-| **T2** | the case table, the driver, `audit_checker.sh`; the stand-in candidates | the stand-in right for one case passes exactly that case; a candidate that cannot start fails every case |
+| **T2** *(built, starter set)* | the case format, the driver, `audit_checker.sh`; the stand-in candidates | `pilot/audit/self_check_standins.sh` (section 4.1) |
 | **T3** | the reference checker | `self_check.sh`: the reference scores N/N |
 | **T4** | the mutants | every mutant scores below N/N; no hole |
 | **T5** | the gate integration, the audit's duration, the results recorded here and in `pilot-results.md` | the gate runs `self_check.sh` |
@@ -112,6 +122,5 @@ T3 is the largest (a checker with DNS, TLS, redirects and a rate limiter); T1 an
 ## 8. Open questions
 
 1. **Is the reference the product?** Recommended no: the company builds the checker from the brief and the contract with a model, and the reference exists only as the audit's witness. If the reference is good enough to ship, that is a decision for later and it would make the experiment pointless.
-2. **The `--allow-private` setting.** The audit needs loopback; the contract names the setting. Recommended: the refusal group runs with it off against **public-looking addresses served through the stub resolver** (the world listens on `127.0.0.1`, so a name mapped to `203.0.113.7` cannot be connected to); decided with T3, when it is clear which cases can run
-   with the setting off at all. The ones that cannot are listed here, not dropped.
+2. **The loopback setting.** Answered in section 4.1: `--allow-loopback`, which allows 127.0.0.0/8 and nothing else private. The refusal group runs with it off; `r11` (a redirect from loopback to the metadata address) runs with it on.
 3. **Time limit.** `check_timeout_ms` for the build's check is the operator's; the audit's slowest cases are seconds long. Measured at T2.

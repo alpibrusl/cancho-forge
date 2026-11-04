@@ -1,0 +1,276 @@
+edition 9;
+module audit_expect;
+
+import std.bytes;
+import std.json;
+
+// What the audit's driver checks an answer against (docs/pilot-audit.md section 4). Pure: the status and body of an answer, and a spec, in; the number of the first
+// check that failed, out. A spec is checks joined by `;`, each one of:
+//
+//   status=N          the HTTP status is N          status>=N  status<=N   the HTTP status is at least / at most N (a class: 400 and 499)
+//   path=V            the JSON field at `path` (keys joined by `.`, objects only) is the string V, the integer V, or the literal true, false or null
+//   path~S            the field is a string containing S
+//   path>=N  path<=N  the field is an integer at least / at most N
+//   path#N            the field is an array of N elements
+//   path?             the field is there and is not null          path-   the field is absent or null
+//
+// A value contains no `;`. The body must be one JSON object when any field check is made. 0 is a pass; N > 0 the 1-based number of the first check that failed; -1 a spec that is
+// empty or has a check of no known shape, -2 a body that is not a JSON object when a field check needs one.
+
+fn trim_spec[&s](s: &s [byte]) -> [] &s [byte] {
+    var a = 0;
+    var b = len(s);
+    while a < b && int_of(s[a]) == 32 {
+        a = a + 1;
+    }
+    while b > a && int_of(s[b - 1]) == 32 {
+        b = b - 1;
+    }
+    return s[a..b];
+}
+
+// Is `path` keys joined by single dots, none empty?
+fn path_ok[&p](path: &p [byte]) -> [] bool {
+    if len(path) == 0 || int_of(path[0]) == 46 || int_of(path[len(path) - 1]) == 46 {
+        return false;
+    }
+    var k = 1;
+    while k < len(path) {
+        if int_of(path[k]) == 46 && int_of(path[k - 1]) == 46 {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// The node at `path` below the object at node 0, or -1.
+fn node_at[&s, &t, &p](src: &s [byte], tp: &t [int], path: &p [byte]) -> [] int {
+    var node = 0;
+    var start = 0;
+    var k = 0;
+    while k <= len(path) {
+        if k == len(path) || int_of(path[k]) == 46 {
+            if node < 0 || json.is_object(tp, node) == false || k == start {
+                return 0 - 1;
+            }
+            node = json.get(src, tp, node, path[start..k]);
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return node;
+}
+
+// Where an operator starts in `check`: the first of `= ~ > < # ? -` after at least one byte of path, and its length. (-1 when there is none.) `>=` and `<=` are two bytes.
+fn op_at[&c](check: &c [byte]) -> [] int {
+    var i = 1;
+    while i < len(check) {
+        let c = int_of(check[i]);
+        if c == 61 || c == 126 || c == 62 || c == 60 || c == 35 || c == 63 {
+            return i;
+        }
+        if c == 45 && i == len(check) - 1 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// A non-negative decimal integer, or -1.
+fn number[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 15 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + c - 48;
+        k = k + 1;
+    }
+    return n;
+}
+
+// Is the decimal text of `n` equal to `text`?
+fn int_is[&t](n: int, text: &t [byte]) -> [] bool {
+    if n < 0 {
+        return len(text) > 1 && int_of(text[0]) == 45 && number(text[1..len(text)]) == 0 - n;
+    }
+    return number(text) == n;
+}
+
+// Does the node satisfy `path<op>value`? 1 yes, 0 no, -1 the check is of no known shape.
+fn holds[&s, &t, &c](src: &s [byte], tp: &t [int], check: &c [byte]) -> [] int {
+    let at = op_at(check);
+    if at < 0 {
+        return 0 - 1;
+    }
+    let path = check[0..at];
+    if path_ok(path) == false {
+        return 0 - 1;
+    }
+    let op = int_of(check[at]);
+    let node = node_at(src, tp, path);
+    if op == 63 {
+        if at != len(check) - 1 {
+            return 0 - 1;
+        }
+        if node >= 0 && json.is_null(tp, node) == false {
+            return 1;
+        }
+        return 0;
+    }
+    if op == 45 {
+        if node < 0 || json.is_null(tp, node) {
+            return 1;
+        }
+        return 0;
+    }
+    var value = check[at + 1..len(check)];
+    if op == 62 || op == 60 {
+        if at + 1 >= len(check) || int_of(check[at + 1]) != 61 {
+            return 0 - 1;
+        }
+        value = check[at + 2..len(check)];
+        let want = number(value);
+        if want < 0 {
+            return 0 - 1;
+        }
+        if node < 0 || json.is_int(tp, node) == false || json.fits_int(src, tp, node) == false {
+            return 0;
+        }
+        if op == 62 && json.to_int(src, tp, node) >= want {
+            return 1;
+        }
+        if op == 60 && json.to_int(src, tp, node) <= want {
+            return 1;
+        }
+        return 0;
+    }
+    if op == 35 {
+        let want = number(value);
+        if want < 0 {
+            return 0 - 1;
+        }
+        if node >= 0 && json.is_array(tp, node) && json.count(tp, node) == want {
+            return 1;
+        }
+        return 0;
+    }
+    if node < 0 {
+        return 0;
+    }
+    if op == 126 {
+        if json.is_string(tp, node) && json.string_plain(tp, node) && bytes.find(json.string_view(src, tp, node), value) >= 0 {
+            return 1;
+        }
+        return 0;
+    }
+    if op == 61 {
+        if json.is_string(tp, node) {
+            if json.string_plain(tp, node) && bytes.equal(json.string_view(src, tp, node), value) {
+                return 1;
+            }
+            return 0;
+        }
+        if json.is_null(tp, node) {
+            if bytes.equal(value, "null") {
+                return 1;
+            }
+            return 0;
+        }
+        if json.is_bool(tp, node) {
+            if json.to_bool(tp, node) && bytes.equal(value, "true") {
+                return 1;
+            }
+            if json.to_bool(tp, node) == false && bytes.equal(value, "false") {
+                return 1;
+            }
+            return 0;
+        }
+        if json.is_int(tp, node) && json.fits_int(src, tp, node) && int_is(json.to_int(src, tp, node), value) {
+            return 1;
+        }
+        return 0;
+    }
+    return 0 - 1;
+}
+
+fn status_holds[&c](check: &c [byte], status: int) -> [] int {
+    if len(check) > 8 && (bytes.equal(check[0..8], "status>=") || bytes.equal(check[0..8], "status<=")) {
+        let bound = number(check[8..len(check)]);
+        if bound < 0 {
+            return 0 - 1;
+        }
+        if int_of(check[6]) == 62 && status >= bound || int_of(check[6]) == 60 && status <= bound {
+            return 1;
+        }
+        return 0;
+    }
+    if len(check) > 7 && bytes.equal(check[0..7], "status=") {
+        let want = number(check[7..len(check)]);
+        if want < 0 {
+            return 0 - 1;
+        }
+        if want == status {
+            return 1;
+        }
+        return 0;
+    }
+    return 2;
+}
+
+// The checks of `spec` against the parsed body (`tp`, valid when `parsed`), numbered from `first`: 0 when all hold, else the number of the first that fails.
+fn run_checks[&s, &b, &t, &p](status: int, body: &b [byte], tp: &t [int], parsed: bool, spec: &s [byte]) -> [] int {
+    var start = 0;
+    var number_of = 0;
+    var k = 0;
+    while k <= len(spec) {
+        if k == len(spec) || int_of(spec[k]) == 59 {
+            let check = trim_spec(spec[start..k]);
+            number_of = number_of + 1;
+            if len(check) == 0 {
+                return 0 - 1;
+            }
+            var held = status_holds(check, status);
+            if held == 2 {
+                if parsed == false || json.is_object(tp, 0) == false {
+                    return 0 - 2;
+                }
+                held = holds(body, tp, check);
+            }
+            if held < 0 {
+                return 0 - 1;
+            }
+            if held == 0 {
+                return number_of;
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+
+// The number of the first check of `spec` that fails for the answer (`status`, `body`): 0 when all hold (see the header for -1 and -2).
+pub fn check[&h, &b, &s](heap: &!h Heap, status: int, body: &b [byte], spec: &s [byte]) -> [heap] int {
+    if len(spec) == 0 {
+        return 0 - 1;
+    }
+    var result = 0;
+    var parsed = false;
+    let tape = box_slice(heap, json.tape_len(body), 0);
+    borrow mut tape as &!tw in {
+        parsed = len(body) > 0 && len(body) <= 1048576 && json.parse(body, contents(tw)) > 0;
+    }
+    borrow tape as &tr in {
+        result = run_checks(status, body, contents(tr), parsed, spec);
+    }
+    unbox_slice(heap, tape);
+    return result;
+}
