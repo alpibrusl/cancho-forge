@@ -34,8 +34,9 @@ run_case() {
   done
   if [ -n "$resolver" ]; then
     # shellcheck disable=SC2086
-    "$bin/resolver" "$pr" $resolver >> "$log.worlds" 2>&1 &
+    "$bin/resolver" "$pr" $resolver > "$log.resolver" 2>&1 &
     echo $! >> "$log.pids"
+    i=0; while [ $i -lt 50 ] && ! grep -q '^listening' "$log.resolver" 2> /dev/null; do sleep 0.1; i=$((i + 1)); done
   fi
   [ -f "$log.pids" ] && pids=$(cat "$log.pids")
   fl=$(sub "$flags")

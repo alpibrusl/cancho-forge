@@ -102,7 +102,7 @@ expect status>=400;status<=499;rule=target.private-address;repair?
 
 case r09
 resolver 4 lo.test=127.0.0.1
-request /check?url=http://lo.test:@w1/
+request /check?url=http://lo.test:8080/
 expect status>=400;status<=499;rule=target.private-address;repair?
 
 case r10
