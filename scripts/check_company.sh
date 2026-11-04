@@ -120,7 +120,12 @@ line: 1" "$F" company status "$jw" format=json
   run "decide: no company.json is manifest-malformed, exit 1" 1 "refusal: manifest-malformed" "$F" company decide "$scratch/dec-nomanifest" product-brief approved because
   run "decide: approved, exit 0, the gate's state is printed" 0 "gate product-brief: approved" env USER=ana "$F" company decide "$dw" product-brief approved looks good to me
   [ "$(wc -l < "$DJ")" -eq 1 ] && echo "ok   company: decide wrote one journal line" || { echo "FAIL company: not one line"; fail=1; }
+  if [ ! -r /proc/self/environ ]; then
+    # the OS user is read from /proc/self/environ (src/company_cmd.cho; the language has no other way to read the environment): "unknown" where there is no /proc
+    grep -q '"kind":"company.gate.decided".*"gate":"product-brief","verdict":"approved","user":"unknown","reason":"looks good to me"' "$DJ" && echo "ok   company: the line holds gate, verdict, the reason and user unknown (no /proc here)" || { echo "FAIL company: wrong line"; cat "$DJ"; fail=1; }
+  else
   grep -q '"kind":"company.gate.decided".*"gate":"product-brief","verdict":"approved","user":"ana","reason":"looks good to me"' "$DJ" && echo "ok   company: the line holds gate, verdict, the OS user and the reason" || { echo "FAIL company: wrong line"; cat "$DJ"; fail=1; }
+  fi
   run "decide: after approval status shows the gate decided" 0 "brief ready
 lib waiting
 gate waiting

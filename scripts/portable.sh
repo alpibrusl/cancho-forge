@@ -17,9 +17,9 @@ if ! command -v timeout > /dev/null 2>&1; then
   }
 fi
 if ! command -v setsid > /dev/null 2>&1; then
-  setsid() { # command...: the command in a session of its own (perl's POSIX::setsid, then exec: the process id is the command's)
-    perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or exit 127' -- "$@"
-  }
+  # a file, not a function: `setsid cmd &` must leave the command's own process id in `$!` (scripts/portable-bin/setsid), and the callers run from the repository root
+  PATH="$(pwd)/scripts/portable-bin:$PATH"
+  export PATH
 fi
 if ! command -v flock > /dev/null 2>&1; then
   flock() { # -n file command...: the command while this process holds an exclusive lock on file (perl's flock; the lock is kept across exec)
