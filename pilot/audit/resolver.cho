@@ -10,7 +10,7 @@ import std.io;
 //
 //   answer   a.b.c.d[,a.b.c.d...]  up to four A records, TTL 60      NX  NXDOMAIN (rcode 3)      SILENT  the query is read and not answered
 //
-// A name not in the table is NXDOMAIN. It serves <queries> queries, one after the other, then exits. Names compare case-insensitively, without a final dot. Prints `served <n>` when it ends.
+// A name not in the table is NXDOMAIN. It serves <queries> queries, one after the other, then exits. Names compare case-insensitively, without a final dot. Prints `listening <port>` once it is bound and `served <n>` when it ends.
 
 fn say_int[&i](io: &!i Io, label: &i [byte], n: int) -> [io_write] int {
     io.write_all(io, label);
@@ -221,6 +221,7 @@ fn serve[&i, &n, &g](io: &!i Io, net: &n Net(""), args: &g Args, port: int, quer
         UdpOpened::Ok(opened) => {
             var sock = opened;
             var served = 0;
+            say_int(io, "listening ", port);
             region r {
                 let dg = alloc_slice[r](512, byte_of(0));
                 let reply = alloc_slice[r](512, byte_of(0));

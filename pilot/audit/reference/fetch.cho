@@ -1,0 +1,696 @@
+edition 9;
+module fetch;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import checker;
+import dns;
+
+// The reference checker's fetcher (docs/pilot-audit.md section 5.1, R2): one URL in, one measured answer out. It resolves the host ITSELF (a UDP query to the resolver it was
+// given, spike/lib/dns.cho), judges every address it got, and connects to the ADDRESS and never to the name. Plain HTTP here; the TLS probe is R2b. Redirects are followed up
+// to five times and every hop is judged again, so a public-looking target cannot send the checker to a private one. At most 64 KiB of a body are read and none is kept.
+
+pub enum Outcome {
+    // Refused under a rule (`url.*`, `target.*`, `check.timeout`): the text of the rule.
+    Refused(&static [byte]),
+    // Measured: the answer's JSON, per docs/pilot-s1.md section 3.
+    Done(buffer.Buffer),
+}
+
+pub fn body_cap() -> [] int {
+    return 65536;
+}
+
+pub fn hard_limit_ms() -> [] int {
+    return 8000;
+}
+
+fn connect_limit_ms() -> [] int {
+    return 3000;
+}
+
+fn max_redirects() -> [] int {
+    return 5;
+}
+
+// ---- the name lookup ----------------------------------------------------------------------------------------------------------------
+
+fn wait_answer[&c, &u, &b](clock: &c Clock, sock: &!u Udp, into: &!b [byte], deadline: int) -> [udp_recv, poll, clock] int {
+    udp_nonblocking(sock);
+    match poller_new() {
+        Polling::Failed(e) => {
+            return 0 - 5;
+        }
+        Polling::Ok(poller) => {
+            var pw = poller;
+            var result = 0 - 4;
+            var done = false;
+            borrow mut pw as &!pm in {
+                poller_add_udp(pm, sock, 1, 1);
+                region r {
+                    let events = alloc_slice[r](8, 0);
+                    while done == false {
+                        let left = deadline - clock_ms(clock);
+                        if left <= 0 {
+                            done = true;
+                        } else {
+                            let ready = poller_wait(pm, events, left);
+                            if ready > 0 {
+                                match udp_recv(sock, into) {
+                                    Datagram::Got(n) => {
+                                        result = n;
+                                        done = true;
+                                    }
+                                    Datagram::Truncated(n) => {
+                                        result = n;
+                                        done = true;
+                                    }
+                                    Datagram::Again => {
+                                        result = 0 - 4;
+                                    }
+                                    Datagram::Failed(e) => {
+                                        result = 0 - 6;
+                                        done = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            poller_close(pw);
+            return result;
+        }
+    }
+}
+
+// Ask the resolver at `server`:`port` for the A records of `name`; the addresses (packed, `dns.max_addrs()` at most) go to `addrs[0..]`. The count, or a negative: -1 the name
+// cannot be asked, -2 no answer in time, -3 an answer that is refused or damaged (NXDOMAIN among them).
+fn resolve[&n, &c, &s, &m, &a](net: &n Net(""), clock: &c Clock, server: &s [byte], port: int, name: &m [byte], id: int, wait_ms: int, addrs: &!a [int]) -> [net_out(""), udp_send, udp_recv, poll, clock] int {
+    let started = clock_ms(clock);
+    match udp_connect(net, server, port) {
+        UdpOpened::Failed(e) => {
+            return 0 - 2;
+        }
+        UdpOpened::Ok(opened) => {
+            var sock = opened;
+            var count = 0 - 2;
+            region r {
+                let query = alloc_slice[r](512, byte_of(0));
+                let datagram = alloc_slice[r](512, byte_of(0));
+                let size = dns.build_query(name, id, query, 0);
+                if size < 0 {
+                    count = 0 - 1;
+                } else {
+                    var got = 0 - 9;
+                    borrow mut sock as &!u in {
+                        match udp_send(u, query[0..size]) {
+                            Sent::Wrote(w) => {
+                                got = wait_answer(clock, u, datagram, started + wait_ms);
+                            }
+                            Sent::Again => {
+                                got = 0 - 2;
+                            }
+                            Sent::Failed(e) => {
+                                got = 0 - 2;
+                            }
+                        }
+                    }
+                    if got > 0 {
+                        let n2 = dns.parse(datagram, got, id, addrs);
+                        if n2 < 0 {
+                            count = 0 - 3;
+                        } else {
+                            count = n2;
+                        }
+                    }
+                }
+            }
+            udp_close(sock);
+            return count;
+        }
+    }
+}
+
+// ---- one request ------------------------------------------------------------------------------------------------------------------
+
+fn lower(c: int) -> [] int {
+    if c >= 65 && c <= 90 {
+        return c + 32;
+    }
+    return c;
+}
+
+// The value of the header `name` (lower case, with its colon) in the head `head` (the bytes before the blank line), trimmed, or an empty slice.
+fn header_value[&h](head: &h [byte], name: &static [byte]) -> [] &h [byte] {
+    var start = 0;
+    var k = 0;
+    while k <= len(head) {
+        if k == len(head) || int_of(head[k]) == 10 {
+            var end = k;
+            if end > start && int_of(head[end - 1]) == 13 {
+                end = end - 1;
+            }
+            let line = head[start..end];
+            if len(line) >= len(name) {
+                var same = true;
+                var j = 0;
+                while j < len(name) {
+                    if lower(int_of(line[j])) != int_of(name[j]) {
+                        same = false;
+                    }
+                    j = j + 1;
+                }
+                if same {
+                    var a = len(name);
+                    while a < len(line) && (int_of(line[a]) == 32 || int_of(line[a]) == 9) {
+                        a = a + 1;
+                    }
+                    return line[a..len(line)];
+                }
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return head[0..0];
+}
+
+fn number[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 12 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + c - 48;
+        k = k + 1;
+    }
+    return n;
+}
+
+// The offset just past the blank line that ends the head, or -1.
+fn head_end[&t](raw: &t [byte]) -> [] int {
+    let at = bytes.find(raw, "\r\n\r\n");
+    if at < 0 {
+        return 0 - 1;
+    }
+    return at + 4;
+}
+
+// The record `r` of a request: 0 status, 1 error, 2 connect ms, 3 first-byte ms, 4 body bytes read, 5 the body was cut at the cap, 6 the total ms.
+// Errors: 0 none, 1 the connection was refused or failed, 2 no connection in time, 3 no usable answer (an empty reply, a reset, half a status line), 4 no answer in time,
+// 5 the body ended before its Content-Length, 6 a head over 64 KiB.
+fn rec() -> [] int {
+    return 8;
+}
+
+// Connect to `ip`:`port`, send `GET target`, read the head and up to the body cap. The Location header (when there is one) is returned; the numbers go to `r`.
+fn fetch_one[&h, &n, &c, &i, &t, &o, &r](heap: &!h Heap, net: &n Net(""), clock: &c Clock, ip: &i [byte], port: int, host_header: &o [byte], target: &t [byte], deadline: int, r: &!r [int]) -> [heap, net_out(""), conn_read, conn_write, poll, clock] buffer.Buffer {
+    var location = buffer.empty(heap, 16);
+    let started = clock_ms(clock);
+    match tcp_connect_start(net, ip, port) {
+        Dialed::Failed(e) => {
+            r[1] = 1;
+            return location;
+        }
+        Dialed::Ok(opened) => {
+            var conn = opened;
+            match poller_new() {
+                Polling::Failed(e) => {
+                    r[1] = 1;
+                    conn_close(conn);
+                    return location;
+                }
+                Polling::Ok(poller) => {
+                    var pw = poller;
+                    var raw = buffer.empty(heap, 2048);
+                    region reg {
+                        let events = alloc_slice[reg](8, 0);
+                        let block = alloc_slice[reg](8192, byte_of(0));
+                        var connected = false;
+                        var connect_by = started + connect_limit_ms();
+                        if connect_by > deadline {
+                            connect_by = deadline;
+                        }
+                        borrow mut pw as &!pm in {
+                            borrow mut conn as &!cm in {
+                                poller_add_conn(pm, cm, 1, 2);
+                                var waiting = true;
+                                while waiting {
+                                    let left = connect_by - clock_ms(clock);
+                                    if left <= 0 {
+                                        waiting = false;
+                                        r[1] = 2;
+                                    } else if poller_wait(pm, events, left) > 0 {
+                                        waiting = false;
+                                        if conn_connect_status(cm) == 0 {
+                                            connected = true;
+                                        } else {
+                                            r[1] = 1;
+                                        }
+                                    }
+                                }
+                                if connected {
+                                    r[2] = clock_ms(clock) - started;
+                                    var request = buffer.append(heap, buffer.empty(heap, 256), "GET ");
+                                    request = buffer.append(heap, request, target);
+                                    request = buffer.append(heap, request, " HTTP/1.1\r\nHost: ");
+                                    request = buffer.append(heap, request, host_header);
+                                    request = buffer.append(heap, request, "\r\nUser-Agent: pilot-reference-checker/1\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+                                    var sent_at = clock_ms(clock);
+                                    var wrote = 0;
+                                    borrow request as &rq in {
+                                        let data = buffer.bytes(rq);
+                                        var failed = false;
+                                        while wrote < len(data) && failed == false {
+                                            match conn_write(cm, data[wrote..len(data)]) {
+                                                Sent::Wrote(w) => {
+                                                    wrote = wrote + w;
+                                                }
+                                                Sent::Again => {
+                                                    wrote = wrote + 0;
+                                                }
+                                                Sent::Failed(e) => {
+                                                    failed = true;
+                                                }
+                                            }
+                                        }
+                                        if failed {
+                                            r[1] = 3;
+                                        }
+                                    }
+                                    buffer.drop(heap, request);
+                                    if r[1] == 0 {
+                                        poller_modify(pm, cm, 1, 1);
+                                        var reading = true;
+                                        var first = true;
+                                        var total = 0;
+                                        while reading {
+                                            let left = deadline - clock_ms(clock);
+                                            if left <= 0 {
+                                                reading = false;
+                                                if r[0] == 0 {
+                                                    r[1] = 4;
+                                                } else {
+                                                    r[1] = 4;
+                                                }
+                                            } else if poller_wait(pm, events, left) > 0 {
+                                                match conn_read(cm, block) {
+                                                    Received::Data(got) => {
+                                                        if first {
+                                                            r[3] = clock_ms(clock) - sent_at;
+                                                            first = false;
+                                                        }
+                                                        raw = buffer.append(heap, raw, block[0..got]);
+                                                        total = total + got;
+                                                        if total > 65536 + 65536 {
+                                                            reading = false;
+                                                            r[5] = 1;
+                                                        }
+                                                        if r[0] == 0 {
+                                                            borrow raw as &rb in {
+                                                                let he = head_end(buffer.bytes(rb));
+                                                                if he < 0 && total > 65536 {
+                                                                    r[1] = 6;
+                                                                    reading = false;
+                                                                }
+                                                                if he >= 0 {
+                                                                    let text = buffer.bytes(rb);
+                                                                    if len(text) >= 12 && bytes.equal(text[0..5], "HTTP/") {
+                                                                        r[0] = number(text[9..12]);
+                                                                    }
+                                                                    if r[0] <= 0 {
+                                                                        r[1] = 3;
+                                                                        reading = false;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if r[0] > 0 {
+                                                            borrow raw as &rb in {
+                                                                let text = buffer.bytes(rb);
+                                                                let he = head_end(text);
+                                                                if he >= 0 && len(text) - he >= 65536 {
+                                                                    r[5] = 1;
+                                                                    reading = false;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Received::End => {
+                                                        reading = false;
+                                                    }
+                                                    Received::Again => {
+                                                        reading = true;
+                                                    }
+                                                    Received::Failed(e) => {
+                                                        reading = false;
+                                                        r[1] = 3;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    poller_close(pw);
+                    conn_close(conn);
+                    r[6] = clock_ms(clock) - started;
+                    borrow raw as &rb in {
+                        let text = buffer.bytes(rb);
+                        let he = head_end(text);
+                        if he < 0 {
+                            if r[1] == 0 {
+                                r[1] = 3;
+                            }
+                        } else {
+                            r[4] = len(text) - he;
+                            let head = text[0..he - 4];
+                            let loc = header_value(head, "location:");
+                            location = buffer.append(heap, location, loc);
+                            let declared = number(header_value(head, "content-length:"));
+                            if declared >= 0 && r[5] == 0 && r[1] == 0 && r[4] < declared {
+                                r[1] = 5;
+                            }
+                        }
+                    }
+                    buffer.drop(heap, raw);
+                    return location;
+                }
+            }
+        }
+    }
+}
+
+// ---- the whole check --------------------------------------------------------------------------------------------------------------
+
+fn put_int_text[&h](heap: &!h Heap, out: buffer.Buffer, n: int) -> [heap] buffer.Buffer {
+    var o = out;
+    if n < 0 {
+        o = buffer.push(heap, o, byte_of(45));
+        return put_int_text(heap, o, 0 - n);
+    }
+    var scale = 1;
+    while scale * 10 <= n {
+        scale = scale * 10;
+    }
+    var rest = n;
+    while scale >= 1 {
+        let d = rest / scale;
+        o = buffer.push(heap, o, byte_of(48 + d));
+        rest = rest - d * scale;
+        scale = scale / 10;
+    }
+    return o;
+}
+
+fn is_redirect(status: int) -> [] bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+}
+
+// The URL a Location leads to from `base`, or an empty buffer when it leads nowhere usable.
+fn next_url[&h, &b, &l](heap: &!h Heap, base: &b [byte], loc: &l [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 128);
+    if len(loc) == 0 {
+        return out;
+    }
+    let prefix_len = len(base) - len(checker.url_target(base));
+    let sep = bytes.find(loc, "://");
+    if sep > 0 && bytes.find(loc[0..sep], "/") < 0 {
+        return buffer.append(heap, out, loc);
+    }
+    if len(loc) >= 2 && int_of(loc[0]) == 47 && int_of(loc[1]) == 47 {
+        let colon = bytes.find(base, ":");
+        out = buffer.append(heap, out, base[0..colon + 1]);
+        return buffer.append(heap, out, loc);
+    }
+    out = buffer.append(heap, out, base[0..prefix_len]);
+    if int_of(loc[0]) != 47 {
+        out = buffer.push(heap, out, byte_of(47));
+    }
+    return buffer.append(heap, out, loc);
+}
+
+// May the checker connect to the packed address `a`? A private one only when `allow_loopback` is on and it is in 127.0.0.0/8.
+fn reachable(a: int, allow_loopback: bool) -> [] bool {
+    if checker.private_v4(a) == false {
+        return true;
+    }
+    return allow_loopback && a / 16777216 == 127;
+}
+
+fn reason_text(error: int) -> [] &static [byte] {
+    if error == 1 {
+        return "the connection was refused or failed";
+    }
+    if error == 2 {
+        return "no connection was made in time";
+    }
+    if error == 3 {
+        return "no usable answer: an empty reply, a reset or a broken status line";
+    }
+    if error == 5 {
+        return "the body ended before its Content-Length";
+    }
+    if error == 6 {
+        return "the answer's head is over 64 KiB";
+    }
+    return "no answer";
+}
+
+fn answer_json[&h, &u, &f, &a, &d](heap: &!h Heap, url: &u [byte], final_url: &f [byte], status: int, redirects: &a [byte], addrs: &d [byte], verdict: int, reason: &static [byte], dns_ms: int, connect_ms: int, first_ms: int, total_ms: int, cut: bool) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 512);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "url");
+    w = json.put_string(heap, w, url);
+    w = json.put_key(heap, w, "final_url");
+    w = json.put_string(heap, w, final_url);
+    w = json.put_key(heap, w, "status");
+    w = json.put_int(heap, w, status);
+    w = json.put_key(heap, w, "redirects");
+    w = json.put_fragment(heap, w, redirects);
+    w = json.put_key(heap, w, "addresses");
+    w = json.put_fragment(heap, w, addrs);
+    w = json.put_key(heap, w, "tls");
+    w = json.put_null(heap, w);
+    w = json.put_key(heap, w, "timing_ms");
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "dns");
+    w = json.put_int(heap, w, dns_ms);
+    w = json.put_key(heap, w, "connect");
+    w = json.put_int(heap, w, connect_ms);
+    w = json.put_key(heap, w, "tls");
+    w = json.put_int(heap, w, 0);
+    w = json.put_key(heap, w, "first_byte");
+    w = json.put_int(heap, w, first_ms);
+    w = json.put_key(heap, w, "total");
+    w = json.put_int(heap, w, total_ms);
+    w = json.end_object(heap, w);
+    w = json.put_key(heap, w, "verdict");
+    w = json.put_string(heap, w, checker.verdict_name(verdict));
+    w = json.put_key(heap, w, "reason");
+    var text = buffer.append(heap, buffer.empty(heap, 96), reason);
+    if cut {
+        text = buffer.append(heap, text, " (body cut at 64 KiB)");
+    }
+    borrow text as &tb in {
+        w = json.put_string(heap, w, buffer.bytes(tb));
+    }
+    buffer.drop(heap, text);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// Check `url`. `resolver` is the IPv4 text of the resolver (port `rport`); `allow_loopback` lets it reach 127.0.0.0/8, on any port, and nothing else private.
+pub fn run[&h, &n, &c, &s, &u](heap: &!h Heap, net: &n Net(""), clock: &c Clock, resolver: &s [byte], rport: int, allow_loopback: bool, url: &u [byte]) -> [heap, net_out(""), udp_send, udp_recv, conn_read, conn_write, poll, clock] Outcome {
+    let started = clock_ms(clock);
+    let deadline = started + hard_limit_ms();
+    var current = buffer.append(heap, buffer.empty(heap, 128), url);
+    var redirects = buffer.append(heap, buffer.empty(heap, 64), "[");
+    var hops = 0;
+    var result = buffer.empty(heap, 1);
+    var final_rule = "";
+    var going = true;
+    var dns_ms = 0;
+    while going {
+        var step_rule = "";
+        var next = buffer.empty(heap, 1);
+        var finished = false;
+        borrow current as &cb in {
+            let text = buffer.bytes(cb);
+            step_rule = checker.url_rule(text);
+            let host = checker.url_host(text);
+            let port = checker.url_port(text);
+            var lit = 0;
+            if len(step_rule) > 0 {
+                lit = checker.literal_private(host);
+                // the port list is lifted for a loopback literal when the setting is on
+                if bytes.equal(step_rule, "url.port") && allow_loopback && lit == 1 && checker.ipv4_loose(host) >= 0 && reachable(checker.ipv4_loose(host), true) && port >= 1 && port <= 65535 {
+                    step_rule = "";
+                }
+            }
+            if len(step_rule) == 0 {
+                region reg {
+                    let addrs = alloc_slice[reg](dns.addrs_size(), 0);
+                    var count = 0;
+                    var name_failed = false;
+                    let packed = checker.ipv4_loose(host);
+                    if int_of(host[0]) == 91 {
+                        let class = checker.ipv6_class(host[1..len(host) - 1]);
+                        if class == 1 {
+                            step_rule = "target.private-address";
+                        } else {
+                            step_rule = "url.invalid";
+                        }
+                    } else if packed == 0 - 2 {
+                        step_rule = "url.invalid";
+                    } else if packed >= 0 {
+                        addrs[0] = packed;
+                        count = 1;
+                    } else {
+                        let t0 = clock_ms(clock);
+                        count = resolve(net, clock, resolver, rport, host, 4242 + hops, 4000, addrs);
+                        dns_ms = clock_ms(clock) - t0;
+                        if count <= 0 {
+                            name_failed = true;
+                        }
+                    }
+                    var k = 0;
+                    while k < count && len(step_rule) == 0 {
+                        if reachable(addrs[k], allow_loopback) == false {
+                            step_rule = "target.private-address";
+                        }
+                        k = k + 1;
+                    }
+                    if len(step_rule) == 0 {
+                        if name_failed {
+                            finished = true;
+                            let d = answer_json(heap, text, text, 0, "[]", "[]", 0, "the name did not resolve", dns_ms, 0, 0, clock_ms(clock) - started, false);
+                            buffer.drop(heap, result);
+                            result = d;
+                        } else {
+                            let ip = alloc_slice[reg](16, byte_of(0));
+                            let il = dns.put_dotted(ip, 0, addrs[0]);
+                            let rr = alloc_slice[reg](rec(), 0);
+                            var host_header = buffer.append(heap, buffer.empty(heap, 64), host);
+                            if checker.url_port(text) != 80 && checker.url_port(text) != 443 {
+                                host_header = buffer.push(heap, host_header, byte_of(58));
+                                host_header = put_int_text(heap, host_header, port);
+                            }
+                            let target = checker.url_target(text);
+                            var tbuf = buffer.empty(heap, 64);
+                            if len(target) == 0 || int_of(target[0]) == 63 {
+                                tbuf = buffer.append(heap, tbuf, "/");
+                            }
+                            tbuf = buffer.append(heap, tbuf, target);
+                            var location = buffer.empty(heap, 1);
+                            borrow host_header as &hh in {
+                                borrow tbuf as &tt in {
+                                    buffer.drop(heap, location);
+                                    location = fetch_one(heap, net, clock, ip[0..il], port, buffer.bytes(hh), buffer.bytes(tt), deadline, rr);
+                                }
+                            }
+                            buffer.drop(heap, host_header);
+                            buffer.drop(heap, tbuf);
+                            var addr_json = buffer.append(heap, buffer.empty(heap, 32), "[\"");
+                            addr_json = buffer.append(heap, addr_json, ip[0..il]);
+                            addr_json = buffer.append(heap, addr_json, "\"]");
+                            let total = clock_ms(clock) - started;
+                            borrow location as &lb in {
+                                if rr[1] == 4 && rr[0] == 0 {
+                                    step_rule = "check.timeout";
+                                } else if rr[1] == 1 || rr[1] == 2 || rr[1] == 3 || rr[1] == 5 || rr[1] == 6 {
+                                    finished = true;
+                                    borrow addr_json as &ab in {
+                                        borrow redirects as &rd in {
+                                            let closed = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), "]");
+                                            borrow closed as &cl in {
+                                                let d = answer_json(heap, url, text, rr[0], buffer.bytes(cl), buffer.bytes(ab), 0, reason_text(rr[1]), dns_ms, rr[2], rr[3], total, false);
+                                                buffer.drop(heap, result);
+                                                result = d;
+                                            }
+                                            buffer.drop(heap, closed);
+                                        }
+                                    }
+                                } else if is_redirect(rr[0]) && len(buffer.bytes(lb)) > 0 {
+                                    if hops >= max_redirects() {
+                                        step_rule = "target.too-many-redirects";
+                                    } else {
+                                        var joined = buffer.empty(heap, 1);
+                                        borrow redirects as &rd in {
+                                            var piece = buffer.empty(heap, 64);
+                                            if hops > 0 {
+                                                piece = buffer.push(heap, piece, byte_of(44));
+                                            }
+                                            piece = buffer.append(heap, piece, "{\"url\":\"");
+                                            piece = buffer.append(heap, piece, text);
+                                            piece = buffer.append(heap, piece, "\",\"status\":");
+                                            piece = put_int_text(heap, piece, rr[0]);
+                                            piece = buffer.append(heap, piece, "}");
+                                            borrow piece as &pc in {
+                                                buffer.drop(heap, next);
+                                                next = next_url(heap, text, buffer.bytes(lb));
+                                                buffer.drop(heap, joined);
+                                                joined = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), buffer.bytes(pc));
+                                            }
+                                            buffer.drop(heap, piece);
+                                        }
+                                        buffer.drop(heap, redirects);
+                                        redirects = joined;
+                                        hops = hops + 1;
+                                    }
+                                } else {
+                                    finished = true;
+                                    let v = checker.verdict_of(true, true, rr[0], 9999, total);
+                                    borrow addr_json as &ab in {
+                                        borrow redirects as &rd in {
+                                            let closed = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), "]");
+                                            borrow closed as &cl in {
+                                                var reason = "responded";
+                                                if rr[1] == 5 {
+                                                    reason = reason_text(5);
+                                                }
+                                                let d = answer_json(heap, url, text, rr[0], buffer.bytes(cl), buffer.bytes(ab), v, reason, dns_ms, rr[2], rr[3], total, rr[5] == 1);
+                                                buffer.drop(heap, result);
+                                                result = d;
+                                            }
+                                            buffer.drop(heap, closed);
+                                        }
+                                    }
+                                }
+                            }
+                            buffer.drop(heap, addr_json);
+                            buffer.drop(heap, location);
+                        }
+                    }
+                }
+            }
+        }
+        if len(step_rule) > 0 {
+            final_rule = step_rule;
+            going = false;
+        } else if finished {
+            going = false;
+        } else {
+            buffer.drop(heap, current);
+            current = next;
+            next = buffer.empty(heap, 1);
+        }
+        buffer.drop(heap, next);
+    }
+    buffer.drop(heap, current);
+    buffer.drop(heap, redirects);
+    if len(final_rule) > 0 {
+        buffer.drop(heap, result);
+        return Outcome::Refused(final_rule);
+    }
+    return Outcome::Done(result);
+}
