@@ -1,0 +1,40 @@
+edition 9;
+
+import std.bytes;
+import std.test;
+import forge.review_net;
+
+// Unit tests for src/review_net.cho: which resolver the review worker asks. Run with `cancho test`.
+
+fn test_an_ipv4_literal_is_four_numbers_up_to_255() -> [] int {
+    test.assert(review_net.ipv4_ok("1.2.3.4"));
+    test.assert(review_net.ipv4_ok("255.255.255.255"));
+    test.assert(review_net.ipv4_ok("0.0.0.0"));
+    test.assert(review_net.ipv4_ok("256.1.1.1") == false);
+    test.assert(review_net.ipv4_ok("1.2.3") == false);
+    test.assert(review_net.ipv4_ok("1.2.3.4.5") == false);
+    test.assert(review_net.ipv4_ok("1..3.4") == false);
+    test.assert(review_net.ipv4_ok(".1.2.3") == false);
+    test.assert(review_net.ipv4_ok("1.2.3.") == false);
+    test.assert(review_net.ipv4_ok("1.2.3.4 ") == false);
+    test.assert(review_net.ipv4_ok("1234.1.1.1") == false);
+    test.assert(review_net.ipv4_ok("") == false);
+    test.assert(review_net.ipv4_ok("a.b.c.d") == false);
+    test.assert(review_net.ipv4_ok("::1") == false);
+    return 0;
+}
+
+fn test_the_resolver_is_the_first_ipv4_nameserver_line() -> [] int {
+    test.assert(bytes.equal(review_net.nameserver("nameserver 192.168.1.1\nnameserver 8.8.8.8\n"), "192.168.1.1"));
+    test.assert(bytes.equal(review_net.nameserver("# generated\nsearch lan\nnameserver\t10.0.0.2  # home\n"), "10.0.0.2"));
+    test.assert(bytes.equal(review_net.nameserver("nameserver fe80::1\nnameserver 1.1.1.1"), "1.1.1.1"));
+    test.assert(bytes.equal(review_net.nameserver("  nameserver 9.9.9.9\r\n"), "9.9.9.9"));
+    test.assert(bytes.equal(review_net.nameserver(""), ""));
+    test.assert(bytes.equal(review_net.nameserver("search lan\noptions ndots:1\n"), ""));
+    test.assert(bytes.equal(review_net.nameserver("nameserver\n"), ""));
+    test.assert(bytes.equal(review_net.nameserver("nameserver 1.2.3\n"), ""));
+    test.assert(bytes.equal(review_net.nameserver("nameservers 1.2.3.4\n"), ""));
+    test.assert(bytes.equal(review_net.nameserver("# nameserver 1.2.3.4\n"), ""));
+    test.assert(bytes.equal(review_net.nameserver("nameserver 1.2.3.4x\n"), ""));
+    return 0;
+}

@@ -3,6 +3,7 @@
 #   cancho fmt --check   every .cho file is canonical
 #   cancho check         every program type-checks, under its declared authority
 #   cancho test          every `fn test_*` passes (pure logic: tasks, journal replay)
+#   repo review         workers/repo_review.cho offline, the provider transport vendored (scripts/check_repo_review.sh)
 #   cancho code adapter  workers/cancho_code.cho against a stand-in build tool and real child processes (scripts/check_cancho_code.sh)
 #   tool runner          workers/tool_run.cho against stand-in tools and real child processes (scripts/check_tool_run.sh)
 #   forge build          `forge build` end to end against the adapter and a stand-in build tool (scripts/check_build_run.sh)
@@ -142,6 +143,12 @@ mkdir "$scratch/authority-review" || exit 1
 CANCHO="$C" sh scripts/check_authority_review.sh "$scratch/authority-review" > "$scratch/authority-review.out" || fail=1
 cat "$scratch/authority-review.out"
 if grep -q '^FAIL ' "$scratch/authority-review.out"; then fail=1; fi
+
+echo "== repo review (workers/repo_review.cho, repo.review: the vendored provider transport, offline: capabilities, every refusal, the inputs, a key it cannot read, a host that does not resolve; the provider call is RV4's, docs/review-step.md)"
+mkdir "$scratch/repo-review" || exit 1
+CANCHO="$C" sh scripts/check_repo_review.sh "$scratch/repo-review" > "$scratch/repo-review.out" || fail=1
+cat "$scratch/repo-review.out"
+if grep -q '^FAIL ' "$scratch/repo-review.out"; then fail=1; fi
 
 echo "== cancho code adapter (workers/cancho_code.cho against a stand-in build tool, real child processes, the build's group killed at its deadline)"
 mkdir "$scratch/cancho-code" || exit 1

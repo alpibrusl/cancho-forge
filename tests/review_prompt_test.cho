@@ -1,0 +1,80 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.review_prompt;
+
+// Unit tests for src/review_prompt.cho (docs/review-step.md section 5): the task check, the prompt, and the files written about the answer. Run with `cancho test`.
+
+fn good(kind: &static [byte], dir: &static [byte], key: &static [byte], model: &static [byte], host: &static [byte], tokens: int, diff: int, timeout: int) -> [] &static [byte] {
+    return review_prompt.check(kind, dir, key, model, host, tokens, diff, timeout);
+}
+
+fn test_a_good_task_is_taken_and_each_wrong_part_has_its_own_code() -> [] int {
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k/key", "claude-sonnet-5-5", "api.anthropic.com", 2048, 65536, 600000), ""));
+    test.assert(bytes.equal(good("repo.authority", "/e/x", "/k/key", "m", "h", 1, 1, 600000), "task-type-invalid"));
+    test.assert(bytes.equal(good("", "/e/x", "/k/key", "m", "h", 1, 1, 600000), "task-type-invalid"));
+    test.assert(bytes.equal(good("repo.review", "e/x", "/k/key", "m", "h", 1, 1, 600000), "path-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "k/key", "m", "h", 1, 1, 600000), "path-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/../x", "/k/key", "m", "h", 1, 1, 600000), "path-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k/key", "a b", "h", 1, 1, 600000), "scope-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k/key", "", "h", 1, 1, 600000), "scope-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k/key", "m", "h/x", 1, 1, 600000), "scope-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k/key", "m", "h:443", 1, 1, 600000), "scope-invalid"));
+    return 0;
+}
+
+fn test_the_numbers_are_held_to_the_grants_ranges() -> [] int {
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k", "m", "h", 8192, 262144, 2000), ""));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k", "m", "h", 0, 1, 600000), "limits-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k", "m", "h", 8193, 1, 600000), "limits-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k", "m", "h", 1, 0, 600000), "limits-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k", "m", "h", 1, 262145, 600000), "limits-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k", "m", "h", 1, 1, 1999), "limits-invalid"));
+    test.assert(bytes.equal(good("repo.review", "/e/x", "/k", "m", "h", 1, 1, 86400001), "limits-invalid"));
+    return 0;
+}
+
+fn test_the_prompt_is_the_instruction_the_brief_and_the_diff_and_nothing_else[&h](heap: &!h Heap) -> [heap] int {
+    let p = review_prompt.prompt(heap, "make it faster", "--- a/x\n+++ b/x\n");
+    borrow p as &pb in {
+        let text = buffer.bytes(pb);
+        test.assert(bytes.starts_with(text, "You review a change to a cancho repository."));
+        test.assert(bytes.find(text, "=== CHANGE REQUEST ===\nmake it faster\n=== DIFF ===\n--- a/x\n+++ b/x\n") > 0);
+        test.assert(bytes.find(text, "Use \"approve\" only if you found nothing to object to (then items is []).") > 0);
+        test.assert_eq(len(text), len(review_prompt.instruction()) + 14 + 15 + 15);
+    }
+    buffer.drop(heap, p);
+    return 0;
+}
+
+fn test_the_usage_line_is_the_format_the_budget_reads[&h](heap: &!h Heap) -> [heap] int {
+    let u = review_prompt.usage_line(heap, 1200, 87, 0, 5);
+    borrow u as &ub in {
+        test.assert(bytes.equal(buffer.bytes(ub), "{\"in\":1200,\"out\":87,\"cache_write\":0,\"cache_read\":5}\n"));
+    }
+    buffer.drop(heap, u);
+    return 0;
+}
+
+fn test_the_report_names_the_model_the_prompt_hash_and_counts_and_nothing_secret[&h](heap: &!h Heap) -> [heap] int {
+    let r = review_prompt.report_json(heap, "claude-sonnet-5-5", "abc", 10, 20, 30, 200);
+    borrow r as &rb in {
+        test.assert(bytes.equal(buffer.bytes(rb), "{\"schema\":\"forge-review-report/1\",\"model\":\"claude-sonnet-5-5\",\"prompt_sha256\":\"abc\",\"brief_bytes\":10,\"patch_bytes\":20,\"reply_bytes\":30,\"status\":200}"));
+    }
+    buffer.drop(heap, r);
+    return 0;
+}
+
+fn test_only_a_whole_reply_with_text_is_kept() -> [] int {
+    test.assert(bytes.equal(review_prompt.answer_failure(200, false, 5), ""));
+    test.assert(bytes.equal(review_prompt.answer_failure(500, false, 5), "review-unavailable"));
+    test.assert(bytes.equal(review_prompt.answer_failure(429, false, 5), "review-unavailable"));
+    test.assert(bytes.equal(review_prompt.answer_failure(200, true, 5), "review-unavailable"));
+    test.assert(bytes.equal(review_prompt.answer_failure(200, false, 0), "review-unavailable"));
+    test.assert(bytes.equal(review_prompt.answer_message(500, false, 5), "the provider did not answer 200"));
+    test.assert(bytes.equal(review_prompt.answer_message(200, true, 5), "the reply was cut at max_tokens"));
+    test.assert(bytes.equal(review_prompt.answer_message(200, false, 0), "the reply has no text"));
+    return 0;
+}

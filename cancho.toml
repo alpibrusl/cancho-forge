@@ -216,3 +216,13 @@ std = true
 name = "review_step"
 sources = ["tests/review_step_test.cho", "src/review_step.cho", "src/company_graph.cho", "src/company_manifest.cho"]
 std = true
+
+[[test]]
+name = "review_prompt"
+sources = ["tests/review_prompt_test.cho", "src/review_prompt.cho", "src/gate_task.cho", "src/gate_env.cho"]
+std = true
+
+[[test]]
+name = "review_net"
+sources = ["tests/review_net_test.cho", "src/review_net.cho"]
+std = true

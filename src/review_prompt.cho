@@ -1,0 +1,131 @@
+edition 9;
+module forge.review_prompt;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import forge.gate_task;
+
+// What the review worker (workers/repo_review.cho, docs/review-step.md section 5) decides without touching anything: whether a task is one it may run, the prompt
+// it sends, and the files it writes about the answer. Pure. The prompt is a constant of the worker: the one measured in spike/r1/review.sh (R-1), word for word,
+// so a change of the words is a change of the instrument (the worker writes the SHA-256 of the prompt into `report.json`).
+
+pub fn task_type() -> [] &static [byte] {
+    return "repo.review";
+}
+
+// The most bytes of the brief the worker reads. The diff is bounded by the grant's `max_diff_bytes`.
+pub fn max_brief_bytes() -> [] int {
+    return 65536;
+}
+
+pub fn instruction() -> [] &static [byte] {
+    return "You review a change to a cancho repository. You are given the change request and the diff, and nothing else. Decide whether the diff does what the request says without breaking what the code did before or must do. Read the diff line by line.\n\nAnswer with one JSON object and nothing else: {\"verdict\":\"approve\"|\"concerns\",\"items\":[{\"file\":\"<path>\",\"line\":<number>,\"claim\":\"<one sentence a person can check>\"}]}. Use \"approve\" only if you found nothing to object to (then items is []). Use \"concerns\" if you found a defect or a doubt, with at most 20 items.\n\n=== CHANGE REQUEST ===\n";
+}
+
+// The whole user message: the instruction, the brief, then the diff. Nothing else goes in.
+pub fn prompt[&h, &b, &p](heap: &!h Heap, brief: &b [byte], patch: &p [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.append(heap, buffer.empty(heap, len(brief) + len(patch) + 640), instruction());
+    out = buffer.append(heap, out, brief);
+    out = buffer.append(heap, out, "\n=== DIFF ===\n");
+    return buffer.append(heap, out, patch);
+}
+
+fn plain_token[&v](v: &v [byte], high: int) -> [] bool {
+    if len(v) < 1 || len(v) > high {
+        return false;
+    }
+    var i = 0;
+    while i < len(v) {
+        let c = int_of(v[i]);
+        let ok = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 46 || c == 45 || c == 95;
+        if ok == false || i == 0 && (c == 46 || c == 45) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// May the worker run this task? "" when it may; else the error code it answers `failed` with, before anything is read: `task-type-invalid` (not `repo.review`),
+// `path-invalid` (the execution directory or the key file is not an absolute path of the rules of `gate_task.path_ok`), `scope-invalid` (the model or the host is not
+// a plain name), `limits-invalid` (a number out of its range, or a timeout outside the contract's).
+pub fn check[&y, &e, &k, &m, &h](kind: &y [byte], exec_dir: &e [byte], key_file: &k [byte], model: &m [byte], host: &h [byte], max_tokens: int, max_diff_bytes: int, timeout_ms: int) -> [] &static [byte] {
+    if bytes.equal(kind, task_type()) == false {
+        return "task-type-invalid";
+    }
+    if gate_task.path_ok(exec_dir) == false || gate_task.path_ok(key_file) == false {
+        return "path-invalid";
+    }
+    if plain_token(model, 64) == false || plain_token(host, 253) == false {
+        return "scope-invalid";
+    }
+    if max_tokens < 1 || max_tokens > 8192 || max_diff_bytes < 1 || max_diff_bytes > 262144 {
+        return "limits-invalid";
+    }
+    if timeout_ms < gate_task.min_timeout_ms() || timeout_ms > gate_task.max_timeout_ms() {
+        return "limits-invalid";
+    }
+    return "";
+}
+
+// The one line of `usage.jsonl` (the format `company.md` section 9 reads).
+pub fn usage_line[&h](heap: &!h Heap, input: int, output: int, cache_write: int, cache_read: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 96);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "in");
+    w = json.put_int(heap, w, input);
+    w = json.put_key(heap, w, "out");
+    w = json.put_int(heap, w, output);
+    w = json.put_key(heap, w, "cache_write");
+    w = json.put_int(heap, w, cache_write);
+    w = json.put_key(heap, w, "cache_read");
+    w = json.put_int(heap, w, cache_read);
+    w = json.end_object(heap, w);
+    let line = json.finish(w);
+    return buffer.append(heap, line, "\n");
+}
+
+// What `report.json` says: the model, the prompt's SHA-256, the byte counts and the HTTP status. Nothing secret: the key, its path and the host are not in it.
+pub fn report_json[&h, &m, &s](heap: &!h Heap, model: &m [byte], prompt_sha256: &s [byte], brief_bytes: int, patch_bytes: int, reply_bytes: int, status: int) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "schema");
+    w = json.put_string(heap, w, "forge-review-report/1");
+    w = json.put_key(heap, w, "model");
+    w = json.put_string(heap, w, model);
+    w = json.put_key(heap, w, "prompt_sha256");
+    w = json.put_string(heap, w, prompt_sha256);
+    w = json.put_key(heap, w, "brief_bytes");
+    w = json.put_int(heap, w, brief_bytes);
+    w = json.put_key(heap, w, "patch_bytes");
+    w = json.put_int(heap, w, patch_bytes);
+    w = json.put_key(heap, w, "reply_bytes");
+    w = json.put_int(heap, w, reply_bytes);
+    w = json.put_key(heap, w, "status");
+    w = json.put_int(heap, w, status);
+    w = json.end_object(heap, w);
+    return json.finish(w);
+}
+
+// The error code the worker answers when the provider was reached but the answer is not a reply to use: `review-unavailable` for any other status than 200, for a
+// reply cut at `max_tokens`, and for one with no text. "" when the reply is to be kept.
+pub fn answer_failure(status: int, cut: bool, text_bytes: int) -> [] &static [byte] {
+    if status != 200 || cut || text_bytes == 0 {
+        return "review-unavailable";
+    }
+    return "";
+}
+
+pub fn answer_message(status: int, cut: bool, text_bytes: int) -> [] &static [byte] {
+    if status != 200 {
+        return "the provider did not answer 200";
+    }
+    if cut {
+        return "the reply was cut at max_tokens";
+    }
+    if text_bytes == 0 {
+        return "the reply has no text";
+    }
+    return "";
+}

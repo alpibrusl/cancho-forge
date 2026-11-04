@@ -1,0 +1,88 @@
+edition 9;
+module forge.review_net;
+
+import std.bytes;
+
+// The pure half of the review worker's name lookup (workers/repo_review.cho, docs/review-step.md section 5): the resolver is the first IPv4 `nameserver` of the
+// system's resolver file. The worker asks it for the A record of the operator's host itself (a UDP query, spike/lib/dns.cho), so the address it connects to is one
+// it resolved and not one a library resolved out of sight.
+
+// Is `v` an IPv4 literal: four decimal numbers of 1 to 3 digits, each at most 255, joined by dots?
+pub fn ipv4_ok[&v](v: &v [byte]) -> [] bool {
+    var parts = 0;
+    var digits = 0;
+    var value = 0;
+    var i = 0;
+    while i < len(v) {
+        let c = int_of(v[i]);
+        if c >= 48 && c <= 57 {
+            digits = digits + 1;
+            value = value * 10 + (c - 48);
+            if digits > 3 || value > 255 {
+                return false;
+            }
+        } else if c == 46 && digits > 0 {
+            parts = parts + 1;
+            digits = 0;
+            value = 0;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    return parts == 3 && digits > 0;
+}
+
+// The first `nameserver <a.b.c.d>` line of `text` (the contents of /etc/resolv.conf) whose address is an IPv4 literal, or "" when there is none. A line is read up to
+// a `#` or `;`; the keyword and the address are separated by blanks.
+pub fn nameserver[&t](text: &t [byte]) -> [] &t [byte] {
+    var start = 0;
+    var i = 0;
+    while i <= len(text) {
+        if i == len(text) || int_of(text[i]) == 10 {
+            let found = nameserver_of_line(text[start..i]);
+            if len(found) > 0 {
+                return found;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return text[0..0];
+}
+
+fn blank(c: int) -> [] bool {
+    return c == 32 || c == 9 || c == 13;
+}
+
+fn nameserver_of_line[&l](line: &l [byte]) -> [] &l [byte] {
+    var end = len(line);
+    var i = 0;
+    while i < len(line) {
+        if int_of(line[i]) == 35 || int_of(line[i]) == 59 {
+            end = i;
+            i = len(line);
+        }
+        i = i + 1;
+    }
+    var a = 0;
+    while a < end && blank(int_of(line[a])) {
+        a = a + 1;
+    }
+    let key = "nameserver";
+    if a + len(key) >= end || bytes.equal(line[a..a + len(key)], key) == false || blank(int_of(line[a + len(key)])) == false {
+        return line[0..0];
+    }
+    var b = a + len(key);
+    while b < end && blank(int_of(line[b])) {
+        b = b + 1;
+    }
+    var e = b;
+    while e < end && blank(int_of(line[e])) == false {
+        e = e + 1;
+    }
+    if ipv4_ok(line[b..e]) {
+        return line[b..e];
+    }
+    return line[0..0];
+}
