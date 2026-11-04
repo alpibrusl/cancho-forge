@@ -81,7 +81,8 @@ def audit(tree, cancho):
             return "fail", t + ": " + [l for l in (r.stdout + r.stderr).splitlines() if "FAIL" in l or "error" in l.lower() or "panic" in l.lower()][:1].__str__()[:160]
     return "pass", ""
 
-def main():
+def main(seeds=None):
+    seeds = SEEDS if seeds is None else seeds
     out, cancho = sys.argv[1], sys.argv[2]
     do_audit = "--no-audit" not in sys.argv
     base = tempfile.mkdtemp(prefix="r1base-", dir=os.environ.get("TMPDIR", "/tmp"))
@@ -90,7 +91,9 @@ def main():
     run(["git", "init", "-q"], base); run(["git", "add", "-A"], base)
     run(["git", "-c", "user.email=r1@example.invalid", "-c", "user.name=r1", "commit", "-q", "-m", "base"], base)
     bad = 0
-    for sid, f, old, new, brief, fate in SEEDS:
+    only = os.environ.get('ONLY')
+    if only: seeds = [x for x in seeds if x[0] in only.split(',')]
+    for sid, f, old, new, brief, fate in seeds:
         p = os.path.join(base, f)
         src = open(p).read()
         if src.count(old) != 1:
@@ -114,4 +117,5 @@ def main():
     shutil.rmtree(base)
     sys.exit(1 if bad else 0)
 
-main()
+if __name__ == "__main__":
+    main()
