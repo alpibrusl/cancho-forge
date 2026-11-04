@@ -7,39 +7,78 @@ import fetch;
 
 // A command line for the reference fetcher, used by pilot/audit/reference/fetch_check.sh to show the fetcher against the audit's world:
 //
-//     fetch_cli <resolver ip> <resolver port> <allow-loopback: 0|1> <url>
+//     fetch_cli <resolver ip> <resolver port> <allow-loopback: 0|1> <url> [<roots.pem> [<now: unix seconds>]]
 //
-// Prints `refused <rule>` or the answer's JSON, and exits 0 (answered), 1 (refused), 2 (usage).
+// Prints `refused <rule>` or the answer's JSON, and exits 0 (answered), 1 (refused), 2 (usage). Without <roots.pem> no root is trusted (an https target is `down`); without <now>
+// the system clock is used for certificates.
 
-fn go[&h, &i, &n, &c, &g](heap: &!h Heap, io: &!i Io, net: &n Net(""), clock: &c Clock, args: &g Args) -> [heap, io_write, net_out(""), udp_send, udp_recv, conn_read, conn_write, poll, clock, args] int {
-    var port = 0;
+fn number[&t](text: &t [byte]) -> [] int {
+    var n = 0;
     var k = 0;
-    while k < len(arg(args, 2)) {
-        port = port * 10 + int_of(arg(args, 2)[k]) - 48;
+    while k < len(text) {
+        n = n * 10 + int_of(text[k]) - 48;
         k = k + 1;
     }
-    match fetch.run(heap, net, clock, arg(args, 1), port, bytes.equal(arg(args, 3), "1"), arg(args, 4)) {
-        fetch.Outcome::Refused(rule) => {
-            io.write_all(io, "refused ");
-            io.write_all(io, rule);
-            io.newline(io);
-            return 1;
-        }
-        fetch.Outcome::Done(d) => {
-            borrow d as &db in {
-                io.write_all(io, buffer.bytes(db));
-            }
-            io.newline(io);
-            buffer.drop(heap, d);
-            return 0;
+    return n;
+}
+
+fn slurp[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], cap: int) -> [heap, fs_read("")] buffer.Buffer {
+    let store = box_slice(heap, cap, byte_of(0));
+    var out = buffer.empty(heap, 16);
+    borrow mut store as &!sw in {
+        let n = fs_read(fs, path, contents(sw));
+        if n >= 0 {
+            out = buffer.append(heap, out, contents(sw)[0..n]);
         }
     }
+    unbox_slice(heap, store);
+    return out;
+}
+
+fn go[&h, &i, &n, &c, &f, &g](heap: &!h Heap, io: &!i Io, net: &n Net(""), clock: &c Clock, fs: &f Fs(""), args: &g Args) -> [heap, io_write, net_out(""), udp_send, udp_recv, conn_read, conn_write, poll, clock, fs_read(""), args] int {
+    let port = number(arg(args, 2));
+    var roots = buffer.empty(heap, 16);
+    if arg_count(args) > 5 {
+        buffer.drop(heap, roots);
+        roots = slurp(heap, fs, arg(args, 5), 1048576);
+    }
+    var now_ms = 0;
+    if arg_count(args) > 6 {
+        now_ms = number(arg(args, 6)) * 1000;
+    }
+    let entropy = box_slice(heap, 32, byte_of(0));
+    borrow mut entropy as &!ew in {
+        fs_read(fs, "/dev/urandom", contents(ew));
+    }
+    var code = 2;
+    borrow roots as &rb in {
+        borrow entropy as &er in {
+            match fetch.run(heap, net, clock, arg(args, 1), port, bytes.equal(arg(args, 3), "1"), buffer.bytes(rb), contents(er), now_ms, arg(args, 4)) {
+                fetch.Outcome::Refused(rule) => {
+                    io.write_all(io, "refused ");
+                    io.write_all(io, rule);
+                    io.newline(io);
+                    code = 1;
+                }
+                fetch.Outcome::Done(d) => {
+                    borrow d as &db in {
+                        io.write_all(io, buffer.bytes(db));
+                    }
+                    io.newline(io);
+                    buffer.drop(heap, d);
+                    code = 0;
+                }
+            }
+        }
+    }
+    unbox_slice(heap, entropy);
+    buffer.drop(heap, roots);
+    return code;
 }
 
 fn main(world: World) -> [] int {
     let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
     release(ffi);
-    release(fs);
     release(signals);
     release(exec);
     release(tty);
@@ -48,11 +87,13 @@ fn main(world: World) -> [] int {
     var code = 2;
     borrow net as &n in {
         borrow clock as &c in {
-            borrow args as &g in {
-                borrow mut console as &!i in {
-                    borrow mut memory as &!h in {
-                        if arg_count(g) >= 5 {
-                            code = go(h, i, n, c, g);
+            borrow fs as &f in {
+                borrow args as &g in {
+                    borrow mut console as &!i in {
+                        borrow mut memory as &!h in {
+                            if arg_count(g) >= 5 {
+                                code = go(h, i, n, c, f, g);
+                            }
                         }
                     }
                 }
@@ -61,6 +102,7 @@ fn main(world: World) -> [] int {
     }
     release(net);
     release(clock);
+    release(fs);
     release(console);
     release(memory);
     release(args);

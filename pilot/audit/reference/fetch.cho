@@ -6,6 +6,8 @@ import std.bytes;
 import std.json;
 import checker;
 import dns;
+import probe;
+import tls;
 
 // The reference checker's fetcher (docs/pilot-audit.md section 5.1, R2): one URL in, one measured answer out. It resolves the host ITSELF (a UDP query to the resolver it was
 // given, spike/lib/dns.cho), judges every address it got, and connects to the ADDRESS and never to the name. Plain HTTP here; the TLS probe is R2b. Redirects are followed up
@@ -205,9 +207,37 @@ fn head_end[&t](raw: &t [byte]) -> [] int {
 
 // The record `r` of a request: 0 status, 1 error, 2 connect ms, 3 first-byte ms, 4 body bytes read, 5 the body was cut at the cap, 6 the total ms.
 // Errors: 0 none, 1 the connection was refused or failed, 2 no connection in time, 3 no usable answer (an empty reply, a reset, half a status line), 4 no answer in time,
-// 5 the body ended before its Content-Length, 6 a head over 64 KiB.
+// 5 the body ended before its Content-Length, 6 a head over 64 KiB, 7 the TLS handshake failed (the engine's code is in 7). Also 7 the TLS failure code, 8 the handshake ms.
 fn rec() -> [] int {
-    return 8;
+    return 10;
+}
+
+// The head of the answer in `raw` (plaintext, head and the start of the body) into the record `r` and the Location it carries (empty when none): the body size, whether it
+// reached the cap, and an error 5 when it ended before its Content-Length.
+fn parse_raw[&h, &w, &e](heap: &!h Heap, text: &w [byte], r: &!e [int]) -> [heap] buffer.Buffer {
+    var location = buffer.empty(heap, 16);
+    let he = head_end(text);
+    if he < 0 {
+        if r[1] == 0 {
+            r[1] = 3;
+        }
+    } else {
+        if len(text) >= 12 && bytes.equal(text[0..5], "HTTP/") && r[0] == 0 {
+            r[0] = number(text[9..12]);
+        }
+        r[4] = len(text) - he;
+        if r[4] >= body_cap() {
+            r[5] = 1;
+        }
+        let head = text[0..he - 4];
+        let loc = header_value(head, "location:");
+        location = buffer.append(heap, location, loc);
+        let declared = number(header_value(head, "content-length:"));
+        if declared >= 0 && r[5] == 0 && r[1] == 0 && r[4] < declared {
+            r[1] = 5;
+        }
+    }
+    return location;
 }
 
 // Connect to `ip`:`port`, send `GET target`, read the head and up to the body cap. The Location header (when there is one) is returned; the numbers go to `r`.
@@ -365,22 +395,8 @@ fn fetch_one[&h, &n, &c, &i, &t, &o, &r](heap: &!h Heap, net: &n Net(""), clock:
                     conn_close(conn);
                     r[6] = clock_ms(clock) - started;
                     borrow raw as &rb in {
-                        let text = buffer.bytes(rb);
-                        let he = head_end(text);
-                        if he < 0 {
-                            if r[1] == 0 {
-                                r[1] = 3;
-                            }
-                        } else {
-                            r[4] = len(text) - he;
-                            let head = text[0..he - 4];
-                            let loc = header_value(head, "location:");
-                            location = buffer.append(heap, location, loc);
-                            let declared = number(header_value(head, "content-length:"));
-                            if declared >= 0 && r[5] == 0 && r[1] == 0 && r[4] < declared {
-                                r[1] = 5;
-                            }
-                        }
+                        buffer.drop(heap, location);
+                        location = parse_raw(heap, buffer.bytes(rb), r);
                     }
                     buffer.drop(heap, raw);
                     return location;
@@ -466,7 +482,51 @@ fn reason_text(error: int) -> [] &static [byte] {
     return "no answer";
 }
 
-fn answer_json[&h, &u, &f, &a, &d](heap: &!h Heap, url: &u [byte], final_url: &f [byte], status: int, redirects: &a [byte], addrs: &d [byte], verdict: int, reason: &static [byte], dns_ms: int, connect_ms: int, first_ms: int, total_ms: int, cut: bool) -> [heap] buffer.Buffer {
+fn down_reason(error: int, tls_code: int) -> [] &static [byte] {
+    if error == 7 {
+        return tls.refusal_tag(tls_code);
+    }
+    return reason_text(error);
+}
+
+fn fetch_tls[&h, &n, &c, &i, &o, &t, &z, &y, &e, &w](heap: &!h Heap, net: &n Net(""), clock: &c Clock, ip: &i [byte], port: int, name: &w [byte], host_header: &o [byte], target: &t [byte], roots: &z [byte], entropy: &y [byte], now_ms: int, deadline: int, r: &!e [int]) -> [heap, net_out(""), conn_read, conn_write, poll, clock] buffer.Buffer {
+    var request = buffer.append(heap, buffer.empty(heap, 256), "GET ");
+    request = buffer.append(heap, request, target);
+    request = buffer.append(heap, request, " HTTP/1.1\r\nHost: ");
+    request = buffer.append(heap, request, host_header);
+    request = buffer.append(heap, request, "\r\nUser-Agent: pilot-reference-checker/1\r\nAccept: */*\r\nConnection: close\r\n\r\n");
+    var location = buffer.empty(heap, 16);
+    region reg {
+        let tr = alloc_slice[reg](probe.rec(), 0);
+        var raw = buffer.empty(heap, 2048);
+        borrow request as &rq in {
+            raw = probe.exchange(heap, net, clock, ip, port, name, buffer.bytes(rq), roots, entropy, now_ms, deadline, 131072, raw, tr);
+        }
+        r[2] = tr[2];
+        r[3] = tr[3];
+        r[8] = tr[1];
+        if tr[0] < 0 {
+            r[1] = 7;
+            r[7] = tr[0];
+        } else if tr[0] == 2 {
+            r[1] = 4;
+        } else if tr[0] > 0 {
+            r[1] = 1;
+        }
+        r[6] = clock_ms(clock);
+        if r[1] == 0 {
+            borrow raw as &rb in {
+                buffer.drop(heap, location);
+                location = parse_raw(heap, buffer.bytes(rb), r);
+            }
+        }
+        buffer.drop(heap, raw);
+    }
+    buffer.drop(heap, request);
+    return location;
+}
+
+fn answer_json[&h, &u, &f, &a, &d, &z](heap: &!h Heap, url: &u [byte], final_url: &f [byte], status: int, redirects: &a [byte], addrs: &d [byte], verdict: int, reason: &static [byte], dns_ms: int, connect_ms: int, first_ms: int, total_ms: int, cut: bool, tls_frag: &z [byte], tls_ms: int) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 512);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "url");
@@ -480,7 +540,7 @@ fn answer_json[&h, &u, &f, &a, &d](heap: &!h Heap, url: &u [byte], final_url: &f
     w = json.put_key(heap, w, "addresses");
     w = json.put_fragment(heap, w, addrs);
     w = json.put_key(heap, w, "tls");
-    w = json.put_null(heap, w);
+    w = json.put_fragment(heap, w, tls_frag);
     w = json.put_key(heap, w, "timing_ms");
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "dns");
@@ -488,7 +548,7 @@ fn answer_json[&h, &u, &f, &a, &d](heap: &!h Heap, url: &u [byte], final_url: &f
     w = json.put_key(heap, w, "connect");
     w = json.put_int(heap, w, connect_ms);
     w = json.put_key(heap, w, "tls");
-    w = json.put_int(heap, w, 0);
+    w = json.put_int(heap, w, tls_ms);
     w = json.put_key(heap, w, "first_byte");
     w = json.put_int(heap, w, first_ms);
     w = json.put_key(heap, w, "total");
@@ -510,9 +570,13 @@ fn answer_json[&h, &u, &f, &a, &d](heap: &!h Heap, url: &u [byte], final_url: &f
 }
 
 // Check `url`. `resolver` is the IPv4 text of the resolver (port `rport`); `allow_loopback` lets it reach 127.0.0.0/8, on any port, and nothing else private.
-pub fn run[&h, &n, &c, &s, &u](heap: &!h Heap, net: &n Net(""), clock: &c Clock, resolver: &s [byte], rport: int, allow_loopback: bool, url: &u [byte]) -> [heap, net_out(""), udp_send, udp_recv, conn_read, conn_write, poll, clock] Outcome {
+pub fn run[&h, &n, &c, &s, &u, &z, &y](heap: &!h Heap, net: &n Net(""), clock: &c Clock, resolver: &s [byte], rport: int, allow_loopback: bool, roots: &z [byte], entropy: &y [byte], now_ms: int, url: &u [byte]) -> [heap, net_out(""), udp_send, udp_recv, conn_read, conn_write, poll, clock] Outcome {
     let started = clock_ms(clock);
     let deadline = started + hard_limit_ms();
+    var probe_now = now_ms;
+    if now_ms == 0 {
+        probe_now = clock_unix_ms(clock);
+    }
     var current = buffer.append(heap, buffer.empty(heap, 128), url);
     var redirects = buffer.append(heap, buffer.empty(heap, 64), "[");
     var hops = 0;
@@ -529,13 +593,11 @@ pub fn run[&h, &n, &c, &s, &u](heap: &!h Heap, net: &n Net(""), clock: &c Clock,
             step_rule = checker.url_rule(text);
             let host = checker.url_host(text);
             let port = checker.url_port(text);
-            var lit = 0;
-            if len(step_rule) > 0 {
-                lit = checker.literal_private(host);
-                // the port list is lifted for a loopback literal when the setting is on
-                if bytes.equal(step_rule, "url.port") && allow_loopback && lit == 1 && checker.ipv4_loose(host) >= 0 && reachable(checker.ipv4_loose(host), true) && port >= 1 && port <= 65535 {
-                    step_rule = "";
-                }
+            // the port list is lifted when the setting is on and every address the host has is in 127.0.0.0/8 (judged below, once they are known)
+            var port_deferred = false;
+            if bytes.equal(step_rule, "url.port") && allow_loopback && port >= 1 && port <= 65535 {
+                step_rule = "";
+                port_deferred = true;
             }
             if len(step_rule) == 0 {
                 region reg {
@@ -570,10 +632,17 @@ pub fn run[&h, &n, &c, &s, &u](heap: &!h Heap, net: &n Net(""), clock: &c Clock,
                         }
                         k = k + 1;
                     }
+                    k = 0;
+                    while port_deferred && k < count && len(step_rule) == 0 {
+                        if addrs[k] / 16777216 != 127 {
+                            step_rule = "url.port";
+                        }
+                        k = k + 1;
+                    }
                     if len(step_rule) == 0 {
                         if name_failed {
                             finished = true;
-                            let d = answer_json(heap, text, text, 0, "[]", "[]", 0, "the name did not resolve", dns_ms, 0, 0, clock_ms(clock) - started, false);
+                            let d = answer_json(heap, text, text, 0, "[]", "[]", 0, "the name did not resolve", dns_ms, 0, 0, clock_ms(clock) - started, false, "null", 0);
                             buffer.drop(heap, result);
                             result = d;
                         } else {
@@ -595,7 +664,11 @@ pub fn run[&h, &n, &c, &s, &u](heap: &!h Heap, net: &n Net(""), clock: &c Clock,
                             borrow host_header as &hh in {
                                 borrow tbuf as &tt in {
                                     buffer.drop(heap, location);
-                                    location = fetch_one(heap, net, clock, ip[0..il], port, buffer.bytes(hh), buffer.bytes(tt), deadline, rr);
+                                    if checker.url_is_https(text) {
+                                        location = fetch_tls(heap, net, clock, ip[0..il], port, host, buffer.bytes(hh), buffer.bytes(tt), roots, entropy, probe_now, deadline, rr);
+                                    } else {
+                                        location = fetch_one(heap, net, clock, ip[0..il], port, buffer.bytes(hh), buffer.bytes(tt), deadline, rr);
+                                    }
                                 }
                             }
                             buffer.drop(heap, host_header);
@@ -604,69 +677,90 @@ pub fn run[&h, &n, &c, &s, &u](heap: &!h Heap, net: &n Net(""), clock: &c Clock,
                             addr_json = buffer.append(heap, addr_json, ip[0..il]);
                             addr_json = buffer.append(heap, addr_json, "\"]");
                             let total = clock_ms(clock) - started;
-                            borrow location as &lb in {
-                                if rr[1] == 4 && rr[0] == 0 {
-                                    step_rule = "check.timeout";
-                                } else if rr[1] == 1 || rr[1] == 2 || rr[1] == 3 || rr[1] == 5 || rr[1] == 6 {
-                                    finished = true;
-                                    borrow addr_json as &ab in {
-                                        borrow redirects as &rd in {
-                                            let closed = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), "]");
-                                            borrow closed as &cl in {
-                                                let d = answer_json(heap, url, text, rr[0], buffer.bytes(cl), buffer.bytes(ab), 0, reason_text(rr[1]), dns_ms, rr[2], rr[3], total, false);
-                                                buffer.drop(heap, result);
-                                                result = d;
-                                            }
-                                            buffer.drop(heap, closed);
-                                        }
+                            var tls_frag = buffer.append(heap, buffer.empty(heap, 40), "null");
+                            var days = 9999;
+                            if checker.url_is_https(text) {
+                                buffer.drop(heap, tls_frag);
+                                if rr[1] == 7 {
+                                    tls_frag = buffer.append(heap, buffer.empty(heap, 40), "{\"verified\":false,\"days_left\":0}");
+                                } else if rr[1] == 0 || rr[1] == 5 {
+                                    days = probe.days_left(heap, net, clock, ip[0..il], port, host, roots, entropy, probe_now, clock_ms(clock) + 5000);
+                                    if days < 0 {
+                                        days = 0;
                                     }
-                                } else if is_redirect(rr[0]) && len(buffer.bytes(lb)) > 0 {
-                                    if hops >= max_redirects() {
-                                        step_rule = "target.too-many-redirects";
-                                    } else {
-                                        var joined = buffer.empty(heap, 1);
-                                        borrow redirects as &rd in {
-                                            var piece = buffer.empty(heap, 64);
-                                            if hops > 0 {
-                                                piece = buffer.push(heap, piece, byte_of(44));
-                                            }
-                                            piece = buffer.append(heap, piece, "{\"url\":\"");
-                                            piece = buffer.append(heap, piece, text);
-                                            piece = buffer.append(heap, piece, "\",\"status\":");
-                                            piece = put_int_text(heap, piece, rr[0]);
-                                            piece = buffer.append(heap, piece, "}");
-                                            borrow piece as &pc in {
-                                                buffer.drop(heap, next);
-                                                next = next_url(heap, text, buffer.bytes(lb));
-                                                buffer.drop(heap, joined);
-                                                joined = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), buffer.bytes(pc));
-                                            }
-                                            buffer.drop(heap, piece);
-                                        }
-                                        buffer.drop(heap, redirects);
-                                        redirects = joined;
-                                        hops = hops + 1;
-                                    }
+                                    tls_frag = buffer.append(heap, buffer.empty(heap, 40), "{\"verified\":true,\"days_left\":");
+                                    tls_frag = put_int_text(heap, tls_frag, days);
+                                    tls_frag = buffer.append(heap, tls_frag, "}");
                                 } else {
-                                    finished = true;
-                                    let v = checker.verdict_of(true, true, rr[0], 9999, total);
-                                    borrow addr_json as &ab in {
-                                        borrow redirects as &rd in {
-                                            let closed = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), "]");
-                                            borrow closed as &cl in {
-                                                var reason = "responded";
-                                                if rr[1] == 5 {
-                                                    reason = reason_text(5);
+                                    tls_frag = buffer.append(heap, buffer.empty(heap, 40), "null");
+                                }
+                            }
+                            borrow tls_frag as &tf in {
+                                borrow location as &lb in {
+                                    if rr[1] == 4 && rr[0] == 0 {
+                                        step_rule = "check.timeout";
+                                    } else if rr[1] == 1 || rr[1] == 2 || rr[1] == 3 || rr[1] == 5 || rr[1] == 6 || rr[1] == 7 {
+                                        finished = true;
+                                        borrow addr_json as &ab in {
+                                            borrow redirects as &rd in {
+                                                let closed = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), "]");
+                                                borrow closed as &cl in {
+                                                    let d = answer_json(heap, url, text, rr[0], buffer.bytes(cl), buffer.bytes(ab), 0, down_reason(rr[1], rr[7]), dns_ms, rr[2], rr[3], total, false, buffer.bytes(tf), rr[8]);
+                                                    buffer.drop(heap, result);
+                                                    result = d;
                                                 }
-                                                let d = answer_json(heap, url, text, rr[0], buffer.bytes(cl), buffer.bytes(ab), v, reason, dns_ms, rr[2], rr[3], total, rr[5] == 1);
-                                                buffer.drop(heap, result);
-                                                result = d;
+                                                buffer.drop(heap, closed);
                                             }
-                                            buffer.drop(heap, closed);
+                                        }
+                                    } else if is_redirect(rr[0]) && len(buffer.bytes(lb)) > 0 {
+                                        if hops >= max_redirects() {
+                                            step_rule = "target.too-many-redirects";
+                                        } else {
+                                            var joined = buffer.empty(heap, 1);
+                                            borrow redirects as &rd in {
+                                                var piece = buffer.empty(heap, 64);
+                                                if hops > 0 {
+                                                    piece = buffer.push(heap, piece, byte_of(44));
+                                                }
+                                                piece = buffer.append(heap, piece, "{\"url\":\"");
+                                                piece = buffer.append(heap, piece, text);
+                                                piece = buffer.append(heap, piece, "\",\"status\":");
+                                                piece = put_int_text(heap, piece, rr[0]);
+                                                piece = buffer.append(heap, piece, "}");
+                                                borrow piece as &pc in {
+                                                    buffer.drop(heap, next);
+                                                    next = next_url(heap, text, buffer.bytes(lb));
+                                                    buffer.drop(heap, joined);
+                                                    joined = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), buffer.bytes(pc));
+                                                }
+                                                buffer.drop(heap, piece);
+                                            }
+                                            buffer.drop(heap, redirects);
+                                            redirects = joined;
+                                            hops = hops + 1;
+                                        }
+                                    } else {
+                                        finished = true;
+                                        let v = checker.verdict_of(true, true, rr[0], days, total);
+                                        borrow addr_json as &ab in {
+                                            borrow redirects as &rd in {
+                                                let closed = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), buffer.bytes(rd)), "]");
+                                                borrow closed as &cl in {
+                                                    var reason = "responded";
+                                                    if rr[1] == 5 {
+                                                        reason = reason_text(5);
+                                                    }
+                                                    let d = answer_json(heap, url, text, rr[0], buffer.bytes(cl), buffer.bytes(ab), v, reason, dns_ms, rr[2], rr[3], total, rr[5] == 1, buffer.bytes(tf), rr[8]);
+                                                    buffer.drop(heap, result);
+                                                    result = d;
+                                                }
+                                                buffer.drop(heap, closed);
+                                            }
                                         }
                                     }
                                 }
                             }
+                            buffer.drop(heap, tls_frag);
                             buffer.drop(heap, addr_json);
                             buffer.drop(heap, location);
                         }

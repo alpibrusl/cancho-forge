@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.." || exit 1
 fail=0
 
 echo "== cancho fmt --check"
-$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho pilot/audit/driver.cho pilot/audit/expect.cho pilot/audit/reference/checker.cho pilot/audit/reference/fetch.cho pilot/audit/reference/fetch_cli.cho || fail=1
+$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho pilot/audit/driver.cho pilot/audit/expect.cho pilot/audit/reference/checker.cho pilot/audit/reference/fetch.cho pilot/audit/reference/fetch_cli.cho pilot/audit/reference/probe.cho || fail=1
 
 echo "== cancho check"
 # A library has no `main`, so the program is checked as a whole (src/*.cho);
@@ -258,7 +258,7 @@ CANCHO="$C" sh pilot/audit/self_check_standins.sh "$scratch/audit-standins" > "$
 cat "$scratch/audit-standins.out"
 if grep -q '^FAIL ' "$scratch/audit-standins.out"; then fail=1; fi
 
-echo "== reference checker, the fetcher (resolve, judge, connect to the address, redirects, caps; against the audit's world; pilot/audit/reference/fetch_check.sh)"
+echo "== reference checker, the fetcher (resolve, judge, connect to the address, redirects, caps, the TLS probe; against the audit's world; pilot/audit/reference/fetch_check.sh)"
 mkdir "$scratch/reference-fetch" || exit 1
 CANCHO="$C" sh pilot/audit/reference/fetch_check.sh "$scratch/reference-fetch" > "$scratch/reference-fetch.out" || fail=1
 cat "$scratch/reference-fetch.out"

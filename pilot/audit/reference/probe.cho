@@ -1,0 +1,267 @@
+edition 9;
+module probe;
+
+import std.buffer;
+import tls;
+
+// The reference checker's TLS side (docs/pilot-audit.md section 5.1, R2b): one TLS 1.3 exchange over an address, with the certificate chain verified for a NAME against the
+// roots it is given, at a clock it is given. `now_ms` is what `--now` sets (docs/pilot-audit.md section 3.1), so the same fixture is valid, nearly expired or expired depending
+// on the audit's clock. The certificate's `notAfter` is not published by the engine (spike P2), so `days_left` is found by handshaking at later and later clocks: the largest whole
+// number of days `d` for which the chain still verifies at `now + d days` is `floor((notAfter - now) / 1 day)`, which is the number the contract asks for.
+
+// The record `r` of an exchange: 0 the result (0 established and, if a request was given, answered; a NEGATIVE number is the engine's refusal, `tls.refusal_tag` names it; 1 the
+// connection failed; 2 no connection or no answer in time; 3 the engine could not start), 1 the milliseconds the handshake took, 2 the milliseconds until the connection was made, 3
+// the milliseconds from the request to the first byte, 4 plaintext bytes received.
+pub fn rec() -> [] int {
+    return 8;
+}
+
+fn pend_cap() -> [] int {
+    return 16384;
+}
+
+// Write the engine's pending bytes to the connection; false when the peer is gone or the deadline passes.
+fn flush[&e, &c, &p, &k](engine: &!e tls.Engine, conn: &!c Conn, clock: &k Clock, pend: &!p [byte], deadline: int) -> [conn_write, clock] bool {
+    var n = tls.take(engine, 0, pend);
+    while n > 0 {
+        var at = 0;
+        while at < n {
+            if clock_ms(clock) > deadline {
+                return false;
+            }
+            match conn_write(conn, pend[at..n]) {
+                Sent::Wrote(w) => {
+                    at = at + w;
+                }
+                Sent::Again => {
+                    at = at + 0;
+                }
+                Sent::Failed(e) => {
+                    return false;
+                }
+            }
+        }
+        n = tls.take(engine, 0, pend);
+    }
+    return true;
+}
+
+// Connect to `ip`:`port`, handshake for `host` with `roots` at `now_ms`, send `request` (nothing is sent when it is empty) and collect the plaintext answer into `plain` (at most
+// `most` bytes). Numbers go to `r` (see `rec`).
+pub fn exchange[&h, &n, &c, &i, &o, &q, &t, &y, &e](heap: &!h Heap, net: &n Net(""), clock: &c Clock, ip: &i [byte], port: int, host: &o [byte], request: &q [byte], roots: &t [byte], entropy: &y [byte], now_ms: int, deadline: int, most: int, plain: buffer.Buffer, r: &!e [int]) -> [heap, net_out(""), conn_read, conn_write, poll, clock] buffer.Buffer {
+    var out = plain;
+    r[0] = 2;
+    let started = clock_ms(clock);
+    match tcp_connect_start(net, ip, port) {
+        Dialed::Failed(e) => {
+            r[0] = 1;
+            return out;
+        }
+        Dialed::Ok(opened) => {
+            var conn = opened;
+            match poller_new() {
+                Polling::Failed(e) => {
+                    conn_close(conn);
+                    return out;
+                }
+                Polling::Ok(poller) => {
+                    var pw = poller;
+                    var engine = tls.open(heap, 1);
+                    borrow mut engine as &!em in {
+                        tls.trust(em, roots);
+                        tls.seed(em, entropy);
+                        region reg {
+                            let events = alloc_slice[reg](8, 0);
+                            let pend = alloc_slice[reg](pend_cap(), byte_of(0));
+                            let input = alloc_slice[reg](8192, byte_of(0));
+                            let app = alloc_slice[reg](8192, byte_of(0));
+                            borrow mut pw as &!pm in {
+                                borrow mut conn as &!cm in {
+                                    poller_add_conn(pm, cm, 1, 2);
+                                    var connected = false;
+                                    var waiting = true;
+                                    while waiting {
+                                        let left = started + 3000 - clock_ms(clock);
+                                        if left <= 0 || clock_ms(clock) > deadline {
+                                            waiting = false;
+                                        } else if poller_wait(pm, events, left) > 0 {
+                                            waiting = false;
+                                            connected = conn_connect_status(cm) == 0;
+                                            if connected == false {
+                                                r[0] = 1;
+                                            }
+                                        }
+                                    }
+                                    if connected {
+                                        r[2] = clock_ms(clock) - started;
+                                        let handshake_at = clock_ms(clock);
+                                        if tls.start(em, 0, host, now_ms) != 0 {
+                                            r[0] = 3;
+                                        } else {
+                                            poller_modify(pm, cm, 1, 1);
+                                            var sent = false;
+                                            var sent_at = 0;
+                                            var established = false;
+                                            var going = true;
+                                            var first = true;
+                                            while going {
+                                                if tls.event(em, 0) == tls.event_failed() {
+                                                    // the engine refused the chain; the alert it wants to send may find the peer gone, so this is looked at before the write
+                                                    r[0] = tls.failure(em, 0);
+                                                    if r[0] == 0 {
+                                                        r[0] = 1;
+                                                    }
+                                                    going = false;
+                                                } else if flush(em, cm, clock, pend, deadline) == false {
+                                                    going = false;
+                                                    if r[0] == 2 {
+                                                        r[0] = 1;
+                                                    }
+                                                } else {
+                                                    let ev = tls.event(em, 0);
+                                                    if ev == tls.event_established() {
+                                                        if established == false {
+                                                            established = true;
+                                                            r[1] = clock_ms(clock) - handshake_at;
+                                                            if len(request) == 0 {
+                                                                r[0] = 0;
+                                                                going = false;
+                                                            }
+                                                        }
+                                                        if going && sent == false {
+                                                            tls.send(em, 0, request);
+                                                            sent = true;
+                                                            sent_at = clock_ms(clock);
+                                                        }
+                                                    } else if ev == tls.event_failed() {
+                                                        r[0] = tls.failure(em, 0);
+                                                        if r[0] == 0 {
+                                                            r[0] = 1;
+                                                        }
+                                                        going = false;
+                                                    } else if ev == tls.event_closed() {
+                                                        r[0] = 0;
+                                                        going = false;
+                                                    }
+                                                    if going {
+                                                        flush(em, cm, clock, pend, deadline);
+                                                        let left = deadline - clock_ms(clock);
+                                                        if left <= 0 {
+                                                            going = false;
+                                                            if established {
+                                                                r[0] = 0;
+                                                            }
+                                                        } else if tls.event(em, 0) != tls.event_want_write() && poller_wait(pm, events, left) > 0 {
+                                                            match conn_read(cm, input) {
+                                                                Received::Data(got) => {
+                                                                    if first && sent {
+                                                                        r[3] = clock_ms(clock) - sent_at;
+                                                                        first = false;
+                                                                    }
+                                                                    var used = 0;
+                                                                    while used < got && going {
+                                                                        let c2 = tls.feed(em, 0, input[used..got]);
+                                                                        if c2 < 0 {
+                                                                            used = got;
+                                                                        } else {
+                                                                            used = used + c2;
+                                                                        }
+                                                                        var m = tls.recv(em, 0, app);
+                                                                        while m > 0 {
+                                                                            out = buffer.append(heap, out, app[0..m]);
+                                                                            r[4] = r[4] + m;
+                                                                            if r[4] >= most {
+                                                                                going = false;
+                                                                                r[0] = 0;
+                                                                            }
+                                                                            m = tls.recv(em, 0, app);
+                                                                        }
+                                                                        if m == 0 {
+                                                                            tls.finish(em, 0);
+                                                                            flush(em, cm, clock, pend, deadline);
+                                                                            r[0] = 0;
+                                                                            going = false;
+                                                                        }
+                                                                        flush(em, cm, clock, pend, deadline);
+                                                                    }
+                                                                }
+                                                                Received::End => {
+                                                                    if established {
+                                                                        r[0] = 0;
+                                                                    } else {
+                                                                        let code = tls.eof(em, 0);
+                                                                        if code != 0 {
+                                                                            r[0] = code;
+                                                                        } else {
+                                                                            r[0] = 1;
+                                                                        }
+                                                                    }
+                                                                    going = false;
+                                                                }
+                                                                Received::Again => {
+                                                                    going = true;
+                                                                }
+                                                                Received::Failed(e) => {
+                                                                    if established == false {
+                                                                        r[0] = 1;
+                                                                    }
+                                                                    going = false;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // a refusal the loop did not see in time (the peer closed first) is still the engine's refusal
+                        if r[0] > 0 && tls.failure(em, 0) != 0 {
+                            r[0] = tls.failure(em, 0);
+                        }
+                    }
+                    poller_close(pw);
+                    conn_close(conn);
+                    tls.close(heap, engine);
+                    return out;
+                }
+            }
+        }
+    }
+}
+
+// Is the chain of the server at `ip`:`port` valid for `host` at `now_ms`? (A handshake and nothing more.)
+fn valid_at[&h, &n, &c, &i, &o, &t, &y](heap: &!h Heap, net: &n Net(""), clock: &c Clock, ip: &i [byte], port: int, host: &o [byte], roots: &t [byte], entropy: &y [byte], now_ms: int, deadline: int) -> [heap, net_out(""), conn_read, conn_write, poll, clock] bool {
+    region reg {
+        let rr = alloc_slice[reg](rec(), 0);
+        let none = buffer.empty(heap, 1);
+        let back = exchange(heap, net, clock, ip, port, host, "", roots, entropy, now_ms, deadline, 0, none, rr);
+        buffer.drop(heap, back);
+        return rr[0] == 0;
+    }
+}
+
+// The whole days the server's certificate has left at `now_ms`, found by handshaking at later clocks: the largest `d` in 0 to 36500 for which the chain verifies at
+// `now_ms + d days`. -1 when it does not verify at `now_ms` itself (the caller should not ask then).
+pub fn days_left[&h, &n, &c, &i, &o, &t, &y](heap: &!h Heap, net: &n Net(""), clock: &c Clock, ip: &i [byte], port: int, host: &o [byte], roots: &t [byte], entropy: &y [byte], now_ms: int, deadline: int) -> [heap, net_out(""), conn_read, conn_write, poll, clock] int {
+    let day = 86400000;
+    if valid_at(heap, net, clock, ip, port, host, roots, entropy, now_ms, deadline) == false {
+        return 0 - 1;
+    }
+    var low = 0;
+    var high = 36500;
+    if valid_at(heap, net, clock, ip, port, host, roots, entropy, now_ms + high * day, deadline) {
+        return high;
+    }
+    while high - low > 1 {
+        let mid = (low + high) / 2;
+        if valid_at(heap, net, clock, ip, port, host, roots, entropy, now_ms + mid * day, deadline) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
