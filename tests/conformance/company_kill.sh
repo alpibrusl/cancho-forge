@@ -61,17 +61,21 @@ op="$w/operator.json"
 # directory names the scratch directory. One pid per line; succeeds when there is one.
 strays() {
   _anc=$(ancestors)
-  { grep -lF "$w/" /proc/[0-9]*/cmdline 2> /dev/null | cut -d/ -f3; find /proc/[0-9]*/cwd -maxdepth 0 -lname "$w/*" 2> /dev/null | cut -d/ -f3; } | sort -u | while read -r _p; do
+  if [ -d /proc/self ]; then
+    { grep -lF "$w/" /proc/[0-9]*/cmdline 2> /dev/null | cut -d/ -f3; find /proc/[0-9]*/cwd -maxdepth 0 -lname "$w/*" 2> /dev/null | cut -d/ -f3; } | sort -u
+  else # no /proc (macOS): the command lines from ps, the working directories from lsof
+    { ps -axo pid=,command= | grep -F "$w/" | awk '{print $1}'; lsof -a -d cwd -Fpn 2> /dev/null | awk -v w="$w/" '/^p/ {p=substr($0,2)} /^n/ && index(substr($0,2), w)==1 {print p}'; } | sort -u
+  fi | while read -r _p; do
     if echo "$_anc" | grep -qx "$_p"; then continue; fi
-    _st=$(sed 's/^.*) //' "/proc/$_p/stat" 2> /dev/null | cut -c1)
+    _st=$(proc_state "$_p")
     if [ -n "$_st" ] && [ "$_st" != Z ]; then echo "$_p"; fi
   done | grep .
 }
 # Is the pid alive and running a command line that contains the text? (A pid reused by another program is not it.)
 alive_as() { # pid, text
-  [ -r "/proc/$1/cmdline" ] || return 1
-  _st=$(sed 's/^.*) //' "/proc/$1/stat" 2> /dev/null | cut -c1)
-  [ -n "$_st" ] && [ "$_st" != Z ] && tr '\0' ' ' < "/proc/$1/cmdline" 2> /dev/null | grep -qF "$2"
+  _st=$(proc_state "$1")
+  [ -n "$_st" ] && [ "$_st" != Z ] || return 1
+  if [ -r "/proc/$1/cmdline" ]; then tr '\0' ' ' < "/proc/$1/cmdline" 2> /dev/null; else ps -o command= -p "$1" 2> /dev/null; fi | grep -qF "$2"
 }
 # None of the pids in the file (two per line: the stub and its grandchild) is alive as what it was.
 recorded_gone() { # file

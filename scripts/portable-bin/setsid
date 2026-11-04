@@ -1,0 +1,4 @@
+#!/bin/sh
+# setsid for a system without it (macOS): the command in a session of its own. perl's POSIX::setsid, then exec, so the process id is the command's
+# (a shell function cannot do this: a backgrounded function is a subshell, and `$!` would name the subshell, not the command). Put on the PATH by scripts/portable.sh.
+exec perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV or exit 127' -- "$@"

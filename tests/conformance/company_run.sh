@@ -547,14 +547,14 @@ mkan anlgone 3
 rm "$w/anlgone/steps/an/ev/checks.log"
 run anlgone 1
 check "analyst: an input that is not there is refused by the worker after admission: the operator is told its code (worker-error: input-unusable), the step's journal records it, step-failed, exit 15" sh -c "[ '$(rc anlgone 1)' = 15 ] && grep -qx 'refusal: step-failed' '$w/anlgone.1.out' && grep -qx 'worker-error: input-unusable' '$w/anlgone.1.out' && grep -q '\"kind\":\"refusal\",\"task\":\"tool-1\",\"rule\":\"input-unusable\"' '$w/anlgone/steps/an/journal.jsonl' && [ ! -e '$w/anlgone/steps/an/ev/tool.out' ] && ! grep -q 'company.step.accepted' '$w/anlgone/company.journal'"
-# the operator's tool_timeout_ms is the one the run is given: a tool that sleeps 30 s under a 10 s timeout (the runner's own deadline
+# the operator's tool_timeout_ms is the one the run is given: a tool that sleeps 73 s under a 10 s timeout (the runner's own deadline
 # is 8 s) ends as tool-timeout, well before the default of 600 s
 mkan anlslow 3
-sed 's|"tool_timeout_ms":20000|"tool_timeout_ms":10000|; s|"argv":\["--status","up"\]|"argv":["--sleep","30"]|' "$w/operator.json" > "$w/op_slow.json"
+sed 's|"tool_timeout_ms":20000|"tool_timeout_ms":10000|; s|"argv":\["--status","up"\]|"argv":["--sleep","73"]|' "$w/operator.json" > "$w/op_slow.json"
 slow_start=$(date +%s)
 run_op anlslow 1 "$w/op_slow.json"
 slow_took=$(( $(date +%s) - slow_start ))
-check "analyst: the operator's tool_timeout_ms is honoured: tool-timeout (worker-error) in about 8 s, step-failed, exit 15, the tool gone" sh -c "[ '$(rc anlslow 1)' = 15 ] && grep -qx 'worker-error: tool-timeout' '$w/anlslow.1.out' && [ $slow_took -lt 20 ] && grep -q '\"ending\":\"timeout\"' '$w/anlslow/steps/an/ev/report.json' && ! pgrep -f '^sleep 30\$' > /dev/null"
+check "analyst: the operator's tool_timeout_ms is honoured: tool-timeout (worker-error) in about 8 s, step-failed, exit 15, the tool gone" sh -c "[ '$(rc anlslow 1)' = 15 ] && grep -qx 'worker-error: tool-timeout' '$w/anlslow.1.out' && [ $slow_took -lt 20 ] && grep -q '\"ending\":\"timeout\"' '$w/anlslow/steps/an/ev/report.json' && ! pgrep -f '^sleep 73\$' > /dev/null"
 # an analyst uses no model: a spent budget does not hold it (a build spends 1100 of a 1000-token ceiling first)
 mkco anlbudget "[$(builder one '' spend audit_pass.sh),$(analyst same_up.sh)]" 1000 one an
 printf 'svc1 up 12\nsvc1 down 0\nsvc2 up 30\nsvc1 up 15\n' > "$w/anlbudget/steps/an/ev/checks.log"
