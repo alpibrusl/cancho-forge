@@ -117,7 +117,7 @@ fn name_char(c: int) -> [] bool {
     return letter || digit || c == 45 || c == 95 || c == 46;
 }
 
-// A branch name of the row: 1 to 64 bytes of letters, digits, `-`, `_`, `.`, `/`, not starting with `-` or `.`, no `..`, no `//`, not
+// A branch name of the row: 1 to 64 bytes of letters, digits, `-`, `_`, `.`, `/`, not starting with `-`, `.` or `/`, no `..`, no `//`, not
 // ending in `/`. It is compared with the checkout's branch by the worker, never put in a command.
 pub fn branch_ok[&b](name: &b [byte]) -> [] bool {
     if len(name) < 1 || len(name) > 64 {
@@ -129,7 +129,7 @@ pub fn branch_ok[&b](name: &b [byte]) -> [] bool {
         if !name_char(c) && c != 47 {
             return false;
         }
-        if i == 0 && (c == 45 || c == 46) {
+        if i == 0 && (c == 45 || c == 46 || c == 47) {
             return false;
         }
         if i > 0 && c == 46 && int_of(name[i - 1]) == 46 {

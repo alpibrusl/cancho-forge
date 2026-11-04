@@ -245,3 +245,67 @@ fn test_the_pin_files_are_read_the_way_the_repositories_write_them() -> [] int {
     test.assert_eq(flag(repo_row.pin_matches(".cancho-rev", "f4ead82", "f4ead82")), 0);
     return 0;
 }
+
+fn test_a_branch_name_is_1_to_64_bytes_of_the_name_set_and_slash() -> [] int {
+    test.assert_eq(flag(repo_row.branch_ok("a")), 1);
+    test.assert_eq(flag(repo_row.branch_ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), 1);
+    test.assert_eq(flag(repo_row.branch_ok("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("forge/lib-1.x_y")), 1);
+    test.assert_eq(flag(repo_row.branch_ok("a/b/c")), 1);
+    test.assert_eq(flag(repo_row.branch_ok("Zz09")), 1);
+    // the bytes next to the ranges: `@` `[` ` and `{` are not letters, `/` is allowed, `0` and `9` are digits, `:` is not
+    test.assert_eq(flag(repo_row.branch_ok("a@")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a[")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a`")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a{")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a0")), 1);
+    test.assert_eq(flag(repo_row.branch_ok("a9")), 1);
+    test.assert_eq(flag(repo_row.branch_ok("a:")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a b")), 0);
+    // the first byte: not `-`, not `.`, but a digit or an uppercase letter may start
+    test.assert_eq(flag(repo_row.branch_ok("-a")), 0);
+    test.assert_eq(flag(repo_row.branch_ok(".a")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("_a")), 1);
+    test.assert_eq(flag(repo_row.branch_ok("9a")), 1);
+    // `..` and `//` anywhere, a trailing slash, a single dot or slash inside
+    test.assert_eq(flag(repo_row.branch_ok("a..b")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a...")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a.b")), 1);
+    test.assert_eq(flag(repo_row.branch_ok("a//b")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a/")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a/b/")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("/a")), 0);
+    test.assert_eq(flag(repo_row.branch_ok("a/-b")), 1);
+    return 0;
+}
+
+fn test_a_slug_is_owner_slash_name_3_to_128_bytes() -> [] int {
+    test.assert_eq(flag(repo_row.slug_ok("a/b")), 1);
+    test.assert_eq(flag(repo_row.slug_ok("ab")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a/")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("/b")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("alpibrusl/cancho-forge")), 1);
+    test.assert_eq(flag(repo_row.slug_ok("a.b/c_d-e")), 1);
+    test.assert_eq(flag(repo_row.slug_ok("a/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")), 1);
+    test.assert_eq(flag(repo_row.slug_ok("a/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("")), 0);
+    // exactly one slash, not at either end
+    test.assert_eq(flag(repo_row.slug_ok("a/b/c")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a//b")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("abc")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a/bc")), 1);
+    test.assert_eq(flag(repo_row.slug_ok("ab/c")), 1);
+    test.assert_eq(flag(repo_row.slug_ok("abc/")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("/abc")), 0);
+    // the name set: a space, a colon, a semicolon and a backtick are not in it; the letters' neighbours are not either
+    test.assert_eq(flag(repo_row.slug_ok("a b/c")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a/c:")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a/c;")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a/c@")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a/c[")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a/c`")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("a/c{")), 0);
+    test.assert_eq(flag(repo_row.slug_ok("A/Z9")), 1);
+    return 0;
+}
