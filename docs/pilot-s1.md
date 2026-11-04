@@ -1,6 +1,6 @@
 # Pilot stage 1: the free checker, its held-out audit and the first week
 
-> **Status: design, nothing built, nothing measured.** Everything below is *(designed)* unless marked *(read)*. It is the design of stage S1 of [`pilot.md`](pilot.md), written
+> **Status: approved by the board on 2026-11-04 (sections 2 and 3, and the build order of section 7); nothing built, nothing measured beyond the spikes.** The approval is the board's, given in chat; the company's own gates `brief`, `contract` and `audit` are still decided by `forge company decide` when the company is run, and the `audit` gate is not given by this approval (the audit does not exist yet). Everything below is *(designed)* unless marked *(read)*. It is the design of stage S1 of [`pilot.md`](pilot.md), written
 > before any code, as the repository's rules require. The product's brand is not written here: the company's name lives only in `pilot/brand.json`, and this document says "the
 > checker" and "the company".
 >
