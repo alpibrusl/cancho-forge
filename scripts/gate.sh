@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.." || exit 1
 fail=0
 
 echo "== cancho fmt --check"
-$C fmt --check src tests spike workers || fail=1
+$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho || fail=1
 
 echo "== cancho check"
 # A library has no `main`, so the program is checked as a whole (src/*.cho);
@@ -240,11 +240,11 @@ CANCHO="$C" sh spike/r2_check.sh "$scratch/r2" > "$scratch/r2.out" || fail=1
 cat "$scratch/r2.out"
 if grep -q '^FAIL ' "$scratch/r2.out"; then fail=1; fi
 
-echo "== spike P4 (the pilot's test world: a scripted hostile HTTP server seen from outside by curl; spike/p4_check.sh)"
-mkdir "$scratch/p4" || exit 1
-CANCHO="$C" sh spike/p4_check.sh "$scratch/p4" > "$scratch/p4.out" || fail=1
-cat "$scratch/p4.out"
-if grep -q '^FAIL ' "$scratch/p4.out"; then fail=1; fi
+echo "== audit world (the pilot audit's test world: a scripted hostile HTTP server and a stub resolver seen from outside by curl and the P1 client; pilot/audit/world_check.sh)"
+mkdir "$scratch/audit-world" || exit 1
+CANCHO="$C" sh pilot/audit/world_check.sh "$scratch/audit-world" > "$scratch/audit-world.out" || fail=1
+cat "$scratch/audit-world.out"
+if grep -q '^FAIL ' "$scratch/audit-world.out"; then fail=1; fi
 
 echo "== audit TLS world (the vendored cancho TLS server on the audit's fixtures, seen from outside by openssl and curl; pilot/audit/tls_check.sh)"
 mkdir "$scratch/audit-tls" || exit 1

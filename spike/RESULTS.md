@@ -1064,8 +1064,8 @@ a wrong name as `client.tls`. **Not there, and the checker must add:** it does n
 state changes it drives), it reads a whole body (the checker stops at 64 KiB and closes), and its failure tag for a bad certificate is the coarse `client.tls`, not P2's specific tags (the checker needs those, so it drives the engine and
 asks `tls.failure`).
 
-**P4: can cancho serve the hostile cases the audit needs? Yes.** `spike/p4_world.cho` is a raw TCP server, one mode a process: ok, status, slow, hang, close, abort, reset, lie, chunked, big, redirect, bighead,
-trickle. `spike/p4_check.sh` (in the gate) has `curl` observe each from outside: a 404 and a 500 as such; a first byte after 1.5 s for a patient client and a timeout (exit 28) for an impatient one; an accepted
+**P4: can cancho serve the hostile cases the audit needs? Yes.** `spike/p4_world.cho` (moved to `pilot/audit/world.cho` by T1 of `docs/pilot-audit.md`, with redirect modes and a stub resolver added) is a raw TCP server, one mode a process: ok, status, slow, hang, close, abort, reset, lie, chunked, big, redirect, bighead,
+trickle. `spike/p4_check.sh` (now `pilot/audit/world_check.sh`, in the gate) has `curl` observe each from outside: a 404 and a 500 as such; a first byte after 1.5 s for a patient client and a timeout (exit 28) for an impatient one; an accepted
 and never answered connection a timeout; a read-and-closed one an empty reply (52); an unread-and-closed one a reset (56); half a status line a failure and not a timeout; a Content-Length of 100 over ten bytes a partial
 transfer (18); a chunked answer decoded; a 300,000-byte body whole; a 100 KiB header refused by a client with a limit; a one-byte-at-a-time answer completing; a redirect to itself stopping at the limit (47); a redirect to
 another port followed once; a refused port (7). 17 of 17. **Not yet in the world:** TLS cases (an expired chain, a self-signed one, one for another name: the fixtures need certificates this repository does not have; `https_hello`'s
