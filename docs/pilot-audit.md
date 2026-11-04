@@ -5,7 +5,7 @@
 
 **What was read** (2026-11-04): `pilot-s1.md` sections 2 to 7; `spike/p4_world.cho` (13 modes, header) and `spike/p4_check.sh` (17 cases, seen from outside by `curl`); `spike/RESULTS.md` P1 to P4; `company.md` section 8 (a check is started with the
 artifact's path and the step's execution directory, `PATH=/usr/local/bin:/usr/bin:/bin`, an empty standard input, a deadline and a 1 MiB output cap; the last `TOTAL a/b` decides; the artifact must never write to the check's standard output).
-**Not read:** whether a cancho program can *serve* TLS with a given certificate and key (P2 drove the client side and used cancho's `https_hello` and its test chain as the server; the server side is the first spike of T1), and what a `project.build` leaves
+**Spike result (2026-11-04, compiler `f4ead824`, macOS arm64):** see section 3.1. **Not read:** what a `project.build` leaves
 as its artifact (this document assumes the checker as one executable file; section 2 says what changes if not).
 
 ## 1. What the audit is for
@@ -19,10 +19,11 @@ broken one is shown to be an oracle; that is the repository's way (`CONTRIBUTING
 `pilot/contract.cho` pins the pure functions. The audit also has to *start* the checker, so the process interface is part of the contract and the board edits it with the file:
 
 ```
-checker serve --port <n> --resolver <a.b.c.d> [--roots <pem>] [--allow-private]
+checker serve --port <n> --resolver <a.b.c.d> [--roots <pem>] [--allow-private] [--now <unix seconds>]
 ```
 
 * It serves `GET /health` and `GET /check?url=<url>` of `pilot-s1.md` section 3 on `127.0.0.1:<port>` and runs until it is killed; it prints its listening line to its own standard error, never to the check's.
+* `--now` fixes the checker's clock for certificate expiry (section 3.1); off by default.
 * `--resolver` is the UDP resolver it asks (port 53 unless `<a.b.c.d:p>`); the audit runs a stub resolver (the P1 stub) that answers the names of the cases, so no case depends on the internet.
 * `--roots` is the PEM bundle the TLS cases trust (the world's test CA); without it the system's are used. `--allow-private` is the single setting that lets the checker reach loopback; it is **off by default**, and the audit runs the refusal group with it off.
 * The artifact is the one executable file. If the build leaves a directory or a source tree instead, `audit_checker.sh` builds it itself with the compiler of the operator's `checker` setting; this is decided with the first `project.build`, not guessed here.
@@ -41,6 +42,23 @@ The world is a cancho program, `pilot/audit/world.cho`, promoted from `spike/p4_
 Each case starts what it needs and kills it afterwards (a world process serves a fixed number of connections and exits, as P4's does), on ports derived from the driver's process, so two audits can run at once.
 
 *Measure (T1):* `pilot/audit/world_check.sh`, a successor of `spike/p4_check.sh` with the new modes seen from outside by `curl` and `openssl s_client`, all in the gate.
+
+### 3.1 The T1 spike: what cancho's TLS server does and does not do *(measured)*
+
+I built cancho's `examples/https_hello` (`scripts/https_hello_test.py`'s recipe) and served three throw-away identities made with `openssl` (ECDSA P-256, a test CA, `ok.test`) from a directory holding `chain.pem`, `key.pem` and `names`, and probed each with `openssl s_client -verify_return_error -verify_hostname ok.test`:
+
+| Identity | Server | Probe |
+|---|---|---|
+| valid for `ok.test` | **serves** (`listening`) | chain verifies |
+| certificate for `other.test` | **serves** | `verify error:num=62:hostname mismatch` |
+| expired (2020 to 2021) | **refuses to load it**: `identity : refused, tls-server-cert-expired`; nothing listens | connection refused |
+
+So the world can serve a valid chain and a wrong-name chain from cancho's server unchanged. Two consequences, corrected in this document:
+
+1. **An expired certificate cannot be served by an unmodified `https_hello`.** The server checks `notAfter` against its own clock when it loads an identity. The world therefore carries **its own copy of the loop with one added argument, `--now <unix seconds>`**, that it passes as the clock of the identity check (a vendored, labelled copy as `spike/lib/dns.cho` is), so that a fixture valid in 2020 to 2021 can be loaded "as of 2020-06-01" and then presented to a checker whose clock says 2026.
+2. **A static fixture cannot keep a "10 days left" or "14 days left" certificate true.** The checker's `days_left` depends on the real date. So the contract gets a **second operator setting, `--now <unix seconds>`**, off by default like `--allow-private`, that fixes the checker's clock (the deploy preflight refuses a production configuration with either). With it, `t05` (10 days) and `t06` (14 days) are fixtures with a fixed `notAfter` and the audit sets `--now` to `notAfter` minus 10 and minus 14 days, deterministic on any day of the year. Without it the cases would rot. The board edits this into `pilot/contract.cho` with the process interface of section 2.
+
+Not yet measured, and measured first in T1 proper: a self-signed leaf served the same way (expected to load, as the server does not need the CA); a TLS 1.2-only or plain-HTTP client against the TLS port (the server is TLS 1.3 only); the fixtures' `make.sh`.
 
 ## 4. The cases and the driver *(designed)*
 
