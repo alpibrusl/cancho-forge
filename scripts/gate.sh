@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.." || exit 1
 fail=0
 
 echo "== cancho fmt --check"
-$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho || fail=1
+$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho pilot/audit/driver.cho pilot/audit/expect.cho || fail=1
 
 echo "== cancho check"
 # A library has no `main`, so the program is checked as a whole (src/*.cho);
@@ -251,6 +251,12 @@ mkdir "$scratch/audit-tls" || exit 1
 CANCHO="$C" sh pilot/audit/tls_check.sh "$scratch/audit-tls" > "$scratch/audit-tls.out" || fail=1
 cat "$scratch/audit-tls.out"
 if grep -q '^FAIL ' "$scratch/audit-tls.out"; then fail=1; fi
+
+echo "== audit driver and stand-in candidates (the driver says pass when it should and fail when it should; pilot/audit/self_check_standins.sh)"
+mkdir "$scratch/audit-standins" || exit 1
+CANCHO="$C" sh pilot/audit/self_check_standins.sh "$scratch/audit-standins" > "$scratch/audit-standins.out" || fail=1
+cat "$scratch/audit-standins.out"
+if grep -q '^FAIL ' "$scratch/audit-standins.out"; then fail=1; fi
 
 echo "== forge company change add (the operator's change requests and the admit: gate; tests/conformance/company_change_add.sh)"
 mkdir "$scratch/company-change-add" || exit 1
