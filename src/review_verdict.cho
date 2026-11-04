@@ -1,0 +1,125 @@
+edition 9;
+module forge.review_verdict;
+
+import std.bytes;
+import std.json;
+
+// The reply of a model reviewer (docs/review-step.md section 6, point 2): what Forge accepts as an answer, and nothing else. The reply is the model's text, so it
+// is data from outside: this module is pure, reads it as bytes and never trusts a word of it.
+//
+//   {"verdict":"approve"|"concerns","items":[{"file":"<1-200 bytes>","line":<0-10000000>,"claim":"<1-400 bytes>"} ...]}
+//
+// One JSON object and nothing around it (no text before or after, no code fence, no second object). Exactly the keys `verdict` and `items`; an item has exactly
+// `file`, `line` and `claim`. At most 20 items. `approve` has none and `concerns` has at least one. Every string is plain (no escape) and of printable ASCII (32 to
+// 126), so a claim can be printed on one line and put in no command, path or journal key as it stands. Anything else is unparsed, and the step is held, not accepted.
+
+pub fn approve() -> [] int {
+    return 0;
+}
+
+pub fn concerns() -> [] int {
+    return 1;
+}
+
+pub fn unparsed() -> [] int {
+    return 2;
+}
+
+pub fn max_items() -> [] int {
+    return 20;
+}
+
+pub fn max_file() -> [] int {
+    return 200;
+}
+
+pub fn max_claim() -> [] int {
+    return 400;
+}
+
+pub fn max_line() -> [] int {
+    return 10000000;
+}
+
+// Is `node` a plain string of printable ASCII, `low` to `high` bytes long?
+fn text_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, low: int, high: int) -> [] bool {
+    if node < 0 || json.is_string(tp, node) == false || json.string_plain(tp, node) == false {
+        return false;
+    }
+    let v = json.string_view(src, tp, node);
+    if len(v) < low || len(v) > high {
+        return false;
+    }
+    var i = 0;
+    while i < len(v) {
+        let c = int_of(v[i]);
+        if c < 32 || c > 126 {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Is the item at `node` of the shape?
+fn item_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if json.is_object(tp, node) == false || json.count(tp, node) != 3 {
+        return false;
+    }
+    if text_ok(src, tp, json.get(src, tp, node, "file"), 1, max_file()) == false || text_ok(src, tp, json.get(src, tp, node, "claim"), 1, max_claim()) == false {
+        return false;
+    }
+    let line = json.get(src, tp, node, "line");
+    if line < 0 || json.fits_int(src, tp, line) == false {
+        return false;
+    }
+    let n = json.to_int(src, tp, line);
+    return n >= 0 && n <= max_line();
+}
+
+// The verdict of a parsed reply (`src`, its tape `tp`): `approve()`, `concerns()` or `unparsed()`.
+pub fn judge_parsed[&s, &t](src: &s [byte], tp: &t [int]) -> [] int {
+    if json.is_object(tp, 0) == false || json.count(tp, 0) != 2 {
+        return unparsed();
+    }
+    let items = json.get(src, tp, 0, "items");
+    let word = json.get(src, tp, 0, "verdict");
+    if items < 0 || json.is_array(tp, items) == false || json.count(tp, items) > max_items() {
+        return unparsed();
+    }
+    if word < 0 || json.is_string(tp, word) == false || json.string_plain(tp, word) == false {
+        return unparsed();
+    }
+    var k = 0;
+    while k < json.count(tp, items) {
+        if item_ok(src, tp, json.at(tp, items, k)) == false {
+            return unparsed();
+        }
+        k = k + 1;
+    }
+    let v = json.string_view(src, tp, word);
+    if bytes.equal(v, "approve") && json.count(tp, items) == 0 {
+        return approve();
+    }
+    if bytes.equal(v, "concerns") && json.count(tp, items) > 0 {
+        return concerns();
+    }
+    return unparsed();
+}
+
+// The verdict of the reply `reply`, parsed here: `approve()`, `concerns()` or `unparsed()`. A reply that is not one JSON document is unparsed.
+pub fn judge[&h, &r](heap: &!h Heap, reply: &r [byte]) -> [heap] int {
+    if len(reply) == 0 || len(reply) > 65536 {
+        return unparsed();
+    }
+    var code = unparsed();
+    let tape = box_slice(heap, json.tape_len(reply), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(reply, tp) > 0 {
+            code = judge_parsed(reply, tp);
+        }
+    }
+    unbox_slice(heap, tape);
+    return code;
+}

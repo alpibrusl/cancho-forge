@@ -1,0 +1,88 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.test;
+import forge.company_manifest;
+import forge.review_step;
+
+// Unit tests for src/review_step.cho (docs/review-step.md section 2): what is decided before a `repo.review` step runs. Run with `cancho test`.
+
+fn change() -> [] &static [byte] {
+    return "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\"}";
+}
+
+fn gate() -> [] &static [byte] {
+    return "{\"id\":\"q\",\"role\":\"qa\",\"task_type\":\"repo.gate\",\"needs\":[\"c\"],\"input\":\"x\"}";
+}
+
+// The manifest of steps `steps`; `last` is the number of the step to ask about.
+fn preflight_of[&h, &s, &o](heap: &!h Heap, steps: &s [byte], op: &o [byte], last: int) -> [heap] int {
+    var text = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},");
+    text = buffer.append(heap, text, "\"budget\":{\"input\":1000,\"output\":500,\"cache_write\":10,\"cache_read\":20,\"max_cost\":900,\"price_table\":\"prices.json\"},");
+    text = buffer.append(heap, text, "\"human_gates\":[],\"roles\":[\"builder\",\"qa\",\"reviewer\"],\"repos\":[{\"id\":\"diff\",\"kind\":\"library\"}],\"steps\":[");
+    text = buffer.append(heap, text, steps);
+    text = buffer.append(heap, text, "]}");
+    var code = 0 - 1;
+    borrow text as &tb in {
+        match company_manifest.parse(heap, buffer.bytes(tb)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    let tape = box_slice(heap, json.tape_len(op), 0);
+                    borrow mut tape as &!tw in {
+                        let tp = contents(tw);
+                        if json.parse(op, tp) > 0 {
+                            code = review_step.preflight(mr, op, tp, last);
+                            test.assert(review_step.is_review(company_manifest.step_at(mr, last)));
+                        }
+                    }
+                    unbox_slice(heap, tape);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+fn test_a_review_step_that_needs_one_repo_change_step_and_has_a_grant_can_run[&h](heap: &!h Heap) -> [heap] int {
+    let steps = ",{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[\"c\"],\"input\":\"x\"}";
+    var all = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 256), change()), steps);
+    borrow all as &ab in {
+        test.assert_eq(preflight_of(heap, buffer.bytes(ab), "{\"workers\":\"/w\",\"review\":{}}", 1), 0);
+        test.assert_eq(preflight_of(heap, buffer.bytes(ab), "{\"workers\":\"/w\"}", 1), 2);
+    }
+    buffer.drop(heap, all);
+    return 0;
+}
+
+fn test_a_review_step_that_does_not_need_exactly_one_repo_change_step_is_review_step_invalid[&h](heap: &!h Heap) -> [heap] int {
+    let granted = "{\"workers\":\"/w\",\"review\":{}}";
+    let none = "{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[],\"input\":\"x\"}";
+    test.assert_eq(preflight_of(heap, none, granted, 0), 1);
+    var gated = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 256), change()), ","), gate());
+    gated = buffer.append(heap, gated, ",{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[\"q\"],\"input\":\"x\"}");
+    borrow gated as &gb in {
+        test.assert_eq(preflight_of(heap, buffer.bytes(gb), granted, 2), 1);
+    }
+    buffer.drop(heap, gated);
+    var two = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 256), change()), ","), gate());
+    two = buffer.append(heap, two, ",{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[\"c\",\"q\"],\"input\":\"x\"}");
+    borrow two as &tb in {
+        test.assert_eq(preflight_of(heap, buffer.bytes(tb), granted, 2), 1);
+    }
+    buffer.drop(heap, two);
+    return 0;
+}
+
+fn test_the_two_tags_are_the_documented_words() -> [] int {
+    test.assert(bytes.equal(review_step.rule_invalid(), "review-step-invalid"));
+    test.assert(bytes.equal(review_step.rule_not_granted(), "review-not-granted"));
+    test.assert(bytes.equal(review_step.task_name(), "repo.review"));
+    return 0;
+}

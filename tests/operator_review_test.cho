@@ -1,0 +1,106 @@
+edition 9;
+
+import std.json;
+import std.test;
+import forge.operator_review;
+
+// Unit tests for src/operator_review.cho (docs/review-step.md section 3): the form check of the operator file's `review`. Run with `cancho test`.
+
+fn reason_of[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] bool {
+    var ok = false;
+    let tape = box_slice(heap, json.tape_len(text), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(text, tp) > 0 {
+            ok = len(operator_review.reason(text, tp)) == 0;
+        }
+    }
+    unbox_slice(heap, tape);
+    return ok;
+}
+
+fn test_no_review_and_a_good_review_are_of_the_shape[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(reason_of(heap, "{\"workers\":\"/w\"}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    return 0;
+}
+
+fn test_a_review_that_is_not_the_eight_keys_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(reason_of(heap, "{\"review\":[]}") == false);
+    test.assert(reason_of(heap, "{\"review\":\"x\"}") == false);
+    test.assert(reason_of(heap, "{\"review\":{}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\",\"ip\":\"1.2.3.4\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"w\",\"worker\":\"w\",\"provider\":\"p\",\"model\":\"m\",\"key_file\":\"/k\",\"host\":\"h\",\"max_tokens\":1,\"mode\":\"advisory\"}}") == false);
+    return 0;
+}
+
+fn test_each_field_is_held_to_its_range[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"a\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\".a\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"-a\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"a/b\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"a b\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"a:b\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"a b\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"_m\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/a/../b\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/a/..\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/a/..b\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/a/.../b\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a.b-c.d\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\".a\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a.\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a..b\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a.-b\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a-.b\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"-a\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a_b\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a b\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a/b\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"a:443\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":1,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":0,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":8192,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":8193,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":-1,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":\"2048\",\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048.5,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":1,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":0,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":262144,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":262145,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":-1,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":\"65536\",\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536.5,\"mode\":\"advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}}"));
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"hold\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"Advisory\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"\"}}") == false);
+    test.assert(reason_of(heap, "{\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory \"}}") == false);
+    return 0;
+}

@@ -1,0 +1,138 @@
+edition 9;
+
+import std.buffer;
+import std.test;
+import forge.review_verdict;
+
+// Unit tests for src/review_verdict.cho (docs/review-step.md section 6): what Forge accepts as a model reviewer's reply. Run with `cancho test`.
+
+fn judge_of[&h, &r](heap: &!h Heap, reply: &r [byte]) -> [heap] int {
+    return review_verdict.judge(heap, reply);
+}
+
+fn one_item() -> [] &static [byte] {
+    return "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"src/a.cho\",\"line\":12,\"claim\":\"the bound is off by one\"}]}";
+}
+
+fn test_a_reply_of_approve_with_no_items_is_approve[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"items\":[]}"), review_verdict.approve());
+    test.assert_eq(judge_of(heap, "{\"items\":[],\"verdict\":\"approve\"}"), review_verdict.approve());
+    return 0;
+}
+
+fn test_a_reply_of_concerns_with_items_is_concerns[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, one_item()), review_verdict.concerns());
+    return 0;
+}
+
+fn test_approve_with_items_and_concerns_without_are_unparsed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"x\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[]}"), review_verdict.unparsed());
+    return 0;
+}
+
+fn test_anything_around_the_object_is_unparsed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, ""), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "Here it is: {\"verdict\":\"approve\",\"items\":[]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"items\":[]} thanks"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "```json\n{\"verdict\":\"approve\",\"items\":[]}\n```"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"items\":[]}{\"verdict\":\"approve\",\"items\":[]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "[{\"verdict\":\"approve\",\"items\":[]}]"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"items\":"), review_verdict.unparsed());
+    return 0;
+}
+
+fn test_a_missing_extra_or_repeated_key_is_unparsed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\"}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"items\":[]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"items\":[],\"note\":\"fine\"}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"verdict\":\"approve\"}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"x\",\"why\":\"y\"}]}"), review_verdict.unparsed());
+    return 0;
+}
+
+fn test_a_verdict_other_than_the_two_words_is_unparsed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"Approve\",\"items\":[]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approved\",\"items\":[]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"\",\"items\":[]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":1,\"items\":[]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":true,\"items\":[]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"items\":null}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"approve\",\"items\":{}}"), review_verdict.unparsed());
+    return 0;
+}
+
+fn test_the_line_is_a_whole_number_from_0_to_10_million[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":0,\"claim\":\"x\"}]}"), review_verdict.concerns());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":10000000,\"claim\":\"x\"}]}"), review_verdict.concerns());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":10000001,\"claim\":\"x\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":-1,\"claim\":\"x\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1.5,\"claim\":\"x\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":\"3\",\"claim\":\"x\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":99999999999999999999,\"claim\":\"x\"}]}"), review_verdict.unparsed());
+    return 0;
+}
+
+fn test_a_file_is_1_to_200_bytes_and_a_claim_1_to_400[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"\",\"line\":1,\"claim\":\"x\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"line\":1,\"claim\":\"x\"}]}"), review_verdict.concerns());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"line\":1,\"claim\":\"x\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}]}"), review_verdict.concerns());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}]}"), review_verdict.unparsed());
+    return 0;
+}
+
+fn test_a_string_with_an_escape_or_a_control_or_a_non_ascii_byte_is_unparsed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"say \\\"x\\\"\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"a\\nb\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"café\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"a\tb\"}]}"), review_verdict.unparsed());
+    test.assert_eq(judge_of(heap, "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a b/c~d\",\"line\":1,\"claim\":\"~!@#$%^&*()_+ `-=[]{};':,./<>? |\"}]}"), review_verdict.concerns());
+    return 0;
+}
+
+fn test_at_most_20_items[&h](heap: &!h Heap) -> [heap] int {
+    let twenty = "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"}]}";
+    let twenty_one = "{\"verdict\":\"concerns\",\"items\":[{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"},{\"file\":\"a\",\"line\":1,\"claim\":\"x\"}]}";
+    test.assert_eq(judge_of(heap, twenty), review_verdict.concerns());
+    test.assert_eq(judge_of(heap, twenty_one), review_verdict.unparsed());
+    return 0;
+}
+
+// A good reply, every prefix of it, and every position changed to each of eight bytes: each is a verdict (a value), never a trap, and no prefix is accepted.
+fn test_every_truncation_and_every_single_byte_change_is_a_verdict[&h](heap: &!h Heap) -> [heap] int {
+    let text = one_item();
+    let n = len(text);
+    var cut = 0;
+    while cut < n {
+        test.assert_eq(judge_of(heap, text[0..cut]), review_verdict.unparsed());
+        cut = cut + 1;
+    }
+    let swaps = "\"{}[:,x\n";
+    var at = 0;
+    while at < n {
+        var k = 0;
+        while k < len(swaps) {
+            var copy = buffer.empty(heap, n + 1);
+            var j = 0;
+            while j < n {
+                if j == at {
+                    copy = buffer.push(heap, copy, swaps[k]);
+                } else {
+                    copy = buffer.push(heap, copy, text[j]);
+                }
+                j = j + 1;
+            }
+            borrow copy as &cb in {
+                let v = judge_of(heap, buffer.bytes(cb));
+                test.assert(v == review_verdict.approve() || v == review_verdict.concerns() || v == review_verdict.unparsed());
+            }
+            buffer.drop(heap, copy);
+            k = k + 1;
+        }
+        at = at + 1;
+    }
+    return 0;
+}

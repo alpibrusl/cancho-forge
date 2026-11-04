@@ -1,6 +1,6 @@
 # The model review as a step: `repo.review`
 
-**Status: design, nothing built.** Written before the code (`CONTRIBUTING.md`). Every claim marked *(designed)* is a proposal; one marked *(read)* was read from the source or document
+**Status: slice RV1 built (the verdict parser, the operator `review` form check, the task type and `review_step.preflight`; no runner, so a `repo.review` step is still refused `task-type-unsupported` where it would run). RV2 to RV4 are design.** Written before the code (`CONTRIBUTING.md`). Every claim marked *(designed)* is a proposal; one marked *(read)* was read from the source or document
 named; each *measure* is a case that must exist before this document says it is true. It is step 4 of the order in [`reviewer.md`](reviewer.md) section 6, and it builds only what
 that document's section 3 and section 9 allow: **a review that is recorded and shown and counts for nothing.**
 
@@ -51,7 +51,7 @@ The manifest says what happens; the operator file says what is allowed (as `auto
 * No `review` in the operator file: a `repo.review` step is refused `review-not-granted` (exit 1, not admitted).
 * **The key is a path, never a value.** Forge never opens `key_file`; it passes the path to the worker, which reads it inside its own authority and never prints, logs or journals it
   (the rule already applied to `ask.cho`: *measure* the worker's output and the journal for the key text in the conformance case).
-* The address is resolved by the worker (it performs the lookup) or given by the operator as `ip` for a host the machine cannot resolve; nothing else about the network is configurable.
+* The address is resolved by the worker (it performs the lookup); nothing else about the network is configurable. (An operator-given `ip` was considered and left out of RV1: the form allows exactly the eight keys above. It is added with a measured need, not before.)
 * The default model is a decision for the operator, not for this document. The measured one (R-1) is `claude-sonnet-5-5`: 4 of 63 false approvals (1 of 60 once the one seed whose request asked for the fault is set aside)
   and 5 of 63 false concerns. Haiku had 0 of 42 false approvals and 11 of 42 false concerns.
 
@@ -88,7 +88,7 @@ the reason the call is a worker and not a function of Forge.
    unpriced model is `price-table-missing` before the step is admitted.
 2. **Parse, by Forge, in cancho.** A pure module `review_verdict` reads `reply.txt`: it accepts one JSON object, `{"verdict":"approve"|"concerns","items":[{"file":string,"line":int,"claim":string}]}`, and
    nothing else (text around the object, a code fence, a second object, a missing key, an extra key: **unparsed**). `approve` with items, or `concerns` with none, is **unparsed**. At most 20 items; `file` 1 to 200
-   bytes, `line` 0 to 10^7, `claim` 1 to 400 bytes; all printable. The text is **data**: it is never put in a command, a path, a journal key or another model's prompt.
+   bytes, `line` 0 to 10^7, `claim` 1 to 400 bytes; all printable ASCII (32 to 126) and written **plain**, with no JSON escape: a claim that quotes code with a `"` is unparsed and the step is held rather than the escape being decoded (*built*, `tests/review_verdict_test.cho`; if this holds too many good reviews, R-3 will show it as `review-unparsed` and decoding can be designed then). The text is **data**: it is never put in a command, a path, a journal key or another model's prompt.
 3. **Record.** A well formed answer: Forge writes `steps/<id>/ev/review.json` (the validated object, the prompt hash, the model), hashes it, appends `company.step.reviewed` (`task` = the step, `verdict`,
    `items` count, `model`) and accepts the step (`company.step.accepted`). `concerns` prints, under the step, one line per item: `review: <file>:<line>: <claim>`.
 4. **Failures are holds, not acceptances.** The model was not reached, the provider answered an error or a refusal, the reply was cut at `max_tokens`, or the reply is unparsed: the step is **held**,
@@ -99,10 +99,10 @@ Tags *(designed)*: `review-step-invalid`, `review-not-granted`, `review-diff-too
 
 ## 7. Where the code goes *(designed)*
 
-* `src/review_verdict.cho` (pure: parse and bound a reply; unit tests for every refusal above, a reply that is a fence, an extra key, a count of 21, a claim of 401 bytes, no trap on any byte string).
+* `src/review_verdict.cho` (*built, RV1*; pure: parse and bound a reply; unit tests for every refusal above, a reply that is a fence, an extra key, a count of 21, a claim of 401 bytes, no trap on any byte string).
 * `src/review_call.cho` (writes the two inputs, starts the worker, reads `reply.txt`, `usage.jsonl`, `report.json`, answers a status), by the shape of `authority_call`.
-* `src/company_manifest.cho`: `TaskType::RepoReview`, `type_code` 7, the rules of section 2. It is at 1892 of 2000 lines: the review rules go in a new module.
-* `src/repo_row.cho` or a new `operator_review.cho`: the form check of `review`.
+* `src/company_manifest.cho` (*built, RV1*): `TaskType::RepoReview`, `type_code` 7, role `reviewer` only (`task-type-unsupported` otherwise), `repo`, `change_kind`, `check` or `gate` on it are `repo-task-invalid`. 1913 of 2000 lines; the rules that need the graph or the operator file are in `review_step.cho`.
+* `src/operator_review.cho` (*built, RV1*): the form check of `review`, with the `reason:` of `operator-invalid`; `company_step.operator_reason` joins it to the build ceilings' and the rows' reasons, so `company_runner.cho` got shorter, not longer. `src/review_step.cho` (*built, RV1*): the two tags and `preflight` (needs exactly one `repo.change` step; the operator file has a `review`).
 * **`src/company_runner.cho` is at 1987 of 2000 lines (`crates/cancho/tests/files.rs` ceiling): the first commit of the runner slice moves the `repo.authority` and `repo.publish` step runners
   into a module of their own and adds nothing**, so the ceiling is not raised.
 * `workers/repo_review.cho`, `docs/authority-repo-review.txt`, a section 14 of `worker-contract.md`, and a section 28 of `company.md` that says what was built.

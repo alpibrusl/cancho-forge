@@ -35,7 +35,8 @@ import std.json;
 //      task type (not the one the role offers)                                           task-type-unsupported
 //      check (a builder or writer without one)                                           check-missing
 //      repo (a `repo.change` step without one)                                           repo-required
-//      repo / change_kind on another task type, contract / library on `repo.change`      repo-task-invalid
+//      repo / change_kind on another task type, contract / library on `repo.change`,     repo-task-invalid
+//        check / gate on `repo.review`
 //      repo (names no entry of `repos`)                                                  repo-unknown
 //      change_kind (not bug, feature, refactor or rename)                                repo-change-kind-invalid
 //      contract (a step that is neither a builder nor a writer names one)                contract-role-invalid
@@ -211,6 +212,8 @@ pub enum TaskType {
     RepoAuthority,
     // A `system` step that makes the local branch and commit of a published change (docs/auto-publish.md); it never pushes.
     RepoPublish,
+    // A reviewer's step that asks a model about the diff of the `repo.change` step it needs and records the answer (docs/review-step.md).
+    RepoReview,
 }
 
 // The kind of a repository (docs/company-lifecycle.md section 2.1): a closed set. `Library` is a module other programs import, `Program` an
@@ -559,6 +562,9 @@ fn type_code[&v](name: &v [byte]) -> [] int {
     if bytes.equal(name, "repo.publish") {
         return 6;
     }
+    if bytes.equal(name, "repo.review") {
+        return 7;
+    }
     return 0 - 1;
 }
 
@@ -611,6 +617,9 @@ fn type_of(code: int) -> [] TaskType {
     }
     if code == 6 {
         return TaskType::RepoPublish;
+    }
+    if code == 7 {
+        return TaskType::RepoReview;
     }
     if code == 0 {
         return TaskType::ProjectBuild;
@@ -859,7 +868,7 @@ fn repo_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, tcode: int, 
     let repo = json.get(src, tp, step, "repo");
     let kind = json.get(src, tp, step, "change_kind");
     if tcode != 4 {
-        if repo >= 0 || kind >= 0 {
+        if repo >= 0 || kind >= 0 || tcode == 7 && (json.get(src, tp, step, "check") >= 0 || json.get(src, tp, step, "gate") >= 0) {
             return 20;
         }
         return 0;
@@ -957,7 +966,7 @@ fn step_rules_code[&s, &t](src: &s [byte], tp: &t [int], step: int, roles: int, 
         return 6;
     }
     let tcode = type_code(json.string_view(src, tp, json.get(src, tp, step, "task_type")));
-    if tcode < 0 || tcode != type_of_role(role) && !(tcode == 4 && role == 0) && !(tcode == 5 && role == 3) {
+    if tcode < 0 || tcode != type_of_role(role) && !(tcode == 4 && role == 0) && !(tcode == 5 && role == 3) && !(tcode == 7 && role == 3) {
         return 7;
     }
     let check = json.get(src, tp, step, "check");
@@ -1690,6 +1699,9 @@ pub fn step_task_name(s: Step) -> [] &static [byte] {
         TaskType::RepoPublish => {
             return "repo.publish";
         }
+        TaskType::RepoReview => {
+            return "repo.review";
+        }
     }
 }
 
@@ -1773,6 +1785,9 @@ pub fn is_repo_change(s: Step) -> [] bool {
         TaskType::RepoPublish => {
             return false;
         }
+        TaskType::RepoReview => {
+            return false;
+        }
     }
 }
 
@@ -1800,6 +1815,9 @@ pub fn is_repo_authority(s: Step) -> [] bool {
         TaskType::RepoPublish => {
             return false;
         }
+        TaskType::RepoReview => {
+            return false;
+        }
     }
 }
 
@@ -1825,6 +1843,9 @@ pub fn is_repo_publish(s: Step) -> [] bool {
             return false;
         }
         TaskType::None => {
+            return false;
+        }
+        TaskType::RepoReview => {
             return false;
         }
     }
