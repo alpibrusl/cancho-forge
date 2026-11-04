@@ -1,0 +1,196 @@
+edition 9;
+module forge.operator_review;
+
+import std.json;
+
+// The operator file's `review` (docs/review-step.md section 3): what the operator allows a `repo.review` step to ask a model. This module is pure: it reads a
+// parsed operator file (`src` and its tape `tp`) and opens nothing. The key file is a path that Forge never opens; the model and the provider are priced by the
+// budget when the step is admitted, not here.
+//
+//   "review": { "worker", "provider", "model", "key_file", "host", "max_tokens", "max_diff_bytes", "mode" }
+//
+// Every key is required and no other is allowed. `reason` says why a file is `operator-invalid` ("" when there is no `review` or it is of the shape).
+
+fn keys() -> [] &static [byte] {
+    return " worker provider model key_file host max_tokens max_diff_bytes mode ";
+}
+
+pub fn max_tokens_limit() -> [] int {
+    return 8192;
+}
+
+pub fn max_diff_limit() -> [] int {
+    return 262144;
+}
+
+// A plain string of 1 to `high` bytes of `A-Za-z0-9._-`, not starting with `.` or `-`.
+fn token_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, high: int) -> [] bool {
+    if node < 0 || json.is_string(tp, node) == false || json.string_plain(tp, node) == false {
+        return false;
+    }
+    let v = json.string_view(src, tp, node);
+    if len(v) < 1 || len(v) > high {
+        return false;
+    }
+    var i = 0;
+    while i < len(v) {
+        let c = int_of(v[i]);
+        let plain = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 46 || c == 45 || c == 95;
+        if plain == false || i == 0 && (c == 46 || c == 45) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// A host name: 1 to 253 bytes of letters, digits, `.` and `-`, not starting or ending with `.` or `-`, no empty label.
+fn host_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if node < 0 || json.is_string(tp, node) == false || json.string_plain(tp, node) == false {
+        return false;
+    }
+    let v = json.string_view(src, tp, node);
+    if len(v) < 1 || len(v) > 253 {
+        return false;
+    }
+    var i = 0;
+    var before = 46;
+    while i < len(v) {
+        let c = int_of(v[i]);
+        let name = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122;
+        let sep = c == 46 || c == 45;
+        if name == false && sep == false {
+            return false;
+        }
+        if sep && (before == 46 || before == 45) {
+            return false;
+        }
+        before = c;
+        i = i + 1;
+    }
+    return before != 46 && before != 45;
+}
+
+// An absolute path: a plain string of 2 to 4096 bytes starting with `/`, no NUL, no `..` component.
+fn path_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if node < 0 || json.is_string(tp, node) == false || json.string_plain(tp, node) == false {
+        return false;
+    }
+    let v = json.string_view(src, tp, node);
+    if len(v) < 2 || len(v) > 4096 || int_of(v[0]) != 47 {
+        return false;
+    }
+    var i = 0;
+    while i < len(v) {
+        let c = int_of(v[i]);
+        if c < 32 || c == 127 {
+            return false;
+        }
+        if c == 47 && i + 3 <= len(v) && int_of(v[i + 1]) == 46 && int_of(v[i + 2]) == 46 && (i + 3 == len(v) || int_of(v[i + 3]) == 47) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn number_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, high: int) -> [] bool {
+    if node < 0 || json.fits_int(src, tp, node) == false {
+        return false;
+    }
+    let n = json.to_int(src, tp, node);
+    return n >= 1 && n <= high;
+}
+
+fn is_word[&v, &w](v: &v [byte], word: &w [byte]) -> [] bool {
+    if len(v) != len(word) {
+        return false;
+    }
+    var i = 0;
+    while i < len(v) {
+        if int_of(v[i]) != int_of(word[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Is every key of the object at `obj` one of `keys()`, plain, once?
+fn keys_exact[&s, &t](src: &s [byte], tp: &t [int], obj: int) -> [] bool {
+    let n = json.count(tp, obj);
+    if n != 8 {
+        return false;
+    }
+    var k = obj + 1;
+    var j = 0;
+    while j < n {
+        if json.is_string(tp, k) == false || json.string_plain(tp, k) == false {
+            return false;
+        }
+        let name = json.string_view(src, tp, k);
+        if json.get(src, tp, obj, name) != k + 1 {
+            return false;
+        }
+        var found = false;
+        var a = 0;
+        var start = 1;
+        let all = keys();
+        while a < len(all) {
+            if int_of(all[a]) == 32 {
+                if a > start && is_word(all[start..a], name) {
+                    found = true;
+                }
+                start = a + 1;
+            }
+            a = a + 1;
+        }
+        if found == false {
+            return false;
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    return true;
+}
+
+// Why the `review` of the operator file is refused, or "" when there is none or it is of the shape.
+pub fn reason[&s, &t](src: &s [byte], tp: &t [int]) -> [] &static [byte] {
+    let node = json.get(src, tp, 0, "review");
+    if node < 0 {
+        return "";
+    }
+    if json.is_object(tp, node) == false || keys_exact(src, tp, node) == false {
+        return "review: not an object of exactly worker, provider, model, key_file, host, max_tokens, max_diff_bytes and mode";
+    }
+    if token_ok(src, tp, json.get(src, tp, node, "worker"), 64) == false {
+        return "review.worker: not a file name of 1 to 64 bytes of A-Za-z0-9._-";
+    }
+    if token_ok(src, tp, json.get(src, tp, node, "provider"), 32) == false {
+        return "review.provider: not a name of 1 to 32 bytes of A-Za-z0-9._-";
+    }
+    if token_ok(src, tp, json.get(src, tp, node, "model"), 64) == false {
+        return "review.model: not a name of 1 to 64 bytes of A-Za-z0-9._-";
+    }
+    if path_ok(src, tp, json.get(src, tp, node, "key_file")) == false {
+        return "review.key_file: not an absolute path";
+    }
+    if host_ok(src, tp, json.get(src, tp, node, "host")) == false {
+        return "review.host: not a host name of letters, digits, dots and dashes";
+    }
+    if number_ok(src, tp, json.get(src, tp, node, "max_tokens"), max_tokens_limit()) == false {
+        return "review.max_tokens: not a whole number from 1 to 8192";
+    }
+    if number_ok(src, tp, json.get(src, tp, node, "max_diff_bytes"), max_diff_limit()) == false {
+        return "review.max_diff_bytes: not a whole number from 1 to 262144";
+    }
+    let mode = json.get(src, tp, node, "mode");
+    if mode < 0 || json.is_string(tp, mode) == false || json.string_plain(tp, mode) == false || is_word(json.string_view(src, tp, mode), "advisory") == false {
+        return "review.mode: not advisory";
+    }
+    return "";
+}
+
+pub fn ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
+    return len(reason(src, tp)) == 0;
+}

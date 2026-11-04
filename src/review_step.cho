@@ -1,0 +1,41 @@
+edition 9;
+module forge.review_step;
+
+import std.bytes;
+import std.json;
+import forge.company_graph;
+import forge.company_manifest;
+
+// A `repo.review` step (docs/review-step.md): a reviewer's step that asks a model about the diff of the one `repo.change` step it needs and records the answer.
+// This module holds what is decided before the step runs; the runner (a later slice) does the rest.
+
+pub fn rule_invalid() -> [] &static [byte] {
+    return "review-step-invalid";
+}
+
+pub fn rule_not_granted() -> [] &static [byte] {
+    return "review-not-granted";
+}
+
+pub fn task_name() -> [] &static [byte] {
+    return "repo.review";
+}
+
+// Is step `s` a `repo.review` step?
+pub fn is_review(s: company_manifest.Step) -> [] bool {
+    return bytes.equal(company_manifest.step_task_name(s), task_name());
+}
+
+// Can step `k` run? 0 when it can; 1 when it does not need exactly one `repo.change` step (`review-step-invalid`); 2 when the operator file (`op`, its tape `tp`)
+// has no `review` (`review-not-granted`).
+pub fn preflight[&m, &s, &t](hm: &m company_manifest.Manifest, op: &s [byte], tp: &t [int], k: int) -> [] int {
+    let step = company_manifest.step_at(hm, k);
+    let at = company_graph.index_of(hm, company_manifest.step_need(hm, step, 0));
+    if company_manifest.step_needs_count(hm, step) != 1 || at < 0 || company_manifest.is_repo_change(company_manifest.step_at(hm, at)) == false {
+        return 1;
+    }
+    if json.get(op, tp, 0, "review") < 0 {
+        return 2;
+    }
+    return 0;
+}

@@ -695,3 +695,41 @@ fn test_a_branch_prefix_follows_the_rules_of_a_branch_name() -> [] int {
     test.assert(company_step.prefix_ok("0123456789012345678901234567890123456789/") == false);
     return 0;
 }
+
+fn good_review() -> [] &static [byte] {
+    return "\"review\":{\"worker\":\"repo_review\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-5-5\",\"key_file\":\"/k/key\",\"host\":\"api.anthropic.com\",\"max_tokens\":2048,\"max_diff_bytes\":65536,\"mode\":\"advisory\"}";
+}
+
+fn test_an_operator_file_may_grant_a_review_and_a_bad_one_is_operator_invalid_with_a_reason[&h](heap: &!h Heap) -> [heap] int {
+    let good = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 400), "{\"workers\":\"/w\","), good_review()), "}");
+    borrow good as &gb in {
+        test.assert(operator_is_ok(heap, buffer.bytes(gb)));
+    }
+    buffer.drop(heap, good);
+    let bad = "{\"workers\":\"/w\",\"review\":{\"mode\":\"hold\"}}";
+    test.assert(operator_is_ok(heap, bad) == false);
+    test.assert(operator_is_ok(heap, "{\"workers\":\"/w\",\"reviews\":{}}") == false);
+    return 0;
+}
+
+fn test_a_repo_review_step_has_no_runner_yet[&h](heap: &!h Heap) -> [heap] int {
+    let steps = "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\"},{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[\"c\"],\"input\":\"x\"}";
+    var text = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":500,\"cache_write\":10,\"cache_read\":20,\"max_cost\":900,\"price_table\":\"prices.json\"},\"human_gates\":[],\"roles\":[\"builder\",\"qa\",\"reviewer\"],\"repos\":[{\"id\":\"diff\",\"kind\":\"library\"}],\"steps\":[");
+    text = buffer.append(heap, buffer.append(heap, text, steps), "]}");
+    borrow text as &tb in {
+        match company_manifest.parse(heap, buffer.bytes(tb)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    test.assert_eq(runner_code(company_step.runner_for(company_manifest.step_at(mr, 1))), 4);
+                    test.assert(runner_code(company_step.runner_for(company_manifest.step_at(mr, 0))) != 4);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return 0;
+}

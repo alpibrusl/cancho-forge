@@ -678,3 +678,35 @@ fn test_the_repo_refusal_tags_are_the_documented_ones() -> [] int {
     test.assert(bytes.equal(company_manifest.rule_name(company_manifest.Refusal::RepoChangeKindInvalid), "repo-change-kind-invalid"));
     return 0;
 }
+
+fn test_a_reviewer_repo_review_step_is_accepted_and_names_no_repo_check_or_gate[&h](heap: &!h Heap) -> [heap] int {
+    let c = "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\"}";
+    let r = ",{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[\"c\"],\"input\":\"x\"}";
+    let repos = "[{\"id\":\"diff\",\"kind\":\"library\"}]";
+    var good = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), c), r);
+    borrow good as &gb in {
+        test.assert(bytes.equal(repos_rule(heap, repos, buffer.bytes(gb)), ""));
+    }
+    buffer.drop(heap, good);
+    let named = "{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[],\"input\":\"x\",\"repo\":\"diff\"}";
+    test.assert(bytes.equal(repos_rule(heap, repos, named), "repo-task-invalid"));
+    let checked = "{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\"}";
+    test.assert(bytes.equal(steps_rule(heap, checked), "repo-task-invalid"));
+    let gated = "{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[],\"input\":\"x\",\"gate\":\"product-brief\"}";
+    test.assert(bytes.equal(steps_rule(heap, gated), "repo-task-invalid"));
+    let kinded = "{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[],\"input\":\"x\",\"change_kind\":\"bug\"}";
+    test.assert(bytes.equal(steps_rule(heap, kinded), "repo-task-invalid"));
+    return 0;
+}
+
+fn test_only_the_reviewer_role_offers_repo_review[&h](heap: &!h Heap) -> [heap] int {
+    let qa = "{\"id\":\"r\",\"role\":\"qa\",\"task_type\":\"repo.review\",\"needs\":[],\"input\":\"x\"}";
+    test.assert(bytes.equal(steps_rule(heap, qa), "task-type-unsupported"));
+    let builder = "{\"id\":\"r\",\"role\":\"builder\",\"task_type\":\"repo.review\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\"}";
+    test.assert(bytes.equal(steps_rule(heap, builder), "task-type-unsupported"));
+    let system = "{\"id\":\"r\",\"role\":\"system\",\"task_type\":\"repo.review\",\"needs\":[],\"input\":\"x\"}";
+    test.assert(bytes.equal(steps_rule(heap, system), "task-type-unsupported"));
+    let gate = "{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.gate\",\"needs\":[],\"input\":\"x\"}";
+    test.assert(bytes.equal(steps_rule(heap, gate), ""));
+    return 0;
+}

@@ -13,7 +13,9 @@ import forge.company_run;
 import forge.build_task;
 import forge.company_state;
 import forge.gate_task;
+import forge.operator_review;
 import forge.repo_row;
+import forge.review_step;
 
 // The pure half of `forge company run` (src/company_runner.cho is the half that acts; docs/superpowers/specs/
 // 2026-10-27-forge-company-layer-design.md, sections 4.3 and 10): which worker runs a step and which file it leaves as the artifact
@@ -157,6 +159,10 @@ pub fn runner_for(step: company_manifest.Step) -> [] Runner {
     }
     if company_manifest.is_repo_publish(step) {
         return Runner::Publish;
+    }
+    // A `repo.review` step (docs/review-step.md) has no runner yet: it is read and refused `task-type-unsupported` where it would run.
+    if review_step.is_review(step) {
+        return Runner::Unsupported;
     }
     return runner_of(step.role);
 }
@@ -757,7 +763,7 @@ pub fn put_hex[&h, &d](heap: &!h Heap, out: buffer.Buffer, digest: &d [byte]) ->
 // again by what uses it (`journal_io.path_ok`, `gate_task.check`, `build_task`), so the file grants nothing.
 
 fn root_keys() -> [] &static [byte] {
-    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs publish commit_trailer repos auto_publish ";
+    return " workers tools checker agent guide gates build_timeout_ms gate_timeout_ms check_timeout_ms analyst_tools granted_tools analysts tool_timeout_ms attempts agent_seconds rounds plan_seconds jobs publish commit_trailer repos auto_publish review ";
 }
 
 fn analyst_keys() -> [] &static [byte] {
@@ -879,7 +885,7 @@ pub fn operator_ok[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
     if guide_ok(src, tp) == false {
         return false;
     }
-    if len(limit_reason(src, tp)) > 0 || len(repo_row.rows_reason(src, tp)) > 0 {
+    if len(limit_reason(src, tp)) > 0 || len(repo_row.rows_reason(src, tp)) > 0 || operator_review.ok(src, tp) == false {
         return false;
     }
     if timeout_ok(src, tp, "tool_timeout_ms") == false || analysts_ok(src, tp) == false || publish_ok(src, tp) == false || auto_publish_ok(src, tp) == false {
@@ -966,6 +972,20 @@ fn limit_ok[&s, &t](src: &s [byte], tp: &t [int], name: &static [byte]) -> [] bo
         return false;
     }
     return limit_in_range(name, json.to_int(src, tp, node));
+}
+
+// Why the operator file is `operator-invalid`, as far as a reason can say: the first of the build ceilings, the repository rows and the `review` that is wrong, or ""
+// when none of them is.
+pub fn operator_reason[&s, &t](src: &s [byte], tp: &t [int]) -> [] &static [byte] {
+    let ceilings = limit_reason(src, tp);
+    if len(ceilings) > 0 {
+        return ceilings;
+    }
+    let rows = repo_row.rows_reason(src, tp);
+    if len(rows) > 0 {
+        return rows;
+    }
+    return operator_review.reason(src, tp);
 }
 
 // Why the build ceilings of the operator file are refused, the first one wrong in a fixed order, or "" when none is (the
