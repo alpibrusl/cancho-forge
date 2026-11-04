@@ -1171,3 +1171,26 @@ leading dot, a trailing slash, a doubled slash) all passed the repository's own 
 
 **Next, if R-1 is to be read:** a second seed set in which every faulty change request asks for something harmless and the diff does something else or something more (the
 case a reviewer exists for), at least 20 per class, each model run three times. That costs cents; it was not run because it is a different experiment, not a repeat.
+
+### R-1, second seed set (2026-11-04, same compiler, same base `04edac8`)
+
+**Setup.** `spike/r1/seeds2.py`: 21 correct and 21 faulty changes, every change request harmless (a tidy, a rename, a refactor, a helper, "no behaviour change"); a faulty diff
+deviates from the request (a dropped test, an off-by-one, `&&` for `||`, a changed constant). Fate measured as before: every faulty seed is caught by the repository's own tests
+(seeds that were not caught, or that fail `cancho check` rather than a test, were dropped: 5 of the first 29 faulty candidates did not break any test and 3 more were
+replaced). Same prompt, 2048 tokens, one call per seed per run. Sonnet 5.5 three runs, Haiku 5.5 two (a third would have passed the $2 ceiling). Spent $0.65 (Sonnet) and
+$0.74 (Haiku) at the deliberately high $3 / $15 price; with the first set, $1.70 of $2.
+
+| model | runs | false approvals (faulty approved) | false concerns (correct flagged) |
+|---|---|---|---|
+| claude-sonnet-5-5 | 3 x 42 | 4/63 (6.3%) | 5/63 (7.9%) |
+| claude-haiku-5-5 | 2 x 42 | 0/42 (0%) | 11/42 (26%) |
+
+Misses: Sonnet approved f13 in all three runs and f03 once. **f13 is a flaw of the seed, not of the reviewer**: its request ("start the scan at the first step after the entry step")
+asks for the behaviour that the tests refuse, the same defect as the first set. Without it Sonnet's false approvals are 1/60 (1.7%). f03 (`count_ok` rewritten as `v > 0 && v < hi`,
+described as writing the lower bound as `v > 0`) is a real miss, once in three. Haiku flagged correct changes: c13 (5 of 5 calls with Sonnet's), c15, c04, c18 and others, mostly
+doubts the diff does not settle.
+
+**Reading, by the protocol's own rule** (false approval over 10% keeps `review` advisory for good): neither model is over it on this set. That is **evidence the rule's
+condition can be met, not yet a decision**: 21 faulty seeds from 2 files and one hand-written mutation style, one author for requests and faults, tests as the only ground truth, and a
+sample too small to put a bound under 10% (63 calls, 4 misses: the 95% upper bound is about 15%). Haiku never approved a fault and flags a quarter of correct changes, which a
+person finds cheap to dismiss. Sonnet is the cheaper reviewer to listen to ($0.0034 a seed).

@@ -93,3 +93,9 @@ It does not build a worker, choose a model, or claim a reviewer catches anything
 (`spike/r1/review.sh`). False approvals: Haiku 2/10, Sonnet 4/10, so under the rule of section 5 `review` stays advisory. But every missed fault was one the change request
 itself asked for, so the run measured "does the diff match the request" more than "is the change right"; the seed set needs a second version in which the request is
 harmless and the diff deviates, before R-1 is read as an answer. Until then the policy is the one section 3 already states: the review is recorded and shown and **counts for nothing**.
+
+**Second run (2026-11-04, `spike/r1/seeds2.py`, 21 + 21 seeds whose requests are harmless and whose faulty diffs deviate).** False approvals: Sonnet 4/63 (1/60 once the one seed
+whose request asked for the fault is set aside), Haiku 0/42; false concerns: Sonnet 5/63, Haiku 11/42. Neither model is over the 10% of section 5 on this set, so the rule no longer
+keeps `review` advisory *because of R-1*. It does not yet license a decision either: one author, two files, 21 faulty seeds, and a 95% upper bound near 15% on Sonnet. The next step
+before `repo.review` may be built as anything but advisory is a seed set from another author, drawn from the changes the builders actually propose, and more of them. Until then the
+policy is still section 3: recorded and shown, **counting for nothing**.
