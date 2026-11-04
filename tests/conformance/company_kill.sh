@@ -37,6 +37,7 @@ cp scripts/standin_cancho_build.sh "$w/tools/cancho-build" && chmod +x "$w/tools
 $C build src/*.cho --std -o "$w/forge" || { echo "FAIL company kill: forge did not build"; exit 1; }
 for p in workers/*.cho; do
   n=$(basename "$p" .cho)
+  [ "$n" = repo_review ] && continue   # needs the vendored provider transport; built and measured by scripts/check_repo_review.sh
   $C build "$p" $libs --std -o "$w/workers/$n" || { echo "FAIL company kill: $n did not build"; exit 1; }
 done
 F="$w/forge"
