@@ -81,6 +81,8 @@ case_ "location long" 1 --max-time 3 -D "$w/hdr" -- location long
 len=$(grep '^Location:' "$w/hdr" | wc -c | tr -d ' ')
 [ "$rc" = 0 ] && [ "${code%% *}" = 302 ] && [ "$len" -gt 8000 ] && ok "a 302 with an 8 KiB Location is served whole ($len bytes of header)" || bad "location long ($rc $code $len)"
 
+case_ "eager" 1 --max-time 3 -- eager
+[ "$rc" = 0 ] && [ "${code%% *}" = 400 ] && ok "a server that speaks first answers a request with a 400 it wrote before reading" || bad "eager ($rc $code)"
 # the stub resolver, seen from outside by the P1 client (spike/p1_resolve.cho) -- an independent program from the one under test
 if $C build pilot/audit/resolver.cho --std -o "$w/resolver" && $C build spike/p1_resolve.cho spike/lib/dns.cho --std -o "$w/p1"; then
   rport=$((base + 90))

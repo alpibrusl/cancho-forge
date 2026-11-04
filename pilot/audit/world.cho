@@ -15,7 +15,7 @@ import std.io;
 //   abort                accept and close without reading the request: the kernel resets the connection
 //   lie                  Content-Length 100, ten bytes, close    chunked             a valid chunked answer: `hello`
 //   big <n>              Content-Length n, n bytes of `a`        redirect <url>      302 to <url> (to itself: a loop; to another port: a chain)
-//   bighead              a header block of 100 KiB               trickle <n>         a valid answer, one byte at a time, <n> ms apart
+//   eager                a 400 written before anything is read   bighead              a header block of 100 KiB               trickle <n>         a valid answer, one byte at a time, <n> ms apart
 //   reply <status>:<json> a canned JSON answer                 redirect301 <url>    301 to <url>                            location <kind>     a 302 whose Location is empty (`empty`), `/next` (`relative`) or 8 KiB long (`long`)
 //
 // It serves <connections> connections, one after the other, then exits. The audit starts one process a case; a case that needs a chain starts several.
@@ -122,6 +122,11 @@ fn read_head[&c](conn: &!c Conn) -> [conn_read] bool {
 
 fn serve_one[&c, &k, &m, &a](conn: &!c Conn, clock: &k Clock, mode: &m [byte], arg: &a [byte]) -> [conn_read, conn_write, poll, clock] int {
     if bytes.equal(mode, "abort") {
+        return 0;
+    }
+    if bytes.equal(mode, "eager") {
+        // speaks first, as a plain HTTP server does to a client that opens a TLS handshake on its port
+        send_all(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return 0;
     }
     if read_head(conn) == false {

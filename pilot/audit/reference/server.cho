@@ -1,0 +1,503 @@
+edition 9;
+
+import std.addr;
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import checker;
+import fetch;
+import ratelimit;
+import request;
+
+// The reference checker, as a process (docs/pilot-audit.md section 5.1, R3): `checker serve` answers `GET /health` and `GET /check?url=<url>` of docs/pilot-s1.md section 3 on
+// 127.0.0.1, one request at a time, and runs until it is killed.
+//
+//     server serve --port <n> --resolver <a.b.c.d[:port]> [--roots <pem>] [--allow-loopback] [--now <unix seconds>]
+//
+// It writes `listening <port>` to its standard error, and nothing to its standard output. `--roots` is the PEM bundle the https targets are checked against (none: no root is
+// trusted); `--allow-loopback` lets it reach 127.0.0.0/8 on any port and nothing else private; `--now` fixes the clock certificates are judged by. Refusals are
+// `application/problem+json` with `rule` and `repair`: url.* 400, target.private-address 403, target.too-many-redirects 422, rate.limited 429, check.timeout 504.
+
+fn number[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || len(text) > 12 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + c - 48;
+        k = k + 1;
+    }
+    return n;
+}
+
+fn slurp[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], cap: int) -> [heap, fs_read("")] buffer.Buffer {
+    let store = box_slice(heap, cap, byte_of(0));
+    var out = buffer.empty(heap, 16);
+    borrow mut store as &!sw in {
+        let n = fs_read(fs, path, contents(sw));
+        if n >= 0 {
+            out = buffer.append(heap, out, contents(sw)[0..n]);
+        }
+    }
+    unbox_slice(heap, store);
+    return out;
+}
+
+fn send_all[&c, &d](conn: &!c Conn, data: &d [byte]) -> [conn_write] bool {
+    var at = 0;
+    while at < len(data) {
+        match conn_write(conn, data[at..len(data)]) {
+            Sent::Wrote(n) => {
+                at = at + n;
+            }
+            Sent::Again => {
+                at = at + 0;
+            }
+            Sent::Failed(e) => {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn status_text(status: int) -> [] &static [byte] {
+    if status == 200 {
+        return "OK";
+    }
+    if status == 400 {
+        return "Bad Request";
+    }
+    if status == 403 {
+        return "Forbidden";
+    }
+    if status == 404 {
+        return "Not Found";
+    }
+    if status == 405 {
+        return "Method Not Allowed";
+    }
+    if status == 414 {
+        return "URI Too Long";
+    }
+    if status == 422 {
+        return "Unprocessable Content";
+    }
+    if status == 429 {
+        return "Too Many Requests";
+    }
+    if status == 431 {
+        return "Request Header Fields Too Large";
+    }
+    if status == 504 {
+        return "Gateway Timeout";
+    }
+    return "Error";
+}
+
+// The status a refusal rule is answered with.
+fn rule_status(rule: &static [byte]) -> [] int {
+    if bytes.equal(rule, "target.private-address") {
+        return 403;
+    }
+    if bytes.equal(rule, "target.too-many-redirects") {
+        return 422;
+    }
+    if bytes.equal(rule, "rate.limited") {
+        return 429;
+    }
+    if bytes.equal(rule, "check.timeout") {
+        return 504;
+    }
+    return 400;
+}
+
+// One response, closed after: the head, then the body unless the request was a HEAD.
+fn respond[&c, &b](conn: &!c Conn, status: int, content_type: &static [byte], body: &b [byte], head_only: bool, allow: &static [byte]) -> [conn_write] int {
+    var number_text = 0;
+    var digits = 1;
+    var scale = 1;
+    while scale * 10 <= len(body) {
+        scale = scale * 10;
+        digits = digits + 1;
+    }
+    send_all(conn, "HTTP/1.1 ");
+    region r {
+        let code = alloc_slice[r](3, byte_of(0));
+        code[0] = byte_of(48 + status / 100);
+        code[1] = byte_of(48 + status / 10 % 10);
+        code[2] = byte_of(48 + status % 10);
+        send_all(conn, code);
+        send_all(conn, " ");
+        send_all(conn, status_text(status));
+        send_all(conn, "\r\nContent-Type: ");
+        send_all(conn, content_type);
+        send_all(conn, "\r\nContent-Length: ");
+        let size = alloc_slice[r](12, byte_of(0));
+        var rest = len(body);
+        var k = 0;
+        while scale >= 1 {
+            size[k] = byte_of(48 + rest / scale);
+            rest = rest - rest / scale * scale;
+            scale = scale / 10;
+            k = k + 1;
+        }
+        send_all(conn, size[0..k]);
+    }
+    if len(allow) > 0 {
+        send_all(conn, "\r\nAllow: ");
+        send_all(conn, allow);
+    }
+    send_all(conn, "\r\nConnection: close\r\n\r\n");
+    if head_only == false {
+        send_all(conn, body);
+    }
+    number_text = digits;
+    return number_text;
+}
+
+// A refusal as a problem document.
+fn problem[&h, &c](heap: &!h Heap, conn: &!c Conn, status: int, rule: &static [byte], head_only: bool) -> [heap, conn_write] int {
+    var w = json.writer(heap, 256);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "type");
+    w = json.put_string(heap, w, "about:blank");
+    w = json.put_key(heap, w, "title");
+    w = json.put_string(heap, w, rule);
+    w = json.put_key(heap, w, "status");
+    w = json.put_int(heap, w, status);
+    w = json.put_key(heap, w, "rule");
+    w = json.put_string(heap, w, rule);
+    w = json.put_key(heap, w, "repair");
+    w = json.put_string(heap, w, checker.repair_of(rule));
+    w = json.end_object(heap, w);
+    let body = json.finish(w);
+    borrow body as &bb in {
+        respond(conn, status, "application/problem+json", buffer.bytes(bb), head_only, "");
+    }
+    buffer.drop(heap, body);
+    return 0;
+}
+
+// Read the request head from the connection: up to 16 KiB, until the blank line, the peer's close or the deadline. The bytes, and whether the blank line was seen.
+fn read_head[&h, &c, &k](heap: &!h Heap, conn: &!c Conn, clock: &k Clock, deadline: int) -> [heap, conn_read, poll, clock] (buffer.Buffer, bool) {
+    var out = buffer.empty(heap, 512);
+    var seen = false;
+    conn_nonblocking(conn);
+    match poller_new() {
+        Polling::Failed(e) => {
+            return (out, false);
+        }
+        Polling::Ok(poller) => {
+            var pw = poller;
+            var done = false;
+            var total = 0;
+            borrow mut pw as &!pm in {
+                poller_add_conn(pm, conn, 1, 1);
+                region r {
+                    let events = alloc_slice[r](8, 0);
+                    let block = alloc_slice[r](4096, byte_of(0));
+                    while done == false {
+                        let left = deadline - clock_ms(clock);
+                        if left <= 0 {
+                            done = true;
+                        } else if poller_wait(pm, events, left) > 0 {
+                            match conn_read(conn, block) {
+                                Received::Data(n) => {
+                                    out = buffer.append(heap, out, block[0..n]);
+                                    total = total + n;
+                                    borrow out as &ob in {
+                                        if bytes.find(buffer.bytes(ob), "\r\n\r\n") >= 0 {
+                                            seen = true;
+                                            done = true;
+                                        }
+                                    }
+                                    if total > 16384 {
+                                        done = true;
+                                    }
+                                }
+                                Received::End => {
+                                    done = true;
+                                }
+                                Received::Again => {
+                                    done = false;
+                                }
+                                Received::Failed(e) => {
+                                    done = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            poller_close(pw);
+            return (out, seen);
+        }
+    }
+}
+
+// The IPv4 address of the connection's peer as a number (the rate limit's key), or 0.
+fn source_of[&c](conn: &c Conn) -> [] int {
+    region r {
+        let raw = alloc_slice[r](addr.raw_len(), byte_of(0));
+        if conn_peer(conn, raw) == 0 {
+            match addr.decode(raw) {
+                addr.Parsed::Ok(p) => {
+                    return p.w3;
+                }
+                addr.Parsed::Bad => {
+                    return 0;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+// What a request needs from the process: the resolver, the roots and the rest of `fetch.run`'s arguments.
+fn handle[&h, &c, &n, &k, &s, &z, &y, &t](heap: &!h Heap, conn: &!c Conn, net: &n Net(""), clock: &k Clock, resolver: &s [byte], rport: int, allow_loopback: bool, roots: &z [byte], entropy: &y [byte], now_ms: int, table: &!t [int]) -> [heap, net_out(""), udp_send, udp_recv, conn_read, conn_write, poll, clock] int {
+    let (head, complete) = read_head(heap, conn, clock, clock_ms(clock) + 5000);
+    borrow head as &hb in {
+        let text = buffer.bytes(hb);
+        let method = request.method_of(text);
+        if method < 0 {
+            if complete || len(text) > 0 {
+                problem(heap, conn, 400, "url.invalid", false);
+            }
+        } else if complete == false {
+            problem(heap, conn, 431, "url.invalid", false);
+        } else {
+            let target = request.target_of(text);
+            let path = request.path_of(target);
+            let head_only = method == 2;
+            if len(target) > 8192 {
+                problem(heap, conn, 414, "url.invalid", head_only);
+            } else if bytes.equal(path, "/health") {
+                if method == 1 || method == 2 {
+                    respond(conn, 200, "application/json", "{\"ok\":true}", head_only, "");
+                } else {
+                    respond(conn, 405, "application/problem+json", "{\"type\":\"about:blank\",\"title\":\"method not allowed\",\"status\":405}", false, "GET, HEAD");
+                }
+            } else if bytes.equal(path, "/check") {
+                if method != 1 {
+                    respond(conn, 405, "application/problem+json", "{\"type\":\"about:blank\",\"title\":\"method not allowed\",\"status\":405}", false, "GET");
+                } else if ratelimit.allow(table, clock_ms(clock), source_of(conn)) == false {
+                    problem(heap, conn, 429, "rate.limited", false);
+                } else {
+                    let query = request.query_of(target);
+                    var rule = "";
+                    var decoded = buffer.empty(heap, 1);
+                    if request.param_count(query, "url") != 1 {
+                        rule = "url.invalid";
+                    } else {
+                        let (d, ok) = request.percent_decode(heap, request.param(query, "url", 0));
+                        buffer.drop(heap, decoded);
+                        decoded = d;
+                        if ok == false {
+                            rule = "url.invalid";
+                        }
+                    }
+                    if len(rule) > 0 {
+                        problem(heap, conn, rule_status(rule), rule, false);
+                    } else {
+                        borrow decoded as &db in {
+                            match fetch.run(heap, net, clock, resolver, rport, allow_loopback, roots, entropy, now_ms, buffer.bytes(db)) {
+                                fetch.Outcome::Refused(why) => {
+                                    problem(heap, conn, rule_status(why), why, false);
+                                }
+                                fetch.Outcome::Done(body) => {
+                                    borrow body as &bb in {
+                                        respond(conn, 200, "application/json", buffer.bytes(bb), false, "");
+                                    }
+                                    buffer.drop(heap, body);
+                                }
+                            }
+                        }
+                    }
+                    buffer.drop(heap, decoded);
+                }
+            } else {
+                respond(conn, 404, "application/problem+json", "{\"type\":\"about:blank\",\"title\":\"not found\",\"status\":404}", head_only, "");
+            }
+        }
+    }
+    buffer.drop(heap, head);
+    return 0;
+}
+
+fn serve[&h, &i, &n, &k, &s, &z, &y](heap: &!h Heap, io: &!i Io, net: &n Net(""), clock: &k Clock, port: int, resolver: &s [byte], rport: int, allow_loopback: bool, roots: &z [byte], entropy: &y [byte], now_ms: int) -> [heap, err_write, net_in(""), net_out(""), udp_send, udp_recv, conn_accept, conn_read, conn_write, poll, clock] int {
+    match tcp_listen(net, port, 16, 0) {
+        Listening::Failed(e) => {
+            io.error_all(io, "server: cannot listen\n");
+            return 1;
+        }
+        Listening::Ok(opened) => {
+            var listener = opened;
+            io.error_all(io, "listening ");
+            region r {
+                let digits = alloc_slice[r](8, byte_of(0));
+                var k2 = 0;
+                var scale = 1;
+                while scale * 10 <= port {
+                    scale = scale * 10;
+                }
+                var rest = port;
+                while scale >= 1 {
+                    digits[k2] = byte_of(48 + rest / scale);
+                    rest = rest - rest / scale * scale;
+                    scale = scale / 10;
+                    k2 = k2 + 1;
+                }
+                io.error_all(io, digits[0..k2]);
+            }
+            io.error_all(io, "\n");
+            let table = box_slice(heap, ratelimit.table_len(), 0);
+            while true {
+                borrow mut listener as &!l in {
+                    match tcp_accept(l) {
+                        Accepted::Ok(accepted) => {
+                            var conn = accepted;
+                            borrow mut table as &!tw in {
+                                borrow mut conn as &!cc in {
+                                    handle(heap, cc, net, clock, resolver, rport, allow_loopback, roots, entropy, now_ms, contents(tw));
+                                }
+                            }
+                            conn_close(conn);
+                        }
+                        Accepted::Again => {
+                            rest_a_moment(clock);
+                        }
+                        Accepted::Failed(e) => {
+                            rest_a_moment(clock);
+                        }
+                    }
+                }
+            }
+            unbox_slice(heap, table);
+            listener_close(listener);
+            return 0;
+        }
+    }
+}
+
+fn rest_a_moment[&k](clock: &k Clock) -> [poll, clock] int {
+    match poller_new() {
+        Polling::Failed(e) => {
+            return 0;
+        }
+        Polling::Ok(poller) => {
+            var pw = poller;
+            let until = clock_ms(clock) + 5;
+            region r {
+                let events = alloc_slice[r](4, 0);
+                borrow mut pw as &!pm in {
+                    while clock_ms(clock) < until {
+                        poller_wait(pm, events, until - clock_ms(clock));
+                    }
+                }
+            }
+            poller_close(pw);
+            return 0;
+        }
+    }
+}
+
+// The index of the flag `name` among the arguments, or -1.
+fn flag_at[&g](args: &g Args, name: &static [byte]) -> [args] int {
+    var i = 1;
+    while i < arg_count(args) {
+        if bytes.equal(arg(args, i), name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn go[&h, &i, &n, &c, &f, &g](heap: &!h Heap, io: &!i Io, net: &n Net(""), clock: &c Clock, fs: &f Fs(""), args: &g Args) -> [heap, err_write, net_in(""), net_out(""), udp_send, udp_recv, conn_accept, conn_read, conn_write, poll, clock, fs_read(""), args] int {
+    let pi = flag_at(args, "--port");
+    let ri = flag_at(args, "--resolver");
+    if pi < 0 || ri < 0 || pi + 1 >= arg_count(args) || ri + 1 >= arg_count(args) {
+        io.error_all(io, "usage: server serve --port <n> --resolver <a.b.c.d[:port]> [--roots <pem>] [--allow-loopback] [--now <unix seconds>]\n");
+        return 2;
+    }
+    let port = number(arg(args, pi + 1));
+    let resolver_text = arg(args, ri + 1);
+    var colon = bytes.find(resolver_text, ":");
+    var rport = 53;
+    var resolver = resolver_text;
+    if colon >= 0 {
+        resolver = resolver_text[0..colon];
+        rport = number(resolver_text[colon + 1..len(resolver_text)]);
+    }
+    if port < 1 || port > 65535 || rport < 1 || rport > 65535 {
+        io.error_all(io, "server: a port is not a number from 1 to 65535\n");
+        return 2;
+    }
+    var roots = buffer.empty(heap, 16);
+    let roots_at = flag_at(args, "--roots");
+    if roots_at >= 0 && roots_at + 1 < arg_count(args) {
+        buffer.drop(heap, roots);
+        roots = slurp(heap, fs, arg(args, roots_at + 1), 1048576);
+    }
+    var now_ms = 0;
+    let now_at = flag_at(args, "--now");
+    if now_at >= 0 && now_at + 1 < arg_count(args) && number(arg(args, now_at + 1)) >= 0 {
+        now_ms = number(arg(args, now_at + 1)) * 1000;
+    }
+    let allow_loopback = flag_at(args, "--allow-loopback") >= 0;
+    let entropy = box_slice(heap, 32, byte_of(0));
+    borrow mut entropy as &!ew in {
+        fs_read(fs, "/dev/urandom", contents(ew));
+    }
+    var code = 2;
+    borrow roots as &rb in {
+        borrow entropy as &er in {
+            code = serve(heap, io, net, clock, port, resolver, rport, allow_loopback, buffer.bytes(rb), contents(er), now_ms);
+        }
+    }
+    unbox_slice(heap, entropy);
+    buffer.drop(heap, roots);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var code = 2;
+    borrow net as &n in {
+        borrow clock as &c in {
+            borrow fs as &f in {
+                borrow args as &g in {
+                    borrow mut console as &!i in {
+                        borrow mut memory as &!h in {
+                            if arg_count(g) >= 2 && bytes.equal(arg(g, 1), "serve") {
+                                code = go(h, i, n, c, f, g);
+                            } else {
+                                io.error_all(i, "usage: server serve --port <n> --resolver <a.b.c.d[:port]> [--roots <pem>] [--allow-loopback] [--now <unix seconds>]\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    release(net);
+    release(clock);
+    release(fs);
+    release(console);
+    release(memory);
+    release(args);
+    return code;
+}
