@@ -231,3 +231,8 @@ std = true
 name = "audit_expect"
 sources = ["tests/audit_expect_test.cho", "pilot/audit/expect.cho"]
 std = true
+
+[[test]]
+name = "checker"
+sources = ["tests/checker_test.cho", "pilot/audit/reference/checker.cho"]
+std = true

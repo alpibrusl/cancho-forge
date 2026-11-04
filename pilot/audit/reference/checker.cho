@@ -1,0 +1,556 @@
+edition 9;
+module checker;
+
+import std.bytes;
+
+// The pure heart of the reference checker (docs/pilot-audit.md section 5): the functions pilot/contract.cho pins, plus the address parsing they stand on. Written by hand against
+// docs/pilot-s1.md sections 2 and 3 as the audit's witness: it is not what the company ships. No network, no clock, no allocation beyond the stack: every function is total.
+
+// ---- the verdict ------------------------------------------------------------------------------------------------------------------
+
+// 0 down, 1 degraded, 2 up (docs/pilot-s1.md section 3). Down: nothing reached, or the chain did not verify. Degraded: a 5xx, a 4xx other than 404 and 410 (those are the target's own
+// answer), fewer than 14 days left, or a total over 5000 ms. Up otherwise.
+pub fn verdict_of(reached: bool, verified: bool, status: int, days_left: int, total_ms: int) -> [] int {
+    if reached == false || verified == false {
+        return 0;
+    }
+    if status >= 500 {
+        return 1;
+    }
+    if status >= 400 && status != 404 && status != 410 {
+        return 1;
+    }
+    if days_left < 14 || total_ms > 5000 {
+        return 1;
+    }
+    return 2;
+}
+
+pub fn verdict_name(verdict: int) -> [] &static [byte] {
+    if verdict == 0 {
+        return "down";
+    }
+    if verdict == 1 {
+        return "degraded";
+    }
+    return "up";
+}
+
+// ---- IPv4 addresses -----------------------------------------------------------------------------------------------------------------
+
+// Is the address (`a * 2^24 + b * 2^16 + c * 2^8 + d`) one the checker must not connect to? 0/8, 10/8, 100.64/10, 127/8, 169.254/16 (link-local, the cloud metadata address
+// among it), 172.16/12, 192.0.0/24, 192.168/16, 224/4 (multicast) and 240/4 (reserved, the broadcast address among it). The documentation ranges (192.0.2/24, 198.51.100/24,
+// 203.0.113/24) are public here: the audit uses 203.0.113.7 as its public-looking address, and a real target never has one.
+pub fn private_v4(address: int) -> [] bool {
+    if address < 0 || address > 4294967295 {
+        return true;
+    }
+    let a = address / 16777216;
+    let b = address / 65536 % 256;
+    let c = address / 256 % 256;
+    if a == 0 || a == 10 || a == 127 || a >= 224 {
+        return true;
+    }
+    if a == 100 && b >= 64 && b <= 127 {
+        return true;
+    }
+    if a == 169 && b == 254 {
+        return true;
+    }
+    if a == 172 && b >= 16 && b <= 31 {
+        return true;
+    }
+    if a == 192 && b == 168 {
+        return true;
+    }
+    if a == 192 && b == 0 && c == 0 {
+        return true;
+    }
+    return false;
+}
+
+fn digit_of(c: int) -> [] int {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    return 0 - 1;
+}
+
+// One part of a loose IPv4 address as `inet_aton` reads it: `0x` and hex digits, a leading `0` and octal digits, or decimal. -1 when it is none of them (or over 2^32).
+fn part_value[&p](part: &p [byte]) -> [] int {
+    if len(part) == 0 {
+        return 0 - 1;
+    }
+    var base = 10;
+    var at = 0;
+    if len(part) >= 2 && int_of(part[0]) == 48 && (int_of(part[1]) == 120 || int_of(part[1]) == 88) {
+        base = 16;
+        at = 2;
+        if len(part) == 2 {
+            return 0 - 1;
+        }
+    } else if len(part) >= 2 && int_of(part[0]) == 48 {
+        base = 8;
+        at = 1;
+    }
+    var value = 0;
+    while at < len(part) {
+        let d = digit_of(int_of(part[at]));
+        if d < 0 || d >= base {
+            return 0 - 1;
+        }
+        value = value * base + d;
+        if value > 4294967295 {
+            return 0 - 1;
+        }
+        at = at + 1;
+    }
+    return value;
+}
+
+// Does the part look like a number in some base (all digits, or `0x` and hex digits)? Used to tell a numeric host from a name.
+fn numeric_part[&p](part: &p [byte]) -> [] bool {
+    if len(part) == 0 {
+        return false;
+    }
+    var at = 0;
+    var hex = false;
+    if len(part) >= 2 && int_of(part[0]) == 48 && (int_of(part[1]) == 120 || int_of(part[1]) == 88) {
+        hex = true;
+        at = 2;
+    }
+    while at < len(part) {
+        let c = int_of(part[at]);
+        let dec = c >= 48 && c <= 57;
+        if hex == false && dec == false || hex && digit_of(c) < 0 {
+            return false;
+        }
+        at = at + 1;
+    }
+    return true;
+}
+
+// A host written the way `inet_aton` reads it: one to four parts joined by dots, each decimal, octal (`0` first) or hex (`0x`); the last part fills the bytes left. The packed
+// address, -1 when the text is not an address of that kind, -2 when it is made of numeric parts but is not a valid address (a part too large, an octal digit 8, five parts).
+pub fn ipv4_loose[&h](host: &h [byte]) -> [] int {
+    var parts = 0;
+    var start = 0;
+    var k = 0;
+    var numeric = true;
+    while k <= len(host) {
+        if k == len(host) || int_of(host[k]) == 46 {
+            if numeric_part(host[start..k]) == false {
+                numeric = false;
+            }
+            parts = parts + 1;
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    if numeric == false {
+        return 0 - 1;
+    }
+    if parts > 4 {
+        return 0 - 2;
+    }
+    var value = 0;
+    start = 0;
+    var index = 0;
+    k = 0;
+    while k <= len(host) {
+        if k == len(host) || int_of(host[k]) == 46 {
+            let v = part_value(host[start..k]);
+            if v < 0 {
+                return 0 - 2;
+            }
+            if index < parts - 1 {
+                if v > 255 {
+                    return 0 - 2;
+                }
+                value = value * 256 + v;
+            } else {
+                var room = 1;
+                var left = 4 - index;
+                while left > 0 {
+                    room = room * 256;
+                    left = left - 1;
+                }
+                if v >= room {
+                    return 0 - 2;
+                }
+                value = value * room + v;
+            }
+            index = index + 1;
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return value;
+}
+
+// ---- IPv6 literals ------------------------------------------------------------------------------------------------------------------
+
+fn lower(c: int) -> [] int {
+    if c >= 65 && c <= 90 {
+        return c + 32;
+    }
+    return c;
+}
+
+// The value of a hextet of 1 to 4 hex digits, or -1.
+fn hextet[&p](part: &p [byte]) -> [] int {
+    if len(part) < 1 || len(part) > 4 {
+        return 0 - 1;
+    }
+    var v = 0;
+    var k = 0;
+    while k < len(part) {
+        let d = digit_of(int_of(part[k]));
+        if d < 0 {
+            return 0 - 1;
+        }
+        v = v * 16 + d;
+        k = k + 1;
+    }
+    return v;
+}
+
+// The packed address of `a.b.c.d` (four decimal parts, no other form), or -1.
+fn dotted_quad[&p](text: &p [byte]) -> [] int {
+    var value = 0;
+    var parts = 0;
+    var start = 0;
+    var k = 0;
+    while k <= len(text) {
+        if k == len(text) || int_of(text[k]) == 46 {
+            let part = text[start..k];
+            if len(part) < 1 || len(part) > 3 || numeric_part(part) == false || bytes.find(part, "x") >= 0 || bytes.find(part, "X") >= 0 {
+                return 0 - 1;
+            }
+            let v = part_value(part);
+            if v < 0 || v > 255 {
+                return 0 - 1;
+            }
+            value = value * 256 + v;
+            parts = parts + 1;
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    if parts != 4 {
+        return 0 - 1;
+    }
+    return value;
+}
+
+// What an IPv6 literal (the text between the brackets) is, for a checker that connects over IPv4 only: 1 for an address it must not reach (unspecified, loopback, an
+// IPv4-mapped or -compatible address of a private IPv4 one, unique-local fc00::/7, link-local fe80::/10, multicast ff00::/8), 0 for any other well-formed literal (public, and
+// unreachable for it), -2 for text that is not an IPv6 literal.
+pub fn ipv6_class[&t](text: &t [byte]) -> [] int {
+    if len(text) < 2 || len(text) > 45 {
+        return 0 - 2;
+    }
+    var colons = 0;
+    var k = 0;
+    while k < len(text) {
+        let c = lower(int_of(text[k]));
+        if c == 58 {
+            colons = colons + 1;
+        } else if c != 46 && digit_of(c) < 0 {
+            return 0 - 2;
+        }
+        k = k + 1;
+    }
+    if colons < 2 || colons > 8 {
+        return 0 - 2;
+    }
+    if bytes.equal(text, "::") || bytes.equal(text, "::1") {
+        return 1;
+    }
+    var first = 0;
+    if int_of(text[0]) != 58 {
+        var e = 0;
+        while e < len(text) && int_of(text[e]) != 58 {
+            e = e + 1;
+        }
+        first = hextet(text[0..e]);
+        if first < 0 {
+            return 0 - 2;
+        }
+    }
+    if first >= 64512 && first <= 65023 || first >= 65152 && first <= 65215 || first >= 65280 {
+        return 1;
+    }
+    if first == 0 && len(text) > 2 && int_of(text[0]) == 58 && int_of(text[1]) == 58 {
+        // ::a.b.c.d, ::ffff:a.b.c.d and ::ffff:hhhh:hhhh
+        var rest = text[2..len(text)];
+        if len(rest) >= 5 && bytes.equal(rest[0..5], "ffff:") || len(rest) >= 5 && bytes.equal(rest[0..5], "FFFF:") {
+            rest = rest[5..len(rest)];
+        }
+        if bytes.find(rest, ".") >= 0 {
+            let packed = dotted_quad(rest);
+            if packed < 0 {
+                return 0 - 2;
+            }
+            if private_v4(packed) {
+                return 1;
+            }
+            return 0;
+        }
+        var split = 0;
+        while split < len(rest) && int_of(rest[split]) != 58 {
+            split = split + 1;
+        }
+        if split < len(rest) {
+            let hi = hextet(rest[0..split]);
+            let lo = hextet(rest[split + 1..len(rest)]);
+            if hi < 0 || lo < 0 {
+                return 0 - 2;
+            }
+            if private_v4(hi * 65536 + lo) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// ---- the URL ------------------------------------------------------------------------------------------------------------------------
+
+// The part of `url` after `scheme://` up to the first `/`, `?` or `#`, or an empty slice.
+fn authority_of[&u](url: &u [byte]) -> [] &u [byte] {
+    let at = bytes.find(url, "://");
+    if at < 0 {
+        return url[0..0];
+    }
+    let from = at + 3;
+    var e = from;
+    while e < len(url) && int_of(url[e]) != 47 && int_of(url[e]) != 63 && int_of(url[e]) != 35 {
+        e = e + 1;
+    }
+    return url[from..e];
+}
+
+fn scheme_of[&u](url: &u [byte]) -> [] &u [byte] {
+    var e = 0;
+    while e < len(url) && int_of(url[e]) != 58 && int_of(url[e]) != 47 && int_of(url[e]) != 63 {
+        e = e + 1;
+    }
+    if e >= len(url) || int_of(url[e]) != 58 {
+        return url[0..0];
+    }
+    return url[0..e];
+}
+
+fn same_ignoring_case[&a, &b](a: &a [byte], b: &b [byte]) -> [] bool {
+    if len(a) != len(b) {
+        return false;
+    }
+    var k = 0;
+    while k < len(a) {
+        if lower(int_of(a[k])) != lower(int_of(b[k])) {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// The host of `url` as written (the brackets of an IPv6 literal kept), the empty slice when there is none.
+pub fn url_host[&u](url: &u [byte]) -> [] &u [byte] {
+    let auth = authority_of(url);
+    if len(auth) == 0 {
+        return auth;
+    }
+    if int_of(auth[0]) == 91 {
+        var close = 0;
+        while close < len(auth) && int_of(auth[close]) != 93 {
+            close = close + 1;
+        }
+        if close >= len(auth) {
+            return auth[0..0];
+        }
+        return auth[0..close + 1];
+    }
+    var e = 0;
+    while e < len(auth) && int_of(auth[e]) != 58 {
+        e = e + 1;
+    }
+    return auth[0..e];
+}
+
+// The port of `url`: the one written, else 80 for http and 443 for https; -1 when the text after the host's colon is not 1 to 5 digits.
+pub fn url_port[&u](url: &u [byte]) -> [] int {
+    let auth = authority_of(url);
+    let host = url_host(url);
+    var rest = auth[len(host)..len(auth)];
+    if len(rest) == 0 {
+        if same_ignoring_case(scheme_of(url), "https") {
+            return 443;
+        }
+        return 80;
+    }
+    if int_of(rest[0]) != 58 {
+        return 0 - 1;
+    }
+    rest = rest[1..len(rest)];
+    if len(rest) < 1 || len(rest) > 5 {
+        return 0 - 1;
+    }
+    var n = 0;
+    var k = 0;
+    while k < len(rest) {
+        let c = int_of(rest[k]);
+        if c < 48 || c > 57 {
+            return 0 - 1;
+        }
+        n = n * 10 + c - 48;
+        k = k + 1;
+    }
+    return n;
+}
+
+pub fn url_is_https[&u](url: &u [byte]) -> [] bool {
+    return same_ignoring_case(scheme_of(url), "https");
+}
+
+// The request target of `url` (path and query; `/` when there is none).
+pub fn url_target[&u](url: &u [byte]) -> [] &u [byte] {
+    let auth = authority_of(url);
+    let at = bytes.find(url, "://");
+    if at < 0 {
+        return url[0..0];
+    }
+    let from = at + 3 + len(auth);
+    var e = from;
+    while e < len(url) && int_of(url[e]) != 35 {
+        e = e + 1;
+    }
+    return url[from..e];
+}
+
+fn host_chars_ok[&h](host: &h [byte]) -> [] bool {
+    if len(host) < 1 || len(host) > 253 {
+        return false;
+    }
+    var k = 0;
+    while k < len(host) {
+        let c = int_of(host[k]);
+        let ok = c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 45 || c == 46 || c == 95;
+        if ok == false {
+            return false;
+        }
+        k = k + 1;
+    }
+    return int_of(host[0]) != 46 && int_of(host[len(host) - 1]) != 46;
+}
+
+// The rule a URL text is refused under before anything is resolved: "" when it may be checked, else `url.invalid`, `url.scheme`, `url.credentials` or `url.port`
+// (the allowed ports are 80, 443, 8080 and 8443). The text is the value of the `url` parameter, already percent-decoded.
+pub fn url_rule[&u](url: &u [byte]) -> [] &static [byte] {
+    if len(url) == 0 || len(url) > 2048 {
+        return "url.invalid";
+    }
+    var k = 0;
+    while k < len(url) {
+        let c = int_of(url[k]);
+        if c <= 32 || c >= 127 {
+            return "url.invalid";
+        }
+        k = k + 1;
+    }
+    let scheme = scheme_of(url);
+    if len(scheme) == 0 {
+        return "url.invalid";
+    }
+    if same_ignoring_case(scheme, "http") == false && same_ignoring_case(scheme, "https") == false {
+        return "url.scheme";
+    }
+    if len(url) < len(scheme) + 3 || bytes.equal(url[len(scheme)..len(scheme) + 3], "://") == false {
+        return "url.invalid";
+    }
+    let auth = authority_of(url);
+    if bytes.find(auth, "@") >= 0 {
+        return "url.credentials";
+    }
+    let host = url_host(url);
+    if len(host) == 0 {
+        return "url.invalid";
+    }
+    if int_of(host[0]) == 91 {
+        if ipv6_class(host[1..len(host) - 1]) == 0 - 2 {
+            return "url.invalid";
+        }
+    } else if host_chars_ok(host) == false {
+        return "url.invalid";
+    }
+    let port = url_port(url);
+    if port < 0 {
+        return "url.invalid";
+    }
+    if port != 80 && port != 443 && port != 8080 && port != 8443 {
+        return "url.port";
+    }
+    return "";
+}
+
+// What the checker must say about the host of a URL before it resolves anything: 1 when the host is an address literal it must not reach, 0 when it is a name or a public
+// literal, -2 when it looks like an address literal and is not a valid one (`url.invalid`). Covers the dotted decimal, octal, hex and single-number IPv4 forms and IPv6 literals.
+pub fn literal_private[&h](host: &h [byte]) -> [] int {
+    if len(host) > 0 && int_of(host[0]) == 91 {
+        if len(host) < 3 {
+            return 0 - 2;
+        }
+        let c = ipv6_class(host[1..len(host) - 1]);
+        if c < 0 {
+            return c;
+        }
+        return c;
+    }
+    let packed = ipv4_loose(host);
+    if packed == 0 - 1 {
+        return 0;
+    }
+    if packed < 0 {
+        return packed;
+    }
+    if private_v4(packed) {
+        return 1;
+    }
+    return 0;
+}
+
+// The `repair` text of a refusal rule: what the caller should change. Empty for a rule this module does not know.
+pub fn repair_of[&r](rule: &r [byte]) -> [] &static [byte] {
+    if bytes.equal(rule, "url.invalid") {
+        return "Send a complete http or https URL, with a host, in the url parameter.";
+    }
+    if bytes.equal(rule, "url.scheme") {
+        return "Use a URL that starts with http:// or https://.";
+    }
+    if bytes.equal(rule, "url.credentials") {
+        return "Remove the user name and password from the URL.";
+    }
+    if bytes.equal(rule, "url.port") {
+        return "Use port 80, 443, 8080 or 8443, or leave the port out.";
+    }
+    if bytes.equal(rule, "target.private-address") {
+        return "Check a public address: private, loopback, link-local and reserved addresses are not checked.";
+    }
+    if bytes.equal(rule, "target.too-many-redirects") {
+        return "The target redirects more than five times; check the URL it finally leads to.";
+    }
+    if bytes.equal(rule, "rate.limited") {
+        return "Wait a minute and try again.";
+    }
+    if bytes.equal(rule, "check.timeout") {
+        return "The target did not answer in time; try again later.";
+    }
+    return "";
+}
