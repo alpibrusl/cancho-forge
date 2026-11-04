@@ -246,6 +246,12 @@ CANCHO="$C" sh spike/p4_check.sh "$scratch/p4" > "$scratch/p4.out" || fail=1
 cat "$scratch/p4.out"
 if grep -q '^FAIL ' "$scratch/p4.out"; then fail=1; fi
 
+echo "== audit TLS world (the vendored cancho TLS server on the audit's fixtures, seen from outside by openssl and curl; pilot/audit/tls_check.sh)"
+mkdir "$scratch/audit-tls" || exit 1
+CANCHO="$C" sh pilot/audit/tls_check.sh "$scratch/audit-tls" > "$scratch/audit-tls.out" || fail=1
+cat "$scratch/audit-tls.out"
+if grep -q '^FAIL ' "$scratch/audit-tls.out"; then fail=1; fi
+
 echo "== forge company change add (the operator's change requests and the admit: gate; tests/conformance/company_change_add.sh)"
 mkdir "$scratch/company-change-add" || exit 1
 CANCHO="$C" sh tests/conformance/company_change_add.sh "$scratch/company-change-add" > "$scratch/company-change-add.out" || fail=1

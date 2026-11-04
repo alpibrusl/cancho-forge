@@ -1,0 +1,512 @@
+// Vendored verbatim from cancho f4ead824, examples/https_hello/app.cho (EUPL-1.2, Copyright (c) 2026 Alpibru S.L., the same entity): the TLS server of the audit's test world (docs/pilot-audit.md section 3.1). No change.
+edition 6;
+module hello_app;
+
+// `https_hello`'s application: what the requests mean, and the bookkeeping for the one
+// answer that does not fit in a single `respond`. It knows nothing of TLS or sockets: it
+// is handed the `http.server` the loop feeds (`docs/http-server.md` §11) and answers
+// what it finds in hand.
+//
+//     GET  /                 hello
+//     GET  /hello/<name>     hello, <name>
+//     POST /echo             the body, if it is JSON, as `{"method":..,"path":..,"bytes":..,"json":<body>}`;
+//                            `400` if it is not
+//     GET  /big/<n>          n bytes, `a`..`z` repeating, held and streamed as the peer takes them
+//     POST /upload           a body of any size (up to the server's `--max-body`), read as it arrives and thrown away; answered
+//                            `{"bytes":<n>,"sha256":"<hex>"}` of what was received. `100 Continue` is sent when it is accepted
+//     POST /upload/refuse    refused with a `413` at once, whatever the body says: no `100 Continue`, no byte of the body read
+//
+// Anything else is `404`, and a known path with the wrong method is `405`. A body that does not fit the server's
+// buffer is only for `/upload`; anywhere else it is a `413`.
+//
+// **The big answer** is why `hold` and `stream` exist: the server buffers one connection's
+// answer up to its output room (64 KiB here), so a body of 100 MB is given to it in
+// pieces, as the connection can take them, while the request stays held (nothing behind
+// it is answered, the idle timeout does not close it for waiting, and it does close it for
+// a client that has stopped taking what was sent). `feed_streams` is that giving.
+//
+// **The upload** is the other direction of the same thing (`docs/http-server.md` §12): the request is `hold`ed, `proceed`ed, and
+// `feed_uploads` takes its body a piece at a time, hashing each, so a body of a gigabyte is read through a 16 KiB buffer. A piece it
+// has not taken is not read from the socket, which is how a slow application slows a fast client.
+
+import std.buffer;
+import std.crypto;
+import std.http;
+import std.json;
+import std.route;
+import http.server;
+
+// The longest body `/big/<n>` will send: 1 GiB.
+fn big_max() -> [] int {
+    return 1073741824;
+}
+
+fn r_root() -> [] int {
+    return 1;
+}
+
+fn r_hello() -> [] int {
+    return 2;
+}
+
+fn r_echo() -> [] int {
+    return 3;
+}
+
+fn r_big() -> [] int {
+    return 4;
+}
+
+fn r_upload() -> [] int {
+    return 5;
+}
+
+fn r_refuse() -> [] int {
+    return 6;
+}
+
+// The routes.
+pub fn routes[&h](heap: &!h Heap) -> [heap] route.Router {
+    var router = route.empty(heap);
+    router = route.add(heap, router, "GET", "/", r_root());
+    router = route.add(heap, router, "GET", "/hello/:name", r_hello());
+    router = route.add(heap, router, "POST", "/echo", r_echo());
+    router = route.add(heap, router, "GET", "/big/:n", r_big());
+    router = route.add(heap, router, "POST", "/upload", r_upload());
+    router = route.add(heap, router, "POST", "/upload/refuse", r_refuse());
+    return router;
+}
+
+// ---- The loop's table, one `[int]` ----
+//
+//     [0]                    the number of connections the server holds (`max`)
+//     [1]                    how many streams are going, [2] how many connections are marked
+//                            (so a turn with none of either does not walk the table)
+//     [8 + 4h ..]            server connection `h`'s stream: its ticket + 1 (0: none), the
+//                            bytes still to send, and how many have been sent
+//     [8 + 4max + h]         the TLS slot of server connection `h`, + 1 (0: none)
+//     [8 + 5max + h]         1 if `h` has something for the loop to move to its TLS slot
+//     [3]                    how many uploads are going
+//     [8 + 6max + 144h ..]   server connection `h`'s upload: its ticket + 1 (0: none), the bytes taken, keep-alive, its kind (1: an upload to be
+//                            hashed, 2: an echo to be answered when its body has all come), then (from 6) a SHA-256 state
+
+pub fn upload_stride() -> [] int {
+    return 144;
+}
+
+pub fn table_len(max: int) -> [] int {
+    return 8 + 6 * max + upload_stride() * max;
+}
+
+pub fn table_init[&a](ap: &!a [int], max: int) -> [] int {
+    ap[0] = max;
+    return 0;
+}
+
+// Server connection `hs` belongs to TLS slot `slot`.
+pub fn link[&a](ap: &!a [int], hs: int, slot: int) -> [] int {
+    ap[8 + 4 * ap[0] + hs] = slot + 1;
+    return 0;
+}
+
+// The TLS slot of `hs`, or -1.
+pub fn slot_of[&a](ap: &a [int], hs: int) -> [] int {
+    return ap[8 + 4 * ap[0] + hs] - 1;
+}
+
+// `hs` is gone: its stream, if any, is forgotten.
+pub fn unlink[&a](ap: &!a [int], hs: int) -> [] int {
+    ap[8 + 4 * ap[0] + hs] = 0;
+    if ap[8 + 5 * ap[0] + hs] == 1 {
+        ap[2] = ap[2] - 1;
+    }
+    ap[8 + 5 * ap[0] + hs] = 0;
+    if ap[8 + 4 * hs] != 0 {
+        ap[1] = ap[1] - 1;
+    }
+    ap[8 + 4 * hs] = 0;
+    ap[8 + 4 * hs + 1] = 0;
+    ap[8 + 4 * hs + 2] = 0;
+    if ap[8 + 6 * ap[0] + upload_stride() * hs] != 0 {
+        ap[3] = ap[3] - 1;
+    }
+    ap[8 + 6 * ap[0] + upload_stride() * hs] = 0;
+    return 0;
+}
+
+pub fn touch[&a](ap: &!a [int], hs: int) -> [] int {
+    if ap[8 + 5 * ap[0] + hs] == 0 {
+        ap[8 + 5 * ap[0] + hs] = 1;
+        ap[2] = ap[2] + 1;
+    }
+    return 0;
+}
+
+// How many connections are marked.
+pub fn touched[&a](ap: &a [int]) -> [] int {
+    return ap[2];
+}
+
+// Was `hs` touched since this was last asked? Clears it.
+pub fn take_touched[&a](ap: &!a [int], hs: int) -> [] bool {
+    let was = ap[8 + 5 * ap[0] + hs];
+    if was == 1 {
+        ap[8 + 5 * ap[0] + hs] = 0;
+        ap[2] = ap[2] - 1;
+    }
+    return was == 1;
+}
+
+// How many streams are going.
+pub fn streaming[&a](ap: &a [int]) -> [] int {
+    return ap[1];
+}
+
+// ---- Answers ----
+
+// `{"method":m,"path":p,"bytes":n,"json":body}`, `body` being a JSON value.
+fn echo_json[&h, &m, &p, &b](heap: &!h Heap, out: buffer.Buffer, method: &m [byte], path: &p [byte], body: &b [byte], keep: bool) -> [heap] buffer.Buffer {
+    var w = json.writer(heap, 128);
+    w = json.begin_object(heap, w);
+    w = json.put_key(heap, w, "method");
+    w = json.put_string(heap, w, method);
+    w = json.put_key(heap, w, "path");
+    w = json.put_string(heap, w, path);
+    w = json.put_key(heap, w, "bytes");
+    w = json.put_int(heap, w, len(body));
+    w = json.put_key(heap, w, "json");
+    w = json.put_fragment(heap, w, body);
+    w = json.end_object(heap, w);
+    let text = json.finish(w);
+    var answer = out;
+    borrow text as &tb in {
+        answer = server.reply(heap, answer, 200, buffer.bytes(tb), keep);
+    }
+    buffer.drop(heap, text);
+    return answer;
+}
+
+// Is `body` one JSON value? (`put_fragment` traps on anything else, so it is asked first.)
+fn is_json[&h, &b](heap: &!h Heap, body: &b [byte]) -> [heap] bool {
+    let tape = box_slice(heap, json.tape_len(body) + 3, 0);
+    var nodes = 0;
+    borrow mut tape as &!tw in {
+        nodes = json.parse(body, contents(tw));
+    }
+    unbox_slice(heap, tape);
+    return nodes > 0;
+}
+
+// What one request in hand turns into. Answers the answer for a request that is answered at
+// once, and, for `/big/<n>`, the answer's head with `big` set to `n` (or -1).
+fn answer_for[&h, &s, &r, &p, &a](heap: &!h Heap, srv: &s server.Server, router: &r route.Router, params: &!p [int], out: buffer.Buffer, big: &!a [int]) -> [heap] buffer.Buffer {
+    let head = server.head(srv);
+    let table = server.parsed(srv);
+    let path = http.path(head, table);
+    let method = http.method(head, table);
+    let keep = http.keeps_alive(table);
+    big[0] = 0 - 1;
+    big[1] = 0;
+    big[2] = 0;
+    if keep {
+        big[2] = 1;
+    }
+    let id = route.find(router, method, path, params);
+    if server.streaming(srv) && id == r_echo() {
+        // The echo needs its body whole: it is held, left in the buffer as it arrives, and answered when it has all come
+        // (`feed_uploads`), or refused if it will not fit.
+        big[1] = 2;
+        return out;
+    }
+    if server.streaming(srv) && id != r_upload() && id != r_refuse() {
+        // A body that does not fit the buffer, for a route that would have to hold it whole.
+        return server.failure(heap, out, 413, "the body is too large for this route", false);
+    }
+    var answer = out;
+    if id == r_root() {
+        answer = server.reply_as(heap, answer, 200, "text/plain", "hello over TLS\n", keep, "");
+    } else if id == r_hello() {
+        var text = buffer.append(heap, buffer.empty(heap, 64), "hello, ");
+        text = buffer.append(heap, text, route.param(path, params, 0));
+        text = buffer.append(heap, text, "\n");
+        borrow text as &tb in {
+            answer = server.reply_as(heap, answer, 200, "text/plain", buffer.bytes(tb), keep, "");
+        }
+        buffer.drop(heap, text);
+    } else if id == r_echo() {
+        let body = server.body(srv);
+        if is_json(heap, body) {
+            answer = echo_json(heap, answer, method, path, body, keep);
+        } else {
+            answer = server.failure(heap, answer, 400, "the body is not one JSON value", keep);
+        }
+    } else if id == r_big() {
+        let n = route.param_nat(path, params, 0);
+        if n < 0 || n > big_max() {
+            answer = server.failure(heap, answer, 400, "the length is not a number up to 1073741824", keep);
+        } else {
+            big[0] = n;
+            answer = http.respond_head(heap, answer, 200, "application/octet-stream", n, keep);
+        }
+    } else if id == r_upload() {
+        // Held, told to go ahead and read as it comes (`feed_uploads`); the answer is made when the body has ended.
+        big[1] = 1;
+    } else if id == r_refuse() {
+        answer = server.failure(heap, answer, 413, "this route takes no body", keep);
+    } else if id == 0 - 2 {
+        answer = server.failure_with(heap, answer, 405, "method not allowed", keep, "Allow: GET, POST\r\n");
+    } else {
+        answer = server.failure(heap, answer, 404, "no such path", keep);
+    }
+    return answer;
+}
+
+// Answers up to `limit` of the requests the server has in hand, and answers how many.
+// Each connection that was answered (or whose stream began) is marked for the loop to move
+// its bytes to the TLS engine.
+// `out` is the loop's scratch for building an answer: it comes back empty.
+pub fn handle[&h, &s, &r, &p, &a, &g](heap: &!h Heap, srv: &!s server.Server, router: &r route.Router, params: &!p [int], scratch: buffer.Buffer, ap: &!a [int], big: &!g [int], limit: int) -> [heap, conn_write, poll] (buffer.Buffer, int) {
+    var out = scratch;
+    var done = 0;
+    var going = true;
+    while going && done < limit {
+        let hs = server.next(heap, srv);
+        if hs < 0 {
+            going = false;
+        } else {
+            out = answer_for(heap, srv, router, params, out, big);
+            if big[0] >= 0 {
+                // The head goes in now (it is a few hundred bytes and the output room is
+                // empty: a request is only handed out when nothing is waiting); the body
+                // follows from `feed_streams`.
+                let ticket = server.hold(srv);
+                borrow out as &ob in {
+                    server.stream(srv, ticket, buffer.bytes(ob));
+                }
+                ap[8 + 4 * hs] = ticket + 1;
+                ap[1] = ap[1] + 1;
+                ap[8 + 4 * hs + 1] = big[0];
+                ap[8 + 4 * hs + 2] = 0;
+            } else if big[1] >= 1 {
+                let ticket = server.hold(srv);
+                server.proceed(srv, ticket);
+                start_upload(ap, hs, ticket, big[2], big[1]);
+            } else {
+                borrow out as &ob in {
+                    server.respond(srv, buffer.bytes(ob));
+                }
+            }
+            borrow mut out as &!ow in {
+                buffer.clear(ow);
+            }
+            touch(ap, hs);
+            done = done + 1;
+        }
+    }
+    return (out, done);
+}
+
+// Gives every stream as many more bytes as its connection has room for, and ends the ones
+// that have sent them all (`answer` with nothing more: the request is answered, and what
+// was pipelined behind it is served). `chunk` is the scratch the bytes are made in.
+// Answers how many bytes were given.
+pub fn feed_streams[&s, &a, &c](srv: &!s server.Server, ap: &!a [int], chunk: &!c [byte]) -> [poll, conn_write] int {
+    var given = 0;
+    var hs = 0;
+    if ap[1] == 0 {
+        return 0;
+    }
+    while hs < ap[0] {
+        let at = 8 + 4 * hs;
+        if ap[at] != 0 {
+            let ticket = ap[at] - 1;
+            var going = true;
+            while going && ap[at + 1] > 0 {
+                var want = server.space(srv, hs);
+                if want > ap[at + 1] {
+                    want = ap[at + 1];
+                }
+                if want > len(chunk) {
+                    want = len(chunk);
+                }
+                if want == 0 {
+                    going = false;
+                } else {
+                    // Byte `j` of the body is `a` + `j` mod 26.
+                    var phase = ap[at + 2] % 26;
+                    var i = 0;
+                    while i < want {
+                        chunk[i] = byte_of(97 + phase);
+                        phase = phase + 1;
+                        if phase == 26 {
+                            phase = 0;
+                        }
+                        i = i + 1;
+                    }
+                    let n = server.stream(srv, ticket, chunk[0..want]);
+                    if n < 0 {
+                        // The connection is gone.
+                        ap[at] = 0;
+                        ap[at + 1] = 0;
+                        ap[1] = ap[1] - 1;
+                        going = false;
+                    } else {
+                        ap[at + 1] = ap[at + 1] - n;
+                        ap[at + 2] = ap[at + 2] + n;
+                        given = given + n;
+                        touch(ap, hs);
+                    }
+                }
+            }
+            if ap[at] != 0 && ap[at + 1] == 0 {
+                server.answer(srv, ticket, "");
+                ap[at] = 0;
+                ap[1] = ap[1] - 1;
+                touch(ap, hs);
+            }
+        }
+        hs = hs + 1;
+    }
+    return given;
+}
+
+// ---- Uploads ----
+
+// `hs`'s request, held under `ticket`, is an upload: its body will be hashed as it comes.
+fn start_upload[&a](ap: &!a [int], hs: int, ticket: int, keep: int, kind: int) -> [] int {
+    let at = 8 + 6 * ap[0] + upload_stride() * hs;
+    ap[at] = ticket + 1;
+    ap[at + 1] = 0;
+    ap[at + 2] = keep;
+    ap[at + 3] = kind;
+    crypto.sha256_init(ap[at + 6..at + upload_stride()]);
+    ap[3] = ap[3] + 1;
+    return 0;
+}
+
+fn hex_digit(d: int) -> [] int {
+    if d < 10 {
+        return 48 + d;
+    }
+    return 87 + d;
+}
+
+// `digest` in lower-case hex, appended to `b`.
+fn push_digest[&h, &d](heap: &!h Heap, b: buffer.Buffer, digest: &d [byte]) -> [heap] buffer.Buffer {
+    var out = b;
+    var i = 0;
+    while i < len(digest) {
+        out = buffer.push(heap, out, byte_of(hex_digit(int_of(digest[i]) / 16)));
+        out = buffer.push(heap, out, byte_of(hex_digit(int_of(digest[i]) % 16)));
+        i = i + 1;
+    }
+    return out;
+}
+
+// `{"bytes":<n>,"sha256":"<hex>"}`, answered to `ticket`.
+fn answer_upload[&h, &s, &a](heap: &!h Heap, srv: &!s server.Server, ap: &!a [int], at: int, ticket: int) -> [heap, conn_write, poll] int {
+    var sent = 0 - 1;
+    region r {
+        let digest = alloc_slice[r](32, byte_of(0));
+        crypto.sha256_final(ap[at + 6..at + upload_stride()], digest);
+        var text = buffer.append(heap, buffer.empty(heap, 128), "{\"bytes\":");
+        text = buffer.push_nat(heap, text, ap[at + 1]);
+        text = buffer.append(heap, text, ",\"sha256\":\"");
+        text = push_digest(heap, text, digest);
+        text = buffer.append(heap, text, "\"}");
+        var out = buffer.empty(heap, 256);
+        borrow text as &tb in {
+            out = server.reply_as(heap, out, 200, "application/json", buffer.bytes(tb), ap[at + 2] == 1, "");
+        }
+        borrow out as &ob in {
+            sent = server.answer(srv, ticket, buffer.bytes(ob));
+        }
+        buffer.drop(heap, text);
+        buffer.drop(heap, out);
+    }
+    return sent;
+}
+
+// An echo held until its body has all come: answered with it if it is JSON, refused if it is not or if it will not fit the buffer; otherwise
+// left as it is, to be looked at again. (The body stays in the server's buffer: nothing is taken.)
+fn answer_whole[&h, &s, &a](heap: &!h Heap, srv: &!s server.Server, ap: &!a [int], at: int, ticket: int) -> [heap, conn_write, poll] int {
+    let state = server.body_state(srv, ticket);
+    let keep = ap[at + 2] == 1;
+    var out = buffer.empty(heap, 256);
+    var ended = false;
+    if state < 0 {
+        ended = true;
+    } else if state == 1 {
+        let body = server.body_part(srv, ticket);
+        if is_json(heap, body) {
+            out = echo_json(heap, out, "POST", "/echo", body, keep);
+        } else {
+            out = server.failure(heap, out, 400, "the body is not one JSON value", keep);
+        }
+        ended = true;
+        borrow out as &ob in {
+            server.answer(srv, ticket, buffer.bytes(ob));
+        }
+    } else if len(server.body_part(srv, ticket)) >= 16384 {
+        // The buffer is full and the body is not over: it will never be whole.
+        out = server.failure(heap, out, 413, "the body is too large for this route", false);
+        ended = true;
+        borrow out as &ob in {
+            server.answer(srv, ticket, buffer.bytes(ob));
+        }
+    }
+    buffer.drop(heap, out);
+    if ended {
+        ap[at] = 0;
+        ap[3] = ap[3] - 1;
+    }
+    return 0;
+}
+
+// Takes every piece of every upload that has one, hashing it, and answers the uploads whose bodies have ended. Each connection
+// that gave up bytes is marked, so the loop reads more for it. Answers how many bytes were taken.
+pub fn feed_uploads[&h, &s, &a](heap: &!h Heap, srv: &!s server.Server, ap: &!a [int]) -> [heap, conn_write, poll] int {
+    var taken = 0;
+    var hs = 0;
+    if ap[3] == 0 {
+        return 0;
+    }
+    while hs < ap[0] {
+        let at = 8 + 6 * ap[0] + upload_stride() * hs;
+        if ap[at] != 0 {
+            let ticket = ap[at] - 1;
+            var going = true;
+            while going && ap[at + 3] == 2 {
+                going = false;
+                answer_whole(heap, srv, ap, at, ticket);
+                touch(ap, hs);
+            }
+            while going {
+                let n = len(server.body_part(srv, ticket));
+                if n > 0 {
+                    crypto.sha256_update(ap[at + 6..at + upload_stride()], server.body_part(srv, ticket));
+                    ap[at + 1] = ap[at + 1] + n;
+                    taken = taken + n;
+                    server.body_take(srv, ticket, n);
+                    touch(ap, hs);
+                } else {
+                    going = false;
+                    let state = server.body_state(srv, ticket);
+                    if state == 1 {
+                        answer_upload(heap, srv, ap, at, ticket);
+                        ap[at] = 0;
+                        ap[3] = ap[3] - 1;
+                        touch(ap, hs);
+                    } else if state < 0 {
+                        // The server ended it (a refusal, a timeout, the client went): there is nothing to answer.
+                        ap[at] = 0;
+                        ap[3] = ap[3] - 1;
+                        touch(ap, hs);
+                    }
+                }
+            }
+        }
+        hs = hs + 1;
+    }
+    return taken;
+}
