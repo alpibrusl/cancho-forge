@@ -97,6 +97,18 @@ are small, reviewable text and not 40 copies of a program.
 
 *Measure (T3, T4):* `pilot/audit/self_check.sh` builds the reference and passes if **the reference scores N/N and every mutant scores below N/N**, naming the cases that caught each; a mutant nothing catches is printed as a hole in the audit and fails the check.
 
+### 5.1 T3 as built so far: the pure core *(measured)*
+
+T3 is cut in three: **R1** the pure core (done), **R2** the fetcher (resolve over UDP with the stub, connect to the literal address, redirects, the 64 KiB cap, phase times, the TLS probe), **R3** the server (`checker serve ...`, `/health`, `/check`, the rate limiter, the JSON answer). Only when R3 is in can `self_check.sh` run the reference against `cases.txt`.
+
+`pilot/audit/reference/checker.cho` (`module checker`, no network, no clock, total) holds the functions `pilot/contract.cho` pins and what they stand on: `verdict_of`, `verdict_name`, `private_v4`, `url_rule`, `repair_of`, and `url_host`, `url_port`, `url_is_https`, `url_target`, `ipv4_loose` (decimal, octal and hex forms, one to four parts, as `inet_aton`), `ipv6_class` and `literal_private` (every way to write loopback is loopback). 10 unit tests, `tests/checker_test.cho`, in the gate, with the boundary on both sides of every private range.
+
+Decisions this forced, for the board to confirm in the contract:
+
+* **Documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) are public** to `private_v4`: the audit's "public-looking" address is 203.0.113.7. 0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.168/16, 224/4 and 240/4 are refused.
+* **`--allow-loopback` lifts the port list for loopback too.** `url_rule` is the contract's pure port list (80, 443, 8080, 8443); the world listens on arbitrary ports, so with the setting on the server accepts any port for a loopback literal and for nothing else. Without this every verdict case would be `url.port`. Found by the first test of `url_rule` on `http://127.0.0.1:41001/`.
+* **A public IPv6 literal is `url.invalid`'s sibling, not checked**: the reference connects over IPv4 only; a private one is `target.private-address`, a well-formed public one is answered `url.invalid` with the repair "use an IPv4 address or a name" (decided in R2).
+
 ## 6. Where it runs, what it costs, what can go wrong *(designed)*
 
 * `audit_checker.sh <artifact> <execution dir>` builds nothing it does not have to: it starts the stub resolver, then one world process per case, then the artifact, runs the driver, and prints the cases that failed on **standard error** and the single line `TOTAL a/b` **last on standard output**. The artifact's

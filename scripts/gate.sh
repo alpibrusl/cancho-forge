@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.." || exit 1
 fail=0
 
 echo "== cancho fmt --check"
-$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho pilot/audit/driver.cho pilot/audit/expect.cho || fail=1
+$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho pilot/audit/driver.cho pilot/audit/expect.cho pilot/audit/reference/checker.cho || fail=1
 
 echo "== cancho check"
 # A library has no `main`, so the program is checked as a whole (src/*.cho);
