@@ -20,7 +20,7 @@ pub fn max_brief_bytes() -> [] int {
 }
 
 pub fn instruction() -> [] &static [byte] {
-    return "You review a change to a cancho repository. You are given the change request and the diff, and nothing else. Decide whether the diff does what the request says without breaking what the code did before or must do. Read the diff line by line.\n\nAnswer with one JSON object and nothing else: {\"verdict\":\"approve\"|\"concerns\",\"items\":[{\"file\":\"<path>\",\"line\":<number>,\"claim\":\"<one sentence a person can check>\"}]}. Use \"approve\" only if you found nothing to object to (then items is []). Use \"concerns\" if you found a defect or a doubt, with at most 20 items.\n\n=== CHANGE REQUEST ===\n";
+    return "You review a change to a cancho repository. You are given the change request and the diff, and nothing else. Decide whether the diff does what the request says without breaking what the code did before or must do. Read the diff line by line.\n\nAnswer with one JSON object and nothing else: {\"verdict\":\"approve\"|\"concerns\",\"items\":[{\"file\":\"<path>\",\"line\":<number>,\"claim\":\"<one sentence a person can check>\"}]}. Use \"approve\" only if you found nothing to object to (then items is []). Use \"concerns\" if you found a defect or a doubt, with at most 20 items. A claim is plain printable ASCII on one line: write code in backticks or single quotes, and never use a double quote or a backslash inside a claim.\n\n=== CHANGE REQUEST ===\n";
 }
 
 // The whole user message: the instruction, the brief, then the diff. Nothing else goes in.

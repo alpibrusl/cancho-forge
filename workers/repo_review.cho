@@ -480,6 +480,17 @@ fn review[&h, &i, &f, &n, &c, &r, &k, &e, &y, &m, &o](heap: &!h Heap, io: &!i Io
                 if answered == false {
                     rc = fail(heap, io, request_id, task_id, "review-unavailable", "the provider could not be reached or trusted");
                 } else if len(review_prompt.answer_failure(status, cut, text_n)) > 0 {
+                    // A provider that ANSWERED 200 has charged for the tokens whatever happens to the reply (cut at `max_tokens`, no text): the usage is written before the failure, so
+                    // Forge records the spend (docs/review-step.md section 5.3). A status other than 200 carries no usage and charges nothing.
+                    if status == 200 {
+                        let usage_file = under(heap, exec_dir, "usage.jsonl");
+                        borrow usage_file as &uf in {
+                            borrow usage as &ub in {
+                                write_file(fs, buffer.bytes(uf), buffer.bytes(ub));
+                            }
+                        }
+                        buffer.drop(heap, usage_file);
+                    }
                     rc = fail(heap, io, request_id, task_id, review_prompt.answer_failure(status, cut, text_n), review_prompt.answer_message(status, cut, text_n));
                 } else {
                     borrow prompt_sha as &ps in {
