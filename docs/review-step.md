@@ -1,6 +1,6 @@
 # The model review as a step: `repo.review`
 
-**Status: slices RV1 and RV2 built (the verdict parser, the operator `review` form check, the task type and `review_step.preflight`; no runner, so a `repo.review` step is still refused `task-type-unsupported` where it would run). RV2 is the worker (offline-measured, section 5); RV3 and RV4 are design.** Written before the code (`CONTRIBUTING.md`). Every claim marked *(designed)* is a proposal; one marked *(read)* was read from the source or document
+**Status: slices RV1, RV2 and RV3 built (the verdict parser, the operator `review` form check, the task type and `review_step.preflight`; the worker, offline-measured, section 5; the Forge runner `Runner::Review`, section 9). RV4 is measured once (section 5.2) and open until the review has run on the pilot's own changes.** Written before the code (`CONTRIBUTING.md`). Every claim marked *(designed)* is a proposal; one marked *(read)* was read from the source or document
 named; each *measure* is a case that must exist before this document says it is true. It is step 4 of the order in [`reviewer.md`](reviewer.md) section 6, and it builds only what
 that document's section 3 and section 9 allow: **a review that is recorded and shown and counts for nothing.**
 
@@ -151,3 +151,10 @@ Tags *(designed)*: `review-step-invalid`, `review-not-granted`, `review-diff-too
 2. **Which model by default?** None: the operator names it, and the price table must price it. The measured candidate is Sonnet 5.5.
 3. **A per-company cap on review spend apart from the build budget?** Proposed: no; the company's `max_cost` covers it. A review costs about $0.003 on a diff of this repository's size (R-1: $0.22 for 42 calls, priced high).
 4. **Should the verdict be shown in `pr.md`?** Proposed: yes, as a clearly marked advisory block, after the authority line; a person who reads the PR sees it. Not built until RV3 has run.
+
+## 9. RV3 as built *(measured)*
+
+`Runner::Review` (`company_step.cho`), the step `company_review_step.review_step` and the call `review_call.run_step`, by the shape of the change step and of `repo_call`. `company_runner.cho` was split first (no behaviour change: 1,984 to 1,567 lines; the shared helpers are `company_run_io.cho`, the `repo.authority` and `repo.publish` runners `company_repo_steps.cho`). `tests/conformance/company_review.sh` runs it end to end, in the gate, against a stand-in worker (`scripts/standin_repo_review.sh`, no network): approve, concerns (accepted and every item printed), a reply that is not a verdict and one in a code fence (held `review-unparsed`, the tokens still recorded), a failed worker and a missing reply (held `review-unavailable`), a patch over the bound (held `review-diff-too-large`, the worker never called), no `review` grant, an unpriced model, and a second run that admits and calls nothing again.
+
+What differs from the design of section 6, corrected here: **no `company.step.reviewed` record** in this slice. The verdict is in `review.json`, the artifact the accepted record names and hashes, so `status` shows the step accepted and not its verdict; a record and a `status` column are the next small slice if the person needs the verdict at a glance. The price is read before admission as section 6 point 1 says (`price-table-missing`), for the operator's review provider and model, not the manifest's.
+
