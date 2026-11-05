@@ -111,7 +111,7 @@ T3 is cut in three: **R1** the pure core (done), **R2** the fetcher (resolve ove
 
 What running the reference found, all fixed in the audit and not in the reference: the first run scored 13 of 21 of the starter set, because (1) a world was not yet listening when the candidate's request reached it, so `audit_checker.sh` now waits for every world's `listening` line, and (2) `r07` asked for `http://127.0.0.1:<arbitrary port>/` with the loopback setting off, which a correct checker may refuse as `url.port` or as `target.private-address`: an ambiguous case, now `http://127.0.0.1:8080/`. The 71-case run then scored 70: `t07` (a TLS URL on a port that speaks plain HTTP) used a world that waited for a request the TLS client never sends, so a correct checker could only time out; the world has an `eager` mode that speaks first, as a plain HTTP server does. And the stand-in check had predicted the canned-up candidate would pass 3 cases; it passes the 8 whose spec is a 200 and `up` and nothing else (`p00 p03 p05 v02 v03 l01 l06 l07`), each checked by reading its spec. The gate runs 12 of the 71 for the three stand-ins (the 8 plus 4 it fails: the full run takes ten minutes, dead candidate's waits dominating) and `FULL=1` runs all; the full run was measured once, after this change: 8 of 71, 0 of 71, and the noisy candidate's `TOTAL 99/99` still not on the audit's standard output.
 
-Not yet: the audit's wall time and the gate's, and the board's reading of the table (T6).
+Measured (T5): the reference through all 77 cases, build included, takes 236 s on a Mac; the CI gate of the PR that added R3 ran 18m48s against 9 to 10 minutes before the audit. Not yet: the board's reading of the table (T6).
 
 ### 5.2 T4, the mutants *(measured)*
 
