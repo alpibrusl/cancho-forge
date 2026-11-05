@@ -75,6 +75,20 @@ fn print_items[&h, &i, &r](heap: &!h Heap, io: &!i Io, reply: &r [byte]) -> [hea
     return 0;
 }
 
+// The number of items of a validated reply.
+fn count_items[&h, &r](heap: &!h Heap, reply: &r [byte]) -> [heap] int {
+    var n = 0;
+    let tape = box_slice(heap, json.tape_len(reply), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(reply, tp) > 0 {
+            n = json.count(tp, json.get(reply, tp, 0, "items"));
+        }
+    }
+    unbox_slice(heap, tape);
+    return n;
+}
+
 // `review.json`, the artifact Forge hashes: the verdict, the model, the SHA-256 of the reply and the reply itself, which `review_verdict` validated (printable ASCII, no escape).
 fn review_json[&h, &m, &r](heap: &!h Heap, verdict: int, model: &m [byte], reply: &r [byte]) -> [heap] buffer.Buffer {
     var b = buffer.append(heap, buffer.empty(heap, 256), "{\"schema\":\"forge-review/1\",\"verdict\":\"");
@@ -250,8 +264,21 @@ fn review_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &w, &e](heap: &!h Heap
         if hwhy != 0 {
             code = company_run_io.refuse_artifact(heap, fs, io, jpath, id, buffer.bytes(wb), hwhy, next);
         } else {
-            borrow sha as &hb in {
-                code = company_run_io.record_buffer(heap, fs, io, jpath, company_state.accepted(heap, next, id, buffer.bytes(wb), buffer.bytes(hb)), false);
+            // The verdict is journaled before the acceptance (docs/review-step.md section 6, point 3); a crash between the two leaves the step unaccepted, so the next run asks again.
+            var word = "concerns";
+            if verdict == review_verdict.approve() {
+                word = "approve";
+            }
+            var count = 0;
+            borrow reply as &yb in {
+                count = count_items(heap, buffer.bytes(yb));
+            }
+            code = company_run_io.record_buffer(heap, fs, io, jpath, company_state.reviewed(heap, next, id, word, count, field(op, tp, "model")), false);
+            if code == 0 {
+                next = next + 1;
+                borrow sha as &hb in {
+                    code = company_run_io.record_buffer(heap, fs, io, jpath, company_state.accepted(heap, next, id, buffer.bytes(wb), buffer.bytes(hb)), false);
+                }
             }
             if code == 0 {
                 company_run_io.say(io, "accepted: ", id);

@@ -303,3 +303,24 @@ fn test_status_json_a_retried_step_is_ready_and_keeps_its_last_score[&h](heap: &
     buffer.drop(heap, j);
     return 0;
 }
+
+// A step a model reviewed shows its verdict in the text (`review=approve`, `review=concerns:N`) and, in the JSON, a `review` object after `failed_check`; a step nobody reviewed shows nothing (the key is absent).
+fn test_status_shows_the_verdict_of_a_reviewed_step_and_only_that[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 1024);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    j = add(heap, j, company_state.reviewed(heap, 2, "a", "concerns", 2, "m"));
+    j = add(heap, j, company_state.accepted(heap, 3, "a", "review.json", "ab"));
+    j = add(heap, j, company_state.reviewed(heap, 4, "d", "approve", 0, "m"));
+    borrow j as &jb in {
+        test.assert(want(heap, buffer.bytes(jb), "a accepted review=concerns:2\nb ready\nc waiting\nd ready review=approve\ne gated\nspend: input 0 output 0 cache_write 0 cache_read 0\nopen gates: h\n"));
+        let doc = json_of(heap, buffer.bytes(jb));
+        borrow doc as &db in {
+            test.assert(bytes.find(buffer.bytes(db), "\"failed_check\":null,\"review\":{\"verdict\":\"concerns\",\"items\":2}}") >= 0);
+            test.assert(bytes.find(buffer.bytes(db), "\"failed_check\":null,\"review\":{\"verdict\":\"approve\",\"items\":0}}") >= 0);
+            test.assert(bytes.find(buffer.bytes(db), "{\"id\":\"b\",\"role\":\"qa\",\"state\":\"ready\",\"held\":null,\"gate\":null,\"artifact\":null,\"failed_check\":null}") >= 0);
+        }
+        buffer.drop(heap, doc);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}

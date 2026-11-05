@@ -1031,3 +1031,89 @@ fn test_a_repo_or_patch_refusal_holds_the_step_as_change_refused[&h](heap: &!h H
     test.assert(bytes.equal(company_state.held_name(5), "change-refused"));
     return 0;
 }
+
+// The verdict of a model reviewer: the last record of a step wins, `approve` has no item and `concerns` has some, and a step outside the manifest is (0, 0).
+fn review_probe[&h, &t](heap: &!h Heap, text: &t [byte], step: int) -> [heap] (int, int, int) {
+    var rule = 0 - 1;
+    var verdict = 0 - 1;
+    var items = 0 - 1;
+    match company_manifest.parse(heap, manifest_text()) {
+        company_manifest.ManifestResult::Held(m) => {
+            borrow m as &mr in {
+                let s = company_state.replay(heap, text, mr);
+                borrow s as &sr in {
+                    rule = company_state.report_of(sr).rule;
+                    let (v, n) = company_state.review_of(sr, step);
+                    verdict = v;
+                    items = n;
+                }
+                company_state.drop(heap, s);
+            }
+            company_manifest.drop(heap, m);
+        }
+        company_manifest.ManifestResult::Refused(r) => {
+            test.assert(false);
+        }
+    }
+    return (rule, verdict, items);
+}
+
+fn test_a_reviewed_record_replays_as_the_steps_verdict[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.reviewed(heap, 1, "a", "concerns", 3, "m1"));
+    j = add(heap, j, company_state.reviewed(heap, 2, "b", "approve", 0, "m1"));
+    j = add(heap, j, company_state.reviewed(heap, 3, "a", "approve", 0, "m2"));
+    borrow j as &jb in {
+        let (ra, va, na) = review_probe(heap, buffer.bytes(jb), 0);
+        test.assert_eq(ra, 0);
+        test.assert_eq(va, 1);
+        test.assert_eq(na, 0);
+        let (rb, vb, nb) = review_probe(heap, buffer.bytes(jb), 1);
+        test.assert_eq(vb, 1);
+        let (rc, vc, nc) = review_probe(heap, buffer.bytes(jb), 2);
+        test.assert_eq(vc, 0);
+        let (rd, vd, nd) = review_probe(heap, buffer.bytes(jb), 0 - 1);
+        test.assert_eq(vd, 0);
+        let (re, ve, ne) = review_probe(heap, buffer.bytes(jb), 99);
+        test.assert_eq(ve, 0);
+    }
+    buffer.drop(heap, j);
+    var k = buffer.empty(heap, 256);
+    k = add(heap, k, company_state.reviewed(heap, 1, "c", "concerns", 3, "m1"));
+    borrow k as &kb in {
+        let (r, v, n) = review_probe(heap, buffer.bytes(kb), 2);
+        test.assert_eq(r, 0);
+        test.assert_eq(v, 2);
+        test.assert_eq(n, 3);
+    }
+    buffer.drop(heap, k);
+    return 0;
+}
+
+fn test_a_reviewed_record_that_contradicts_itself_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
+    var a = buffer.empty(heap, 256);
+    a = add(heap, a, company_state.reviewed(heap, 1, "a", "approve", 2, "m"));
+    borrow a as &ab in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(ab)), "event-malformed"));
+    }
+    buffer.drop(heap, a);
+    var b = buffer.empty(heap, 256);
+    b = add(heap, b, company_state.reviewed(heap, 1, "a", "concerns", 0, "m"));
+    borrow b as &bb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(bb)), "event-malformed"));
+    }
+    buffer.drop(heap, b);
+    var c = buffer.empty(heap, 256);
+    c = add(heap, c, company_state.reviewed(heap, 1, "a", "fine", 0, "m"));
+    borrow c as &cb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(cb)), "event-malformed"));
+    }
+    buffer.drop(heap, c);
+    var d = buffer.empty(heap, 256);
+    d = add(heap, d, company_state.reviewed(heap, 1, "zz", "approve", 0, "m"));
+    borrow d as &db in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(db)), "event-malformed"));
+    }
+    buffer.drop(heap, d);
+    return 0;
+}
