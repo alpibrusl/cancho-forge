@@ -1,0 +1,344 @@
+# The audit's mutants (docs/pilot-audit.md section 5.2). One block each: what the fault is, the file, the text it replaces (exactly once), its replacement, and the cases that must notice it.
+
+mutant m02
+what a 410 answer is degraded
+file checker.cho
+from status >= 400 && status != 404 && status != 410
+to status >= 400 && status != 404
+catch v03
+
+mutant m03
+what a 404 answer is degraded
+file checker.cho
+from status >= 400 && status != 404 && status != 410
+to status >= 400 && status != 410
+catch v02
+
+mutant m04
+what a 403 answer is up
+file checker.cho
+from status >= 400 && status != 404 && status != 410
+to status >= 404 && status != 404 && status != 410
+catch v06
+
+mutant m05
+what the expiry boundary at 15 days
+file checker.cho
+from days_left < 14 ||
+to days_left < 15 ||
+catch t06
+
+mutant m06
+what the expiry boundary at 13 days
+file checker.cho
+from days_left < 14 ||
+to days_left < 13 ||
+catch t08
+
+mutant m07
+what degraded for a 3 s answer
+file checker.cho
+from total_ms > 5000
+to total_ms > 3000
+catch l01
+
+mutant m08
+what up for a 6 s answer
+file checker.cho
+from total_ms > 5000
+to total_ms > 8000
+catch v09
+
+mutant m09
+what the word degraded is down
+file checker.cho
+from return "degraded";
+to return "down";
+catch v04
+
+mutant m10
+what multicast is public
+file checker.cho
+from a == 0 || a == 10 || a == 127 || a >= 224
+to a == 0 || a == 10 || a == 127 || a >= 225
+catch r33
+
+mutant m11
+what 10/8 is public
+file checker.cho
+from a == 0 || a == 10 || a == 127 || a >= 224
+to a == 0 || a == 127 || a >= 224
+catch r26
+
+mutant m12
+what 0.0.0.0 is public
+file checker.cho
+from a == 0 || a == 10 || a == 127 || a >= 224
+to a == 10 || a == 127 || a >= 224
+catch r25
+
+mutant m13
+what 127/8 is public
+file checker.cho
+from a == 0 || a == 10 || a == 127 || a >= 224
+to a == 0 || a == 10 || a >= 224
+catch r07
+
+mutant m14
+what 100.64/10 starts at 65
+file checker.cho
+from a == 100 && b >= 64 && b <= 127
+to a == 100 && b >= 65 && b <= 127
+catch r34
+
+mutant m15
+what link-local is 169.253
+file checker.cho
+from a == 169 && b == 254
+to a == 169 && b == 253
+catch r08
+
+mutant m16
+what 172.16/12 starts at 17
+file checker.cho
+from a == 172 && b >= 16 && b <= 31
+to a == 172 && b >= 17 && b <= 31
+catch r27
+
+mutant m17
+what 192.168/16 is 192.169
+file checker.cho
+from a == 192 && b == 168
+to a == 192 && b == 169
+catch r28
+
+mutant m18
+what an octal form is read as decimal
+file checker.cho
+from base = 8;
+to base = 10;
+catch r21
+
+mutant m19
+what a hex form is read as decimal
+file checker.cho
+from base = 16;
+to base = 10;
+catch r22
+
+mutant m20
+what ::1 is public
+file checker.cho
+from bytes.equal(text, "::1")
+to bytes.equal(text, "::2")
+catch r23
+
+mutant m21
+what fd00::/8 is public
+file checker.cho
+from first >= 64512 && first <= 65023
+to first >= 64512 && first <= 64767
+catch r30
+
+mutant m22
+what fe80::/10 starts at 65153
+file checker.cho
+from first >= 65152 && first <= 65215
+to first >= 65153 && first <= 65215
+catch r29
+
+mutant m23
+what a mapped IPv4 address is public
+file checker.cho
+from if bytes.find(rest, ".") >= 0 {
+to if bytes.find(rest, "~") >= 0 {
+catch r24
+
+mutant m24
+what a URL of 2049 bytes is valid
+file checker.cho
+from len(url) > 2048
+to len(url) > 4096
+catch r37
+
+mutant m25
+what credentials are an invalid URL
+file checker.cho
+from return "url.credentials";
+to return "url.invalid";
+catch r03
+
+mutant m26
+what a user name with no password is allowed
+file checker.cho
+from bytes.find(auth, "@") >= 0
+to bytes.find(auth, ":@") >= 0
+catch r19
+
+mutant m27
+what port 8443 is refused
+file checker.cho
+from port != 80 && port != 443 && port != 8080 && port != 8443
+to port != 80 && port != 443 && port != 8080
+catch r35
+
+mutant m28
+what port 8080 is refused
+file checker.cho
+from port != 80 && port != 443 && port != 8080 && port != 8443
+to port != 80 && port != 443 && port != 8443
+catch r36
+
+mutant m29
+what port 8081 is allowed
+file checker.cho
+from port != 80 && port != 443 && port != 8080 && port != 8443
+to port != 80 && port != 443 && port != 8080 && port != 8443 && port != 8081
+catch r05
+
+mutant m30
+what https is refused as a scheme
+file checker.cho
+from same_ignoring_case(scheme, "http") == false && same_ignoring_case(scheme, "https") == false
+to same_ignoring_case(scheme, "http") == false
+catch t01
+
+mutant m31
+what a refusal with an empty repair
+file checker.cho
+from return "Wait a minute and try again.";
+to return "";
+catch r31
+
+mutant m32
+what a private address is 400
+file server.cho
+from return 403;
+to return 400;
+catch r07
+
+mutant m33
+what too many redirects is 400
+file server.cho
+from return 422;
+to return 400;
+catch l09
+
+mutant m34
+what rate limited is 503
+file server.cho
+from problem(heap, conn, 429,
+to problem(heap, conn, 503,
+catch r31
+
+mutant m35
+what a timeout is 502
+file server.cho
+from return 504;
+to return 502;
+catch l02
+
+mutant m36
+what a target over 8 KiB is read
+file server.cho
+from if len(target) > 8192 {
+to if len(target) > 65536 {
+catch p04
+
+mutant m37
+what the limit is 31 a minute
+file ratelimit.cho
+from return 30;
+to return 31;
+catch r31
+
+mutant m38
+what the limit is 29 a minute
+file ratelimit.cho
+from return 30;
+to return 29;
+catch r32
+
+mutant m39
+what an unknown path is 400
+file server.cho
+from respond(conn, 404,
+to respond(conn, 400,
+catch p06
+
+mutant m40
+what percent-encoding is not decoded
+file request.cho
+from if c == 37 {
+to if c == 38 {
+catch p03
+
+mutant m41
+what six redirects are followed
+file fetch.cho
+from return 5;
+to return 6;
+catch l09
+
+mutant m42
+what only four redirects are followed
+file fetch.cho
+from return 5;
+to return 4;
+catch l08
+
+mutant m43
+what a 301 is not followed
+file fetch.cho
+from status == 301 ||
+to status == 300 ||
+catch v07
+
+mutant m44
+what a redirect to a private address is followed
+file fetch.cho
+from return allow_loopback && a / 16777216 == 127;
+to return allow_loopback;
+catch r11
+
+mutant m45
+what only the first hop is judged
+file fetch.cho
+from while k < count && len(step_rule) == 0 {
+to while k < count && len(step_rule) == 0 && hops == 0 {
+catch r11
+
+mutant m46
+what an IPv6 literal is not judged
+file fetch.cho
+from if class == 1 {
+to if class == 2 {
+catch r23
+
+mutant m47
+what days_left is one too many
+file probe.cho
+from return low;
+to return low + 1;
+catch t01
+
+mutant m48
+what a refused chain is reported verified
+file fetch.cho
+from {\"verified\":false,\"days_left\":0}
+to {\"verified\":true,\"days_left\":0}
+catch t03
+
+mutant m49
+what the body cap is 32 KiB
+file fetch.cho
+from return 65536;
+to return 32768;
+catch l03
+
+mutant m50
+what an empty reason
+file fetch.cho
+from var reason = "responded";
+to var reason = "";
+catch l03

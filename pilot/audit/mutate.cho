@@ -1,0 +1,92 @@
+edition 9;
+module mutate;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+
+// The audit's mutants are one-line edits of the reference (docs/pilot-audit.md section 5.2). `mutate <file> <from> <to>` writes `file` to standard output with the text
+// `from` replaced by `to`, and refuses (exit 3, nothing written) unless `from` occurs in the file EXACTLY ONCE: a mutant that matches nowhere, or in two places, is a mistake of the
+// mutant's and must not pass as a fault that no case found. Exit 2 is a wrong command line, 4 a file that is not there or is over 256 KiB.
+
+// `text` with its only `from` replaced by `to`: the code (0 done, 1 `from` not found, 2 found more than once, 3 `from` empty) and the bytes (empty unless done).
+pub fn replace_once[&h, &t, &f, &o](heap: &!h Heap, text: &t [byte], from: &f [byte], to: &o [byte]) -> [heap] (int, buffer.Buffer) {
+    var out = buffer.empty(heap, 16);
+    if len(from) == 0 {
+        return (3, out);
+    }
+    let at = bytes.find(text, from);
+    if at < 0 {
+        return (1, out);
+    }
+    let rest = at + len(from);
+    if bytes.find(text[at + 1..len(text)], from) >= 0 {
+        return (2, out);
+    }
+    out = buffer.append(heap, out, text[0..at]);
+    out = buffer.append(heap, out, to);
+    out = buffer.append(heap, out, text[rest..len(text)]);
+    return (0, out);
+}
+
+fn slurp[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], cap: int) -> [heap, fs_read("")] (int, buffer.Buffer) {
+    let store = box_slice(heap, cap, byte_of(0));
+    var out = buffer.empty(heap, 16);
+    var n = 0 - 1;
+    borrow mut store as &!sw in {
+        n = fs_read(fs, path, contents(sw));
+        if n >= 0 && n < cap {
+            out = buffer.append(heap, out, contents(sw)[0..n]);
+        }
+    }
+    unbox_slice(heap, store);
+    return (n, out);
+}
+
+fn go[&h, &i, &f, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), args: &g Args) -> [heap, io_write, fs_read(""), args] int {
+    let (n, text) = slurp(heap, fs, arg(args, 1), 262144);
+    var code = 4;
+    if n >= 0 && n < 262144 {
+        borrow text as &tb in {
+            let (c, made) = replace_once(heap, buffer.bytes(tb), arg(args, 2), arg(args, 3));
+            code = c;
+            if c == 0 {
+                borrow made as &mb in {
+                    io.write_all(io, buffer.bytes(mb));
+                }
+            }
+            buffer.drop(heap, made);
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(clock);
+    release(signals);
+    release(exec);
+    release(tty);
+    var console = io;
+    var memory = heap;
+    var code = 2;
+    borrow fs as &f in {
+        borrow args as &g in {
+            borrow mut console as &!i in {
+                borrow mut memory as &!h in {
+                    if arg_count(g) == 4 {
+                        code = go(h, i, f, g);
+                    }
+                }
+            }
+        }
+    }
+    release(fs);
+    release(console);
+    release(memory);
+    release(args);
+    return code;
+}

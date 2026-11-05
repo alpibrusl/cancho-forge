@@ -55,7 +55,7 @@ expect status=200;verdict=degraded
 case v10
 flags --allow-loopback
 request /check?url=http://127.0.0.1:@w1/
-expect status=200;verdict=down;reason?
+expect status=200;verdict=down;reason+
 
 case v07
 flags --allow-loopback
@@ -66,57 +66,57 @@ expect status=200;verdict=up;redirects#1;final_url~:@w2
 
 case l09
 flags --allow-loopback
-world w1 8 redirect http://127.0.0.1:@w1/
+world w1 6 redirect http://127.0.0.1:@w1/
 request /check?url=http://127.0.0.1:@w1/
-expect status>=400;status<=499;rule=target.too-many-redirects;repair?
+expect status=422;rule=target.too-many-redirects;repair+
 
 case r01
 request /check?url=ftp://x.test/a
-expect status>=400;status<=499;rule=url.scheme;repair?
+expect status>=400;status<=499;rule=url.scheme;repair+
 
 case r02
 request /check?url=file:///etc/passwd
-expect status>=400;status<=499;rule=url.scheme;repair?
+expect status>=400;status<=499;rule=url.scheme;repair+
 
 case r03
 request /check?url=http://user:secret@x.test/
-expect status>=400;status<=499;rule=url.credentials;repair?
+expect status>=400;status<=499;rule=url.credentials;repair+
 
 case r04
 request /check?url=http://x.test:22/
-expect status>=400;status<=499;rule=url.port;repair?
+expect status>=400;status<=499;rule=url.port;repair+
 
 case r05
 request /check?url=http://x.test:8081/
-expect status>=400;status<=499;rule=url.port;repair?
+expect status>=400;status<=499;rule=url.port;repair+
 
 case r06
 request /check?url=
-expect status>=400;status<=499;rule=url.invalid;repair?
+expect status>=400;status<=499;rule=url.invalid;repair+
 
 case r07
 request /check?url=http://127.0.0.1:8080/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r08
 request /check?url=http://169.254.169.254/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r09
 resolver 4 lo.test=127.0.0.1
 request /check?url=http://lo.test:8080/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r10
 resolver 4 mixed.test=203.0.113.7,10.0.0.5
 request /check?url=http://mixed.test/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r11
 flags --allow-loopback
 world w1 2 redirect301 http://169.254.169.254/
 request /check?url=http://127.0.0.1:@w1/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case v06
 flags --allow-loopback
@@ -141,13 +141,13 @@ case v11
 flags --allow-loopback
 world w1 2 reset
 request /check?url=http://127.0.0.1:@w1/
-expect status=200;verdict=down;reason?
+expect status=200;verdict=down;reason+
 
 case v12
 flags --allow-loopback
 world w1 2 close
 request /check?url=http://127.0.0.1:@w1/
-expect status=200;verdict=down;reason?
+expect status=200;verdict=down;reason+
 
 case l01
 flags --allow-loopback
@@ -161,7 +161,7 @@ flags --allow-loopback
 world w1 2 hang 30000
 timeout 12000
 request /check?url=http://127.0.0.1:@w1/
-expect status=504;rule=check.timeout;repair?
+expect status=504;rule=check.timeout;repair+
 
 case l03
 flags --allow-loopback
@@ -208,94 +208,94 @@ case l11
 flags --allow-loopback
 world w1 2 lie
 request /check?url=http://127.0.0.1:@w1/
-expect status=200;verdict=down;reason?
+expect status=200;verdict=down;reason+
 
 case l12
 flags --allow-loopback
 world w1 2 bighead
 request /check?url=http://127.0.0.1:@w1/
-expect status=200;verdict=down;reason?
+expect status=200;verdict=down;reason+
 
 case r12
 request /check?url=http://exa%20mple.test/
-expect status>=400;status<=499;rule=url.invalid;repair?
+expect status>=400;status<=499;rule=url.invalid;repair+
 
 case r13
 request /check?url=example.test
-expect status>=400;status<=499;rule=url.invalid;repair?
+expect status>=400;status<=499;rule=url.invalid;repair+
 
 case r14
 request /check?url=http://x.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-expect status>=400;status<=499;rule=url.invalid;repair?
+expect status>=400;status<=499;rule=url.invalid;repair+
 
 case r15
 request /check?url=javascript:alert(1)
-expect status>=400;status<=499;rule=url.scheme;repair?
+expect status>=400;status<=499;rule=url.scheme;repair+
 
 case r16
 request /check?url=http://x.test:25/
-expect status>=400;status<=499;rule=url.port;repair?
+expect status>=400;status<=499;rule=url.port;repair+
 
 case r17
 request /check?url=http://x.test:0/
-expect status>=400;status<=499;rule=url.port;repair?
+expect status>=400;status<=499;rule=url.port;repair+
 
 case r18
 request /check?url=http://x.test:65536/
-expect status>=400;status<=499;rule=url.port;repair?
+expect status>=400;status<=499;rule=url.port;repair+
 
 case r19
 request /check?url=http://user@x.test/
-expect status>=400;status<=499;rule=url.credentials;repair?
+expect status>=400;status<=499;rule=url.credentials;repair+
 
 case r20
 request /check?url=http://2130706433:8080/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r21
 request /check?url=http://0177.0.0.1:8080/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r22
 request /check?url=http://0x7f.1:8080/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r23
 request /check?url=http://[::1]:8080/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r24
 request /check?url=http://[::ffff:127.0.0.1]:8080/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r25
 request /check?url=http://0.0.0.0:8080/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r26
 request /check?url=http://10.0.0.5/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r27
 request /check?url=http://172.16.0.1/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r28
 request /check?url=http://192.168.1.1/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r29
 request /check?url=http://[fe80::1]/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r30
 request /check?url=http://[fd00::1]/
-expect status>=400;status<=499;rule=target.private-address;repair?
+expect status=403;rule=target.private-address;repair+
 
 case r31
 warm 30
 request /check?url=ftp://x.test/
-expect status=429;rule=rate.limited;repair?
+expect status=429;rule=rate.limited;repair+
 
 case r32
 warm 29
@@ -304,11 +304,11 @@ expect status=400;rule=url.scheme
 
 case p01
 request /check
-expect status=400;rule=url.invalid;repair?
+expect status=400;rule=url.invalid;repair+
 
 case p02
 request /check?url=http://x.test/&url=http://y.test/
-expect status=400;rule=url.invalid;repair?
+expect status=400;rule=url.invalid;repair+
 
 case p03
 flags --allow-loopback
@@ -332,7 +332,7 @@ expect status=405
 
 case p08
 request /check?url=%zz
-expect status=400;rule=url.invalid;repair?
+expect status=400;rule=url.invalid;repair+
 
 case t01
 flags --allow-loopback --roots @ca --now 1893456000
@@ -348,7 +348,7 @@ tls w1 valid
 resolver 40 ok.test=127.0.0.1
 timeout 12000
 request /check?url=https://ok.test:@w1/
-expect status=200;verdict=down;tls.verified=false;reason?
+expect status=200;verdict=down;tls.verified=false;reason+
 
 case t03
 flags --allow-loopback --roots @ca --now 1893456000
@@ -388,3 +388,33 @@ world w1 2 eager
 resolver 8 ok.test=127.0.0.1
 request /check?url=https://ok.test:@w1/
 expect status=200;verdict=down
+
+case t08
+flags --allow-loopback --roots @ca --now 2050012801
+tls w1 valid
+resolver 40 ok.test=127.0.0.1
+timeout 12000
+request /check?url=https://ok.test:@w1/
+expect status=200;verdict=degraded;tls.verified=true;tls.days_left=13
+
+case r33
+request /check?url=http://224.0.0.1/
+expect status=403;rule=target.private-address;repair+
+
+case r34
+request /check?url=http://100.64.0.1/
+expect status=403;rule=target.private-address;repair+
+
+case r35
+resolver 4 other.test=203.0.113.7
+request /check?url=http://nx.test:8443/
+expect status=200;verdict=down
+
+case r36
+resolver 4 other.test=203.0.113.7
+request /check?url=http://nx.test:8080/
+expect status=200;verdict=down
+
+case r37
+request /check?url=http://x.test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+expect status>=400;status<=499;rule=url.invalid;repair+

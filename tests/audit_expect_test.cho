@@ -6,7 +6,7 @@ import audit_expect;
 // Unit tests for pilot/audit/expect.cho (docs/pilot-audit.md section 4): what the audit's driver checks an answer against. Run with `cancho test`.
 
 fn body() -> [] &static [byte] {
-    return "{\"verdict\":\"up\",\"status\":200,\"final_url\":\"http://x.test/a\",\"redirects\":[{\"url\":\"u1\",\"status\":301}],\"tls\":null,\"timing_ms\":{\"total\":42,\"dns\":0},\"ok\":true,\"neg\":-5,\"rule\":\"url.port\"}";
+    return "{\"verdict\":\"up\",\"status\":200,\"final_url\":\"http://x.test/a\",\"redirects\":[{\"url\":\"u1\",\"status\":301}],\"tls\":null,\"timing_ms\":{\"total\":42,\"dns\":0},\"ok\":true,\"neg\":-5,\"rule\":\"url.port\",\"empty\":\"\"}";
 }
 
 fn pass[&h](heap: &!h Heap, spec: &static [byte]) -> [heap] bool {
@@ -63,6 +63,14 @@ fn test_contains_ranges_lengths_presence_and_absence[&h](heap: &!h Heap) -> [hea
     test.assert(pass(heap, "missing-"));
     test.assert(pass(heap, "a.b.c-"));
     test.assert(pass(heap, "verdict-") == false);
+    test.assert(pass(heap, "verdict+"));
+    test.assert(pass(heap, "timing_ms.dns+") == false);
+    test.assert(pass(heap, "ok+") == false);
+    test.assert(pass(heap, "tls+") == false);
+    test.assert(pass(heap, "missing+") == false);
+    test.assert(pass(heap, "empty?"));
+    test.assert(pass(heap, "empty+") == false);
+    test.assert(pass(heap, "verdict+x") == false);
     return 0;
 }
 

@@ -1,0 +1,34 @@
+edition 9;
+
+import std.buffer;
+import std.test;
+import mutate;
+
+// Unit tests for pilot/audit/mutate.cho (docs/pilot-audit.md section 5.2): a mutant's edit applies exactly once or not at all.
+
+fn run[&h](heap: &!h Heap, text: &static [byte], from: &static [byte], to: &static [byte], want: &static [byte]) -> [heap] int {
+    let (code, out) = mutate.replace_once(heap, text, from, to);
+    var same = true;
+    borrow out as &ob in {
+        same = len(buffer.bytes(ob)) == len(want);
+    }
+    buffer.drop(heap, out);
+    if code == 0 && same == false {
+        return 99;
+    }
+    return code;
+}
+
+fn test_the_edit_applies_when_the_text_is_there_once[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(run(heap, "a=1;b=2", "b=2", "b=33", "a=1;b=33"), 0);
+    test.assert_eq(run(heap, "a=1;b=2", "a=1", "", ";b=2"), 0);
+    return 0;
+}
+
+fn test_a_text_that_is_not_there_or_is_there_twice_or_is_empty_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(run(heap, "a=1;b=2", "zz", "x", ""), 1);
+    test.assert_eq(run(heap, "a=1;a=1", "a=1", "x", ""), 2);
+    test.assert_eq(run(heap, "aaa", "aa", "x", ""), 2);
+    test.assert_eq(run(heap, "abc", "", "x", ""), 3);
+    return 0;
+}
