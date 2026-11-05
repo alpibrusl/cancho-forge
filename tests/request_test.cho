@@ -1,0 +1,138 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import request;
+import ratelimit;
+
+// Unit tests for pilot/audit/reference/request.cho and ratelimit.cho (docs/pilot-audit.md section 5.1, R3). Run with `cancho test`.
+
+fn test_a_request_line_gives_its_method_and_target() -> [] int {
+    test.assert_eq(request.method_of("GET /health HTTP/1.1\r\nHost: x\r\n\r\n"), 1);
+    test.assert_eq(request.method_of("HEAD /health HTTP/1.1\r\n\r\n"), 2);
+    test.assert_eq(request.method_of("POST /check HTTP/1.1\r\n\r\n"), 3);
+    test.assert_eq(request.method_of("DELETE /x HTTP/1.0\r\n\r\n"), 4);
+    test.assert_eq(request.method_of("GET /health\r\n\r\n"), 0 - 1);
+    test.assert_eq(request.method_of("GET  HTTP/1.1\r\n\r\n"), 0 - 1);
+    test.assert_eq(request.method_of(" /health HTTP/1.1\r\n\r\n"), 0 - 1);
+    test.assert_eq(request.method_of("GET /health HTTX/1.1\r\n\r\n"), 0 - 1);
+    test.assert_eq(request.method_of(""), 0 - 1);
+    test.assert_eq(request.method_of("GET"), 0 - 1);
+    test.assert_eq(request.method_of("\r\n\r\n"), 0 - 1);
+    test.assert(bytes.equal(request.target_of("GET /check?url=a%20b HTTP/1.1\r\nHost: x\r\n\r\n"), "/check?url=a%20b"));
+    test.assert(bytes.equal(request.target_of("GET / HTTP/1.1\r\n\r\n"), "/"));
+    test.assert(bytes.equal(request.target_of("garbage"), ""));
+    return 0;
+}
+
+fn test_the_path_and_the_query_of_a_target() -> [] int {
+    test.assert(bytes.equal(request.path_of("/check?url=x&a=b#frag"), "/check"));
+    test.assert(bytes.equal(request.query_of("/check?url=x&a=b#frag"), "url=x&a=b"));
+    test.assert(bytes.equal(request.path_of("/health"), "/health"));
+    test.assert(bytes.equal(request.query_of("/health"), ""));
+    test.assert(bytes.equal(request.query_of("/check?"), ""));
+    test.assert(bytes.equal(request.path_of("/a#b?c"), "/a"));
+    test.assert(bytes.equal(request.query_of("/a#b?c"), ""));
+    return 0;
+}
+
+fn test_a_parameter_is_found_counted_and_read_in_order() -> [] int {
+    test.assert(bytes.equal(request.param("url=http://x.test/&a=1", "url", 0), "http://x.test/"));
+    test.assert(bytes.equal(request.param("a=1&url=x", "url", 0), "x"));
+    test.assert(bytes.equal(request.param("url=a&url=b", "url", 1), "b"));
+    test.assert(bytes.equal(request.param("url=a&url=b", "url", 2), ""));
+    test.assert(bytes.equal(request.param("urls=a", "url", 0), ""));
+    test.assert(bytes.equal(request.param("xurl=a", "url", 0), ""));
+    test.assert(bytes.equal(request.param("url", "url", 0), ""));
+    test.assert_eq(request.param_count("url=a&url=b&x=1", "url"), 2);
+    test.assert_eq(request.param_count("url=a", "url"), 1);
+    test.assert_eq(request.param_count("url", "url"), 1);
+    test.assert_eq(request.param_count("url=", "url"), 1);
+    test.assert_eq(request.param_count("urls=a&xurl=b", "url"), 0);
+    test.assert_eq(request.param_count("", "url"), 0);
+    return 0;
+}
+
+fn decoded[&h, &t](heap: &!h Heap, text: &t [byte], want: &static [byte], good: bool) -> [heap] bool {
+    let (out, ok) = request.percent_decode(heap, text);
+    var same = false;
+    borrow out as &ob in {
+        same = bytes.equal(buffer.bytes(ob), want);
+    }
+    buffer.drop(heap, out);
+    return ok == good && (same || good == false);
+}
+
+fn test_percent_escapes_are_decoded_once_and_a_broken_one_is_refused[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(decoded(heap, "http%3A%2F%2Fx.test%2F", "http://x.test/", true));
+    test.assert(decoded(heap, "a%20b", "a b", true));
+    test.assert(decoded(heap, "a+b", "a+b", true));
+    test.assert(decoded(heap, "%2541", "%41", true));
+    test.assert(decoded(heap, "", "", true));
+    test.assert(decoded(heap, "abc", "abc", true));
+    test.assert(decoded(heap, "%", "", false));
+    test.assert(decoded(heap, "%4", "", false));
+    test.assert(decoded(heap, "abc%4", "", false));
+    test.assert(decoded(heap, "%zz", "", false));
+    test.assert(decoded(heap, "%4g", "", false));
+    test.assert(decoded(heap, "%41%", "", false));
+    return 0;
+}
+
+fn test_the_31st_check_in_a_window_is_refused_a_new_window_and_another_source_are_not[&h](heap: &!h Heap) -> [heap] int {
+    let table = box_slice(heap, ratelimit.table_len(), 0);
+    borrow mut table as &!tw in {
+        let t = contents(tw);
+        var k = 0;
+        while k < 30 {
+            test.assert(ratelimit.allow(t, 1000 + k, 7));
+            k = k + 1;
+        }
+        test.assert(ratelimit.allow(t, 5000, 7) == false);
+        test.assert(ratelimit.allow(t, 59999, 7) == false);
+        test.assert(ratelimit.allow(t, 5000, 8));
+        test.assert(ratelimit.allow(t, 61000, 7));
+        test.assert(ratelimit.allow(t, 61001, 7));
+    }
+    unbox_slice(heap, table);
+    return 0;
+}
+
+fn test_a_full_table_gives_its_oldest_slot_to_a_new_source[&h](heap: &!h Heap) -> [heap] int {
+    let table = box_slice(heap, ratelimit.table_len(), 0);
+    borrow mut table as &!tw in {
+        let t = contents(tw);
+        var k = 0;
+        while k < 64 {
+            test.assert(ratelimit.allow(t, 1000 + k, 100 + k));
+            k = k + 1;
+        }
+        test.assert(ratelimit.allow(t, 2000, 999));
+        test.assert(ratelimit.allow(t, 2001, 999));
+        var j = 0;
+        while j < 30 {
+            ratelimit.allow(t, 3000, 164);
+            j = j + 1;
+        }
+        test.assert(ratelimit.allow(t, 3001, 164) == false);
+    }
+    unbox_slice(heap, table);
+    return 0;
+}
+
+fn test_a_clock_that_goes_backwards_opens_a_new_window_not_a_trap[&h](heap: &!h Heap) -> [heap] int {
+    let table = box_slice(heap, ratelimit.table_len(), 0);
+    borrow mut table as &!tw in {
+        let t = contents(tw);
+        var k = 0;
+        while k < 30 {
+            ratelimit.allow(t, 50000, 5);
+            k = k + 1;
+        }
+        test.assert(ratelimit.allow(t, 50000, 5) == false);
+        test.assert(ratelimit.allow(t, 10, 5));
+    }
+    unbox_slice(heap, table);
+    return 0;
+}

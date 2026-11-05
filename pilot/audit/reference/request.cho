@@ -1,0 +1,170 @@
+edition 9;
+module request;
+
+import std.buffer;
+import std.bytes;
+
+// The reference checker's reading of an HTTP request head (docs/pilot-audit.md section 5.1, R3). Pure and total: every function takes the bytes of what a stranger sent and answers a
+// number, a slice of it, or "not usable"; none traps on any input.
+
+// 1 GET, 2 HEAD, 3 POST, 4 any other well-formed method, -1 a request line that is not `METHOD SP target SP HTTP/1.x`.
+pub fn method_of[&h](head: &h [byte]) -> [] int {
+    let line_end = bytes.find(head, "\r\n");
+    var line = head;
+    if line_end >= 0 {
+        line = head[0..line_end];
+    }
+    var sp1 = 0;
+    while sp1 < len(line) && int_of(line[sp1]) != 32 {
+        sp1 = sp1 + 1;
+    }
+    if sp1 == 0 || sp1 >= len(line) {
+        return 0 - 1;
+    }
+    var sp2 = sp1 + 1;
+    while sp2 < len(line) && int_of(line[sp2]) != 32 {
+        sp2 = sp2 + 1;
+    }
+    if sp2 >= len(line) || sp2 == sp1 + 1 || len(line) - sp2 < 9 || bytes.equal(line[sp2 + 1..sp2 + 6], "HTTP/") == false {
+        return 0 - 1;
+    }
+    let method = line[0..sp1];
+    if bytes.equal(method, "GET") {
+        return 1;
+    }
+    if bytes.equal(method, "HEAD") {
+        return 2;
+    }
+    if bytes.equal(method, "POST") {
+        return 3;
+    }
+    return 4;
+}
+
+// The request target (the second token of the request line), or an empty slice when the line is malformed.
+pub fn target_of[&h](head: &h [byte]) -> [] &h [byte] {
+    if method_of(head) < 0 {
+        return head[0..0];
+    }
+    let line_end = bytes.find(head, "\r\n");
+    var line = head;
+    if line_end >= 0 {
+        line = head[0..line_end];
+    }
+    var sp1 = 0;
+    while sp1 < len(line) && int_of(line[sp1]) != 32 {
+        sp1 = sp1 + 1;
+    }
+    var sp2 = sp1 + 1;
+    while sp2 < len(line) && int_of(line[sp2]) != 32 {
+        sp2 = sp2 + 1;
+    }
+    return line[sp1 + 1..sp2];
+}
+
+// The path of a target: up to the first `?` (or `#`).
+pub fn path_of[&t](target: &t [byte]) -> [] &t [byte] {
+    var e = 0;
+    while e < len(target) && int_of(target[e]) != 63 && int_of(target[e]) != 35 {
+        e = e + 1;
+    }
+    return target[0..e];
+}
+
+// The query of a target: after the first `?` up to a `#`, empty when there is none.
+pub fn query_of[&t](target: &t [byte]) -> [] &t [byte] {
+    var q = 0;
+    while q < len(target) && int_of(target[q]) != 63 && int_of(target[q]) != 35 {
+        q = q + 1;
+    }
+    if q >= len(target) || int_of(target[q]) == 35 {
+        return target[0..0];
+    }
+    var e = q + 1;
+    while e < len(target) && int_of(target[e]) != 35 {
+        e = e + 1;
+    }
+    return target[q + 1..e];
+}
+
+// The `which`-th (from 0) value of the parameter `name` in `query` (`a=1&b=2&a=3`), written as it was; an empty slice when there is no such one.
+pub fn param[&q](query: &q [byte], name: &static [byte], which: int) -> [] &q [byte] {
+    var seen = 0;
+    var start = 0;
+    var k = 0;
+    while k <= len(query) {
+        if k == len(query) || int_of(query[k]) == 38 {
+            let pair = query[start..k];
+            if len(pair) > len(name) && bytes.equal(pair[0..len(name)], name) && int_of(pair[len(name)]) == 61 {
+                if seen == which {
+                    return pair[len(name) + 1..len(pair)];
+                }
+                seen = seen + 1;
+            } else if bytes.equal(pair, name) {
+                if seen == which {
+                    return pair[len(pair)..len(pair)];
+                }
+                seen = seen + 1;
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return query[0..0];
+}
+
+// How many times the parameter `name` appears in `query` (with or without a value).
+pub fn param_count[&q](query: &q [byte], name: &static [byte]) -> [] int {
+    var seen = 0;
+    var start = 0;
+    var k = 0;
+    while k <= len(query) {
+        if k == len(query) || int_of(query[k]) == 38 {
+            let pair = query[start..k];
+            if len(pair) > len(name) && bytes.equal(pair[0..len(name)], name) && int_of(pair[len(name)]) == 61 || bytes.equal(pair, name) {
+                seen = seen + 1;
+            }
+            start = k + 1;
+        }
+        k = k + 1;
+    }
+    return seen;
+}
+
+fn hex_value(c: int) -> [] int {
+    if c >= 48 && c <= 57 {
+        return c - 48;
+    }
+    if c >= 97 && c <= 102 {
+        return c - 87;
+    }
+    if c >= 65 && c <= 70 {
+        return c - 55;
+    }
+    return 0 - 1;
+}
+
+// `text` with its `%XX` escapes decoded once (a `+` stays a plus). `ok` is false when an escape is cut or not hex; the buffer then holds what was decoded so far.
+pub fn percent_decode[&h, &t](heap: &!h Heap, text: &t [byte]) -> [heap] (buffer.Buffer, bool) {
+    var out = buffer.empty(heap, len(text) + 1);
+    var k = 0;
+    while k < len(text) {
+        let c = int_of(text[k]);
+        if c == 37 {
+            if k + 2 >= len(text) {
+                return (out, false);
+            }
+            let hi = hex_value(int_of(text[k + 1]));
+            let lo = hex_value(int_of(text[k + 2]));
+            if hi < 0 || lo < 0 {
+                return (out, false);
+            }
+            out = buffer.push(heap, out, byte_of(hi * 16 + lo));
+            k = k + 3;
+        } else {
+            out = buffer.push(heap, out, byte_of(c));
+            k = k + 1;
+        }
+    }
+    return (out, true);
+}

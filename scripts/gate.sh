@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.." || exit 1
 fail=0
 
 echo "== cancho fmt --check"
-$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho pilot/audit/driver.cho pilot/audit/expect.cho pilot/audit/reference/checker.cho pilot/audit/reference/fetch.cho pilot/audit/reference/fetch_cli.cho pilot/audit/reference/probe.cho || fail=1
+$C fmt --check src tests spike workers pilot/audit/world.cho pilot/audit/resolver.cho pilot/audit/driver.cho pilot/audit/expect.cho pilot/audit/reference/checker.cho pilot/audit/reference/fetch.cho pilot/audit/reference/fetch_cli.cho pilot/audit/reference/probe.cho pilot/audit/reference/request.cho pilot/audit/reference/ratelimit.cho pilot/audit/reference/server.cho || fail=1
 
 echo "== cancho check"
 # A library has no `main`, so the program is checked as a whole (src/*.cho);
@@ -263,6 +263,12 @@ mkdir "$scratch/reference-fetch" || exit 1
 CANCHO="$C" sh pilot/audit/reference/fetch_check.sh "$scratch/reference-fetch" > "$scratch/reference-fetch.out" || fail=1
 cat "$scratch/reference-fetch.out"
 if grep -q '^FAIL ' "$scratch/reference-fetch.out"; then fail=1; fi
+
+echo "== audit self-check (the reference checker is built and run through every case of the audit; it must score N/N; pilot/audit/self_check.sh)"
+mkdir "$scratch/audit-self" || exit 1
+CANCHO="$C" sh pilot/audit/self_check.sh "$scratch/audit-self" > "$scratch/audit-self.out" || fail=1
+cat "$scratch/audit-self.out"
+if grep -q '^FAIL ' "$scratch/audit-self.out"; then fail=1; fi
 
 echo "== forge company change add (the operator's change requests and the admit: gate; tests/conformance/company_change_add.sh)"
 mkdir "$scratch/company-change-add" || exit 1

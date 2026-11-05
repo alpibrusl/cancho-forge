@@ -1,0 +1,57 @@
+edition 9;
+module ratelimit;
+
+// The reference checker's per-source rate limit (docs/pilot-s1.md section 2; docs/pilot-audit.md section 5.1): at most `limit()` checks from one source in a window of
+// `window_ms()`, in memory, nothing kept across restarts. A fixed window per source in a small table the caller owns: three integers a slot (the source's key, the start of its
+// window, the checks counted in it). A full table gives its slot to the source whose window began longest ago. Pure: the clock is an argument.
+
+pub fn limit() -> [] int {
+    return 30;
+}
+
+pub fn window_ms() -> [] int {
+    return 60000;
+}
+
+pub fn slots() -> [] int {
+    return 64;
+}
+
+// The size of the table to make (`table_len()` integers, all zero to begin with).
+pub fn table_len() -> [] int {
+    return 192;
+}
+
+// May the source `key` (any non-negative number, a packed address) check now? Counts the check when it may.
+pub fn allow[&t](table: &!t [int], now_ms: int, key: int) -> [] bool {
+    var found = 0 - 1;
+    var oldest = 0;
+    var i = 0;
+    while i < slots() {
+        if table[i * 3 + 2] > 0 && table[i * 3] == key {
+            found = i;
+        }
+        if table[i * 3 + 2] == 0 {
+            oldest = i;
+        } else if table[oldest * 3 + 2] != 0 && table[i * 3 + 1] < table[oldest * 3 + 1] {
+            oldest = i;
+        }
+        i = i + 1;
+    }
+    if found < 0 {
+        table[oldest * 3] = key;
+        table[oldest * 3 + 1] = now_ms;
+        table[oldest * 3 + 2] = 1;
+        return true;
+    }
+    if now_ms - table[found * 3 + 1] >= window_ms() || now_ms < table[found * 3 + 1] {
+        table[found * 3 + 1] = now_ms;
+        table[found * 3 + 2] = 1;
+        return true;
+    }
+    if table[found * 3 + 2] >= limit() {
+        return false;
+    }
+    table[found * 3 + 2] = table[found * 3 + 2] + 1;
+    return true;
+}
