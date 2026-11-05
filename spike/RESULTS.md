@@ -1194,3 +1194,26 @@ doubts the diff does not settle.
 condition can be met, not yet a decision**: 21 faulty seeds from 2 files and one hand-written mutation style, one author for requests and faults, tests as the only ground truth, and a
 sample too small to put a bound under 10% (63 calls, 4 misses: the 95% upper bound is about 15%). Haiku never approved a fault and flags a quarter of correct changes, which a
 person finds cheap to dismiss. Sonnet is the cheaper reviewer to listen to ($0.0034 a seed).
+
+## R-3 (docs/review-step.md section 5.3): the model reviewer on the pilot's own changes (2026-11-05, macOS arm64, `claude-haiku-5-5`, compiler `5a5dd1f2` with `--ignore-compiler-rev`)
+
+The worker `workers/repo_review.cho` against the provider, one call per diff, `brief.txt` the commit's message and `change.patch` the commit's diff (or the files of it named). The reply was judged by `forge.review_verdict` (a throw-away driver around `judge`).
+
+| diff | patch bytes | `max_tokens` | result | tokens in / out |
+|---|---|---|---|---|
+| 3439175 (reference core) | 35,826 | 4,096, 8,192 | cut, cut | not recorded (defect below) |
+| 6aed25c (fetcher) | 49,972 | 4,096, 8,192 | cut, cut | not recorded |
+| fba62a9 (TLS probe) | 55,948 | 4,096, 8,192 | cut, cut | not recorded |
+| 7546dc3 (expectation checks) | 49,326 | 4,096, 8,192 | cut, cut | not recorded |
+| f68cb95 (mutants) | 46,688 | 4,096, 8,192 | cut, cut | not recorded |
+| `checker.cho` of 3439175 | 17,960 | 8,192 | cut | not recorded |
+| A: `mutate.cho`, its test, `gate.sh` | 7,259 | 8,192 | **unparsed** (a claim with `\"`) | 3,939 / 3,671 |
+| B: `self_check_mutants.sh`, `expect.cho` | 6,691 | 8,192 | concerns, 5 items | 3,759 / 3,236 |
+| D: `resolver.cho` | 11,074 | 8,192 | concerns, 6 items | 4,667 / 3,351 |
+| E: results log | 3,999 | 8,192 | concerns, 4 items | 1,940 / 2,437 |
+| the same A, B, D, E after the prompt forbids the double quote | | 8,192 | concerns 5, 7, 6, 3 items; **4 of 4 parsed** | 14,489 / 13,092 |
+| E, `max_tokens` 50 (after the usage fix) | 3,999 | 50 | cut; `usage.jsonl` written `{"in":1940,"out":50}` | 1,940 / 50 |
+
+* A cut call wrote no `usage.jsonl` before the fix, so all eleven cut calls before the fix are unrecorded; their cost is estimated from about 0.5 tokens per patch byte and the ceiling (about 247,000 in, 69,632 out; 6 cents). Recorded: 30,734 in and 25,837 out (1.6 cents). Prices: `pilot/prices.json`.
+* Quality was read by a person against the files for the second run of A, B, D, E: 21 items, 12 true, 6 the model correctly saying the request names files the diff does not hold (my slicing), 3 noise or unchecked. Four true ones are defects the gate had not found (listed in `docs/review-step.md` section 5.3). This is two samples of one author's work; it is not a hit rate.
+
