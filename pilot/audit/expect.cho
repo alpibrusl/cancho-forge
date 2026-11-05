@@ -13,6 +13,7 @@ import std.json;
 //   path>=N  path<=N  the field is an integer at least / at most N
 //   path#N            the field is an array of N elements
 //   path?             the field is there and is not null          path-   the field is absent or null
+//   path+             the field is a string of at least one byte (a `repair` or a `reason` that is there and says nothing is not one)
 //
 // A value contains no `;`. The body must be one JSON object when any field check is made. 0 is a pass; N > 0 the 1-based number of the first check that failed; -1 a spec that is
 // empty or has a check of no known shape, -2 a body that is not a JSON object when a field check needs one.
@@ -62,12 +63,12 @@ fn node_at[&s, &t, &p](src: &s [byte], tp: &t [int], path: &p [byte]) -> [] int 
     return node;
 }
 
-// Where an operator starts in `check`: the first of `= ~ > < # ? -` after at least one byte of path, and its length. (-1 when there is none.) `>=` and `<=` are two bytes.
+// Where an operator starts in `check`: the first of `= ~ > < # ? + -` after at least one byte of path, and its length. (-1 when there is none.) `>=` and `<=` are two bytes.
 fn op_at[&c](check: &c [byte]) -> [] int {
     var i = 1;
     while i < len(check) {
         let c = int_of(check[i]);
-        if c == 61 || c == 126 || c == 62 || c == 60 || c == 35 || c == 63 {
+        if c == 61 || c == 126 || c == 62 || c == 60 || c == 35 || c == 63 || c == 43 {
             return i;
         }
         if c == 45 && i == len(check) - 1 {
@@ -121,6 +122,15 @@ fn holds[&s, &t, &c](src: &s [byte], tp: &t [int], check: &c [byte]) -> [] int {
             return 0 - 1;
         }
         if node >= 0 && json.is_null(tp, node) == false {
+            return 1;
+        }
+        return 0;
+    }
+    if op == 43 {
+        if at != len(check) - 1 {
+            return 0 - 1;
+        }
+        if node >= 0 && json.is_string(tp, node) && len(json.string_view(src, tp, node)) > 0 {
             return 1;
         }
         return 0;

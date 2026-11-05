@@ -241,3 +241,8 @@ std = true
 name = "request"
 sources = ["tests/request_test.cho", "pilot/audit/reference/request.cho", "pilot/audit/reference/ratelimit.cho"]
 std = true
+
+[[test]]
+name = "mutate"
+sources = ["tests/mutate_test.cho", "pilot/audit/mutate.cho"]
+std = true
