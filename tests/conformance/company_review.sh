@@ -81,11 +81,17 @@ check "approve: the grant reached the worker: the model, the host and the key fi
 check "approve: the spend is recorded once, for the review step" sh -c "[ \$(grep 'company.spend.recorded' '$w/co1/company.journal' | grep -c '\"task\":\"rv\"') = 1 ] && grep 'company.spend.recorded' '$w/co1/company.journal' | grep '\"task\":\"rv\"' | grep -q '\"input\":1000,\"output\":200'"
 run "$w/co1" "$w/op1.json"
 check "approve: a second run admits nothing again and calls the worker no more" sh -c "[ \$(cat '$w/rc') = 0 ] && [ \$(grep -c 'company.step.admitted' '$w/co1/company.journal') = 2 ] && [ \$(wc -l < '$w/co1/steps/rv/requests.log' | tr -d ' ') = 1 ]"
+check "approve: the verdict is journaled once, for rv, immediately before its acceptance" sh -c "[ \$(grep -c 'company.step.reviewed' '$w/co1/company.journal') = 1 ] && grep -A1 'company.step.reviewed' '$w/co1/company.journal' | tail -1 | grep -q 'company.step.accepted' && grep 'company.step.reviewed' '$w/co1/company.journal' | grep -q '\"task\":\"rv\".*\"verdict\":\"approve\",\"items\":0,\"model\":\"m1\"'"
+"$F" company status "$w/co1" > "$w/st" 2>&1
+check "approve: status shows the verdict beside the step" grep -qx 'rv accepted review=approve' "$w/st"
+"$F" company status "$w/co1" format=json > "$w/stj" 2>&1
+check "approve: status format=json has review {approve, 0} on rv only" sh -c "grep -q '\"review\":{\"verdict\":\"approve\",\"items\":0}' '$w/stj' && [ \$(grep -o '\"review\"' '$w/stj' | wc -l | tr -d ' ') = 1 ]"
 
 # ---- concerns
 mkrepo ck2; operator op2 "$w/ck2"; mkco co2 concerns
 run "$w/co2" "$w/op2.json"
 check "concerns: the step is accepted (advisory) and every item is printed on one line" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: rv' '$w/out' && grep -qx 'review: concerns' '$w/out' && grep -qx 'review: src/a.cho:3: the new line is never read' '$w/out' && grep -qx 'review: README.md:0: no test covers it' '$w/out'"
+check "concerns: the journal holds the verdict and the count, and status shows them" sh -c "grep 'company.step.reviewed' '$w/co2/company.journal' | grep -q '\"verdict\":\"concerns\",\"items\":2' && '$F' company status '$w/co2' | grep -qx 'rv accepted review=concerns:2'"
 
 # ---- a reply that is not a verdict, and one in a fence
 for mode in garbage fence; do
@@ -104,6 +110,7 @@ check "cut: held review-unavailable, exit 14" sh -c "[ \$(cat '$w/rc') = 14 ] &&
 mkrepo ck5; operator op5 "$w/ck5"; mkco co5 silent
 run "$w/co5" "$w/op5.json"
 check "silent: no reply.txt is a review that did not happen: held, exit 14" sh -c "[ \$(cat '$w/rc') = 14 ] && ! grep -qx 'accepted: rv' '$w/out'"
+check "held endings write no verdict: no reviewed record in a garbage, a fence or a silent run" sh -c "! grep -q 'company.step.reviewed' '$w/co-garbage/company.journal' '$w/co-fence/company.journal' '$w/co5/company.journal'"
 
 # ---- a patch over the operator's bound
 mkrepo ck6; operator op6 "$w/ck6" 20; mkco co6 approve

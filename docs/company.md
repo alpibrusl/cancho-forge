@@ -211,7 +211,9 @@ document invalid (pinned by `tests/company_cmd_test.cho` and a hostile journal i
   any step not accepted that is held, else `null`; `gate` the step's gate name or `null`; `artifact` the path (relative to the company
   directory) and SHA-256 of its last `company.step.accepted` record, `null` until it is accepted; `failed_check` the score and total of
   its **last** `company.step.check_failed` record, kept after a retry or an acceptance (it is a record, not the current verdict), `null`
-  when it has none.
+  when it has none; `review`, **present only for a step a model reviewed**, `{"verdict":"approve"|"concerns","items":N}` of its last
+  `company.step.reviewed` record (the key is absent otherwise, so a document written before it is unchanged). The text status appends
+  ` review=approve` or ` review=concerns:N` to that step's line.
 * `gates`: every name of `human_gates` in manifest order, then each `retry:<id>` that has a decision, in step order; `decision` is
   `open`, `approved` or `rejected` (the last decision wins). A gate name in the journal that is neither is not shown.
 * `open_gates`: exactly the text's `open gates:` list.
@@ -310,6 +312,7 @@ One JSON object per line, framed like every Forge journal (`v`, `seq` from 1 and
 | `company.step.accepted` | the step id | `artifact` (path relative to the company directory), `sha256` (computed by Forge) |
 | `company.step.check_failed` | the step id | `score`, `total` |
 | `company.step.check_unavailable` | the step id | `reason` (the printed tag: `check-unavailable`, `artifact-invalid` or `usage-invalid`; a later run names it again) |
+| `company.step.reviewed` | the step id | `verdict` (`approve` with `items` 0, or `concerns` with `items` 1 or more), `items`, `model`: a `repo.review` step's validated reply (docs/review-step.md); written after `review.json` is hashed and immediately before the step's `company.step.accepted`; replay checks the shape and keeps the last one per step, which `status` shows |
 | `company.step.published` | the step id | `branch`, `commit` (40 hex): `forge company publish` made this commit for the step (section 26); replay checks the shape only |
 | `company.gate.decided` | the gate name | `gate`, `verdict` (`approved` / `rejected`), `user`, `reason` |
 | `company.spend.recorded` | the step id | `input`, `output`, `cache_write`, `cache_read`, `cost_micro` |

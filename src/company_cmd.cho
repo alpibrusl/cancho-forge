@@ -130,6 +130,13 @@ pub fn status_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, 
         out = buffer.append(heap, out, company_manifest.step_id(m, company_manifest.step_at(m, i)));
         out = buffer.append(heap, out, " ");
         out = buffer.append(heap, out, state_name(step_state(m, s, i)));
+        let (verdict, items) = company_state.review_of(s, i);
+        if verdict == 1 {
+            out = buffer.append(heap, out, " review=approve");
+        }
+        if verdict == 2 {
+            out = put_spend(heap, out, " review=concerns:", items);
+        }
         out = buffer.append(heap, out, "\n");
         i = i + 1;
     }
@@ -246,7 +253,7 @@ fn put_tokens[&h](heap: &!h Heap, w: json.Writer, key: &static [byte], a: int, b
 
 // Step `i` as an object: id, role, state (the text's state, except that a step the text shows `ready` and its check holds is
 // `held`), held (the tag, or null), gate (its gate's name, or null), artifact ({name, sha256} once accepted, or null), failed_check
-// ({score, total} of its last failed check, or null).
+// ({score, total} of its last failed check, or null), and, only for a step a model reviewed, review ({verdict, items}).
 fn put_step[&h, &m, &s](heap: &!h Heap, w: json.Writer, m: &m company_manifest.Manifest, s: &s company_state.CompanyState, i: int) -> [heap] json.Writer {
     let step = company_manifest.step_at(m, i);
     let code = step_state(m, s, i);
@@ -291,6 +298,18 @@ fn put_step[&h, &m, &s](heap: &!h Heap, w: json.Writer, m: &m company_manifest.M
         o = json.end_object(heap, o);
     } else {
         o = json.put_null(heap, o);
+    }
+    let (verdict, items) = company_state.review_of(s, i);
+    if verdict != 0 {
+        o = json.put_key(heap, o, "review");
+        o = json.begin_object(heap, o);
+        if verdict == 1 {
+            o = put_text(heap, o, "verdict", "approve");
+        } else {
+            o = put_text(heap, o, "verdict", "concerns");
+        }
+        o = put_count(heap, o, "items", items);
+        o = json.end_object(heap, o);
     }
     return json.end_object(heap, o);
 }
