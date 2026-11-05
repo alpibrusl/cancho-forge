@@ -13,6 +13,7 @@
 #   company run          `forge company run` end to end, real workers, the lying-worker test (tests/conformance/company_run.sh)
 #   company kill         `forge company run` killed mid-step and run again: nothing left running, each step accepted once (tests/conformance/company_kill.sh)
 #   company change      `forge company run` of a repo.change step, the change worker real, a stand-in build tool (tests/conformance/company_change.sh)
+#   company review      `forge company run` of a repo.review step, the model reviewer's worker a stand-in (tests/conformance/company_review.sh)
 #   company change add  `forge company change add` and the `admit:` gate end to end, every tag of the verb (tests/conformance/company_change_add.sh)
 #   company derive      derived steps of a flow in `status` and `decide`, nothing derived before admission (tests/conformance/company_derive.sh)
 #   company publish lib `forge company publish` of a library step (tests/conformance/repo_publish_library.sh)
@@ -222,6 +223,12 @@ CANCHO="$C" sh tests/conformance/company_change.sh "$scratch/company-change" > "
 cat "$scratch/company-change.out"
 if grep -q '^FAIL ' "$scratch/company-change.out"; then fail=1; fi
 
+echo "== forge company run of a repo.review step (the change worker real, the model reviewer's worker a stand-in with no network: approve, concerns, an unparsed reply, a failed worker, a patch over the bound, no grant, no price; tests/conformance/company_review.sh)"
+mkdir "$scratch/company-review" || exit 1
+CANCHO="$C" sh tests/conformance/company_review.sh "$scratch/company-review" > "$scratch/company-review.out" || fail=1
+cat "$scratch/company-review.out"
+if grep -q '^FAIL ' "$scratch/company-review.out"; then fail=1; fi
+
 echo "== spike P1 (the pilot: a cancho program resolves a name over UDP with a deadline; spike/p1_check.sh)"
 mkdir "$scratch/p1" || exit 1
 CANCHO="$C" sh spike/p1_check.sh "$scratch/p1" > "$scratch/p1.out" || fail=1
@@ -378,7 +385,7 @@ fi
 
 echo "== docs: every rule tag the company code can print is in docs/company.md and docs/architecture.md"
 # An oracle from outside the program: the tags are the kebab-case string literals of the company files and the tool task (listed; workers/*.cho are left out: their literals include non-tag names).
-company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_change.cho src/company_change_cmd.cho src/company_check.cho src/company_cmd.cho src/company_derive.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_needs.cho src/company_provision.cho src/company_run.cho src/company_runner.cho src/company_state.cho src/company_step.cho src/company_time.cho src/company_publish.cho src/publish_plan.cho src/step_run.cho src/tool_call.cho src/tool_task.cho src/repo_row.cho src/patch_check.cho src/repo_task.cho src/repo_call.cho src/company_authority.cho src/company_review.cho src/company_autopub.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
+company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_change.cho src/company_change_cmd.cho src/company_check.cho src/company_cmd.cho src/company_derive.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_needs.cho src/company_provision.cho src/company_run.cho src/company_runner.cho src/company_run_io.cho src/company_repo_steps.cho src/company_review_step.cho src/review_step.cho src/company_state.cho src/company_step.cho src/company_time.cho src/company_publish.cho src/publish_plan.cho src/step_run.cho src/tool_call.cho src/tool_task.cho src/repo_row.cho src/patch_check.cho src/repo_task.cho src/repo_call.cho src/company_authority.cho src/company_review.cho src/company_autopub.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
 for t in $company_tags; do
   for d in docs/company.md docs/architecture.md; do
     if grep -qF "\`$t\`" "$d"; then :; else echo "FAIL docs: tag $t is not in $d"; fail=1; fi

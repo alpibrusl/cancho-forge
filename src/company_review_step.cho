@@ -1,0 +1,274 @@
+edition 9;
+module forge.company_review_step;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import std.option;
+import forge.company_budget;
+import forge.company_cmd;
+import forge.company_files;
+import forge.company_graph;
+import forge.company_manifest;
+import forge.company_needs;
+import forge.company_run_io;
+import forge.company_state;
+import forge.company_step;
+import forge.review_call;
+import forge.review_step;
+import forge.review_verdict;
+
+// A `repo.review` step (docs/review-step.md sections 6 and 7): the model reviewer's worker over the patch of the one `repo.change` step it needs. Advisory: a well formed
+// answer, `approve` or `concerns`, ACCEPTS the step (the concerns are printed, one line each, and kept in `review.json`); anything else HOLDS it, `check-unavailable` exit 14,
+// with the reason `review-unavailable` (the model was not reached, the provider refused, the reply was cut or the worker failed), `review-unparsed` (a reply that is not
+// the verdict's shape) or `review-diff-too-large` (the patch is over the operator's `max_diff_bytes`). The call is made ONCE per run; `decide retry:<id>` frees a hold.
+// The tokens are priced from the price table for the operator's provider and model, and recorded once (`company.spend.recorded`), whatever the ending.
+
+pub fn rule_unavailable() -> [] &static [byte] {
+    return "review-unavailable";
+}
+
+pub fn rule_unparsed() -> [] &static [byte] {
+    return "review-unparsed";
+}
+
+pub fn rule_too_large() -> [] &static [byte] {
+    return "review-diff-too-large";
+}
+
+fn timeout_ms() -> [] int {
+    return 120000;
+}
+
+// The text of the field `name` of the operator's `review` object.
+fn field[&s, &t](op: &s [byte], tp: &t [int], name: &static [byte]) -> [] &s [byte] {
+    return json.string_view(op, tp, json.get(op, tp, json.get(op, tp, 0, "review"), name));
+}
+
+fn number[&s, &t](op: &s [byte], tp: &t [int], name: &static [byte]) -> [] int {
+    return json.to_int(op, tp, json.get(op, tp, json.get(op, tp, 0, "review"), name));
+}
+
+// Print the concerns of a validated reply, one line each: `review: <file>:<line>: <claim>`.
+fn print_items[&h, &i, &r](heap: &!h Heap, io: &!i Io, reply: &r [byte]) -> [heap, io_write] int {
+    let tape = box_slice(heap, json.tape_len(reply), 0);
+    borrow mut tape as &!tw in {
+        let tp = contents(tw);
+        if json.parse(reply, tp) > 0 {
+            let items = json.get(reply, tp, 0, "items");
+            var k = 0;
+            while k < json.count(tp, items) {
+                let it = json.at(tp, items, k);
+                io.write_all(io, "review: ");
+                io.write_all(io, json.string_view(reply, tp, json.get(reply, tp, it, "file")));
+                io.write_all(io, ":");
+                io.print_int(io, json.to_int(reply, tp, json.get(reply, tp, it, "line")));
+                io.write_all(io, ": ");
+                io.write_all(io, json.string_view(reply, tp, json.get(reply, tp, it, "claim")));
+                io.newline(io);
+                k = k + 1;
+            }
+        }
+    }
+    unbox_slice(heap, tape);
+    return 0;
+}
+
+// `review.json`, the artifact Forge hashes: the verdict, the model, the SHA-256 of the reply and the reply itself, which `review_verdict` validated (printable ASCII, no escape).
+fn review_json[&h, &m, &r](heap: &!h Heap, verdict: int, model: &m [byte], reply: &r [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 256), "{\"schema\":\"forge-review/1\",\"verdict\":\"");
+    if verdict == review_verdict.approve() {
+        b = buffer.append(heap, b, "approve");
+    } else {
+        b = buffer.append(heap, b, "concerns");
+    }
+    b = buffer.append(heap, b, "\",\"model\":\"");
+    b = buffer.append(heap, b, model);
+    b = buffer.append(heap, b, "\",\"reply_sha256\":\"");
+    let sha = company_files.hex_of(heap, reply);
+    borrow sha as &sb in {
+        b = buffer.append(heap, b, buffer.bytes(sb));
+    }
+    buffer.drop(heap, sha);
+    b = buffer.append(heap, b, "\",\"reply\":");
+    b = buffer.append(heap, b, reply);
+    return buffer.append(heap, b, "}");
+}
+
+// The step. Refused before admission (exit 1, nothing written): `review-step-invalid`, `review-not-granted`, `price-table-missing`, a need that changed.
+pub fn review_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &q, &n](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices_text: &q [byte], k: int, seq: int, existed: bool, before: company_budget.Usage, before_cost: int, needs: &n [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write] int {
+    let step = company_manifest.step_at(hm, k);
+    let id = company_manifest.step_id(hm, step);
+    let pre = review_step.preflight(hm, op, tp, k);
+    if pre == 1 {
+        company_run_io.refuse(io, review_step.rule_invalid());
+        company_run_io.say(io, "step: ", id);
+        return company_step.exit_refused();
+    }
+    if pre == 2 {
+        company_run_io.refuse(io, review_step.rule_not_granted());
+        company_run_io.say(io, "step: ", id);
+        return company_step.exit_refused();
+    }
+    var prices = company_budget.Prices { input: 0, output: 0, cache_write: 0, cache_read: 0, prompt_limit: 0, has_over: false, over_input: 0, over_output: 0, over_cache_write: 0, over_cache_read: 0 };
+    var priced = false;
+    match company_budget.parse_prices_for(heap, prices_text, field(op, tp, "provider"), field(op, tp, "model")) {
+        option.Option::None => {
+            priced = false;
+        }
+        option.Option::Some(p) => {
+            prices = p;
+            priced = true;
+        }
+    }
+    if priced == false {
+        company_run_io.refuse(io, company_manifest.rule_name(company_manifest.Refusal::PriceTableMissing));
+        company_run_io.say(io, "step: ", id);
+        return company_step.exit_refused();
+    }
+    let rel = company_run_io.glue(heap, "steps/", id);
+    var stepdir = buffer.empty(heap, 1);
+    borrow rel as &rb in {
+        buffer.drop(heap, stepdir);
+        stepdir = company_cmd.under(heap, dir, buffer.bytes(rb));
+    }
+    var code = 0;
+    borrow rel as &rb in {
+        borrow stepdir as &sb in {
+            let evdir = company_run_io.glue(heap, buffer.bytes(sb), "/ev");
+            borrow evdir as &eb in {
+                if company_run_io.ev_ready(heap, fs, dir, id, k >= company_manifest.own_step_count(hm), buffer.bytes(eb)) == false {
+                    company_run_io.refuse(io, company_run_io.rule_step_dir_missing());
+                    company_run_io.say(io, "step: ", id);
+                    code = company_step.exit_refused();
+                } else {
+                    code = company_needs.take_needs(heap, fs, io, hm, dir, id, needs, false, buffer.bytes(eb));
+                    if code == 0 {
+                        code = company_run_io.record_buffer(heap, fs, io, jpath, company_state.admitted(heap, seq, id, buffer.bytes(rb)), existed == false);
+                    }
+                    if code == 0 {
+                        code = review_run(heap, fs, exec, clock, io, hm, dir, jpath, op, tp, prices, step, seq + 1, before, before_cost, buffer.bytes(rb), buffer.bytes(sb), buffer.bytes(eb));
+                    }
+                }
+            }
+            buffer.drop(heap, evdir);
+        }
+    }
+    buffer.drop(heap, rel);
+    buffer.drop(heap, stepdir);
+    return code;
+}
+
+// Admitted: the two inputs into the execution directory, the call, the spend, the reply, the verdict.
+fn review_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &w, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], prices: company_budget.Prices, step: company_manifest.Step, seq: int, before: company_budget.Usage, before_cost: int, rel: &r [byte], stepdir: &w [byte], evdir: &e [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write] int {
+    let id = company_manifest.step_id(hm, step);
+    var next = seq;
+    if company_run_io.write_decoded(heap, fs, hm, step, evdir, "/brief.txt") != 0 {
+        company_run_io.say(io, "error: cannot write the brief of step ", id);
+        return company_step.exit_io();
+    }
+    // The patch is the need's accepted artifact (`take_needs` checked its bytes against the journal); it is copied, not linked.
+    let need = company_manifest.step_need(hm, step, 0);
+    var needev = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/steps/"), need);
+    needev = buffer.append(heap, needev, "/ev");
+    var patch = buffer.empty(heap, 1);
+    var pwhy = 4;
+    borrow needev as &nb in {
+        let (p, why) = company_files.read_artifact(heap, fs, buffer.bytes(nb), "change.patch");
+        buffer.drop(heap, patch);
+        patch = p;
+        pwhy = why;
+    }
+    buffer.drop(heap, needev);
+    if pwhy != 0 {
+        buffer.drop(heap, patch);
+        return company_run_io.change_refused(heap, fs, io, jpath, id, rule_unavailable(), next);
+    }
+    var too_large = false;
+    borrow patch as &pb in {
+        too_large = buffer.size(pb) > number(op, tp, "max_diff_bytes");
+        if too_large == false {
+            let target = company_run_io.glue(heap, evdir, "/change.patch");
+            borrow target as &tb in {
+                if company_run_io.write_file(fs, buffer.bytes(tb), buffer.bytes(pb)) != 0 {
+                    too_large = true;
+                }
+            }
+            buffer.drop(heap, target);
+        }
+    }
+    buffer.drop(heap, patch);
+    if too_large {
+        return company_run_io.change_refused(heap, fs, io, jpath, id, rule_too_large(), next);
+    }
+    let workers = company_step.op_text(op, tp, "workers");
+    let (ran, worker_code) = review_call.run_step(heap, fs, exec, clock, timeout_ms(), stepdir, workers, field(op, tp, "worker"), evdir, field(op, tp, "key_file"), field(op, tp, "host"), field(op, tp, "model"), number(op, tp, "max_tokens"), number(op, tp, "max_diff_bytes"));
+    // What the call spent is recorded whatever its ending.
+    let (spent_code, after_seq) = company_run_io.record_spend(heap, fs, io, jpath, id, evdir, prices, before, before_cost, next);
+    if spent_code != 0 {
+        return spent_code;
+    }
+    next = after_seq;
+    if ran != 0 {
+        return company_run_io.change_refused(heap, fs, io, jpath, id, rule_unavailable(), next);
+    }
+    let (reply, rwhy) = company_files.read_artifact(heap, fs, evdir, "reply.txt");
+    var code = 0;
+    var verdict = review_verdict.unparsed();
+    if rwhy == 0 {
+        borrow reply as &yb in {
+            verdict = review_verdict.judge(heap, buffer.bytes(yb));
+        }
+    }
+    if verdict == review_verdict.unparsed() {
+        buffer.drop(heap, reply);
+        return company_run_io.change_refused(heap, fs, io, jpath, id, rule_unparsed(), next);
+    }
+    var doc = buffer.empty(heap, 1);
+    borrow reply as &yb in {
+        buffer.drop(heap, doc);
+        doc = review_json(heap, verdict, field(op, tp, "model"), buffer.bytes(yb));
+    }
+    let target = company_run_io.glue(heap, evdir, "/review.json");
+    var wrote = 1;
+    borrow doc as &db in {
+        borrow target as &tb in {
+            wrote = company_run_io.write_file(fs, buffer.bytes(tb), buffer.bytes(db));
+        }
+    }
+    buffer.drop(heap, doc);
+    buffer.drop(heap, target);
+    if wrote != 0 {
+        company_run_io.say(io, "error: cannot write the review of step ", id);
+        buffer.drop(heap, reply);
+        return company_step.exit_io();
+    }
+    let (sha, hwhy) = company_run_io.hash_artifact(heap, fs, evdir, "review.json");
+    let shown = company_step.artifact_rel(heap, id, company_step.Runner::Review);
+    borrow shown as &wb in {
+        if hwhy != 0 {
+            code = company_run_io.refuse_artifact(heap, fs, io, jpath, id, buffer.bytes(wb), hwhy, next);
+        } else {
+            borrow sha as &hb in {
+                code = company_run_io.record_buffer(heap, fs, io, jpath, company_state.accepted(heap, next, id, buffer.bytes(wb), buffer.bytes(hb)), false);
+            }
+            if code == 0 {
+                company_run_io.say(io, "accepted: ", id);
+                if verdict == review_verdict.approve() {
+                    company_run_io.say(io, "review: ", "approve");
+                } else {
+                    company_run_io.say(io, "review: ", "concerns");
+                }
+                borrow reply as &yb in {
+                    print_items(heap, io, buffer.bytes(yb));
+                }
+                code = 0 - 1;
+            }
+        }
+    }
+    buffer.drop(heap, shown);
+    buffer.drop(heap, sha);
+    buffer.drop(heap, reply);
+    return code;
+}

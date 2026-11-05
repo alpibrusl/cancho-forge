@@ -189,3 +189,84 @@ pub fn refuse_artifact[&h, &f, &i, &j, &n, &w](heap: &!h Heap, fs: &f Fs(""), io
     say(io, "reason: ", company_step.artifact_reason(why));
     return company_step.exit_check_unavailable();
 }
+
+// The build's `usage.jsonl` (none is no usage), priced call by call, less what was recorded for the step: appended as one priced
+// spend record when anything is new. (0 or the exit status of a failure, the next record).
+pub fn record_spend[&h, &f, &i, &j, &n, &e](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], id: &n [byte], evdir: &e [byte], prices: company_budget.Prices, before: company_budget.Usage, before_cost: int, seq: int) -> [heap, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write] (int, int) {
+    var code = 0;
+    var next = seq;
+    // Read like an artifact (final review, I1): beneath the execution directory, no link followed, a regular file of at most 16 MiB,
+    // a FIFO never opened. Not there is no usage (1); anything else is `usage-invalid`, recorded, and the step held.
+    let (text, why) = company_files.read_artifact(heap, fs, evdir, "usage.jsonl");
+    if why != 0 && why != 1 {
+        code = record_buffer(heap, fs, io, jpath, company_state.check_unavailable(heap, seq, id, company_step.rule_usage_invalid()), false);
+        if code == 0 {
+            refuse(io, company_step.rule_usage_invalid());
+            say(io, "step: ", id);
+            say(io, "reason: the build's usage.jsonl is ", company_step.artifact_reason(why));
+            code = company_step.exit_check_unavailable();
+            next = seq + 1;
+        }
+    } else {
+        borrow text as &tb in {
+            let after = company_budget.parse_usage_for(buffer.bytes(tb), prices);
+            let delta = company_step.usage_delta(after, before);
+            let cost = company_step.cost_delta(company_budget.cost_micro(after, prices), before_cost);
+            if company_step.any_tokens(delta) || cost > 0 {
+                code = record_buffer(heap, fs, io, jpath, company_state.spend_priced(heap, seq, id, delta.input, delta.output, delta.cache_write, delta.cache_read, cost), false);
+                next = seq + 1;
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return (code, next);
+}
+
+// The step's `input`, decoded, written to `<dir><name>` (`name` begins with `/`; a `repo.change` step's request text is `change.txt` in
+// its execution directory).
+pub fn write_decoded[&h, &f, &m, &w, &z](heap: &!h Heap, fs: &f Fs(""), hm: &m company_manifest.Manifest, step: company_manifest.Step, stepdir: &w [byte], name: &z [byte]) -> [heap, fs_write(""), file_write] int {
+    let text = company_manifest.step_input(hm, step);
+    let quoted = glue(heap, "\"", text);
+    var q = buffer.append(heap, quoted, "\"");
+    var rc = 0 - 2;
+    borrow q as &qb in {
+        let src = buffer.bytes(qb);
+        let tape = box_slice(heap, json.tape_len(src), 0);
+        borrow mut tape as &!tw in {
+            let tp = contents(tw);
+            if json.parse(src, tp) > 0 {
+                if json.is_string(tp, 0) {
+                    let n = json.string_length(src, tp, 0);
+                    if n >= 0 {
+                        let out = box_slice(heap, n, byte_of(0));
+                        borrow mut out as &!ow in {
+                            json.string_into(src, tp, 0, contents(ow));
+                        }
+                        let path = glue(heap, stepdir, name);
+                        borrow path as &pb in {
+                            borrow out as &or in {
+                                rc = write_file(fs, buffer.bytes(pb), contents(or));
+                            }
+                        }
+                        buffer.drop(heap, path);
+                        unbox_slice(heap, out);
+                    }
+                }
+            }
+        }
+        unbox_slice(heap, tape);
+    }
+    buffer.drop(heap, q);
+    return rc;
+}
+
+// A repository or patch refusal: `refusal: <tag>`, `step:`, recorded as an unavailable check (held; `retry:<id>` frees it), exit 14.
+pub fn change_refused[&h, &f, &i, &j, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], id: &n [byte], tag: &static [byte], seq: int) -> [heap, fs_read(""), fs_write(""), file_write, io_write] int {
+    let wrote = record_buffer(heap, fs, io, jpath, company_state.check_unavailable(heap, seq, id, tag), false);
+    if wrote != 0 {
+        return wrote;
+    }
+    refuse(io, tag);
+    say(io, "step: ", id);
+    return company_step.exit_check_unavailable();
+}

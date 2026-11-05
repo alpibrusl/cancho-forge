@@ -147,6 +147,8 @@ pub enum Runner {
     Authority,
     // A `system` step's `repo.publish` (docs/auto-publish.md): Forge makes the local branch and commit; its artifact `publish.txt` names them.
     Publish,
+    // A `repo.review` step (docs/review-step.md): the model reviewer's worker over the patch of the `repo.change` step it needs; its artifact `review.json` is the validated verdict.
+    Review,
 }
 
 // The runner of a step: `Change` for a `repo.change` step, else the role's (`runner_of`).
@@ -160,9 +162,8 @@ pub fn runner_for(step: company_manifest.Step) -> [] Runner {
     if company_manifest.is_repo_publish(step) {
         return Runner::Publish;
     }
-    // A `repo.review` step (docs/review-step.md) has no runner yet: it is read and refused `task-type-unsupported` where it would run.
     if review_step.is_review(step) {
-        return Runner::Unsupported;
+        return Runner::Review;
     }
     return runner_of(step.role);
 }
@@ -219,6 +220,9 @@ pub fn artifact_name(r: Runner) -> [] &static [byte] {
         Runner::Authority => {
             return "authority.txt";
         }
+        Runner::Review => {
+            return "review.json";
+        }
         Runner::Publish => {
             return "publish.txt";
         }
@@ -250,6 +254,9 @@ pub fn artifact_rel[&h, &i](heap: &!h Heap, id: &i [byte], r: Runner) -> [heap] 
             out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
         }
         Runner::Authority => {
+            out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
+        }
+        Runner::Review => {
             out = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.append(heap, out, "steps/"), id), "/ev/"), name);
         }
         Runner::Publish => {
@@ -292,6 +299,9 @@ fn is_person(r: Runner) -> [] bool {
             return false;
         }
         Runner::Authority => {
+            return false;
+        }
+        Runner::Review => {
             return false;
         }
         Runner::Publish => {

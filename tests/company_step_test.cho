@@ -66,6 +66,9 @@ fn runner_code(r: company_step.Runner) -> [] int {
         company_step.Runner::Publish => {
             return 8;
         }
+        company_step.Runner::Review => {
+            return 9;
+        }
     }
 }
 
@@ -712,7 +715,7 @@ fn test_an_operator_file_may_grant_a_review_and_a_bad_one_is_operator_invalid_wi
     return 0;
 }
 
-fn test_a_repo_review_step_has_no_runner_yet[&h](heap: &!h Heap) -> [heap] int {
+fn test_a_repo_review_step_has_the_review_runner[&h](heap: &!h Heap) -> [heap] int {
     let steps = "{\"id\":\"c\",\"role\":\"builder\",\"task_type\":\"repo.change\",\"needs\":[],\"input\":\"x\",\"check\":\"a.sh\",\"repo\":\"diff\"},{\"id\":\"r\",\"role\":\"reviewer\",\"task_type\":\"repo.review\",\"needs\":[\"c\"],\"input\":\"x\"}";
     var text = buffer.append(heap, buffer.empty(heap, 512), "{\"id\":\"co\",\"mission\":\"m\",\"model\":{\"provider\":\"anthropic\",\"name\":\"haiku\"},\"budget\":{\"input\":1000,\"output\":500,\"cache_write\":10,\"cache_read\":20,\"max_cost\":900,\"price_table\":\"prices.json\"},\"human_gates\":[],\"roles\":[\"builder\",\"qa\",\"reviewer\"],\"repos\":[{\"id\":\"diff\",\"kind\":\"library\"}],\"steps\":[");
     text = buffer.append(heap, buffer.append(heap, text, steps), "]}");
@@ -720,8 +723,9 @@ fn test_a_repo_review_step_has_no_runner_yet[&h](heap: &!h Heap) -> [heap] int {
         match company_manifest.parse(heap, buffer.bytes(tb)) {
             company_manifest.ManifestResult::Held(m) => {
                 borrow m as &mr in {
-                    test.assert_eq(runner_code(company_step.runner_for(company_manifest.step_at(mr, 1))), 4);
-                    test.assert(runner_code(company_step.runner_for(company_manifest.step_at(mr, 0))) != 4);
+                    test.assert_eq(runner_code(company_step.runner_for(company_manifest.step_at(mr, 1))), 9);
+                    test.assert_eq(runner_code(company_step.runner_for(company_manifest.step_at(mr, 0))), 6);
+                    test.assert_eq(len(company_step.artifact_name(company_step.Runner::Review)), 11);
                 }
                 company_manifest.drop(heap, m);
             }
