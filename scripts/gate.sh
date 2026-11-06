@@ -15,6 +15,7 @@
 #   company change      `forge company run` of a repo.change step, the change worker real, a stand-in build tool (tests/conformance/company_change.sh)
 #   company review      `forge company run` of a repo.review step, the model reviewer's worker a stand-in (tests/conformance/company_review.sh)
 #   company change add  `forge company change add` and the `admit:` gate end to end, every tag of the verb (tests/conformance/company_change_add.sh)
+#   audit mutants harness  the mutants script's verdict and scratch directory (tests/conformance/audit_mutants_harness.sh)
 #   company derive      derived steps of a flow in `status` and `decide`, nothing derived before admission (tests/conformance/company_derive.sh)
 #   company publish lib `forge company publish` of a library step (tests/conformance/repo_publish_library.sh)
 #   company publish     `forge company publish` end to end against throw-away git repositories, the publish worker real: the good path, one case per refusal tag, the hostile cases (tests/conformance/repo_publish.sh)
@@ -282,6 +283,12 @@ mkdir "$scratch/audit-mutants" || exit 1
 MUTANTS="m06 m13 m24 m33 m41 m47" CANCHO="$C" sh pilot/audit/self_check_mutants.sh "$scratch/audit-mutants" > "$scratch/audit-mutants.out" || fail=1
 cat "$scratch/audit-mutants.out"
 if grep -q '^FAIL \|^HOLE ' "$scratch/audit-mutants.out"; then fail=1; fi
+
+echo "== audit mutants harness (a crashed audit is not a catch; a relative scratch directory; tests/conformance/audit_mutants_harness.sh)"
+mkdir "$scratch/audit-mutants-harness" || exit 1
+CANCHO="$C" sh tests/conformance/audit_mutants_harness.sh "$scratch/audit-mutants-harness" > "$scratch/audit-mutants-harness.out" || fail=1
+cat "$scratch/audit-mutants-harness.out"
+if grep -q '^FAIL ' "$scratch/audit-mutants-harness.out"; then fail=1; fi
 
 echo "== forge company change add (the operator's change requests and the admit: gate; tests/conformance/company_change_add.sh)"
 mkdir "$scratch/company-change-add" || exit 1

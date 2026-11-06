@@ -5,9 +5,11 @@
 # Usage: CANCHO=... [CANCHO_PACKAGES=dir] [MUTANTS="m01 m02"] pilot/audit/self_check_mutants.sh <scratch directory, empty>
 set -u
 C="${CANCHO:-cancho}"
+# the scratch directory is resolved BEFORE the cd: a relative one means relative to where the caller stands, not to the repository
+case "$1" in /*) w=$1 ;; *) w=$(pwd)/$1 ;; esac
 cd "$(dirname "$0")/../.." || exit 1
 . scripts/packages.sh
-w=$1
+. pilot/audit/mutant_verdict.sh
 R=pilot/audit/reference
 fail=0
 mkdir -p "$w/bin" "$w/ev" "$w/m"
@@ -34,11 +36,11 @@ for id in $ids; do
   k=$(echo $catch | wc -w | tr -d ' ')
   ONLY="$catch" AUDIT_BIN="$w/bin" sh pilot/audit/audit_checker.sh "$d/candidate" "$w/ev" > "$d/out" 2> "$d/err"
   by=$(grep '^fail' "$d/err" | awk '{print $2}' | tr '\n' ' ')
-  if [ "$(tail -1 "$d/out")" = "TOTAL $k/$k" ]; then
-    echo "HOLE $id: $(field "$id" what) -- cases $catch all passed"; fail=1
-  else
-    caught=$((caught + 1)); echo "caught $id by $by"
-  fi
+  case "$(mutant_verdict "$d/out" "$k")" in
+    hole) echo "HOLE $id: $(field "$id" what) -- cases $catch all passed"; fail=1 ;;
+    caught) caught=$((caught + 1)); echo "caught $id by $by" ;;
+    *) echo "FAIL audit mutants: $id: the audit did not finish (no \`TOTAL a/$k\` line; see $d/err), so nothing is claimed caught"; fail=1 ;;
+  esac
 done
 if [ "$fail" = 0 ]; then echo "ok   audit mutants: $caught of $n caught"; else echo "FAIL audit mutants: $caught of $n caught"; fi
 exit "$fail"
