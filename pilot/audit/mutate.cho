@@ -6,8 +6,9 @@ import std.bytes;
 import std.io;
 
 // The audit's mutants are one-line edits of the reference (docs/pilot-audit.md section 5.2). `mutate <file> <from> <to>` writes `file` to standard output with the text
-// `from` replaced by `to`, and refuses (exit 3, nothing written) unless `from` occurs in the file EXACTLY ONCE: a mutant that matches nowhere, or in two places, is a mistake of the
-// mutant's and must not pass as a fault that no case found. Exit 2 is a wrong command line, 4 a file that is not there or is over 256 KiB.
+// `from` replaced by `to`, and refuses (exit 3, nothing written) unless `from` occurs in the file EXACTLY ONCE: a mutant that matches nowhere, or in two places, or is empty, is a
+// mistake of the mutant's and must not pass as a fault that no case found. Every such refusal is exit 3 (`exit_for`; the finer code of `replace_once` is not passed through, 2 would
+// collide with the usage error). Exit 2 is a wrong command line, 4 a file that is not there or is over 256 KiB.
 
 // `text` with its only `from` replaced by `to`: the code (0 done, 1 `from` not found, 2 found more than once, 3 `from` empty) and the bytes (empty unless done).
 pub fn replace_once[&h, &t, &f, &o](heap: &!h Heap, text: &t [byte], from: &f [byte], to: &o [byte]) -> [heap] (int, buffer.Buffer) {
@@ -27,6 +28,14 @@ pub fn replace_once[&h, &t, &f, &o](heap: &!h Heap, text: &t [byte], from: &f [b
     out = buffer.append(heap, out, to);
     out = buffer.append(heap, out, text[rest..len(text)]);
     return (0, out);
+}
+
+// The exit code for a `replace_once` code: 0 when done, 3 for each of its three refusals (rule `mutant-from-refused`, docs/pilot-audit.md section 5.2).
+pub fn exit_for(code: int) -> [] int {
+    if code == 0 {
+        return 0;
+    }
+    return 3;
 }
 
 fn slurp[&h, &f, &p](heap: &!h Heap, fs: &f Fs(""), path: &p [byte], cap: int) -> [heap, fs_read("")] (int, buffer.Buffer) {
@@ -49,7 +58,7 @@ fn go[&h, &i, &f, &g](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), args: &g Args) 
     if n >= 0 && n < 262144 {
         borrow text as &tb in {
             let (c, made) = replace_once(heap, buffer.bytes(tb), arg(args, 2), arg(args, 3));
-            code = c;
+            code = exit_for(c);
             if c == 0 {
                 borrow made as &mb in {
                     io.write_all(io, buffer.bytes(mb));
