@@ -1,0 +1,25 @@
+// DRAFT, for the board to edit (docs/pilot-s1.md sections 3 and 7). The exact public signatures the build must implement: the pure heart of the checker, the
+// part the held-out audit and the unit tests can pin without a network. The HTTP server, the fetcher and the TLS probe are the build's to design behind them.
+// All numbers are integers (milliseconds, days, bytes): no floating point sits near a decision (docs/company.md section 9).
+
+module checker;
+
+// The verdict of one check, a function of the measurements and nothing else (docs/pilot-s1.md section 3). `reached` is false when no response arrived or a
+// connection failed; `verified` is false when the certificate chain did not verify for the name (pass true for an `http` target); `status` is the final HTTP status;
+// `days_left` is the certificate's remaining days (pass a large number for an `http` target); `total_ms` is the whole check's time. Answers 0 for down, 1 for
+// degraded, 2 for up.
+pub fn verdict_of(reached: bool, verified: bool, status: int, days_left: int, total_ms: int) -> [] int
+
+// The stable name of a verdict: "down", "degraded" or "up".
+pub fn verdict_name(verdict: int) -> [] &static [byte]
+
+// The rule a URL text is refused under, before anything is resolved: "" when the text may be checked, else one of "url.invalid", "url.scheme", "url.credentials" or
+// "url.port" (the allowed ports are 80, 443, 8080 and 8443). The text is the value of the `url` query parameter, already percent-decoded.
+pub fn url_rule(url: &[byte]) -> [] &static [byte]
+
+// Is the IPv4 address `a * 2^24 + b * 2^16 + c * 2^8 + d` one the checker must not connect to: private, loopback, link-local (including the cloud metadata address),
+// multicast, unspecified or reserved? Judged after every resolution and every redirect.
+pub fn private_v4(address: int) -> [] bool
+
+// The `repair` text of a refusal rule (docs/pilot-s1.md section 3): what the caller should change. Never empty for a rule this module can answer.
+pub fn repair_of(rule: &[byte]) -> [] &static [byte]
