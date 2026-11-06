@@ -1,6 +1,7 @@
 edition 9;
 
 import std.buffer;
+import std.bytes;
 import std.test;
 import mutate;
 
@@ -10,7 +11,7 @@ fn run[&h](heap: &!h Heap, text: &static [byte], from: &static [byte], to: &stat
     let (code, out) = mutate.replace_once(heap, text, from, to);
     var same = true;
     borrow out as &ob in {
-        same = len(buffer.bytes(ob)) == len(want);
+        same = bytes.equal(buffer.bytes(ob), want);
     }
     buffer.drop(heap, out);
     if code == 0 && same == false {
@@ -30,5 +31,19 @@ fn test_a_text_that_is_not_there_or_is_there_twice_or_is_empty_is_refused[&h](he
     test.assert_eq(run(heap, "a=1;a=1", "a=1", "x", ""), 2);
     test.assert_eq(run(heap, "aaa", "aa", "x", ""), 2);
     test.assert_eq(run(heap, "abc", "", "x", ""), 3);
+    return 0;
+}
+
+fn test_the_edit_gives_the_bytes_asked_for_not_only_their_length[&h](heap: &!h Heap) -> [heap] int {
+    // same length as the right answer, different bytes: the old length-only comparison passed this
+    test.assert_eq(run(heap, "a=1;b=2", "b=2", "b=3", "a=1;b=2"), 99);
+    return 0;
+}
+
+fn test_every_refusal_exits_3_and_none_collides_with_the_usage_error_2() -> [] int {
+    test.assert_eq(mutate.exit_for(0), 0);
+    test.assert_eq(mutate.exit_for(1), 3);
+    test.assert_eq(mutate.exit_for(2), 3);
+    test.assert_eq(mutate.exit_for(3), 3);
     return 0;
 }
