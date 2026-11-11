@@ -27,6 +27,8 @@ case "$mode" in
   good|The)  # `The`: the first word of every request Forge frames for a derived step (docs/company.md section 19): it edits like `good`
              prepare; printf 'edited\n' >> "$work/tree/src/a.cho"; finish ;;
   spend)     prepare; usage 600; usage 500; printf 'edited\n' >> "$work/tree/src/a.cho"; finish ;;
+  spendlie)  # a retry's spend (company_change.sh): the two usage records of `spend`, and a patch the repository's gate fails
+             prepare; usage 600; usage 500; printf 'BROKEN\n' >> "$work/tree/src/a.cho"; finish ;;
   outside)   prepare; printf 'more\n' >> "$work/tree/docs/x.md"; finish ;;
   denied)    prepare; printf 'more\n' >> "$work/tree/src/secret/k.cho"; finish ;;
   big)       prepare; i=0; while [ $i -lt 30 ]; do printf 'line %s\n' $i >> "$work/tree/src/a.cho"; i=$((i + 1)); done; finish ;;

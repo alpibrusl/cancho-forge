@@ -177,6 +177,13 @@ mkrepo ck3; operator op3 "$w/ck3"; mkco co3 "spend"
 run "$w/co3" "$w/op3.json"
 check "spend: the build's two usage records are priced and recorded" sh -c "[ \$(cat '$w/rc') = 0 ] && grep 'company.spend.recorded' '$w/co3/company.journal' | grep -q '\"input\":1100'"
 
+# a retry is booked in full: the same build twice (the gate fails both times, `retry:chg` between), 1100 input tokens each
+mkrepo ck3b; operator op3b "$w/ck3b"; mkco co3b "spendlie"
+run "$w/co3b" "$w/op3b.json"
+"$F" company decide "$w/co3b" retry:chg approved again > /dev/null
+run "$w/co3b" "$w/op3b.json"
+check "spend: a retried build's own spend is booked in full (two records of 1100 input, not one and a delta of 0)" sh -c "[ \$(grep -c 'company.spend.recorded' '$w/co3b/company.journal') = 2 ] && [ \$(grep 'company.spend.recorded' '$w/co3b/company.journal' | grep -c '\"input\":1100') = 2 ] && [ \$(grep -c 'company.step.admitted' '$w/co3b/company.journal') = 2 ]"
+
 # ---- one case per refusal. refused NAME TAG MODE [operator file] [checkout]
 refused() { # name, tag, input, operator name, checkout, exit
   nm=$1; tag=$2; input=$3; opn=${4:-op}; ck=$5; want=${6:-14}

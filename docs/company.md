@@ -873,6 +873,14 @@ for the step's repository) and `repo-kind-mismatch` (the row's `kind` is not the
    its state again (`repo-checkout-changed` for any difference), and applies the patch to `ev/fresh` with `patch --dry-run`
    (`patch-not-applicable`).
 
+**A `repo.change` build's spend is booked in full, every time it runs.** Each build starts from an empty `ev/work` (`rm -rf` in the build
+script) and `collect` replaces `ev/usage.jsonl` with that build's own log, and a build's `ev/usage.jsonl` from an earlier run is removed
+before it starts, so the file holds exactly the one build's calls. Section 9's "less what the journal holds for the step" is for a tool
+that **appends** to one log across runs (the worker steps); applied here it booked a retry only by how much it exceeded the first build
+(company 4, `retry:chg`: the journal held $0.0055 for two builds that spent about $0.0099; the second was booked as nothing because its
+cost, $0.0044, was below the first's). For `repo.change` the baseline is zero, so the budget cap sees the true total. (`repo.review`
+writes its log the same way and has the same shape; not changed here.)
+
 Forge then records the build's spend (whatever the ending), reads `change.patch` itself (a regular file of at most 16 MiB, like any artifact),
 and bounds it with `patch_check` against the row (`patch-kind-invalid`, `patch-path-denied`, `patch-too-large`; a patch the worker found not
 applicable is bounded first, so a rename is named a rename); appends `company.step.change` (`repo`, `base`, `tree`, `patch_sha256`, `files`,
