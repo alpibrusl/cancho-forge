@@ -117,6 +117,24 @@ fn put_spend[&h](heap: &!h Heap, out: buffer.Buffer, label: &static [byte], n: i
     return put_nat(heap, buffer.append(heap, out, label), n);
 }
 
+// The tail of a check's output, each of its lines indented by four spaces and ended by a line feed (nothing for an empty tail).
+fn put_tail[&h, &t](heap: &!h Heap, out: buffer.Buffer, tail: &t [byte]) -> [heap] buffer.Buffer {
+    var o = out;
+    var start = 0;
+    var i = 0;
+    while i <= len(tail) {
+        if i == len(tail) || int_of(tail[i]) == 10 {
+            if i > start || i < len(tail) {
+                o = buffer.append(heap, buffer.append(heap, o, "    "), tail[start..i]);
+                o = buffer.append(heap, o, "\n");
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
 // The status of a company, as text: one line `id state` for each step in manifest order, then
 //   spend: input N output N cache_write N cache_read N
 //   open gates: <names in step order, each once> | none
@@ -138,6 +156,12 @@ pub fn status_text[&h, &m, &s](heap: &!h Heap, m: &m company_manifest.Manifest, 
             out = put_spend(heap, out, " review=concerns:", items);
         }
         out = buffer.append(heap, out, "\n");
+        let (env, tail) = company_state.check_output_of(heap, s, company_manifest.step_id(m, company_manifest.step_at(m, i)));
+        if len(env) > 0 {
+            out = buffer.append(heap, buffer.append(heap, out, "  check env: "), env);
+            out = buffer.append(heap, out, "\n");
+            out = put_tail(heap, out, tail);
+        }
         i = i + 1;
     }
     out = put_spend(heap, out, "spend: input ", company_state.spend_input(s));
@@ -298,6 +322,14 @@ fn put_step[&h, &m, &s](heap: &!h Heap, w: json.Writer, m: &m company_manifest.M
         o = json.end_object(heap, o);
     } else {
         o = json.put_null(heap, o);
+    }
+    let (env, tail) = company_state.check_output_of(heap, s, company_manifest.step_id(m, step));
+    if len(env) > 0 {
+        o = json.put_key(heap, o, "check_output");
+        o = json.begin_object(heap, o);
+        o = put_text(heap, o, "env", env);
+        o = put_text(heap, o, "tail", tail);
+        o = json.end_object(heap, o);
     }
     let (verdict, items) = company_state.review_of(s, i);
     if verdict != 0 {

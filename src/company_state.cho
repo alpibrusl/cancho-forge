@@ -308,6 +308,37 @@ pub fn check_failed[&h, &s](heap: &!h Heap, seq: int, step: &s [byte], score: in
     return closed(heap, w);
 }
 
+// The same, and what the check left. `env` (the names the check was given) and `tail` (the last lines of its output,
+// `company_step.output_tail`) are written when `env` is not empty (docs/company.md section 8).
+pub fn check_failed_ran[&h, &s, &e, &t](heap: &!h Heap, seq: int, step: &s [byte], score: int, total: int, env: &e [byte], tail: &t [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_check_failed(), step);
+    w = json.put_key(heap, w, "score");
+    w = json.put_int(heap, w, score);
+    w = json.put_key(heap, w, "total");
+    w = json.put_int(heap, w, total);
+    w = put_output(heap, w, env, tail);
+    return closed(heap, w);
+}
+
+// What the check that ran and could not judge the step left: `reason`, as `check_unavailable`, with `env` and `tail` as `check_failed`.
+pub fn check_unavailable_ran[&h, &s, &r, &e, &t](heap: &!h Heap, seq: int, step: &s [byte], reason: &r [byte], env: &e [byte], tail: &t [byte]) -> [heap] buffer.Buffer {
+    var w = opened(heap, seq, kind_check_unavailable(), step);
+    w = json.put_key(heap, w, "reason");
+    w = json.put_string(heap, w, reason);
+    w = put_output(heap, w, env, tail);
+    return closed(heap, w);
+}
+
+fn put_output[&h, &e, &t](heap: &!h Heap, w: json.Writer, env: &e [byte], tail: &t [byte]) -> [heap] json.Writer {
+    if len(env) == 0 {
+        return w;
+    }
+    var o = json.put_key(heap, w, "env");
+    o = json.put_string(heap, o, env);
+    o = json.put_key(heap, o, "tail");
+    return json.put_string(heap, o, tail);
+}
+
 // `user` decided `gate`: `verdict` is "approved" or "rejected" (anything else is refused on replay).
 pub fn gate_decided[&h, &g, &v, &u, &r](heap: &!h Heap, seq: int, gate: &g [byte], verdict: &v [byte], user: &u [byte], reason: &r [byte]) -> [heap] buffer.Buffer {
     var w = opened(heap, seq, kind_gate_decided(), gate);
@@ -593,6 +624,37 @@ fn decide_change[&h, &g](heap: &!h Heap, changes: map.Map[int], gate: &g [byte],
     return out;
 }
 
+// What a check that ran and did not pass left on its record (`env`, `tail`: docs/company.md section 8): both decoded, appended to `arts`, their
+// places in `info` under `oe:<step>` and `ot:<step>` as start * 1048576 + length. Fields that are missing, not strings or over their bounds are
+// not kept (an older Forge wrote none), never a refusal.
+fn keep_output[&h, &i, &l, &t](heap: &!h Heap, arts: buffer.Buffer, info: map.Map[int], id: &i [byte], line: &l [byte], tp: &t [int]) -> [heap] (buffer.Buffer, map.Map[int]) {
+    let ev = json.get(line, tp, 0, "env");
+    let tl = json.get(line, tp, 0, "tail");
+    if json.is_string(tp, ev) == false || json.is_string(tp, tl) == false {
+        return (arts, info);
+    }
+    if len(json.string_view(line, tp, ev)) > 256 || len(json.string_view(line, tp, tl)) > 16384 {
+        return (arts, info);
+    }
+    let (a0, start) = size_of(arts);
+    let a1 = put_decoded(heap, a0, line, tp, ev);
+    let (a2, mid) = size_of(a1);
+    let a3 = put_decoded(heap, a2, line, tp, tl);
+    let (a4, end) = size_of(a3);
+    var m = info;
+    let ke = ledger_key(heap, "oe:", id);
+    borrow ke as &kb in {
+        m = map.put(heap, m, buffer.bytes(kb), start * 1048576 + (mid - start));
+    }
+    buffer.drop(heap, ke);
+    let kt = ledger_key(heap, "ot:", id);
+    borrow kt as &kb in {
+        m = map.put(heap, m, buffer.bytes(kb), mid * 1048576 + (end - mid));
+    }
+    buffer.drop(heap, kt);
+    return (a4, m);
+}
+
 // Apply one complete line (no newline) that must carry `expect` as its `seq`. Answers the two maps and 0, or a rule code.
 fn apply[&h, &l, &m, &a, &s, &k, &c, &y, &x](heap: &!h Heap, line: &l [byte], expect: int, man: &m company_manifest.Manifest, accepted: &!a [bool], spend: &!s [int], held: &!k [int], scores: &!c [int], reviews: &!y [int], art_at: &!x [int], gates: map.Map[int], admitted: map.Map[int], changes: map.Map[int], info: map.Map[int], arts: buffer.Buffer) -> [heap] (map.Map[int], map.Map[int], map.Map[int], map.Map[int], buffer.Buffer, int) {
     var gs = gates;
@@ -736,6 +798,9 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &y, &x](heap: &!h Heap, line: &l [byte], ex
                         set_held(held, at, 1);
                         set_held(scores, 2 * at, score);
                         set_held(scores, 2 * at + 1, total);
+                        let (ka, ki) = keep_output(heap, ar, inf, id, line, tp);
+                        ar = ka;
+                        inf = ki;
                     }
                 } else if bytes.equal(kind, kind_check_unavailable()) {
                     let why = json.get(line, tp, 0, "reason");
@@ -753,6 +818,9 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &y, &x](heap: &!h Heap, line: &l [byte], ex
                             code = 5;
                         }
                         set_held(held, company_graph.index_of(man, id), code);
+                        let (ka, ki) = keep_output(heap, ar, inf, id, line, tp);
+                        ar = ka;
+                        inf = ki;
                     }
                 } else if bytes.equal(kind, kind_gate_decided()) {
                     let gate = json.get(line, tp, 0, "gate");
@@ -1054,6 +1122,31 @@ pub fn change_count[&s](s: &s CompanyState, state: int) -> [] int {
         e = e + 1;
     }
     return n;
+}
+
+// What the last check of step `id` that ran and did not pass left on its record: (the names it was given, the tail of its output), both empty
+// when its record had none. Kept after a retry or an acceptance, as `failed_score` is.
+pub fn check_output_of[&h, &s, &i](heap: &!h Heap, s: &s CompanyState, id: &i [byte]) -> [heap] (&s [byte], &s [byte]) {
+    let text = buffer.bytes(s.arts);
+    var env = text[0..0];
+    var tail = text[0..0];
+    let ke = ledger_key(heap, "oe:", id);
+    borrow ke as &kb in {
+        let v = map.get(s.chginfo, buffer.bytes(kb), 0 - 1);
+        if v >= 0 {
+            env = text[v / 1048576..v / 1048576 + v % 1048576];
+        }
+    }
+    buffer.drop(heap, ke);
+    let kt = ledger_key(heap, "ot:", id);
+    borrow kt as &kb in {
+        let v = map.get(s.chginfo, buffer.bytes(kb), 0 - 1);
+        if v >= 0 {
+            tail = text[v / 1048576..v / 1048576 + v % 1048576];
+        }
+    }
+    buffer.drop(heap, kt);
+    return (env, tail);
 }
 
 // The cost recorded for the steps of change `id`, in micro-dollars (the steps that ran under a day-less journal count too).

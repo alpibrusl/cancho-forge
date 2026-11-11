@@ -1446,9 +1446,7 @@ fn guarded[&h, &f, &x, &c, &d, &o, &n, &a, &g, &l](heap: &!h Heap, fs: &f Fs("")
                 failed = e1 + e2 + e3 + e4 + e5 + e6;
             }
             buffer.drop(heap, ms);
-            var env = buffer.append(heap, buffer.empty(heap, 64), "PATH=");
-            env = buffer.append(heap, env, gate_env.fixed_path());
-            env = buffer.push(heap, env, byte_of(0));
+            let env = company_step.check_env(heap);
             var out = buffer.empty(heap, 1);
             var ran = process.Ran::Failed(0 - 2);
             if failed == 0 {
@@ -1504,6 +1502,19 @@ fn check_and_accept[&h, &f, &x, &c, &i, &d, &o, &j, &n, &k, &a, &w, &g](heap: &!
         score = a;
         total = b;
     }
+    // What the check leaves when it does not pass: the names of its environment and the last lines of its output (docs/company.md section 8).
+    let envblock = company_step.check_env(heap);
+    var env_names = buffer.empty(heap, 1);
+    borrow envblock as &eb in {
+        buffer.drop(heap, env_names);
+        env_names = company_step.env_keys(heap, buffer.bytes(eb));
+    }
+    buffer.drop(heap, envblock);
+    var tail = buffer.empty(heap, 1);
+    borrow out as &ob in {
+        buffer.drop(heap, tail);
+        tail = company_step.output_tail(heap, buffer.bytes(ob));
+    }
     buffer.drop(heap, out);
     let (second, again) = company_run_io.hash_artifact(heap, fs, argdir, name);
     var same = false;
@@ -1518,6 +1529,8 @@ fn check_and_accept[&h, &f, &x, &c, &i, &d, &o, &j, &n, &k, &a, &w, &g](heap: &!
     if same == false {
         // Whatever the check said, it judged bytes that are not the ones Forge hashed first.
         buffer.drop(heap, first);
+        buffer.drop(heap, env_names);
+        buffer.drop(heap, tail);
         var reason = 5;
         if again != 0 {
             reason = again;
@@ -1534,7 +1547,14 @@ fn check_and_accept[&h, &f, &x, &c, &i, &d, &o, &j, &n, &k, &a, &w, &g](heap: &!
             }
         }
     } else if verdict == 1 {
-        let failed = company_run_io.record_buffer(heap, fs, io, jpath, company_state.check_failed(heap, seq, id, score, total), false);
+        var rec = buffer.empty(heap, 1);
+        borrow env_names as &nb in {
+            borrow tail as &tb in {
+                buffer.drop(heap, rec);
+                rec = company_state.check_failed_ran(heap, seq, id, score, total, buffer.bytes(nb), buffer.bytes(tb));
+            }
+        }
+        let failed = company_run_io.record_buffer(heap, fs, io, jpath, rec, false);
         if failed != 0 {
             code = failed;
         } else {
@@ -1549,7 +1569,16 @@ fn check_and_accept[&h, &f, &x, &c, &i, &d, &o, &j, &n, &k, &a, &w, &g](heap: &!
             buffer.drop(heap, sc);
         }
     } else {
-        let wrote = company_run_io.record_buffer(heap, fs, io, jpath, company_state.check_unavailable(heap, seq, id, "check-unavailable"), false);
+        var rec = company_state.check_unavailable(heap, seq, id, "check-unavailable");
+        if company_step.is_guard_missing(ran) == false && company_step.is_guard_busy(ran) == false {
+            buffer.drop(heap, rec);
+            borrow env_names as &nb in {
+                borrow tail as &tb in {
+                    rec = company_state.check_unavailable_ran(heap, seq, id, "check-unavailable", buffer.bytes(nb), buffer.bytes(tb));
+                }
+            }
+        }
+        let wrote = company_run_io.record_buffer(heap, fs, io, jpath, rec, false);
         if wrote != 0 {
             code = wrote;
         } else {
@@ -1564,5 +1593,7 @@ fn check_and_accept[&h, &f, &x, &c, &i, &d, &o, &j, &n, &k, &a, &w, &g](heap: &!
         }
     }
     buffer.drop(heap, first);
+    buffer.drop(heap, env_names);
+    buffer.drop(heap, tail);
     return code;
 }

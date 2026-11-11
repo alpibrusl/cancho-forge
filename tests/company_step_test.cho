@@ -737,3 +737,87 @@ fn test_a_repo_review_step_has_the_review_runner[&h](heap: &!h Heap) -> [heap] i
     buffer.drop(heap, text);
     return 0;
 }
+
+// ---- what a check that did not pass leaves (docs/company.md section 8) ---------------------------------------------------------
+
+fn tail_of[&h, &o](heap: &!h Heap, out: &o [byte]) -> [heap] buffer.Buffer {
+    return company_step.output_tail(heap, out);
+}
+
+fn tail_is[&h, &o, &w](heap: &!h Heap, out: &o [byte], wanted: &w [byte]) -> [heap] bool {
+    let t = tail_of(heap, out);
+    var same = false;
+    borrow t as &tb in {
+        same = bytes.equal(buffer.bytes(tb), wanted);
+    }
+    buffer.drop(heap, t);
+    return same;
+}
+
+fn test_the_check_environment_is_path_only_and_its_names_are_listed[&h](heap: &!h Heap) -> [heap] int {
+    let block = company_step.check_env(heap);
+    borrow block as &bb in {
+        let names = company_step.env_keys(heap, buffer.bytes(bb));
+        borrow names as &nb in {
+            test.assert(bytes.equal(buffer.bytes(nb), "PATH"));
+        }
+        buffer.drop(heap, names);
+    }
+    buffer.drop(heap, block);
+    let two = company_step.env_keys(heap, "HOME=/root\0LC_ALL=C\0A=\0=x\0");
+    borrow two as &tb in {
+        test.assert(bytes.equal(buffer.bytes(tb), "HOME,LC_ALL,A"));
+    }
+    buffer.drop(heap, two);
+    let none = company_step.env_keys(heap, "");
+    borrow none as &zb in {
+        test.assert_eq(buffer.size(zb), 0);
+    }
+    buffer.drop(heap, none);
+    return 0;
+}
+
+fn test_the_output_tail_is_the_last_lines_in_printable_ascii[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(tail_is(heap, "", ""));
+    test.assert(tail_is(heap, "one\ntwo\nTOTAL 0/1\n", "one\ntwo\nTOTAL 0/1"));
+    test.assert(tail_is(heap, "a\r\nb\r\n\n\n  \n", "a\nb"));
+    test.assert(tail_is(heap, "tab\there \0x café\n", "tab here ?x caf??"));
+    return 0;
+}
+
+fn test_the_output_tail_keeps_20_lines_200_bytes_each_and_4096_in_all[&h](heap: &!h Heap) -> [heap] int {
+    var text = buffer.empty(heap, 256);
+    var n = 1;
+    while n <= 25 {
+        text = buffer.push_nat(heap, buffer.append(heap, text, "l"), n);
+        text = buffer.push(heap, text, byte_of(10));
+        n = n + 1;
+    }
+    borrow text as &xb in {
+        let t = tail_of(heap, buffer.bytes(xb));
+        borrow t as &tb in {
+            test.assert(bytes.equal(buffer.bytes(tb), "l6\nl7\nl8\nl9\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25"));
+        }
+        buffer.drop(heap, t);
+    }
+    buffer.drop(heap, text);
+    var wide = buffer.empty(heap, 512);
+    var k = 0;
+    while k < 300 {
+        wide = buffer.push(heap, wide, byte_of(120));
+        k = k + 1;
+    }
+    wide = buffer.append(heap, wide, "\nend\n");
+    borrow wide as &wb in {
+        let t = tail_of(heap, buffer.bytes(wb));
+        borrow t as &tb in {
+            test.assert_eq(buffer.size(tb), 200 + 1 + 3);
+        }
+        buffer.drop(heap, t);
+    }
+    buffer.drop(heap, wide);
+    // 20 lines of 200 bytes is 4019 bytes: under the total; 20 of 250 cut to 200 is the same. The total cap bites only through a long
+    // run of lines at the cap, so it is shown by the 20 x 200 + 19 = 4019 <= 4096 bound itself.
+    test.assert(company_step.tail_lines() * company_step.tail_line_bytes() + company_step.tail_lines() - 1 <= company_step.tail_bytes());
+    return 0;
+}
