@@ -65,6 +65,7 @@ a=0; b=0
 if (cd "$t" && patch -p1 -s -i "$1") > /dev/null 2>&1; then a=1; fi
 if [ $a = 1 ] && (cd "$t" && sh scripts/gate.sh) > /dev/null 2>&1; then b=1; fi
 rm -rf "$t"
+[ $((a + b)) = 2 ] || { [ -n "${HOME:-}" ] || echo "check: HOME is unset"; echo "check: the patch or the gate failed ($a $b)"; }
 echo "TOTAL $((a + b))/2"
 EOT
   chmod +x "$co/audit_change.sh"
@@ -177,6 +178,13 @@ mkrepo ck3; operator op3 "$w/ck3"; mkco co3 "spend"
 run "$w/co3" "$w/op3.json"
 check "spend: the build's two usage records are priced and recorded" sh -c "[ \$(cat '$w/rc') = 0 ] && grep 'company.spend.recorded' '$w/co3/company.journal' | grep -q '\"input\":1100'"
 
+# a retry is booked in full: the same build twice (the gate fails both times, `retry:chg` between), 1100 input tokens each
+mkrepo ck3b; operator op3b "$w/ck3b"; mkco co3b "spendlie"
+run "$w/co3b" "$w/op3b.json"
+"$F" company decide "$w/co3b" retry:chg approved again > /dev/null
+run "$w/co3b" "$w/op3b.json"
+check "spend: a retried build's own spend is booked in full (two records of 1100 input, not one and a delta of 0)" sh -c "[ \$(grep -c 'company.spend.recorded' '$w/co3b/company.journal') = 2 ] && [ \$(grep 'company.spend.recorded' '$w/co3b/company.journal' | grep -c '\"input\":1100') = 2 ] && [ \$(grep -c 'company.step.admitted' '$w/co3b/company.journal') = 2 ]"
+
 # ---- one case per refusal. refused NAME TAG MODE [operator file] [checkout]
 refused() { # name, tag, input, operator name, checkout, exit
   nm=$1; tag=$2; input=$3; opn=${4:-op}; ck=$5; want=${6:-14}
@@ -233,6 +241,12 @@ refused noagent operator-invalid good op-noagent "" 1
 # ---- a lying worker: the patch applies, the repository's gate fails
 refused lie check-failed lie op-lie "$w/ck-lie" 13
 check "lie: score 1/2 and no company.step.accepted; retry:chg frees it and the step is admitted again" sh -c "grep -qx 'score: 1/2' '$w/out' && '$F' company decide '$w/co-lie' retry:chg approved again > /dev/null && '$F' company run '$w/co-lie' '$w/op-lie.json' > /dev/null 2>&1; [ \$(grep -c 'company.step.admitted' '$w/co-lie/company.journal') = 2 ]"
+lie_pat='"env":"PATH","tail":"check: HOME is unset\ncheck: the patch or the gate failed (1 0)\nTOTAL 1/2"'
+check "lie: the check_failed record carries the names of the check's environment (PATH only) and the last lines it printed" grep -qF -- "$lie_pat" "$w/co-lie/company.journal"
+"$F" company status "$w/co-lie" > "$w/status-lie"
+check "lie: status shows the environment keys and the check's last lines under the step" sh -c "grep -qx '  check env: PATH' '$w/status-lie' && grep -qx '    check: HOME is unset' '$w/status-lie'"
+"$F" company status "$w/co-lie" format=json > "$w/status-lie.json"
+check "lie: status format=json has check_output with the same two" sh -c "grep -q '\"check_output\":{\"env\":\"PATH\",\"tail\":\"check: HOME is unset' '$w/status-lie.json'"
 
 # ---- runs that end without a claim: step-failed, nothing held, the next run admits the step again
 for m in stuck:change-stuck provider:change-provider-error usage:change-refused-args; do

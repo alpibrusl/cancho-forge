@@ -12,6 +12,7 @@ import forge.company_manifest;
 import forge.company_run;
 import forge.build_task;
 import forge.company_state;
+import forge.gate_env;
 import forge.gate_task;
 import forge.operator_review;
 import forge.repo_row;
@@ -1254,4 +1255,109 @@ pub fn op_publish_files[&s, &t, &i](src: &s [byte], tp: &t [int], step: &i [byte
     let all = json.get(src, tp, 0, "publish");
     let entry = json.get(src, tp, all, step);
     return json.get(src, tp, entry, "files");
+}
+
+// ---- what a check that did not pass leaves (docs/company.md section 8) ----------------------------------------------------------
+
+// The environment block of a check, as the guard and Forge both give it: `PATH=<fixed path>` and a NUL, and nothing else.
+pub fn check_env[&h](heap: &!h Heap) -> [heap] buffer.Buffer {
+    var env = buffer.append(heap, buffer.empty(heap, 64), "PATH=");
+    env = buffer.append(heap, env, gate_env.fixed_path());
+    return buffer.push(heap, env, byte_of(0));
+}
+
+// The names (never the values) in an environment block of NUL-terminated `NAME=value` entries, comma separated.
+pub fn env_keys[&h, &e](heap: &!h Heap, block: &e [byte]) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 32);
+    var start = 0;
+    var i = 0;
+    var first = true;
+    while i < len(block) {
+        if int_of(block[i]) == 0 {
+            var eq = start;
+            while eq < i && int_of(block[eq]) != 61 {
+                eq = eq + 1;
+            }
+            if eq > start {
+                if first == false {
+                    out = buffer.push(heap, out, byte_of(44));
+                }
+                out = buffer.append(heap, out, block[start..eq]);
+                first = false;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Most lines, bytes of a line and bytes in all of the tail of a check's output kept in the journal.
+pub fn tail_lines() -> [] int {
+    return 20;
+}
+
+pub fn tail_line_bytes() -> [] int {
+    return 200;
+}
+
+pub fn tail_bytes() -> [] int {
+    return 4096;
+}
+
+// The last lines of `out`, bounded (`tail_lines`, `tail_line_bytes`, `tail_bytes`: a longer line is cut, the earliest lines go first), a byte that is not
+// printable ASCII shown as `?`, a tab as a space, lines joined by a line feed, trailing blank lines dropped. Empty for no output.
+pub fn output_tail[&h, &o](heap: &!h Heap, out: &o [byte]) -> [heap] buffer.Buffer {
+    var end = len(out);
+    while end > 0 && (int_of(out[end - 1]) == 10 || int_of(out[end - 1]) == 13 || int_of(out[end - 1]) == 32) {
+        end = end - 1;
+    }
+    var start = end;
+    var lines = 1;
+    var seeking = true;
+    while seeking && start > 0 {
+        if int_of(out[start - 1]) == 10 && lines >= tail_lines() {
+            seeking = false;
+        } else {
+            if int_of(out[start - 1]) == 10 {
+                lines = lines + 1;
+            }
+            start = start - 1;
+        }
+    }
+    var joined = buffer.empty(heap, 256);
+    var col = 0;
+    var i = start;
+    while i < end {
+        let c = int_of(out[i]);
+        if c == 10 {
+            joined = buffer.push(heap, joined, byte_of(10));
+            col = 0;
+        } else if c != 13 {
+            if col < tail_line_bytes() {
+                if c == 9 {
+                    joined = buffer.push(heap, joined, byte_of(32));
+                } else if c < 32 || c > 126 {
+                    joined = buffer.push(heap, joined, byte_of(63));
+                } else {
+                    joined = buffer.push(heap, joined, byte_of(c));
+                }
+            }
+            col = col + 1;
+        }
+        i = i + 1;
+    }
+    var n = 0;
+    borrow joined as &jb in {
+        n = buffer.size(jb);
+    }
+    if n <= tail_bytes() {
+        return joined;
+    }
+    var kept = buffer.empty(heap, tail_bytes());
+    borrow joined as &jb in {
+        kept = buffer.append(heap, kept, buffer.bytes(jb)[n - tail_bytes()..n]);
+    }
+    buffer.drop(heap, joined);
+    return kept;
 }

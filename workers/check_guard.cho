@@ -78,9 +78,7 @@ fn guard[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""
             let (l1, e1) = process.add(heap, list, artifact);
             let (l2, e2) = process.add(heap, l1, argdir);
             list = l2;
-            var env = buffer.append(heap, buffer.empty(heap, 64), "PATH=");
-            env = buffer.append(heap, env, gate_env.fixed_path());
-            env = buffer.push(heap, env, byte_of(0));
+            let env = company_step.check_env(heap);
             var code = company_step.guard_code(process.Ran::Failed(0 - 2), 0);
             if e1 == 0 && e2 == 0 {
                 match process.channels() {

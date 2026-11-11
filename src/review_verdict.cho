@@ -1,6 +1,7 @@
 edition 9;
 module forge.review_verdict;
 
+import std.buffer;
 import std.bytes;
 import std.json;
 
@@ -10,8 +11,10 @@ import std.json;
 //   {"verdict":"approve"|"concerns","items":[{"file":"<1-200 bytes>","line":<0-10000000>,"claim":"<1-400 bytes>"} ...]}
 //
 // One JSON object and nothing around it (no text before or after, no code fence, no second object). Exactly the keys `verdict` and `items`; an item has exactly
-// `file`, `line` and `claim`. At most 20 items. `approve` has none and `concerns` has at least one. Every string is plain (no escape) and of printable ASCII (32 to
-// 126), so a claim can be printed on one line and put in no command, path or journal key as it stands. Anything else is unparsed, and the step is held, not accepted.
+// `file`, `line` and `claim`. At most 20 items. `approve` has none and `concerns` has at least one. Every string is valid JSON, and its VALUE (the escapes decoded)
+// is printable ASCII (32 to 126) of the stated length, so a claim can be printed on one line, decoded, and put in no command, path or journal key as it stands.
+// `\"`, `\\` and the other JSON escapes are accepted; one that decodes to a control character (`\n`, `\t`) is not. The `verdict` word is plain. Anything else is
+// unparsed, and the step is held, not accepted.
 
 pub fn approve() -> [] int {
     return 0;
@@ -41,12 +44,29 @@ pub fn max_line() -> [] int {
     return 10000000;
 }
 
-// Is `node` a plain string of printable ASCII, `low` to `high` bytes long?
-fn text_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, low: int, high: int) -> [] bool {
-    if node < 0 || json.is_string(tp, node) == false || json.string_plain(tp, node) == false {
-        return false;
+// The value of the string at `node`, decoded as JSON decodes it (a string without an escape is its own bytes). Empty for a node that is not a string.
+pub fn decoded[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], node: int) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 1);
+    let n = json.string_length(src, tp, node);
+    if n > 0 {
+        let raw = box_slice(heap, n, byte_of(0));
+        var w = 0 - 1;
+        borrow mut raw as &!rw in {
+            w = json.string_into(src, tp, node, contents(rw));
+        }
+        if w == n {
+            borrow raw as &rr in {
+                buffer.drop(heap, out);
+                out = buffer.append(heap, buffer.empty(heap, n), contents(rr));
+            }
+        }
+        unbox_slice(heap, raw);
     }
-    let v = json.string_view(src, tp, node);
+    return out;
+}
+
+// Is the decoded value `v` of 1 `low` to `high` bytes of printable ASCII?
+fn value_ok[&v](v: &v [byte], low: int, high: int) -> [] bool {
     if len(v) < low || len(v) > high {
         return false;
     }
@@ -61,12 +81,30 @@ fn text_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, low: int, high: int)
     return true;
 }
 
+// Is `node` a string whose VALUE (its JSON escapes decoded: `\"`, `\\`, `\/`, `\uXXXX`) is printable ASCII, `low` to `high` bytes long? An escape that
+// decodes to a control character (`\n`, `\t`, `\u0000`) or to a byte over 126 makes it not ok.
+fn text_ok[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], node: int, low: int, high: int) -> [heap] bool {
+    if node < 0 || json.is_string(tp, node) == false {
+        return false;
+    }
+    if json.string_plain(tp, node) {
+        return value_ok(json.string_view(src, tp, node), low, high);
+    }
+    let d = decoded(heap, src, tp, node);
+    var ok = false;
+    borrow d as &db in {
+        ok = value_ok(buffer.bytes(db), low, high);
+    }
+    buffer.drop(heap, d);
+    return ok;
+}
+
 // Is the item at `node` of the shape?
-fn item_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+fn item_ok[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], node: int) -> [heap] bool {
     if json.is_object(tp, node) == false || json.count(tp, node) != 3 {
         return false;
     }
-    if text_ok(src, tp, json.get(src, tp, node, "file"), 1, max_file()) == false || text_ok(src, tp, json.get(src, tp, node, "claim"), 1, max_claim()) == false {
+    if text_ok(heap, src, tp, json.get(src, tp, node, "file"), 1, max_file()) == false || text_ok(heap, src, tp, json.get(src, tp, node, "claim"), 1, max_claim()) == false {
         return false;
     }
     let line = json.get(src, tp, node, "line");
@@ -78,7 +116,7 @@ fn item_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
 }
 
 // The verdict of a parsed reply (`src`, its tape `tp`): `approve()`, `concerns()` or `unparsed()`.
-pub fn judge_parsed[&s, &t](src: &s [byte], tp: &t [int]) -> [] int {
+pub fn judge_parsed[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int]) -> [heap] int {
     if json.is_object(tp, 0) == false || json.count(tp, 0) != 2 {
         return unparsed();
     }
@@ -92,7 +130,7 @@ pub fn judge_parsed[&s, &t](src: &s [byte], tp: &t [int]) -> [] int {
     }
     var k = 0;
     while k < json.count(tp, items) {
-        if item_ok(src, tp, json.at(tp, items, k)) == false {
+        if item_ok(heap, src, tp, json.at(tp, items, k)) == false {
             return unparsed();
         }
         k = k + 1;
@@ -117,7 +155,7 @@ pub fn judge[&h, &r](heap: &!h Heap, reply: &r [byte]) -> [heap] int {
     borrow mut tape as &!tw in {
         let tp = contents(tw);
         if json.parse(reply, tp) > 0 {
-            code = judge_parsed(reply, tp);
+            code = judge_parsed(heap, reply, tp);
         }
     }
     unbox_slice(heap, tape);

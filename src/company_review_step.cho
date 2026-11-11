@@ -50,7 +50,7 @@ fn number[&s, &t](op: &s [byte], tp: &t [int], name: &static [byte]) -> [] int {
     return json.to_int(op, tp, json.get(op, tp, json.get(op, tp, 0, "review"), name));
 }
 
-// Print the concerns of a validated reply, one line each: `review: <file>:<line>: <claim>`.
+// Print the concerns of a validated reply, one line each: `review: <file>:<line>: <claim>`, the strings decoded (printable ASCII, so one line).
 fn print_items[&h, &i, &r](heap: &!h Heap, io: &!i Io, reply: &r [byte]) -> [heap, io_write] int {
     let tape = box_slice(heap, json.tape_len(reply), 0);
     borrow mut tape as &!tw in {
@@ -61,11 +61,19 @@ fn print_items[&h, &i, &r](heap: &!h Heap, io: &!i Io, reply: &r [byte]) -> [hea
             while k < json.count(tp, items) {
                 let it = json.at(tp, items, k);
                 io.write_all(io, "review: ");
-                io.write_all(io, json.string_view(reply, tp, json.get(reply, tp, it, "file")));
+                let file = review_verdict.decoded(heap, reply, tp, json.get(reply, tp, it, "file"));
+                borrow file as &fb in {
+                    io.write_all(io, buffer.bytes(fb));
+                }
+                buffer.drop(heap, file);
                 io.write_all(io, ":");
                 io.print_int(io, json.to_int(reply, tp, json.get(reply, tp, it, "line")));
                 io.write_all(io, ": ");
-                io.write_all(io, json.string_view(reply, tp, json.get(reply, tp, it, "claim")));
+                let claim = review_verdict.decoded(heap, reply, tp, json.get(reply, tp, it, "claim"));
+                borrow claim as &cb in {
+                    io.write_all(io, buffer.bytes(cb));
+                }
+                buffer.drop(heap, claim);
                 io.newline(io);
                 k = k + 1;
             }

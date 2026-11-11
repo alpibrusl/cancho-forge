@@ -125,7 +125,7 @@ check "lying worker: company.journal holds NO company.step.accepted, and the che
 "$F" company status "$w/lie" > "$w/lie.status"
 check "lying worker: status shows the step not accepted" sh -c "grep -qx 'lib ready' '$w/lie.status'"
 check "status format=json: one object, nothing else on stdout, exit 0, the states of the text status" sj lie
-check "status format=json: the held step is held with its tag and its score, no artifact" jq_ok lie 'd["steps"][0] == {"id": "lib", "role": "builder", "state": "held", "held": "check-failed", "gate": None, "artifact": None, "failed_check": {"score": 1, "total": 2}}'
+check "status format=json: the held step is held with its tag and its score, no artifact" jq_ok lie '{k: v for k, v in d["steps"][0].items() if k != "check_output"} == {"id": "lib", "role": "builder", "state": "held", "held": "check-failed", "gate": None, "artifact": None, "failed_check": {"score": 1, "total": 2}} and d["steps"][0]["check_output"]["env"] == "PATH"'
 check "status format=json: company, gates, budget and the journal's record count" jq_ok lie 'd["company"] == "co" and d["gates"] == [{"name": "ship", "decision": "open"}, {"name": "g", "decision": "open"}] and d["open_gates"] == [] and d["budget"]["limits"]["input"] == 100000 and d["budget"]["max_cost_micro"] == 10000000 and d["journal"] == {"records": '"$(wc -l < "$w/lie/company.journal")"', "torn_tail_bytes": 0}'
 proposed() { grep -c '"kind":"task.proposed"' "$w/$1/steps/$2/journal.jsonl"; } # name, step: builds the step's workspace saw
 run lie 2

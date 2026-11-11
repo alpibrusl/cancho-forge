@@ -324,3 +324,58 @@ fn test_status_shows_the_verdict_of_a_reviewed_step_and_only_that[&h](heap: &!h 
     buffer.drop(heap, j);
     return 0;
 }
+
+// ---- what a check that did not pass leaves (docs/company.md section 8) ----------------------------------------------------------
+
+fn test_status_shows_the_environment_names_and_the_last_lines_of_a_failed_check[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "x", "y"));
+    j = add(heap, j, company_state.check_failed_ran(heap, 3, "b", 0, 1, "PATH", "base build failed: HOME is not set\nTOTAL 0/1"));
+    borrow j as &jb in {
+        let text = status_of(heap, buffer.bytes(jb));
+        borrow text as &tb in {
+            test.assert(bytes.find(buffer.bytes(tb), "b ready\n  check env: PATH\n    base build failed: HOME is not set\n    TOTAL 0/1\n") >= 0);
+        }
+        buffer.drop(heap, text);
+        let doc = json_of(heap, buffer.bytes(jb));
+        borrow doc as &db in {
+            test.assert(bytes.find(buffer.bytes(db), "\"failed_check\":{\"score\":0,\"total\":1},\"check_output\":{\"env\":\"PATH\",\"tail\":\"base build failed: HOME is not set\\nTOTAL 0/1\"}") >= 0);
+        }
+        buffer.drop(heap, doc);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_check_that_could_not_judge_leaves_its_output_too_and_a_plain_record_leaves_none[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    j = add(heap, j, company_state.accepted(heap, 2, "a", "x", "y"));
+    j = add(heap, j, company_state.check_unavailable_ran(heap, 3, "b", "check-unavailable", "PATH", "Traceback: no HOME"));
+    borrow j as &jb in {
+        let text = status_of(heap, buffer.bytes(jb));
+        borrow text as &tb in {
+            test.assert(bytes.find(buffer.bytes(tb), "  check env: PATH\n    Traceback: no HOME\n") >= 0);
+        }
+        buffer.drop(heap, text);
+    }
+    var k = add(heap, buffer.empty(heap, 256), company_state.gate_decided(heap, 1, "g", "approved", "u", "ok"));
+    k = add(heap, k, company_state.accepted(heap, 2, "a", "x", "y"));
+    k = add(heap, k, company_state.check_failed(heap, 3, "b", 0, 1));
+    borrow k as &kb in {
+        let text = status_of(heap, buffer.bytes(kb));
+        borrow text as &tb in {
+            test.assert(bytes.find(buffer.bytes(tb), "check env") < 0);
+        }
+        buffer.drop(heap, text);
+        let doc = json_of(heap, buffer.bytes(kb));
+        borrow doc as &db in {
+            test.assert(bytes.find(buffer.bytes(db), "check_output") < 0);
+        }
+        buffer.drop(heap, doc);
+    }
+    buffer.drop(heap, j);
+    buffer.drop(heap, k);
+    return 0;
+}

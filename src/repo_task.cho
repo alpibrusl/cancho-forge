@@ -280,7 +280,8 @@ pub fn materialise_script[&h, &c, &e, &s](heap: &!h Heap, checkout: &c [byte], e
 // The build: `cancho-build --repo <ev>/base --change <ev>/change.txt --kind K --checker C --work <ev>/work --agent 'A' --provider P --model M`
 // and the ceilings the operator set. `exec` so the status is the tool's.
 pub fn build_script[&h, &t, &e, &k, &a, &c, &p, &m, &y](heap: &!h Heap, tools: &t [byte], ev: &e [byte], checker: &k [byte], agent: &a [byte], kind: &c [byte], provider: &p [byte], model: &m [byte], attempts: int, agent_seconds: int) -> [heap] buffer.Buffer {
-    var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 512), "exec 2>&1; rm -rf "), ev, "/work; cd ", ev);
+    var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 512), "exec 2>&1; rm -rf "), ev, "/work; rm -f ", ev);
+    b = cat3(heap, b, "/usage.jsonl; cd ", ev, "");
     b = cat3(heap, b, " || exit 2; exec ", tools, "/");
     b = cat3(heap, b, build_task.tool_name(), " --repo ", ev);
     b = cat3(heap, b, "/base --change ", ev, "/");

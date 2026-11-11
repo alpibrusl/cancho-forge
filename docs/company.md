@@ -213,7 +213,7 @@ document invalid (pinned by `tests/company_cmd_test.cho` and a hostile journal i
   its **last** `company.step.check_failed` record, kept after a retry or an acceptance (it is a record, not the current verdict), `null`
   when it has none; `review`, **present only for a step a model reviewed**, `{"verdict":"approve"|"concerns","items":N}` of its last
   `company.step.reviewed` record (the key is absent otherwise, so a document written before it is unchanged). The text status appends
-  ` review=approve` or ` review=concerns:N` to that step's line.
+  ` review=approve` or ` review=concerns:N` to that step's line. `check_output`, **present only for a step whose last failed or unjudged check left output**, `{"env":"PATH","tail":"..."}`: the names of the check's environment and the last lines it printed (section 8, "What a check that did not pass leaves"); the text status prints them under the step's line.
 * `gates`: every name of `human_gates` in manifest order, then each `retry:<id>` that has a decision, in step order; `decision` is
   `open`, `approved` or `rejected` (the last decision wins). A gate name in the journal that is neither is not shown.
 * `open_gates`: exactly the text's `open gates:` list.
@@ -310,8 +310,8 @@ One JSON object per line, framed like every Forge journal (`v`, `seq` from 1 and
 |---|---|---|
 | `company.step.admitted` | the step id | `forge_task` (the step's workspace, `steps/<id>`) |
 | `company.step.accepted` | the step id | `artifact` (path relative to the company directory), `sha256` (computed by Forge) |
-| `company.step.check_failed` | the step id | `score`, `total` |
-| `company.step.check_unavailable` | the step id | `reason` (the printed tag: `check-unavailable`, `artifact-invalid` or `usage-invalid`; a later run names it again) |
+| `company.step.check_failed` | the step id | `score`, `total`; optional `env`, `tail` (see "What a check that did not pass leaves", section 8) |
+| `company.step.check_unavailable` | the step id | `reason` (the printed tag: `check-unavailable`, `artifact-invalid` or `usage-invalid`; a later run names it again); optional `env`, `tail` as in `check_failed`, written when the check ran and could not judge |
 | `company.step.reviewed` | the step id | `verdict` (`approve` with `items` 0, or `concerns` with `items` 1 or more), `items`, `model`: a `repo.review` step's validated reply (docs/review-step.md); written after `review.json` is hashed and immediately before the step's `company.step.accepted`; replay checks the shape and keeps the last one per step, which `status` shows |
 | `company.step.published` | the step id | `branch`, `commit` (40 hex): `forge company publish` made this commit for the step (section 26); replay checks the shape only |
 | `company.gate.decided` | the gate name | `gate`, `verdict` (`approved` / `rejected`), `user`, `reason` |
@@ -364,6 +364,17 @@ Forge computed. A worker's `done`, a gate's `passed`, a tool's exit 0: none of t
 * A score below the total is `check-failed` whatever the program's exit status. A full score with a non-zero exit, no score line, an
   unreadable one (a sign, text after it, a number of more than 15 digits, `a > b`, `0/0`), a signal, the deadline or the output cap are
   `check-unavailable`: never a pass.
+* **What a check that did not pass leaves.** When the check ran and the verdict is `check-failed` or `check-unavailable` (not a pass, not an
+  artifact or guard refusal), Forge puts two optional fields on that record: `env`, the names (not the values) of the variables the check was
+  given, comma separated (today `PATH`; the guard and Forge build the block from one function, `company_step.check_env`, so the names are the
+  ones used), and `tail`, the **last lines of the check's standard output**: at most 20 lines of at most 200 bytes each and 4096 bytes in all
+  (a longer line is cut, the earlier lines are dropped first), a byte outside printable ASCII shown as `?`, lines joined by a line feed. The
+  guard gives the check no standard error (`/dev/null`), so a check that wants its reason seen prints it on standard output, as company 4's
+  wrapper did; capturing standard error would mean changing the guard's supervision loop and is not done. `forge company status` shows them
+  for a step whose last failed check has them: the text status adds, after the step's line, `  check env: PATH` and each tail line indented by
+  four spaces; `format=json` adds, to the step, `check_output`: `{"env":"PATH","tail":"..."}` (the key is **absent** for a step with none, so a document
+  written before it is unchanged). The last such record wins and it is kept after a retry or an acceptance, as `failed_check` is. A record without
+  the fields (an older Forge's) replays as before. The check's score is still journaled only when it failed (unchanged).
 * The audit's result is **never fed back** to the builder, so a re-run does not learn from it.
 * **For audit authors:** the LAST `TOTAL` line on the check's standard output decides. An audit that runs the artifact must not let the
   artifact write to the audit's standard output (redirect the artifact's output to a file or `/dev/null`, and print the `TOTAL` line
@@ -721,7 +732,9 @@ drawn from the review ledger of the build (`.superpowers/sdd/2026-10-27-forge-co
 * **A step id of `.` or `..`** passes the manifest's name rule (a manifest rule is still to be added).
 * **A role changed after acceptance** (a builder step edited into a product step) skips the re-verification of its artifact for the steps
   that need it; an edit to `company.json` after a product step was accepted is not noticed (product needs are trusted).
-* **A check's environment is `PATH` only**: a check that needs `HOME` or a locale fails or cannot judge.
+* **A check's environment is `PATH` only**: a check that needs `HOME` or a locale fails or cannot judge. This is deliberate isolation and is not
+  changed; what changed is that the failure is visible (section 8, "What a check that did not pass leaves"). Company 4's audit wrapper, run without
+  `HOME`, failed its base build and scored 0/1, and nothing in the journal or `status` said why.
 * **A directory planted at `needs-<id>-<name>`** in an execution directory makes the delivery fail as an I/O error (exit 3), not a tag.
   A file `needs-*` of the worker's own in `ev` is deleted at the next start (those names are Forge's).
 * **`forge build` has no `--contract` option**: a contract can only be given by a manifest step (or a direct task).
@@ -872,6 +885,14 @@ for the step's repository) and `repo-kind-mismatch` (the row's `kind` is not the
 5. takes `ev/work/change.patch` out as a regular file of its own (`patch-missing` for none or a link) with `usage.jsonl`, asks the checkout for
    its state again (`repo-checkout-changed` for any difference), and applies the patch to `ev/fresh` with `patch --dry-run`
    (`patch-not-applicable`).
+
+**A `repo.change` build's spend is booked in full, every time it runs.** Each build starts from an empty `ev/work` (`rm -rf` in the build
+script) and `collect` replaces `ev/usage.jsonl` with that build's own log, and a build's `ev/usage.jsonl` from an earlier run is removed
+before it starts, so the file holds exactly the one build's calls. Section 9's "less what the journal holds for the step" is for a tool
+that **appends** to one log across runs (the worker steps); applied here it booked a retry only by how much it exceeded the first build
+(company 4, `retry:chg`: the journal held $0.0055 for two builds that spent about $0.0099; the second was booked as nothing because its
+cost, $0.0044, was below the first's). For `repo.change` the baseline is zero, so the budget cap sees the true total. (`repo.review`
+writes its log the same way and has the same shape; not changed here.)
 
 Forge then records the build's spend (whatever the ending), reads `change.patch` itself (a regular file of at most 16 MiB, like any artifact),
 and bounds it with `patch_check` against the row (`patch-kind-invalid`, `patch-path-denied`, `patch-too-large`; a patch the worker found not

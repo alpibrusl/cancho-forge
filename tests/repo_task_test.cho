@@ -102,7 +102,7 @@ fn test_the_shell_texts_hold_only_paths_and_closed_words[&h](heap: &!h Heap) -> 
     buffer.drop(heap, m);
     let b = repo_task.build_script(heap, "/t", "/ev", "/c/cancho", "stand-in-agent", "bug", "stand", "m1", 0, 0);
     borrow b as &bb in {
-        test.assert(bytes.equal(buffer.bytes(bb), "exec 2>&1; rm -rf /ev/work; cd /ev || exit 2; exec /t/cancho-build --repo /ev/base --change /ev/change.txt --kind bug --checker /c/cancho --work /ev/work --agent 'stand-in-agent' --provider stand --model m1"));
+        test.assert(bytes.equal(buffer.bytes(bb), "exec 2>&1; rm -rf /ev/work; rm -f /ev/usage.jsonl; cd /ev || exit 2; exec /t/cancho-build --repo /ev/base --change /ev/change.txt --kind bug --checker /c/cancho --work /ev/work --agent 'stand-in-agent' --provider stand --model m1"));
     }
     buffer.drop(heap, b);
     let b2 = repo_task.build_script(heap, "/t", "/ev", "/c/cancho", "a", "feature", "p", "m", 3, 90);
