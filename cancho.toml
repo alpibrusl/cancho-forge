@@ -1,6 +1,6 @@
 [package]
 name = "cancho-forge"
-cancho = "ab3e22481e7da23ae90509a92c1706473ffde19e"
+cancho = "5a5dd1f21250b96b3f735a45b781489374219466"
 
 [[bin]]
 name = "forge"
