@@ -68,7 +68,9 @@ if $C build src/*.cho --std -o "$rc_dir/forge" && $C build workers/gate_runner.c
   check "real crash: no worker was started again" eval "[ \$(grep -c execution.started '$rc_dir/real/journal.jsonl') -eq 1 ]"
   # what the killed run left: the gate's own `sleep` and its runner (not the runner we may be running under, `leftover`)
   for p in $(leftover -f '^sleep 83$'; leftover -x gate_runner); do kill "$p" 2> /dev/null; done
-  sleep 0.3
+  # a killed process is gone when the kernel says so, not 0.3 s later: on a loaded machine the fixed wait was a red line (seen once in a full gate)
+  n=0
+  while [ "$n" -lt 30 ] && leftover -f '^sleep 83$' > /dev/null; do sleep 0.1; n=$((n + 1)); done
   check "real crash: nothing it started is left running" eval "! leftover -f '^sleep 83\$' > /dev/null"
   ! leftover -x gate_runner > /dev/null || kill $(leftover -x gate_runner) 2> /dev/null
 
