@@ -13,6 +13,7 @@
 #   company run          `forge company run` end to end, real workers, the lying-worker test (tests/conformance/company_run.sh)
 #   company kill         `forge company run` killed mid-step and run again: nothing left running, each step accepted once (tests/conformance/company_kill.sh)
 #   company change      `forge company run` of a repo.change step, the change worker real, a stand-in build tool (tests/conformance/company_change.sh)
+#   repository layer    each question of src/repo_vcs.cho asked of a git and of a cancho vcs repository with the same files (tests/conformance/repo_vcs.sh)
 #   company review      `forge company run` of a repo.review step, the model reviewer's worker a stand-in (tests/conformance/company_review.sh)
 #   company change add  `forge company change add` and the `admit:` gate end to end, every tag of the verb (tests/conformance/company_change_add.sh)
 #   audit mutants harness  the mutants script's verdict and scratch directory (tests/conformance/audit_mutants_harness.sh)
@@ -210,6 +211,12 @@ mkdir "$scratch/repo-publish-library" || exit 1
 CANCHO="$C" sh tests/conformance/repo_publish_library.sh "$scratch/repo-publish-library" > "$scratch/repo-publish-library.out" || fail=1
 cat "$scratch/repo-publish-library.out"
 if grep -q '^FAIL ' "$scratch/repo-publish-library.out"; then fail=1; fi
+
+echo "== repository layer (src/repo_vcs.cho: each question asked of a git repository and of a cancho vcs repository with the same files, and the answers compared; tests/conformance/repo_vcs.sh)"
+mkdir "$scratch/repo-vcs" || exit 1
+CANCHO="$C" sh tests/conformance/repo_vcs.sh "$scratch/repo-vcs" > "$scratch/repo-vcs.out" || fail=1
+cat "$scratch/repo-vcs.out"
+if grep -q '^FAIL ' "$scratch/repo-vcs.out"; then fail=1; fi
 
 echo "== forge company run of a repo.change step (workers/repo_change.cho on a copy of a throw-away git checkout, a stand-in build tool: the good path, one case per refusal tag, the lying worker, kill and resume; tests/conformance/company_change.sh)"
 $C check workers/repo_change.cho $libs --std || fail=1

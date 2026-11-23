@@ -309,3 +309,24 @@ fn test_a_slug_is_owner_slash_name_3_to_128_bytes() -> [] int {
     test.assert_eq(flag(repo_row.slug_ok("A/Z9")), 1);
     return 0;
 }
+
+// The good row with `more` (`,"key":value`) after it.
+fn row_and[&h](heap: &!h Heap, more: &static [byte]) -> [heap] &static [byte] {
+    var o = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 256), good_row()), more);
+    var why = "";
+    borrow o as &ob in {
+        why = with_row(heap, buffer.bytes(ob));
+    }
+    buffer.drop(heap, o);
+    return why;
+}
+
+fn test_a_row_names_its_version_control_and_only_git_runs_yet[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(len(row_and(heap, ",\"vcs\":\"git\"")), 0);
+    test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"cancho\""), "repos: vcs is cancho, which the tasks are not wired to yet (docs/repo-vcs.md): only git"));
+    test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"svn\""), "repos: vcs is not git or cancho"));
+    test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"\""), "repos: vcs is not git or cancho"));
+    test.assert(bytes.equal(row_and(heap, ",\"vcs\":7"), "repos: vcs is not git or cancho"));
+    test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"Git\""), "repos: vcs is not git or cancho"));
+    return 0;
+}

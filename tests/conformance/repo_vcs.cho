@@ -1,0 +1,83 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import forge.repo_vcs;
+
+// The shell texts of src/repo_vcs.cho, printed so that `tests/conformance/repo_vcs.sh` can run each against a real repository of each kind and
+// compare what the two kinds answer. This program starts nothing and reads nothing.
+//
+// Usage: repo_vcs <git|cancho> state <checkout> | tracked <checkout> <ev> <sub> | head <workspace> | file <workspace> <revision> <path>
+//                                 | export <workspace> <revision> <exec dir>
+// Exit status: 0 the text was printed, 2 the command line is not one of those.
+
+fn go[&h, &i, &g](heap: &!h Heap, io: &!i Io, args: &g Args) -> [args, heap, io_write] int {
+    let n = arg_count(args);
+    if n < 4 {
+        return 2;
+    }
+    let kind = repo_vcs.kind_of(arg(args, 1));
+    let op = arg(args, 2);
+    if kind < 0 || len(arg(args, 1)) == 0 {
+        return 2;
+    }
+    var text = buffer.empty(heap, 0);
+    var known = true;
+    if bytes.equal(op, "state") && n == 4 {
+        buffer.drop(heap, text);
+        text = repo_vcs.state_script(heap, kind, arg(args, 3));
+    } else if bytes.equal(op, "tracked") && n == 6 {
+        buffer.drop(heap, text);
+        text = repo_vcs.materialise_script(heap, kind, arg(args, 3), arg(args, 4), arg(args, 5));
+    } else if bytes.equal(op, "head") && n == 4 {
+        buffer.drop(heap, text);
+        text = repo_vcs.head_script(heap, kind, arg(args, 3));
+    } else if bytes.equal(op, "file") && n == 6 {
+        buffer.drop(heap, text);
+        text = repo_vcs.file_script(heap, kind, arg(args, 3), arg(args, 4), arg(args, 5));
+    } else if bytes.equal(op, "export") && n == 6 {
+        buffer.drop(heap, text);
+        text = repo_vcs.export_script(heap, kind, arg(args, 3), arg(args, 4), arg(args, 5));
+    } else {
+        known = false;
+    }
+    if known {
+        borrow text as &tb in {
+            io.write_all(io, buffer.bytes(tb));
+        }
+    }
+    buffer.drop(heap, text);
+    if known {
+        return 0;
+    }
+    return 2;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(net);
+    release(signals);
+    release(tty);
+    release(fs);
+    release(exec);
+    release(clock);
+    var console = io;
+    var memory = heap;
+    var status = 2;
+    borrow mut console as &!i in {
+        borrow mut memory as &!h in {
+            borrow args as &g in {
+                status = go(h, i, g);
+                if status == 2 {
+                    io.error_all(i, "usage: repo_vcs <git|cancho> state <checkout> | tracked <checkout> <ev> <sub> | head <workspace> | file <workspace> <revision> <path> | export <workspace> <revision> <exec dir>\n");
+                }
+            }
+        }
+    }
+    release(console);
+    release(memory);
+    release(args);
+    return status;
+}

@@ -6,6 +6,7 @@ import std.bytes;
 import std.json;
 import forge.authority_review;
 import forge.gate_task;
+import forge.repo_vcs;
 
 // The `repo.authority` task (docs/reviewer.md section 2): given a repository of the allow-list, the head revision the checkout is at, and the
 // base revision the ceiling is read from, report whether the head's authority is within the ceiling. This module is the pure half: what a task
@@ -159,13 +160,7 @@ pub fn programs_text[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], n
 // The shell text that prints the ceiling file as it is at the base commit: `git show <base>:<ceiling>`. A failure (no such commit or file) is the
 // shell's non-zero status, which is a missing ceiling. Standard error is dropped. `workspace`, `base` and `ceiling` have passed `check`.
 pub fn ceiling_script[&h, &w, &b, &c](heap: &!h Heap, workspace: &w [byte], base: &b [byte], ceiling: &c [byte]) -> [heap] buffer.Buffer {
-    var s = buffer.append(heap, buffer.empty(heap, 128), "exec 2>/dev/null; cd ");
-    s = buffer.append(heap, s, workspace);
-    s = buffer.append(heap, s, " && git show ");
-    s = buffer.append(heap, s, base);
-    s = buffer.push(heap, s, byte_of(58));
-    s = buffer.append(heap, s, ceiling);
-    return buffer.append(heap, s, "; exit $?");
+    return repo_vcs.file_script(heap, repo_vcs.git(), workspace, base, ceiling);
 }
 
 // The shell text that exports the head commit's tree: `git archive` of `revision` from the repository at `workspace` into `<exec_dir>/tree`, through a tar
@@ -173,24 +168,7 @@ pub fn ceiling_script[&h, &w, &b, &c](heap: &!h Heap, workspace: &w [byte], base
 // commit is content-addressed, so the tree is exactly the commit's). A non-zero status is a commit the repository does not have, or a tree that
 // could not be written. `workspace`, `revision` and `exec_dir` have passed `check`.
 pub fn export_script[&h, &w, &v, &e](heap: &!h Heap, workspace: &w [byte], revision: &v [byte], exec_dir: &e [byte]) -> [heap] buffer.Buffer {
-    var s = buffer.append(heap, buffer.empty(heap, 192), "exec 2>&1; rm -rf ");
-    s = buffer.append(heap, s, exec_dir);
-    s = buffer.append(heap, s, "/tree && git -C ");
-    s = buffer.append(heap, s, workspace);
-    s = buffer.append(heap, s, " archive -o ");
-    s = buffer.append(heap, s, exec_dir);
-    s = buffer.append(heap, s, "/tree.tar ");
-    s = buffer.append(heap, s, revision);
-    s = buffer.append(heap, s, " && mkdir ");
-    s = buffer.append(heap, s, exec_dir);
-    s = buffer.append(heap, s, "/tree && tar -xf ");
-    s = buffer.append(heap, s, exec_dir);
-    s = buffer.append(heap, s, "/tree.tar -C ");
-    s = buffer.append(heap, s, exec_dir);
-    s = buffer.append(heap, s, "/tree; s=$?; rm -f ");
-    s = buffer.append(heap, s, exec_dir);
-    s = buffer.append(heap, s, "/tree.tar; exit $s");
-    return s;
+    return repo_vcs.export_script(heap, repo_vcs.git(), workspace, revision, exec_dir);
 }
 
 // The shell text that asks the compiler for the head's authority: `<compiler> authority <programs> [--std]`, run in the exported tree
