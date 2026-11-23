@@ -195,11 +195,15 @@ mkrepo ck5 "$ORIGIN"
 printf '#!/bin/sh\ntouch "%s/hook-ran"\nexit 0\n' "$w" > "$w/ck5/.git/hooks/pre-commit"; chmod +x "$w/ck5/.git/hooks/pre-commit"
 printf '#!/bin/sh\ntouch "%s/hook-ran"\nexit 0\n' "$w" > "$w/ck5/.git/hooks/commit-msg"; chmod +x "$w/ck5/.git/hooks/commit-msg"
 printf '#!/bin/sh\ntouch "%s/hook-ran"\nexit 0\n' "$w" > "$w/ck5/.git/hooks/post-commit"; chmod +x "$w/ck5/.git/hooks/post-commit"
-HOSTILE='T: $(touch '"$w"'/trailer-ran); `touch '"$w"'/trailer-ran2`; x'
+# The trailer is at most 200 bytes and names its two files by full path: a short directory of their own, since the scratch directory under
+# a long $TMPDIR (macOS: /var/folders/...) made the trailer too long and the publish was refused as operator-invalid before anything was tried.
+hd=$(mktemp -d /tmp/fh.XXXXXX) || exit 1
+HOSTILE='T: $(touch '"$hd"'/trailer-ran); `touch '"$hd"'/trailer-ran2`; x'
 operator "$w/op5.json" "$w/ck5" alpibrusl/cancho-diff "$FILES" "$w/workers" "$HOSTILE"
 "$F" company publish "$co" "$w/op5.json" lib forge/hostile > "$w/pub5.out" 2> /dev/null; rc=$?
 check "hostile trailer and hooks: published (exit 0)" sh -c "[ '$rc' = 0 ]"
-check "hostile trailer: it is in the message as text and no command ran" sh -c "git -C '$w/ck5' log -1 --format=%B forge/hostile | grep -qF 'touch $w/trailer-ran' && [ ! -e '$w/trailer-ran' ] && [ ! -e '$w/trailer-ran2' ]"
+check "hostile trailer: it is in the message as text and no command ran" sh -c "git -C '$w/ck5' log -1 --format=%B forge/hostile | grep -qF 'touch $hd/trailer-ran' && [ ! -e '$hd/trailer-ran' ] && [ ! -e '$hd/trailer-ran2' ]"
+rm -rf "$hd"
 check "the checkout's commit hooks did not run" sh -c "[ ! -e '$w/hook-ran' ]"
 
 # ---- a detached checkout goes back to where it was

@@ -55,7 +55,9 @@ echo "== conformance (file layer)"
 # and the shared helpers in tests/conformance/support.cho. They are built and
 # run against a scratch directory made here and removed on exit.
 libs=$(ls src/*.cho | grep -v '/main\.cho$')
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/forge-conformance.XXXXXX") || exit 1
+# $TMPDIR may end in a slash (macOS: /var/folders/.../T/): `//` in a path is one the gate environment refuses (env-invalid), by design.
+tmp=${TMPDIR:-/tmp}
+scratch=$(mktemp -d "${tmp%/}/forge-conformance.XXXXXX") || exit 1
 trap 'rm -rf "$scratch"' EXIT
 held=0
 for prog in journal_files snapshot_files evidence_files; do

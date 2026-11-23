@@ -1,15 +1,15 @@
 Install cancho-forge and check it on this machine. Work in a new empty directory, keep every path free of spaces, and never use sudo. Run steps 2 to 5 in one shell session. Report honestly; do not retry a failing command in a loop and do not edit the repository to make a command pass.
 
-1. Check that `git`, `cargo` (Rust, via rustup), a C compiler (`cc`), `clang` and `sh` exist. If one is missing, stop and tell me which; do not install system packages on your own.
+1. Check that `git`, `curl`, a C compiler (`cc`), `clang` (15 or newer) and `sh` exist. If one is missing, stop and tell me which; do not install system packages on your own.
 
 2. Get the two repositories side by side, both cloned into the new empty directory (call it the parent):
    git clone https://github.com/alpibrusl/cancho-forge.git
    git clone https://github.com/alpibrusl/cancho.git
    git -C cancho checkout "$(cat cancho-forge/.cancho-rev)"
 
-3. Build the compiler (a few minutes) and point at it:
-   (cd cancho && cargo build --release -p cancho)
-   export CANCHO="$PWD/cancho/target/release/cancho"
+3. Install the released compiler of that commit (a prebuilt binary, checked against its published sha256) and point at it:
+   sh cancho/scripts/install.sh "$(cat cancho-forge/.cancho-rev)" "$PWD/cancho-inst"
+   export CANCHO="$PWD/cancho-inst/bin/cancho"
 
 4. Prove the install works. This needs no network, no key and no model. Start from the parent directory:
    cd cancho-forge
