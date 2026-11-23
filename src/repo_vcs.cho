@@ -1,0 +1,188 @@
+edition 9;
+module forge.repo_vcs;
+
+import std.buffer;
+import std.bytes;
+
+// The one place Forge says how a repository is asked a question (docs/repo-vcs.md): the shell texts that read a checkout, for each kind of version
+// control a repository row can name. `git` is what every task ran before this module, byte for byte (the tests of `repo_task`, `gate_task` and
+// `authority_task` pin the texts). `cancho` is the same questions asked of `cancho vcs` (alpibrusl/cancho, docs/vcs-cli.md): a revision is a change id
+// of 64 digits, the tree of a change is read from the store's own files (`.cancho/vcs/objects/KIND/AB/REST`, a tree being lines `MODE BLOB PATH`),
+// and no `git` is started.
+//
+//   state        the head revision, its tree's id and `clean` or `dirty`, one to a line
+//   tracked      the tracked files of the checkout, each ended by a NUL
+//   head         the head revision
+//   file         a file as it is at a revision
+//   export       the tree of a revision, as files beneath a directory
+//
+// Every path and revision a text holds was checked by its caller (`gate_task.path_ok`, `revision_ok` here): nothing the shell treats specially.
+// The texts that WRITE a repository (a branch, a commit: `workers/repo_publish.cho`) are the `git` ones only; `publish_built` says so.
+
+pub fn git() -> [] int {
+    return 0;
+}
+
+pub fn cancho() -> [] int {
+    return 1;
+}
+
+// The kind a repository row's `vcs` names: `git` (also when the row has none), `cancho`, or -1.
+pub fn kind_of[&t](text: &t [byte]) -> [] int {
+    if len(text) == 0 || bytes.equal(text, "git") {
+        return 0;
+    }
+    if bytes.equal(text, "cancho") {
+        return 1;
+    }
+    return 0 - 1;
+}
+
+// The program a kind starts, by the name the shell looks up on `PATH`.
+pub fn tool(kind: int) -> [] &static [byte] {
+    if kind == 1 {
+        return "cancho";
+    }
+    return "git";
+}
+
+// How many digits a revision of a kind has: a git commit 40, a change id 64.
+pub fn revision_digits(kind: int) -> [] int {
+    if kind == 1 {
+        return 64;
+    }
+    return 40;
+}
+
+// Exactly the digits of a revision of `kind`, each of `0-9a-f`.
+pub fn revision_ok[&r](kind: int, revision: &r [byte]) -> [] bool {
+    if len(revision) != revision_digits(kind) {
+        return false;
+    }
+    var i = 0;
+    while i < len(revision) {
+        let c = int_of(revision[i]);
+        if !(c >= 48 && c <= 57 || c >= 97 && c <= 102) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Whether the texts that write a repository of `kind` (a branch and a commit with the provenance) exist: only git's do.
+pub fn publish_built(kind: int) -> [] bool {
+    return kind == 0;
+}
+
+fn cat3[&h, &a, &b, &c](heap: &!h Heap, out: buffer.Buffer, a: &a [byte], b: &b [byte], c: &c [byte]) -> [heap] buffer.Buffer {
+    return buffer.append(heap, buffer.append(heap, buffer.append(heap, out, a), b), c);
+}
+
+// What the `cancho` texts start with: `R` the repository's directory, and three shell functions. `cvh` prints the head change, `cvt CHANGE` the id
+// of its tree, `cvo KIND ID` the path of an object of the store. Each prints nothing when there is no such thing, which the texts test for.
+fn prelude[&h, &r](heap: &!h Heap, out: buffer.Buffer, repository: &r [byte]) -> [heap] buffer.Buffer {
+    var b = cat3(heap, out, "R=", repository, "; ");
+    b = buffer.append(heap, b, "cvh() { cancho vcs status --repo \"$R\" --output json | sed -n 's/^  \"head\": \"\\([0-9a-f]\\{64\\}\\)\",\\{0,1\\}$/\\1/p'; }; ");
+    b = buffer.append(heap, b, "cvt() { cancho vcs show \"$1\" --repo \"$R\" --output json | sed -n 's/^  \"tree\": \"\\([0-9a-f]\\{64\\}\\)\",\\{0,1\\}$/\\1/p'; }; ");
+    return buffer.append(heap, b, "cvo() { printf '%s/.cancho/vcs/objects/%s/%s/%s\\n' \"$R\" \"$1\" \"$(printf %s \"$2\" | cut -c1-2)\" \"$(printf %s \"$2\" | cut -c3-64)\"; }; ");
+}
+
+// Print the checkout's head revision, the tree of it and whether the working copy is clean (nothing modified, added or untracked): `exit 2` when the
+// checkout cannot be entered, 3 when it has no head.
+pub fn state_script[&h, &c](heap: &!h Heap, kind: int, checkout: &c [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 256), "exec 2>&1; ");
+    if kind == 1 {
+        b = prelude(heap, b, checkout);
+        b = cat3(heap, b, "cd ", checkout, " || exit 2; h=$(cvh); [ -n \"$h\" ] || exit 3; t=$(cvt \"$h\"); [ -n \"$t\" ] || exit 3; echo \"$h\"; echo \"$t\"; ");
+        return buffer.append(heap, b, "if cancho vcs status --output json | grep -q '^  \"clean\": true,\\{0,1\\}$'; then echo clean; else echo dirty; fi");
+    }
+    b = buffer.append(heap, b, "cd ");
+    b = buffer.append(heap, b, checkout);
+    return buffer.append(heap, b, " || exit 2; git rev-parse --verify HEAD || exit 3; git rev-parse \"HEAD^{tree}\" || exit 3; if [ -z \"$(git status --porcelain --untracked-files=all)\" ]; then echo clean; else echo dirty; fi");
+}
+
+// Make `<ev>/<sub>` a copy of the checkout's TRACKED files (nothing of the store, nothing untracked): the file list and a tar beside it, removed again.
+pub fn materialise_script[&h, &c, &e, &s](heap: &!h Heap, kind: int, checkout: &c [byte], ev: &e [byte], sub: &s [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 256), "exec 2>&1; ");
+    if kind == 1 {
+        b = prelude(heap, b, checkout);
+    }
+    b = cat3(heap, buffer.append(heap, b, "rm -rf "), ev, "/", sub);
+    b = cat3(heap, b, " ", ev, "/tracked.lst ");
+    b = cat3(heap, b, ev, "/tracked.tar; mkdir ", ev);
+    b = cat3(heap, b, "/", sub, " || exit 1; cd ");
+    if kind == 1 {
+        b = cat3(heap, b, checkout, " || exit 2; t=$(cvt \"$(cvh)\"); [ -n \"$t\" ] || exit 3; cut -d' ' -f3- \"$(cvo tree \"$t\")\" | tr '\\n' '\\0' > ", ev);
+    } else {
+        b = cat3(heap, b, checkout, " || exit 2; git ls-files -z > ", ev);
+    }
+    b = cat3(heap, b, "/tracked.lst || exit 3; tar --null -T ", ev, "/tracked.lst -cf ");
+    b = cat3(heap, b, ev, "/tracked.tar || exit 4; tar -xf ", ev);
+    b = cat3(heap, b, "/tracked.tar -C ", ev, "/");
+    b = cat3(heap, b, sub, " || exit 5; rm -f ", ev);
+    return cat3(heap, b, "/tracked.lst ", ev, "/tracked.tar");
+}
+
+// The shell text that prints the checkout's revision.
+pub fn head_script[&h, &w](heap: &!h Heap, kind: int, workspace: &w [byte]) -> [heap] buffer.Buffer {
+    if kind == 1 {
+        let b = prelude(heap, buffer.empty(heap, 512), workspace);
+        return buffer.append(heap, b, "h=$(cvh); [ -n \"$h\" ] && echo \"$h\"");
+    }
+    var b = buffer.append(heap, buffer.empty(heap, 64), "cd ");
+    b = buffer.append(heap, b, workspace);
+    return buffer.append(heap, b, " && git rev-parse HEAD");
+}
+
+// The shell text that prints the file `path` as it is at the revision `base`. A failure (no such revision or file) is the shell's non-zero status.
+// Standard error is dropped.
+pub fn file_script[&h, &w, &b, &c](heap: &!h Heap, kind: int, workspace: &w [byte], base: &b [byte], path: &c [byte]) -> [heap] buffer.Buffer {
+    var s = buffer.append(heap, buffer.empty(heap, 128), "exec 2>/dev/null; ");
+    if kind == 1 {
+        s = prelude(heap, s, workspace);
+        s = cat3(heap, s, "t=$(cvt ", base, ") && [ -n \"$t\" ] && b=$(awk -v p='");
+        s = buffer.append(heap, s, path);
+        s = buffer.append(heap, s, "' '{ id = $2; sub(/^[0-9]+ [0-9a-f]+ /, \"\"); if ($0 == p) { print id; exit } }' \"$(cvo tree \"$t\")\") && [ -n \"$b\" ] && cat \"$(cvo blob \"$b\")\"");
+        return buffer.append(heap, s, "; exit $?");
+    }
+    s = buffer.append(heap, s, "cd ");
+    s = buffer.append(heap, s, workspace);
+    s = buffer.append(heap, s, " && git show ");
+    s = buffer.append(heap, s, base);
+    s = buffer.push(heap, s, byte_of(58));
+    s = buffer.append(heap, s, path);
+    return buffer.append(heap, s, "; exit $?");
+}
+
+// The shell text that exports the tree of `revision` from the repository at `workspace` into `<exec_dir>/tree`. The repository's checkout is read,
+// never written. A non-zero status is a revision the repository does not have, or a tree that could not be written.
+pub fn export_script[&h, &w, &v, &e](heap: &!h Heap, kind: int, workspace: &w [byte], revision: &v [byte], exec_dir: &e [byte]) -> [heap] buffer.Buffer {
+    var s = buffer.append(heap, buffer.empty(heap, 192), "exec 2>&1; ");
+    if kind == 1 {
+        s = prelude(heap, s, workspace);
+        s = cat3(heap, s, "rm -rf ", exec_dir, "/tree && t=$(cvt ");
+        s = cat3(heap, s, revision, ") && [ -n \"$t\" ] && mkdir ", exec_dir);
+        s = cat3(heap, s, "/tree && while read -r m b p; do d=", exec_dir, "/tree/$p; mkdir -p \"$(dirname \"$d\")\" || exit 1; ");
+        s = buffer.append(heap, s, "if [ \"$m\" = 120000 ]; then ln -s \"$(cat \"$(cvo blob \"$b\")\")\" \"$d\" || exit 1; else cp \"$(cvo blob \"$b\")\" \"$d\" || exit 1; ");
+        return buffer.append(heap, s, "if [ \"$m\" = 100755 ]; then chmod 755 \"$d\"; else chmod 644 \"$d\"; fi; fi; done < \"$(cvo tree \"$t\")\"");
+    }
+    s = buffer.append(heap, s, "rm -rf ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree && git -C ");
+    s = buffer.append(heap, s, workspace);
+    s = buffer.append(heap, s, " archive -o ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree.tar ");
+    s = buffer.append(heap, s, revision);
+    s = buffer.append(heap, s, " && mkdir ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree && tar -xf ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree.tar -C ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree; s=$?; rm -f ");
+    s = buffer.append(heap, s, exec_dir);
+    s = buffer.append(heap, s, "/tree.tar; exit $s");
+    return s;
+}

@@ -5,20 +5,21 @@ import std.bytes;
 import std.json;
 import forge.authority_task;
 import forge.gate_task;
+import forge.repo_vcs;
 
 // The operator file's `repos` (docs/company-lifecycle.md sections 2.1 and 8.1, docs/company.md section 16): one row per repository the
 // manifest's `repos` lists, saying where its checkout is, which compiler revision it is built with and which paths and how much a
 // change may touch. This module is pure: it reads a parsed operator file (`src` and its tape `tp`) and opens nothing.
 //
 //   "repos": { "<id>": { "kind", "checkout", "compiler_rev", "publish_allow", "max_patch_files", "max_patch_lines",
-//                        "slug"?, "branch"?, "pins"?, "publish_deny"?, "authority"?, "compiler"? } ... }
+//                        "slug"?, "branch"?, "pins"?, "publish_deny"?, "authority"?, "compiler"?, "vcs"? } ... }
 //
 // The slice reads the rows it needs and rejects every other key of the autonomy registry (`gate`, `policy`: docs/autonomy.md section 3)
 // as `operator-invalid`, with the `reason:` that `rows_reason` gives. The values are checked again where they are used (the patch
 // bounds by `patch_check`, the paths by `repo_task`, the pin by the change worker), so a row grants nothing a user of it does not allow.
 
 fn row_keys() -> [] &static [byte] {
-    return " slug branch checkout kind compiler_rev pins publish_allow publish_deny max_patch_files max_patch_lines authority compiler ";
+    return " slug branch checkout kind compiler_rev pins publish_allow publish_deny max_patch_files max_patch_lines authority compiler vcs ";
 }
 
 // The most rows, patterns in a list, and bytes of a pattern.
@@ -453,6 +454,17 @@ fn row_reason[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] &static [byt
     let kind = json.get(src, tp, row, "kind");
     if !plain(tp, kind) || !kind_ok(json.string_view(src, tp, kind)) {
         return "repos: kind is not library, program or service";
+    }
+    // Which version control keeps the repository (docs/repo-vcs.md): `git` when the row does not say. `cancho` is a kind the layer can read
+    // (`repo_vcs`), and the tasks are not wired to it yet, so a row that names it is refused here and not run against `git`.
+    let vcs = json.get(src, tp, row, "vcs");
+    if vcs >= 0 {
+        if !plain(tp, vcs) || repo_vcs.kind_of(json.string_view(src, tp, vcs)) < 0 || len(json.string_view(src, tp, vcs)) == 0 {
+            return "repos: vcs is not git or cancho";
+        }
+        if repo_vcs.kind_of(json.string_view(src, tp, vcs)) != repo_vcs.git() {
+            return "repos: vcs is cancho, which the tasks are not wired to yet (docs/repo-vcs.md): only git";
+        }
     }
     let checkout = json.get(src, tp, row, "checkout");
     if !plain(tp, checkout) || !gate_task.path_ok(json.string_view(src, tp, checkout)) {

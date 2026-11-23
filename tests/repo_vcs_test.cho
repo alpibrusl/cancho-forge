@@ -1,0 +1,136 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.repo_vcs;
+
+// Unit tests for src/repo_vcs.cho (docs/repo-vcs.md): the kinds, what a revision of each is, and the shell texts. The `git` texts are pinned where
+// they were before the layer (tests/repo_task_test.cho, tests/gate_task_test.cho, tests/authority_task_test.cho) and once more here, so that a
+// change to one is seen in the layer's own tests; what the `cancho` texts answer, against a real repository, is tests/conformance/repo_vcs.sh.
+// Run with `cancho test`.
+
+fn flag(b: bool) -> [] int {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+// Does `text` hold `word`?
+fn holds[&t, &w](text: &t [byte], word: &w [byte]) -> [] int {
+    var at = 0;
+    while at + len(word) <= len(text) {
+        if bytes.equal(text[at..at + len(word)], word) {
+            return 1;
+        }
+        at = at + 1;
+    }
+    return 0;
+}
+
+fn test_a_row_names_git_or_cancho_and_no_name_is_git() -> [] int {
+    test.assert_eq(repo_vcs.kind_of("git"), repo_vcs.git());
+    test.assert_eq(repo_vcs.kind_of(""), repo_vcs.git());
+    test.assert_eq(repo_vcs.kind_of("cancho"), repo_vcs.cancho());
+    test.assert_eq(repo_vcs.kind_of("svn"), 0 - 1);
+    test.assert_eq(repo_vcs.kind_of("Git"), 0 - 1);
+    test.assert_eq(repo_vcs.kind_of("git "), 0 - 1);
+    test.assert(bytes.equal(repo_vcs.tool(repo_vcs.git()), "git"));
+    test.assert(bytes.equal(repo_vcs.tool(repo_vcs.cancho()), "cancho"));
+    test.assert_eq(flag(repo_vcs.publish_built(repo_vcs.git())), 1);
+    test.assert_eq(flag(repo_vcs.publish_built(repo_vcs.cancho())), 0);
+    return 0;
+}
+
+fn test_a_revision_is_40_digits_for_git_and_64_for_cancho() -> [] int {
+    let c40 = "0123456789abcdef0123456789abcdef01234567";
+    let c64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), c40)), 1);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), c64)), 0);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.cancho(), c64)), 1);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.cancho(), c40)), 0);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), "")), 0);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), "0123456789ABCDEF0123456789abcdef01234567")), 0);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), "0123456789abcdeg0123456789abcdef01234567")), 0);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), "0123456789abcdef0123456789abcdef0123456/")), 0);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), "0123456789abcdef0123456789abcdef0123456:")), 0);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), "0123456789abcdef0123456789abcdef0123456`")), 0);
+    test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.cancho(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg")), 0);
+    test.assert_eq(repo_vcs.revision_digits(repo_vcs.git()), 40);
+    test.assert_eq(repo_vcs.revision_digits(repo_vcs.cancho()), 64);
+    return 0;
+}
+
+fn test_the_git_texts_are_the_ones_the_tasks_ran_before_the_layer[&h](heap: &!h Heap) -> [heap] int {
+    let s = repo_vcs.state_script(heap, repo_vcs.git(), "/ck");
+    borrow s as &sb in {
+        test.assert(bytes.equal(buffer.bytes(sb), "exec 2>&1; cd /ck || exit 2; git rev-parse --verify HEAD || exit 3; git rev-parse \"HEAD^{tree}\" || exit 3; if [ -z \"$(git status --porcelain --untracked-files=all)\" ]; then echo clean; else echo dirty; fi"));
+    }
+    buffer.drop(heap, s);
+    let m = repo_vcs.materialise_script(heap, repo_vcs.git(), "/ck", "/ev", "base");
+    borrow m as &mb in {
+        test.assert(bytes.equal(buffer.bytes(mb), "exec 2>&1; rm -rf /ev/base /ev/tracked.lst /ev/tracked.tar; mkdir /ev/base || exit 1; cd /ck || exit 2; git ls-files -z > /ev/tracked.lst || exit 3; tar --null -T /ev/tracked.lst -cf /ev/tracked.tar || exit 4; tar -xf /ev/tracked.tar -C /ev/base || exit 5; rm -f /ev/tracked.lst /ev/tracked.tar"));
+    }
+    buffer.drop(heap, m);
+    let d = repo_vcs.head_script(heap, repo_vcs.git(), "/work/forge");
+    borrow d as &db in {
+        test.assert(bytes.equal(buffer.bytes(db), "cd /work/forge && git rev-parse HEAD"));
+    }
+    buffer.drop(heap, d);
+    let f = repo_vcs.file_script(heap, repo_vcs.git(), "/work/forge", "0123456789abcdef0123456789abcdef01234567", "docs/authority.txt");
+    borrow f as &fb in {
+        test.assert(bytes.equal(buffer.bytes(fb), "exec 2>/dev/null; cd /work/forge && git show 0123456789abcdef0123456789abcdef01234567:docs/authority.txt; exit $?"));
+    }
+    buffer.drop(heap, f);
+    let x = repo_vcs.export_script(heap, repo_vcs.git(), "/work/forge", "0123456789abcdef0123456789abcdef01234567", "/work/exec/e-1");
+    borrow x as &xb in {
+        test.assert(bytes.equal(buffer.bytes(xb), "exec 2>&1; rm -rf /work/exec/e-1/tree && git -C /work/forge archive -o /work/exec/e-1/tree.tar 0123456789abcdef0123456789abcdef01234567 && mkdir /work/exec/e-1/tree && tar -xf /work/exec/e-1/tree.tar -C /work/exec/e-1/tree; s=$?; rm -f /work/exec/e-1/tree.tar; exit $s"));
+    }
+    buffer.drop(heap, x);
+    return 0;
+}
+
+fn test_the_cancho_texts_start_no_git_and_name_the_repository[&h](heap: &!h Heap) -> [heap] int {
+    let c64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let s = repo_vcs.state_script(heap, repo_vcs.cancho(), "/ck");
+    borrow s as &sb in {
+        test.assert_eq(holds(buffer.bytes(sb), "git"), 0);
+        test.assert_eq(holds(buffer.bytes(sb), "exec 2>&1; R=/ck; "), 1);
+        test.assert_eq(holds(buffer.bytes(sb), "cd /ck || exit 2; "), 1);
+        test.assert_eq(holds(buffer.bytes(sb), "cancho vcs status --repo \"$R\" --output json"), 1);
+        test.assert_eq(holds(buffer.bytes(sb), "then echo clean; else echo dirty; fi"), 1);
+    }
+    buffer.drop(heap, s);
+    let m = repo_vcs.materialise_script(heap, repo_vcs.cancho(), "/ck", "/ev", "base");
+    borrow m as &mb in {
+        test.assert_eq(holds(buffer.bytes(mb), "git"), 0);
+        test.assert_eq(holds(buffer.bytes(mb), "rm -rf /ev/base /ev/tracked.lst /ev/tracked.tar; mkdir /ev/base || exit 1; cd /ck || exit 2; "), 1);
+        test.assert_eq(holds(buffer.bytes(mb), " > /ev/tracked.lst || exit 3; tar --null -T /ev/tracked.lst -cf /ev/tracked.tar || exit 4; tar -xf /ev/tracked.tar -C /ev/base || exit 5; rm -f /ev/tracked.lst /ev/tracked.tar"), 1);
+    }
+    buffer.drop(heap, m);
+    let d = repo_vcs.head_script(heap, repo_vcs.cancho(), "/work/forge");
+    borrow d as &db in {
+        test.assert_eq(holds(buffer.bytes(db), "git"), 0);
+        test.assert_eq(holds(buffer.bytes(db), "R=/work/forge; "), 1);
+        test.assert_eq(holds(buffer.bytes(db), "h=$(cvh); [ -n \"$h\" ] && echo \"$h\""), 1);
+    }
+    buffer.drop(heap, d);
+    let f = repo_vcs.file_script(heap, repo_vcs.cancho(), "/work/forge", c64, "docs/authority.txt");
+    borrow f as &fb in {
+        test.assert_eq(holds(buffer.bytes(fb), "git"), 0);
+        test.assert_eq(holds(buffer.bytes(fb), "exec 2>/dev/null; R=/work/forge; "), 1);
+        test.assert_eq(holds(buffer.bytes(fb), "t=$(cvt 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef) && "), 1);
+        test.assert_eq(holds(buffer.bytes(fb), "awk -v p='docs/authority.txt' "), 1);
+        test.assert_eq(holds(buffer.bytes(fb), "; exit $?"), 1);
+    }
+    buffer.drop(heap, f);
+    let x = repo_vcs.export_script(heap, repo_vcs.cancho(), "/work/forge", c64, "/work/exec/e-1");
+    borrow x as &xb in {
+        test.assert_eq(holds(buffer.bytes(xb), "git"), 0);
+        test.assert_eq(holds(buffer.bytes(xb), "rm -rf /work/exec/e-1/tree && t=$(cvt 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef) && "), 1);
+        test.assert_eq(holds(buffer.bytes(xb), "mkdir /work/exec/e-1/tree && while read -r m b p; do d=/work/exec/e-1/tree/$p; "), 1);
+    }
+    buffer.drop(heap, x);
+    return 0;
+}

@@ -7,6 +7,7 @@ import std.json;
 import forge.build_task;
 import forge.gate_task;
 import forge.repo_row;
+import forge.repo_vcs;
 
 // The `repo.change` task (docs/company-lifecycle.md section 4.2, docs/company.md section 16): a change request against a repository that
 // already exists, answered with a patch. This module is the pure half, as `forge.tool_task` is for `tool.run`: what a task may say, the
@@ -258,23 +259,12 @@ fn cat3[&h, &a, &b, &c](heap: &!h Heap, out: buffer.Buffer, a: &a [byte], b: &b 
 
 // Print the checkout's HEAD commit, the tree of that commit and whether the working tree is clean (nothing modified, staged or untracked).
 pub fn state_script[&h, &c](heap: &!h Heap, checkout: &c [byte]) -> [heap] buffer.Buffer {
-    var b = buffer.append(heap, buffer.empty(heap, 256), "exec 2>&1; cd ");
-    b = buffer.append(heap, b, checkout);
-    return buffer.append(heap, b, " || exit 2; git rev-parse --verify HEAD || exit 3; git rev-parse \"HEAD^{tree}\" || exit 3; if [ -z \"$(git status --porcelain --untracked-files=all)\" ]; then echo clean; else echo dirty; fi");
+    return repo_vcs.state_script(heap, repo_vcs.git(), checkout);
 }
 
 // Make `<ev>/<sub>` a copy of the checkout's TRACKED files (no `.git`, nothing untracked): the file list and a tar beside it, removed again.
 pub fn materialise_script[&h, &c, &e, &s](heap: &!h Heap, checkout: &c [byte], ev: &e [byte], sub: &s [byte]) -> [heap] buffer.Buffer {
-    var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 256), "exec 2>&1; rm -rf "), ev, "/", sub);
-    b = cat3(heap, b, " ", ev, "/tracked.lst ");
-    b = cat3(heap, b, ev, "/tracked.tar; mkdir ", ev);
-    b = cat3(heap, b, "/", sub, " || exit 1; cd ");
-    b = cat3(heap, b, checkout, " || exit 2; git ls-files -z > ", ev);
-    b = cat3(heap, b, "/tracked.lst || exit 3; tar --null -T ", ev, "/tracked.lst -cf ");
-    b = cat3(heap, b, ev, "/tracked.tar || exit 4; tar -xf ", ev);
-    b = cat3(heap, b, "/tracked.tar -C ", ev, "/");
-    b = cat3(heap, b, sub, " || exit 5; rm -f ", ev);
-    return cat3(heap, b, "/tracked.lst ", ev, "/tracked.tar");
+    return repo_vcs.materialise_script(heap, repo_vcs.git(), checkout, ev, sub);
 }
 
 // The build: `cancho-build --repo <ev>/base --change <ev>/change.txt --kind K --checker C --work <ev>/work --agent 'A' --provider P --model M`

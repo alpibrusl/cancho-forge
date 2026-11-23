@@ -4,6 +4,7 @@ module forge.gate_task;
 import std.buffer;
 import std.bytes;
 import forge.gate_env;
+import forge.repo_vcs;
 
 // The `repo.gate` task (docs/self-hosting.md, section 3.1): given a repository from the allow-list and a 40-hex
 // revision, run the repository's own gate. This module is the pure half: what a task may name, the refusals with their
@@ -206,9 +207,7 @@ pub fn head_deadline_ms(runner_ms: int) -> [] int {
 // The shell text that prints the checkout's revision: `cd <workspace> && git rev-parse HEAD`. `workspace` has passed
 // `path_ok`, which leaves nothing the shell treats specially. A caller that has not checked it must not call this.
 pub fn head_script[&h, &w](heap: &!h Heap, workspace: &w [byte]) -> [heap] buffer.Buffer {
-    var b = buffer.append(heap, buffer.empty(heap, 64), "cd ");
-    b = buffer.append(heap, b, workspace);
-    return buffer.append(heap, b, " && git rev-parse HEAD");
+    return repo_vcs.head_script(heap, repo_vcs.git(), workspace);
 }
 
 // The shell text that runs the gate: its output (both streams) to stdout, in the workspace, after a check that each of

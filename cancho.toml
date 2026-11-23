@@ -49,12 +49,12 @@ std = true
 
 [[test]]
 name = "gate_task"
-sources = ["tests/gate_task_test.cho", "src/gate_task.cho", "src/gate_env.cho"]
+sources = ["tests/gate_task_test.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]
 name = "build_task"
-sources = ["tests/build_task_test.cho", "src/build_task.cho", "src/gate_task.cho", "src/gate_env.cho"]
+sources = ["tests/build_task_test.cho", "src/build_task.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]
@@ -69,7 +69,7 @@ std = true
 
 [[test]]
 name = "gate_run"
-sources = ["tests/gate_run_test.cho", "src/gate_run.cho", "src/worker.cho", "src/verbs.cho", "src/dispatch.cho", "src/response.cho", "src/evidence_io.cho", "src/flow.cho", "src/retry.cho", "src/gate_task.cho", "src/gate_env.cho", "src/journal.cho", "src/journal_io.cho", "src/task.cho", "src/event.cho", "src/snapshot.cho"]
+sources = ["tests/gate_run_test.cho", "src/gate_run.cho", "src/worker.cho", "src/verbs.cho", "src/dispatch.cho", "src/response.cho", "src/evidence_io.cho", "src/flow.cho", "src/retry.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho", "src/journal.cho", "src/journal_io.cho", "src/task.cho", "src/event.cho", "src/snapshot.cho"]
 std = true
 
 [[test]]
@@ -164,32 +164,37 @@ std = true
 
 [[test]]
 name = "publish_plan"
-sources = ["tests/publish_plan_test.cho", "src/publish_plan.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/gate_task.cho", "src/gate_env.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho", "src/company_change.cho"]
+sources = ["tests/publish_plan_test.cho", "src/publish_plan.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho", "src/company_change.cho"]
 std = true
 
 [[test]]
 name = "company_step"
-sources = ["tests/company_step_test.cho", "src/company_step.cho", "src/operator_review.cho", "src/review_step.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/company_run.cho", "src/company_budget.cho", "src/company_check.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/gate_task.cho", "src/gate_env.cho", "src/build_task.cho", "src/company_time.cho", "src/company_change.cho"]
+sources = ["tests/company_step_test.cho", "src/company_step.cho", "src/operator_review.cho", "src/review_step.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/company_run.cho", "src/company_budget.cho", "src/company_check.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho", "src/build_task.cho", "src/company_time.cho", "src/company_change.cho"]
 std = true
 
 [[test]]
 name = "tool_task"
-sources = ["tests/tool_task_test.cho", "src/tool_task.cho", "src/build_task.cho", "src/gate_task.cho", "src/gate_env.cho"]
+sources = ["tests/tool_task_test.cho", "src/tool_task.cho", "src/build_task.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]
 name = "repo_row"
-sources = ["tests/repo_row_test.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/gate_task.cho", "src/gate_env.cho"]
+sources = ["tests/repo_row_test.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]
 name = "patch_check"
-sources = ["tests/patch_check_test.cho", "src/patch_check.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/gate_task.cho", "src/gate_env.cho", "src/patch_apply.cho"]
+sources = ["tests/patch_check_test.cho", "src/patch_check.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho", "src/patch_apply.cho"]
+std = true
+
+[[test]]
+name = "repo_vcs"
+sources = ["tests/repo_vcs_test.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]
 name = "repo_task"
-sources = ["tests/repo_task_test.cho", "src/repo_task.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/build_task.cho", "src/gate_task.cho", "src/gate_env.cho"]
+sources = ["tests/repo_task_test.cho", "src/repo_task.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/build_task.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]
@@ -199,7 +204,7 @@ std = true
 
 [[test]]
 name = "authority_task"
-sources = ["tests/authority_task_test.cho", "src/authority_task.cho", "src/authority_review.cho", "src/gate_task.cho", "src/gate_env.cho"]
+sources = ["tests/authority_task_test.cho", "src/authority_task.cho", "src/authority_review.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]
@@ -219,7 +224,7 @@ std = true
 
 [[test]]
 name = "review_prompt"
-sources = ["tests/review_prompt_test.cho", "src/review_prompt.cho", "src/gate_task.cho", "src/gate_env.cho"]
+sources = ["tests/review_prompt_test.cho", "src/review_prompt.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
 std = true
 
 [[test]]

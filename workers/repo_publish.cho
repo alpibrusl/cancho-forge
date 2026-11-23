@@ -10,6 +10,7 @@ import forge.gate_task;
 import forge.journal_io;
 import forge.patch_apply;
 import forge.publish_plan;
+import forge.repo_vcs_write;
 import forge.snapshot;
 
 // The publish worker (docs/company.md, section 15): one JSON request on standard input, one JSON line on standard output, exit 0. It
@@ -212,193 +213,6 @@ fn write_file[&f, &p, &b](fs: &f Fs(""), path: &p [byte], contents: &b [byte]) -
     }
 }
 
-// The directory part of `dest` (everything before the last slash), or empty.
-fn dir_of[&d](dest: &d [byte]) -> [] &d [byte] {
-    var k = len(dest);
-    while k > 0 {
-        if int_of(dest[k - 1]) == 47 {
-            return dest[0..k - 1];
-        }
-        k = k - 1;
-    }
-    return dest[0..0];
-}
-
-// The end of the line of `text` that starts at `from` (the index of its line feed, or the length).
-fn line_end[&t](text: &t [byte], from: int) -> [] int {
-    var e = from;
-    while e < len(text) && int_of(text[e]) != 10 {
-        e = e + 1;
-    }
-    return e;
-}
-
-fn put[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buffer.Buffer {
-    return buffer.append(heap, out, text);
-}
-
-// `text` between single quotes. Every piece the worker puts in a script has passed a name rule (letters, digits, `._/-`), so none
-// holds a quote; the quotes are for the shell's own sake.
-fn q[&h, &t](heap: &!h Heap, out: buffer.Buffer, text: &t [byte]) -> [heap] buffer.Buffer {
-    return buffer.push(heap, buffer.append(heap, buffer.push(heap, out, byte_of(39)), text), byte_of(39));
-}
-
-// The part of a script that fails with 16 when a link or a directory is where `path` (relative to the checkout) goes, or on the way.
-// Every name of the newline-separated `names` between single quotes, each followed by a space.
-fn quoted_lines[&h, &t](heap: &!h Heap, out: buffer.Buffer, names: &t [byte]) -> [heap] buffer.Buffer {
-    var s = out;
-    var pos = 0;
-    while pos < len(names) {
-        let e = line_end(names, pos);
-        if e > pos {
-            s = q(heap, s, names[pos..e]);
-            s = put(heap, s, " ");
-        }
-        pos = e + 1;
-    }
-    return s;
-}
-
-fn on_the_way[&h, &t](heap: &!h Heap, out: buffer.Buffer, path: &t [byte]) -> [heap] buffer.Buffer {
-    var s = put(heap, out, "p=''\nw=");
-    s = q(heap, s, path);
-    s = put(heap, s, "\nIFS=/\nset -f\nfor c in $w; do p=\"$p$c\"; if [ -L \"$p\" ]; then exit 16; fi; p=\"$p/\"; done\nunset IFS\nif [ -d ");
-    s = q(heap, s, path);
-    s = put(heap, s, " ]; then exit 16; fi\n");
-    return s;
-}
-
-// Step 1, as a script. Exits: 11 the checkout is not a directory, not the toplevel of a repository, or has no commit; 13 `origin` is not
-// the allow-listed repository on github.com; 14 something is modified or untracked; 15 the branch exists; 16 a link or a directory is where a
-// file goes. On success it prints the branch the checkout is on (or, detached, the commit).
-fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte], adopting: bool) -> [heap] buffer.Buffer {
-    var s = put(heap, buffer.empty(heap, 1024), "cd ");
-    s = q(heap, s, checkout);
-    s = put(heap, s, " 2>/dev/null || exit 11\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 11\nhere=$(pwd -P)\n[ \"$root\" = \"$here\" ] || exit 11\n");
-    s = put(heap, s, "git rev-parse --verify --quiet HEAD >/dev/null 2>&1 || exit 11\nurl=$(git remote get-url origin 2>/dev/null) || exit 13\ncase \"$url\" in\n  'https://github.com/");
-    s = put(heap, s, repo);
-    s = put(heap, s, "'|'https://github.com/");
-    s = put(heap, s, repo);
-    s = put(heap, s, ".git'|'git@github.com:");
-    s = put(heap, s, repo);
-    s = put(heap, s, "'|'git@github.com:");
-    s = put(heap, s, repo);
-    s = put(heap, s, ".git') ;;\n  *) exit 13 ;;\nesac\n");
-    if len(base) > 0 {
-        s = put(heap, s, "[ \"$(git rev-parse HEAD 2>/dev/null)\" = '");
-        s = put(heap, s, base);
-        s = put(heap, s, "' ] || exit 23\n");
-    }
-    s = put(heap, s, "mod=$(git status --porcelain --untracked-files=all 2>/dev/null) || exit 11\n[ -z \"$mod\" ] || exit 14\n");
-    if adopting == false {
-        s = put(heap, s, "if git rev-parse --verify --quiet 'refs/heads/");
-        s = put(heap, s, branch);
-        s = put(heap, s, "' >/dev/null 2>&1; then exit 15; fi\n");
-    }
-    var at = 0;
-    while at < len(dest) {
-        let e = line_end(dest, at);
-        if e > at {
-            s = on_the_way(heap, s, dest[at..e]);
-        }
-        at = e + 1;
-    }
-    s = on_the_way(heap, s, prov);
-    s = put(heap, s, "git symbolic-ref -q --short HEAD || git rev-parse HEAD\n");
-    return s;
-}
-
-// Step 3a: make the branch and the directories. Exit 18 when either fails (the caller then undoes).
-fn branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], make_branch: bool) -> [heap] buffer.Buffer {
-    var s = put(heap, buffer.empty(heap, 512), "cd ");
-    s = q(heap, s, checkout);
-    s = put(heap, s, " || exit 11\n");
-    if make_branch {
-        s = put(heap, s, "git checkout -q -b ");
-        s = q(heap, s, branch);
-        s = put(heap, s, " || exit 18\n");
-    }
-    let pd = dir_of(prov);
-    var at = 0;
-    while at < len(dest) {
-        let e = line_end(dest, at);
-        let dd = dir_of(dest[at..e]);
-        if len(dd) > 0 {
-            s = put(heap, s, "mkdir -p ");
-            s = q(heap, s, dd);
-            s = put(heap, s, " || exit 18\n");
-        }
-        at = e + 1;
-    }
-    if len(pd) > 0 {
-        s = put(heap, s, "mkdir -p ");
-        s = q(heap, s, pd);
-        s = put(heap, s, " || exit 18\n");
-    }
-    return s;
-}
-
-// Step 3b: stage, commit with the message on standard input (hooks off, no signing), print the commit, go back. Exit 19 when staging or
-// committing fails (no identity, an ignored path), 20 when going back fails.
-fn commit_script[&h, &c, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
-    var s = put(heap, buffer.empty(heap, 512), "cd ");
-    s = q(heap, s, checkout);
-    s = put(heap, s, " || exit 11\ngit add -- ");
-    s = quoted_lines(heap, s, dest);
-    s = q(heap, s, prov);
-    s = put(heap, s, " || exit 19\ngit -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -q --no-verify -F - || exit 19\ngit rev-parse HEAD || exit 19\ngit checkout -q ");
-    s = q(heap, s, orig);
-    s = put(heap, s, " || exit 20\n");
-    return s;
-}
-
-// Does a branch of that name exist in the checkout? Status 0 when it does.
-fn exists_script[&h, &c, &b](heap: &!h Heap, checkout: &c [byte], branch: &b [byte]) -> [heap] buffer.Buffer {
-    var s = put(heap, buffer.empty(heap, 256), "cd ");
-    s = q(heap, s, checkout);
-    s = put(heap, s, " || exit 11\ngit rev-parse --verify --quiet 'refs/heads/");
-    s = put(heap, s, branch);
-    s = put(heap, s, "' >/dev/null 2>&1\n");
-    return s;
-}
-
-// Adoption (docs/auto-publish.md section 4): the files of this publish are in the working tree of a checkout at `base`. Stage them and
-// ask whether the branch is what the publish would have made: one commit above `base`, the very tree the index now holds, the very message
-// (on standard input). Exit 21 when it is not; else print the branch's commit. Nothing is committed and no ref is touched.
-fn adopt_script[&h, &c, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte]) -> [heap] buffer.Buffer {
-    var s = put(heap, buffer.empty(heap, 768), "cd ");
-    s = q(heap, s, checkout);
-    s = put(heap, s, " || exit 11\ngit add -- ");
-    s = quoted_lines(heap, s, dest);
-    s = q(heap, s, prov);
-    s = put(heap, s, " || exit 19\nb='refs/heads/");
-    s = put(heap, s, branch);
-    s = put(heap, s, "'\n[ \"$(git rev-parse --verify --quiet \"$b^\")\" = '");
-    s = put(heap, s, base);
-    s = put(heap, s, "' ] || exit 21\n[ \"$(git write-tree)\" = \"$(git rev-parse --verify --quiet \"$b^{tree}\")\" ] || exit 21\n");
-    s = put(heap, s, "want=$(git stripspace)\ngot=$(git log -1 --format=%B \"$b\" | git stripspace)\n[ \"$want\" = \"$got\" ] || exit 21\ngit rev-parse --verify \"$b\" || exit 21\n");
-    return s;
-}
-
-// The undo of a publish that failed after the branch was made. The checkout was clean when it began, so a reset loses nothing of the
-// operator's; a file this publish added that git does not track is removed.
-fn undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
-    var s = put(heap, buffer.empty(heap, 512), "cd ");
-    s = q(heap, s, checkout);
-    s = put(heap, s, " || exit 11\ngit reset -q --hard\nfor f in ");
-    s = quoted_lines(heap, s, dest);
-    s = q(heap, s, prov);
-    s = put(heap, s, "; do git ls-files --error-unmatch \"$f\" >/dev/null 2>&1 || rm -f \"$f\"; done\ngit checkout -q ");
-    s = q(heap, s, orig);
-    s = put(heap, s, "\n");
-    if len(branch) > 0 {
-        s = put(heap, s, "git branch -D -q ");
-        s = q(heap, s, branch);
-        s = put(heap, s, "\n");
-    }
-    return s;
-}
-
 fn under[&h, &d, &n](heap: &!h Heap, dir: &d [byte], name: &n [byte]) -> [heap] buffer.Buffer {
     var b = buffer.append(heap, buffer.empty(heap, 64), dir);
     b = buffer.push(heap, b, byte_of(47));
@@ -448,7 +262,7 @@ fn hex64_40[&t](text: &t [byte]) -> [] bool {
 
 // Undo, then answer `rule`.
 fn undo_and_fail[&h, &i, &x, &c, &k, &b, &d, &e, &o](heap: &!h Heap, io: &!i Io, exec: &x Exec("/bin/sh"), clock: &c Clock, checkout: &k [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte], rule: &static [byte], message: &static [byte]) -> [heap, io_write, exec("/bin/sh"), clock, poll] int {
-    let script = undo_script(heap, checkout, branch, dest, prov, orig);
+    let script = repo_vcs_write.undo_script(heap, checkout, branch, dest, prov, orig);
     borrow script as &sb in {
         let (status, out) = run_sh(heap, exec, clock, buffer.bytes(sb), "");
         buffer.drop(heap, out);
@@ -567,7 +381,7 @@ fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a,
     // A request to adopt takes the branch that is there; with none, it publishes as any request does.
     var adopting = false;
     if adopt {
-        let probe = exists_script(heap, checkout, branch);
+        let probe = repo_vcs_write.exists_script(heap, checkout, branch);
         borrow probe as &pr in {
             let (found, shown) = run_sh(heap, exec, clock, buffer.bytes(pr), "");
             adopting = found == 0;
@@ -575,7 +389,7 @@ fn publish_texts[&h, &i, &f, &c, &x, &k, &r, &b, &d, &n, &y, &z, &p, &v, &m, &a,
         }
         buffer.drop(heap, probe);
     }
-    let check = checks_script(heap, checkout, repo, branch, alld, prov_dest, base, adopting);
+    let check = repo_vcs_write.checks_script(heap, checkout, repo, branch, alld, prov_dest, base, adopting);
     borrow check as &cb in {
         let (status, out) = run_sh(heap, exec, clock, buffer.bytes(cb), "");
         refused = status;
@@ -625,7 +439,7 @@ fn patch_dests_ok[&d, &p](dest: &d [byte], prov_dest: &p [byte]) -> [] bool {
     var at = 0;
     var n = 0;
     while at < len(dest) {
-        let e = line_end(dest, at);
+        let e = repo_vcs_write.line_end(dest, at);
         let one = dest[at..e];
         if publish_plan.dest_ok(one) == false || bytes.equal(one, prov_dest) || n >= 64 {
             return false;
@@ -633,7 +447,7 @@ fn patch_dests_ok[&d, &p](dest: &d [byte], prov_dest: &p [byte]) -> [] bool {
         var seen = 0;
         var back = 0;
         while back < at {
-            let be = line_end(dest, back);
+            let be = repo_vcs_write.line_end(dest, back);
             if bytes.equal(dest[back..be], one) {
                 seen = 1;
             }
@@ -670,7 +484,7 @@ fn apply_patch[&h, &f, &k, &p, &d](heap: &!h Heap, fs: &f Fs(""), checkout: &k [
     var at = 0;
     while at < len(dests) {
         wanted = wanted + 1;
-        at = line_end(dests, at) + 1;
+        at = repo_vcs_write.line_end(dests, at) + 1;
     }
     while pos < len(patch) {
         let sec = patch_apply.next_section(patch, pos);
@@ -683,8 +497,8 @@ fn apply_patch[&h, &f, &k, &p, &d](heap: &!h Heap, fs: &f Fs(""), checkout: &k [
             }
             files = files + 1;
             let hunks = patch[sec.body..sec.end];
-            var folder = under(heap, checkout, dir_of(path));
-            if len(dir_of(path)) == 0 {
+            var folder = under(heap, checkout, repo_vcs_write.dir_of(path));
+            if len(repo_vcs_write.dir_of(path)) == 0 {
                 buffer.drop(heap, folder);
                 folder = buffer.append(heap, buffer.empty(heap, 64), checkout);
             }
@@ -787,7 +601,7 @@ fn nul_end[&t](text: &t [byte], from: int) -> [] int {
 fn has_line[&t, &n](names: &t [byte], name: &n [byte]) -> [] bool {
     var pos = 0;
     while pos < len(names) {
-        let e = line_end(names, pos);
+        let e = repo_vcs_write.line_end(names, pos);
         if bytes.equal(names[pos..e], name) {
             return true;
         }
@@ -829,7 +643,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
         return answer_failed(heap, io, publish_plan.rule_artifact_changed(), "the artifact is not the one that was accepted");
     }
     var status = 0;
-    let made = branch_script(heap, checkout, branch, alld, prov_dest, adopting == false);
+    let made = repo_vcs_write.branch_script(heap, checkout, branch, alld, prov_dest, adopting == false);
     borrow made as &mb in {
         let (st, out) = run_sh(heap, exec, clock, buffer.bytes(mb), "");
         status = st;
@@ -885,7 +699,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
     if adopting {
         return adopt_branch(heap, io, exec, clock, checkout, branch, alld, prov_dest, message, orig, base);
     }
-    let commit = commit_script(heap, checkout, alld, prov_dest, orig);
+    let commit = repo_vcs_write.commit_script(heap, checkout, alld, prov_dest, orig);
     var hash = buffer.empty(heap, 1);
     borrow commit as &cb in {
         let (st, out) = run_sh(heap, exec, clock, buffer.bytes(cb), message);
@@ -912,7 +726,7 @@ fn publish_checked[&h, &i, &f, &c, &x, &k, &b, &d, &n, &y, &z, &p, &v, &m, &o, &
 // The files of the publish are in the working tree; ask whether the branch that is there is what they would have made. Either way the
 // working tree goes back to the checkout's own state and the branch is left as it was.
 fn adopt_branch[&h, &i, &x, &c, &k, &b, &d, &e, &m, &o, &a](heap: &!h Heap, io: &!i Io, exec: &x Exec("/bin/sh"), clock: &c Clock, checkout: &k [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], message: &m [byte], orig: &o [byte], base: &a [byte]) -> [heap, io_write, exec("/bin/sh"), clock, poll] int {
-    let script = adopt_script(heap, checkout, branch, dest, prov, base);
+    let script = repo_vcs_write.adopt_script(heap, checkout, branch, dest, prov, base);
     var status = 0 - 1;
     var hash = buffer.empty(heap, 1);
     borrow script as &sb in {
@@ -928,7 +742,7 @@ fn adopt_branch[&h, &i, &x, &c, &k, &b, &d, &e, &m, &o, &a](heap: &!h Heap, io: 
     var code = 0;
     borrow hash as &hb in {
         if status == 0 && hex64_40(buffer.bytes(hb)) {
-            let back = undo_script(heap, checkout, dest[0..0], dest, prov, orig);
+            let back = repo_vcs_write.undo_script(heap, checkout, dest[0..0], dest, prov, orig);
             borrow back as &bk in {
                 let (rs, shown) = run_sh(heap, exec, clock, buffer.bytes(bk), "");
                 buffer.drop(heap, shown);
