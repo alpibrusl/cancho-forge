@@ -106,7 +106,7 @@ pub fn check[&y, &r, &v, &b, &w, &e, &c, &f](task_type_text: &y [byte], repo: &r
     if !repo_known(repo) {
         return Checked::Refused(Refusal::ScopeInvalid);
     }
-    if !gate_task.revision_ok(revision) || !gate_task.revision_ok(base) {
+    if !gate_task.revision_ok(revision) || repo_vcs.revision_kind(revision) != repo_vcs.revision_kind(base) {
         return Checked::Refused(Refusal::RevisionInvalid);
     }
     if !gate_task.path_ok(workspace) || !gate_task.path_ok(execution_dir) || !gate_task.path_ok(compiler) || !rel_ok(ceiling, false) {
@@ -118,8 +118,8 @@ pub fn check[&y, &r, &v, &b, &w, &e, &c, &f](task_type_text: &y [byte], repo: &r
     return Checked::Held;
 }
 
-// Exactly 40 lower-case hexadecimal digits: a commit.
-pub fn hex40[&x](text: &x [byte]) -> [] bool {
+// A revision (`gate_task.revision_ok`): a commit of 40 lower-case hexadecimal digits, or a change of `cancho vcs` of 64.
+pub fn commit_ok[&x](text: &x [byte]) -> [] bool {
     return gate_task.revision_ok(text);
 }
 
@@ -157,10 +157,19 @@ pub fn programs_text[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], n
     return b;
 }
 
-// The shell text that prints the ceiling file as it is at the base commit: `git show <base>:<ceiling>`. A failure (no such commit or file) is the
+// The kind of version control a checked revision is a revision of (git for a text that is none: `check` refused it before any text is made).
+fn kind_at[&r](revision: &r [byte]) -> [] int {
+    let kind = repo_vcs.revision_kind(revision);
+    if kind < 0 {
+        return repo_vcs.git();
+    }
+    return kind;
+}
+
+// The shell text that prints the ceiling file as it is at the base revision (`git show <base>:<ceiling>` for a commit; `repo_vcs.file_script`). A failure (no such commit or file) is the
 // shell's non-zero status, which is a missing ceiling. Standard error is dropped. `workspace`, `base` and `ceiling` have passed `check`.
 pub fn ceiling_script[&h, &w, &b, &c](heap: &!h Heap, workspace: &w [byte], base: &b [byte], ceiling: &c [byte]) -> [heap] buffer.Buffer {
-    return repo_vcs.file_script(heap, repo_vcs.git(), workspace, base, ceiling);
+    return repo_vcs.file_script(heap, kind_at(base), workspace, base, ceiling);
 }
 
 // The shell text that exports the head commit's tree: `git archive` of `revision` from the repository at `workspace` into `<exec_dir>/tree`, through a tar
@@ -168,7 +177,7 @@ pub fn ceiling_script[&h, &w, &b, &c](heap: &!h Heap, workspace: &w [byte], base
 // commit is content-addressed, so the tree is exactly the commit's). A non-zero status is a commit the repository does not have, or a tree that
 // could not be written. `workspace`, `revision` and `exec_dir` have passed `check`.
 pub fn export_script[&h, &w, &v, &e](heap: &!h Heap, workspace: &w [byte], revision: &v [byte], exec_dir: &e [byte]) -> [heap] buffer.Buffer {
-    return repo_vcs.export_script(heap, repo_vcs.git(), workspace, revision, exec_dir);
+    return repo_vcs.export_script(heap, kind_at(revision), workspace, revision, exec_dir);
 }
 
 // The shell text that asks the compiler for the head's authority: `<compiler> authority <programs> [--std]`, run in the exported tree

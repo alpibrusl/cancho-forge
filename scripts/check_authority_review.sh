@@ -94,6 +94,47 @@ check refused "a ceiling path that leaves the repository is path-invalid" reply_
 for n in mismatch refused; do
   if [ -z "$(ls -A "$ar/ev_$n")" ]; then ok "$n: nothing written"; else bad "$n: files were written"; fi
 done
+# ---- a repository kept by `cancho vcs` (docs/repo-vcs.md): the same worker, a revision and a base of 64 digits, and no git started ----------------
+# The worker starts `cancho` by name, so the request's environment puts the compiler under test on the PATH (an operator's `env` does the same).
+cbin=$(cd "$(dirname "$(command -v "$C")")" && pwd -P)
+cv() { dir=$1; shift; ( cd "$dir" && "$cbin/$(basename "$C")" vcs "$@" --output json > /dev/null 2>&1 ); }
+# vfixture <name> <head stub_out printf text>: a base change with the ceiling, a head change with the head's report
+vfixture() {
+  d="$ar/$1"; mkdir -p "$d/docs" || exit 1
+  printf "$ceiling_text" > "$d/docs/authority.txt"; printf "$ceiling_text" > "$d/stub_out.txt"
+  cv "$d" init && cv "$d" record --all --time 1 --author 'forge <forge@example.invalid>' || { bad "$1: no cancho vcs repository"; return; }
+  sed -n 1p "$d/.cancho/vcs/refs/heads/main" > "$ar/base_$1"
+  printf "$2" > "$d/stub_out.txt"; echo head > "$d/note.txt"
+  cv "$d" record --all --time 2 --author 'forge <forge@example.invalid>' || { bad "$1: no second change"; return; }
+  sed -n 1p "$d/.cancho/vcs/refs/heads/main" > "$ar/head_$1"
+  mkdir "$ar/ev_$1"
+}
+vrequest() { # name, [revision override], [base override]
+  d="$ar/$1"
+  printf '{"contract":"forge-worker/1","verb":"execute","request_id":"r-%s","task":{"id":"t-%s","type":"repo.authority","input":{"repo":"alpibrusl/cancho-forge","revision":"%s","base":"%s","ceiling":"docs/authority.txt","programs":["src/*.cho"],"std":true}},"grants":{"workspace":"%s","execution_dir":"%s","compiler":"%s","env":["PATH=%s:/usr/bin:/bin"]},"limits":{"timeout_ms":60000}}' \
+    "$1" "$1" "${2:-$(cat "$ar/head_$1")}" "${3:-$(cat "$ar/base_$1")}" "$d" "$ar/ev_$1" "$ar/stubc" "$cbin"
+}
+vfixture vequal "$same"
+vfixture vwider 'performs\n    clock\n    exec("/bin/sh")\n    fs_read("")\n    heap\n    net\nnever touches\n    the network\n    foreign code\n'
+vfixture vmismatch "$same"
+vfixture vmixed "$same"
+if [ "$(wc -c < "$ar/head_vequal" | tr -d ' ')" = 65 ]; then ok "cancho vcs: a revision is a change id of 64 digits"; else bad "cancho vcs: the head of the fixture is not 64 digits"; fi
+for n in vequal vwider; do vrequest $n | "$ar/worker" > "$ar/reply_$n"; done
+check vequal "cancho vcs: succeeded" reply_vequal '"state":"succeeded"'
+check vequal "cancho vcs: the report says equal" ev_vequal/report.json '"verdict":"equal","rule":""'
+check vwider "cancho vcs: the report says wider with its rule tag" ev_vwider/report.json '"verdict":"wider","rule":"authority-widened"'
+if cmp -s "$ar/want_ceiling" "$ar/ev_vwider/ceiling.txt"; then ok "cancho vcs: ceiling.txt is the base change's file"; else bad "cancho vcs: ceiling.txt is not the base change's file"; fi
+if cmp -s "$ar/vwider/stub_out.txt" "$ar/ev_vwider/head.txt"; then ok "cancho vcs: head.txt is what the compiler printed in the head change's tree"; else bad "cancho vcs: head.txt differs from the compiler's output"; fi
+if [ ! -e "$ar/ev_vwider/tree" ]; then ok "cancho vcs: the exported tree is removed"; else bad "cancho vcs: the exported tree is left behind"; fi
+if [ ! -e "$ar/vwider/.git" ] && [ "$(sed -n 1p "$ar/vwider/.cancho/vcs/refs/heads/main")" = "$(cat "$ar/head_vwider")" ]; then ok "cancho vcs: the repository is untouched and has no .git"; else bad "cancho vcs: the repository was changed"; fi
+vrequest vmismatch "$(printf '%064d' 0)" | "$ar/worker" > "$ar/reply_vmismatch"
+check vmismatch "cancho vcs: a change the store does not have is revision-mismatch" reply_vmismatch '"code":"revision-mismatch"'
+# a commit and a change in one task are of no one repository: refused before anything runs
+vrequest vmixed "" 0123456789abcdef0123456789abcdef01234567 | "$ar/worker" > "$ar/reply_vmixed"
+check vmixed "cancho vcs: a change with a base of 40 digits is revision-invalid" reply_vmixed '"code":"revision-invalid"'
+for n in vmismatch vmixed; do
+  if [ -z "$(ls -A "$ar/ev_$n")" ]; then ok "$n: nothing written"; else bad "$n: files were written"; fi
+done
 # the capabilities verb
 printf '{"contract":"forge-worker/1","verb":"capabilities","request_id":"c-1"}' | "$ar/worker" > "$ar/reply_caps"
 check caps "task type repo.authority, level sync" reply_caps 'repo.authority'

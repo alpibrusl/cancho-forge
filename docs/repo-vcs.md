@@ -1,7 +1,8 @@
 # The repository layer: one place that says how a repository is asked a question
 
-> **Status: built for the questions (the texts that read a repository), for git and for `cancho vcs`. Not built: a
-> repository row that runs on `cancho vcs`.** Issue #116. A claim marked *(measured)* was measured on the date given; one
+> **Status: built for the questions (the texts that read a repository), for git and for `cancho vcs`, and for the
+> revisions of both kinds in every task, worker and reader of the journal (section 6). Not built: the publish on
+> `cancho vcs`, so a repository row that names it is still refused.** Issue #116. A claim marked *(measured)* was measured on the date given; one
 > marked *(read)* was read from the source.
 
 ## 1. What was there
@@ -69,9 +70,6 @@ and not the working copy's; the checkout is never written.
 The issue's second step ends when the conformance scripts pass unchanged against a row that says `vcs: "cancho"`. That
 is not reached, and these are the pieces between:
 
-* **Revisions are 40 digits in every task.** `gate_task.revision_ok`, `authority_task.hex40`, `repo_row.rev_ok`,
-  `repo_task.state_ok`, the journal's records and the publish worker's answer all say 40. Each has to take the kind.
-  `repo_vcs.revision_ok` is the function they would call; none calls it yet.
 * **The publish.** A branch, a commit with the provenance and its trailers, adoption and undo are git's six scripts.
   For `cancho vcs` they are `record` with the intent (the company, the job and the run as `--intent-session` and
   `--intent-issue`), and, while there is no cancho remote, `export-git` to the GitHub origin. Not written.
@@ -79,8 +77,53 @@ is not reached, and these are the pieces between:
   with the rule tag). Reported as the publish's own refusal: not written.
 * **The review by declaration.** The review step is given a text diff. `cancho vcs diff` answers by declaration: not
   wired.
-* **The tools a gate needs** (`gate_task.required_tools`) name `git` for two repositories; they do not take the kind.
+* **The change worker's `PATH`.** `workers/repo_change.cho` gives its shell a fixed `PATH` (`/usr/local/bin:/usr/bin:/bin`),
+  and the cancho texts start `cancho` by name: on a host where the compiler is elsewhere, the state of a checkout kept
+  by `cancho vcs` cannot be read. The authority worker takes the operator's `env`, which is how section 6 ran it.
 * **What `cancho vcs` itself lacks**: a merge (alpibrusl/cancho#520), and a command that reads a file or a tree at a
   change (section 3). `replay` (#818) and attestations (#817) are built there and not released.
 
-So this change is the issue's first step in full, and of its second step the module and its measurement, not the row.
+So the first change (#117) is the issue's first step in full, and of its second step the module and its measurement;
+section 6 is the revisions. The row waits for the publish.
+
+*Corrected 2026-11-23:* this section said that the tools a gate needs (`gate_task.required_tools`) would have to take
+the kind. They do not: that list is what a repository's own gate script starts (Forge's gate starts `git` in its
+tests), whatever keeps the workspace. The head check that runs before it starts `git` or `cancho` by the kind of the
+revision, and a missing one is the shell's 127 there.
+
+## 6. Revisions of both kinds *(built 2026-11-23)*
+
+A revision of `cancho vcs` is a change id of 64 digits. Every place that said 40 now asks the layer:
+
+| where | what it asks |
+|---|---|
+| `gate_task.revision_ok`, and so `gate_task.check` | `repo_vcs.revision_kind(text) >= 0`: 40 or 64 digits of `0-9a-f` |
+| `gate_task.head_script(workspace, revision)`, `head_matches` | the text of the kind the revision is of; the digits and a newline |
+| `authority_task.check` | the revision and the base are of one kind (a commit with a change is `revision-invalid`) |
+| `authority_task.ceiling_script`, `export_script` | the text of the kind the revision is of |
+| `repo_task.state_ok`, `state_head`, `state_tree`, `state_clean` | two lines of 40 or of 64 digits, never one of each |
+| `repo_task.state_of(vcs, out)` | the state of a checkout kept by `vcs`: what the change worker asks |
+| the `repo.change` request | `"vcs":"cancho"` in the input for such a row; **nothing** for git, so git's request is the bytes it was |
+| `company_authority`, `company_repo_steps` (the row is at hand) | `repo_vcs.revision_ok(repo_row.vcs_kind(row), base)` |
+| `company_state`, `company_publish`, `company_autopub` (the journal) | `repo_vcs.revision_sized`: as long as a revision of some kind, which is what `len == 40` asked |
+| `company_runner` (the change report) | a base and a tree of one kind |
+
+**The kind comes from the row where there is a row, and from the shape of the revision where there is none.** The
+gate task and the authority task carry a revision and no row; 40 digits is a commit and 64 a change, and no text is
+both. A `repos` row's `compiler_rev` and the pin files stay 40 digits (`repo_row.rev_ok`): the compiler is a git commit
+whatever keeps the repository.
+
+For git nothing changes: every unit test that pinned a text or a refusal passes with its assertions as they were (two
+calls gained an argument: `gate_task.head_script`, `repo_task.state_script` and `materialise_script`).
+
+*(measured, 2026-11-23, macOS arm64, cancho 0.1.0)* `scripts/check_authority_review.sh` now also runs the **real
+authority worker** against repositories kept by `cancho vcs`, with a revision and a base of 64 digits and the compiler
+on the `PATH` of the request's `env`: 11 more checks, all hold (44 in all). An equal and a wider report get their
+verdicts; `ceiling.txt` is the base change's file and `head.txt` what the compiler printed in the head change's
+exported tree; a change the store does not have is `revision-mismatch`; a change with a base of 40 digits is
+`revision-invalid` with nothing written; the repository is left as it was and has no `.git`.
+
+**Not measured:** the gate runner and the change worker against a checkout kept by `cancho vcs`. The gate runner's
+allow-list is four GitHub repositories with their own gate commands; the change worker is reached through `forge
+company run`, which refuses the row. Their texts are the ones section 4 measured, and their revision checks are unit
+tests only.

@@ -20,6 +20,7 @@ import forge.journal_io;
 import forge.lock;
 import forge.publish_plan;
 import forge.repo_row;
+import forge.repo_vcs;
 import forge.task;
 
 // `forge company authority <company-dir> <operator-file> <step id> <commit>` (docs/reviewer.md section 2, docs/company.md section 25): ask the authority
@@ -67,7 +68,7 @@ pub fn authority_cmd[&h, &f, &x, &c, &i, &g](heap: &!h Heap, fs: &f Fs(""), exec
                 if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false || journal_io.path_ok(fs, buffer.bytes(lp)) == false || journal_io.path_ok(fs, opath) == false {
                     company_cmd.refuse(io, task.rule_name(task.Rule::PathInvalid));
                     code = company_step.exit_usage();
-                } else if authority_task.hex40(commit) == false {
+                } else if authority_task.commit_ok(commit) == false {
                     company_cmd.refuse(io, rule_commit_invalid());
                 } else if company_step.inside(dir, opath) {
                     company_cmd.refuse(io, "operator-invalid");
@@ -219,7 +220,7 @@ fn with_row[&h, &f, &x, &c, &i, &m, &d, &o, &t, &s, &b, &k](heap: &!h Heap, fs: 
     let slug = repo_row.field_text(src, tp, row, "slug");
     let compiler = repo_row.field_text(src, tp, row, "compiler");
     let n = repo_row.authority_count(src, tp, row);
-    if row < 0 || len(slug) == 0 || len(compiler) == 0 || n < 1 || len(base) != 40 {
+    if row < 0 || len(slug) == 0 || len(compiler) == 0 || n < 1 || !repo_vcs.revision_ok(repo_row.vcs_kind(src, tp, row), base) {
         company_cmd.refuse(io, rule_not_configured());
         company_cmd.line(io, "reason: ", "the repos row needs slug, compiler and authority, and the journal a base commit for the step");
         return company_step.exit_refused();

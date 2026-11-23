@@ -5,6 +5,7 @@ import std.bytes;
 import std.json;
 import std.test;
 import forge.repo_task;
+import forge.repo_vcs;
 
 // Unit tests for src/repo_task.cho: the `repo.change` task (docs/company.md section 16): what a task may say, the shell texts, how the
 // checkout's state is read, the worker codes, and the request. The worker and the runner are tests/conformance/company_change.sh.
@@ -86,16 +87,37 @@ fn test_the_state_of_a_checkout_is_read_from_what_state_script_prints() -> [] in
     test.assert_eq(flag(repo_task.state_ok("fatal: not a git repository\n")), 0);
     test.assert_eq(flag(repo_task.state_ok("0123456789012345678901234567890123456789\n9876543210987654321098765432109876543210\nclean")), 0);
     test.assert_eq(len(repo_task.state_head("junk")), 0);
+    test.assert_eq(len(repo_task.state_tree("junk")), 0);
+    test.assert_eq(flag(repo_task.state_of(repo_vcs.git(), a)), 1);
+    test.assert_eq(flag(repo_task.state_of(repo_vcs.cancho(), a)), 0);
+    // A checkout kept by `cancho vcs`: a change and its tree, 64 digits each.
+    let c = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\nclean\n";
+    test.assert_eq(flag(repo_task.state_ok(c)), 1);
+    test.assert_eq(flag(repo_task.state_clean(c)), 1);
+    test.assert_eq(flag(repo_task.state_of(repo_vcs.cancho(), c)), 1);
+    test.assert_eq(flag(repo_task.state_of(repo_vcs.git(), c)), 0);
+    test.assert(bytes.equal(repo_task.state_head(c), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    test.assert(bytes.equal(repo_task.state_tree(c), "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"));
+    // A head of one kind and a tree of the other is the state of no checkout; so is a digit that is not `0-9a-f`.
+    test.assert_eq(flag(repo_task.state_ok("0123456789012345678901234567890123456789\nfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\nclean\n")), 0);
+    test.assert_eq(flag(repo_task.state_ok("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n9876543210987654321098765432109876543210\nclean\n")), 0);
+    test.assert_eq(flag(repo_task.state_ok("012345678901234567890123456789012345678G\n9876543210987654321098765432109876543210\nclean\n")), 0);
     return 0;
 }
 
 fn test_the_shell_texts_hold_only_paths_and_closed_words[&h](heap: &!h Heap) -> [heap] int {
-    let s = repo_task.state_script(heap, "/ck");
+    let s = repo_task.state_script(heap, repo_vcs.git(), "/ck");
     borrow s as &sb in {
         test.assert(bytes.equal(buffer.bytes(sb), "exec 2>&1; cd /ck || exit 2; git rev-parse --verify HEAD || exit 3; git rev-parse \"HEAD^{tree}\" || exit 3; if [ -z \"$(git status --porcelain --untracked-files=all)\" ]; then echo clean; else echo dirty; fi"));
     }
     buffer.drop(heap, s);
-    let m = repo_task.materialise_script(heap, "/ck", "/ev", "base");
+    let cs = repo_task.state_script(heap, repo_vcs.cancho(), "/ck");
+    borrow cs as &cb in {
+        test.assert(bytes.find(buffer.bytes(cb), "git") < 0);
+        test.assert(bytes.find(buffer.bytes(cb), "cancho vcs status") >= 0);
+    }
+    buffer.drop(heap, cs);
+    let m = repo_task.materialise_script(heap, repo_vcs.git(), "/ck", "/ev", "base");
     borrow m as &mb in {
         test.assert(bytes.equal(buffer.bytes(mb), "exec 2>&1; rm -rf /ev/base /ev/tracked.lst /ev/tracked.tar; mkdir /ev/base || exit 1; cd /ck || exit 2; git ls-files -z > /ev/tracked.lst || exit 3; tar --null -T /ev/tracked.lst -cf /ev/tracked.tar || exit 4; tar -xf /ev/tracked.tar -C /ev/base || exit 5; rm -f /ev/tracked.lst /ev/tracked.tar"));
     }
@@ -139,7 +161,7 @@ fn test_the_request_is_json_with_the_checkout_in_grants_and_not_in_the_input[&h]
     let tape0 = box_slice(heap, json.tape_len(pins), 0);
     borrow mut tape0 as &!tw0 in {
         test.assert(json.parse(pins, contents(tw0)) > 0);
-        let req = repo_task.request(heap, "change-1-1", 1, "change-1", "diff", "bug", "stand", "m1", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", pins, contents(tw0), 0, 3, 0, 10000, 1048576, "/ev", "/ck", "/t", "/c/cancho", "stand-in-agent");
+        let req = repo_task.request(heap, "change-1-1", 1, "change-1", "diff", "bug", "stand", "m1", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", pins, contents(tw0), 0, 3, 0, 10000, 1048576, "/ev", "/ck", "/t", "/c/cancho", "stand-in-agent", repo_vcs.git());
         borrow req as &rb in {
             let src = buffer.bytes(rb);
             let tape = box_slice(heap, json.tape_len(src), 0);
@@ -156,10 +178,17 @@ fn test_the_request_is_json_with_the_checkout_in_grants_and_not_in_the_input[&h]
                 test.assert(json.string_equals(src, tp, json.get(src, tp, grants, "checkout"), "/ck"));
                 test.assert(json.string_equals(src, tp, json.get(src, tp, grants, "agent"), "stand-in-agent"));
                 test.assert_eq(json.to_int(src, tp, json.get(src, tp, input, "attempts")), 3);
+                // A git repository's request says nothing of its version control: the bytes are what they were before a row could name one.
+                test.assert(json.get(src, tp, input, "vcs") < 0);
             }
             unbox_slice(heap, tape);
         }
         buffer.drop(heap, req);
+        let other = repo_task.request(heap, "change-1-1", 1, "change-1", "diff", "bug", "stand", "m1", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", pins, contents(tw0), 0, 3, 0, 10000, 1048576, "/ev", "/ck", "/t", "/c/cancho", "stand-in-agent", repo_vcs.cancho());
+        borrow other as &ob in {
+            test.assert(bytes.find(buffer.bytes(ob), "\"agent_seconds\":0,\"vcs\":\"cancho\"}") >= 0);
+        }
+        buffer.drop(heap, other);
     }
     unbox_slice(heap, tape0);
     return 0;

@@ -42,6 +42,10 @@ fn test_each_refusal_is_reached_and_named() -> [] int {
     test.assert(bytes.equal(judged("repo.authority", "someone/else", rev(), rev(), "/work/forge", "/c", "docs/a.txt", 600000), "scope-invalid"));
     test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", "abc", rev(), "/work/forge", "/c", "docs/a.txt", 600000), "revision-invalid"));
     test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), "ABCDEF", "/work/forge", "/c", "docs/a.txt", 600000), "revision-invalid"));
+    // Two changes of `cancho vcs` (64 digits) hold; a commit and a change together are of no one repository.
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "/work/forge", "/c", "docs/a.txt", 600000), ""));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", rev(), "/work/forge", "/c", "docs/a.txt", 600000), "revision-invalid"));
+    test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "/work/forge", "/c", "docs/a.txt", 600000), "revision-invalid"));
     test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "work/forge", "/c", "docs/a.txt", 600000), "path-invalid"));
     test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "/work/forge", "cancho", "docs/a.txt", 600000), "path-invalid"));
     test.assert(bytes.equal(judged("repo.authority", "alpibrusl/cancho-forge", rev(), rev(), "/work/forge", "/c", "/etc/passwd", 600000), "path-invalid"));
@@ -127,6 +131,22 @@ fn test_the_shell_text_is_exactly_the_documented_commands[&h](heap: &!h Heap) ->
         test.assert(bytes.equal(buffer.bytes(xb), "exec 2>&1; rm -rf /work/exec/e-1/tree && git -C /work/forge archive -o /work/exec/e-1/tree.tar 0123456789abcdef0123456789abcdef01234567 && mkdir /work/exec/e-1/tree && tar -xf /work/exec/e-1/tree.tar -C /work/exec/e-1/tree; s=$?; rm -f /work/exec/e-1/tree.tar; exit $s"));
     }
     buffer.drop(heap, x);
+    // The same two questions of a change of `cancho vcs` start no git.
+    let cc = authority_task.ceiling_script(heap, "/work/forge", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "docs/authority.txt");
+    borrow cc as &ccb in {
+        test.assert(bytes.find(buffer.bytes(ccb), "git") < 0);
+        test.assert(bytes.find(buffer.bytes(ccb), "R=/work/forge; ") >= 0);
+    }
+    buffer.drop(heap, cc);
+    let cx = authority_task.export_script(heap, "/work/forge", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", "/work/exec/e-1");
+    borrow cx as &cxb in {
+        test.assert(bytes.find(buffer.bytes(cxb), "git") < 0);
+        test.assert(bytes.find(buffer.bytes(cxb), "/work/exec/e-1/tree") >= 0);
+    }
+    buffer.drop(heap, cx);
+    test.assert(authority_task.commit_ok(rev()));
+    test.assert(authority_task.commit_ok("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    test.assert(!authority_task.commit_ok("0123456789abcdef"));
     let a = authority_task.authority_script(heap, "/work/exec/e-1", "/opt/cancho/bin/cancho", "src/*.cho", true);
     borrow a as &ab in {
         test.assert(bytes.equal(buffer.bytes(ab), "exec 2>&1; cd /work/exec/e-1/tree && /opt/cancho/bin/cancho authority src/*.cho --std; s=$?; cd / ; rm -rf /work/exec/e-1/tree; exit $s"));

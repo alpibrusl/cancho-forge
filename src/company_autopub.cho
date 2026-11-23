@@ -12,6 +12,7 @@ import forge.company_state;
 import forge.company_step;
 import forge.journal_io;
 import forge.publish_plan;
+import forge.repo_vcs;
 
 // A `repo.publish` step (docs/auto-publish.md): Forge itself makes the local branch and commit of the `repo.change` step it needs, by the code of
 // `forge company publish`, to a branch the operator's `auto_publish` row names the prefix of. It never pushes. The runner (company_runner.cho) does the
@@ -80,7 +81,7 @@ pub fn run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &e](heap: &!h Heap, fs: &f Fs
         borrow journal as &jb in {
             let have = company_state.published_commit(heap, buffer.bytes(jb), need);
             borrow have as &hv in {
-                if len(buffer.bytes(hv)) == 40 {
+                if repo_vcs.revision_sized(buffer.bytes(hv)) {
                     text = buffer.append(heap, buffer.append(heap, text, "commit "), buffer.bytes(hv));
                     adopted = true;
                     code = 0;
@@ -115,7 +116,7 @@ pub fn run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &e](heap: &!h Heap, fs: &f Fs
         borrow after as &ab in {
             let commit = company_state.published_commit(heap, buffer.bytes(ab), need);
             borrow commit as &cb in {
-                if why != 0 || len(buffer.bytes(cb)) != 40 {
+                if why != 0 || !repo_vcs.revision_sized(buffer.bytes(cb)) {
                     code = company_step.exit_io();
                 } else if adopted == false {
                     text = buffer.append(heap, buffer.append(heap, text, "commit "), buffer.bytes(cb));

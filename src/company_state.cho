@@ -13,6 +13,7 @@ import forge.company_time;
 import forge.company_manifest;
 import forge.event;
 import forge.journal;
+import forge.repo_vcs;
 import forge.task;
 
 // The company journal (docs/superpowers/specs/2026-10-27-forge-company-layer-design.md, section 4.3): the events a company run
@@ -277,7 +278,7 @@ pub fn published_commit[&h, &j, &s](heap: &!h Heap, journal: &j [byte], step: &s
                     let kind = json.get(line, tp, 0, "kind");
                     let task = json.get(line, tp, 0, "task");
                     let commit = json.get(line, tp, 0, "commit");
-                    if json.is_string(tp, kind) && json.is_string(tp, task) && json.is_string(tp, commit) && bytes.equal(json.string_view(line, tp, kind), kind_published()) && bytes.equal(json.string_view(line, tp, task), step) && len(json.string_view(line, tp, commit)) == 40 {
+                    if json.is_string(tp, kind) && json.is_string(tp, task) && json.is_string(tp, commit) && bytes.equal(json.string_view(line, tp, kind), kind_published()) && bytes.equal(json.string_view(line, tp, task), step) && repo_vcs.revision_sized(json.string_view(line, tp, commit)) {
                         buffer.drop(heap, out);
                         out = buffer.append(heap, buffer.empty(heap, 48), json.string_view(line, tp, commit));
                     }
@@ -676,7 +677,7 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &y, &x](heap: &!h Heap, line: &l [byte], ex
                     }
                 } else if bytes.equal(kind, kind_published()) {
                     let commit = json.get(line, tp, 0, "commit");
-                    if named == false || json.is_string(tp, json.get(line, tp, 0, "branch")) == false || json.is_string(tp, commit) == false || len(json.string_view(line, tp, commit)) != 40 {
+                    if named == false || json.is_string(tp, json.get(line, tp, 0, "branch")) == false || json.is_string(tp, commit) == false || !repo_vcs.revision_sized(json.string_view(line, tp, commit)) {
                         rule = bad;
                     }
                 } else if bytes.equal(kind, kind_change_proposed()) {

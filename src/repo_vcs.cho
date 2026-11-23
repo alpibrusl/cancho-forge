@@ -70,6 +70,23 @@ pub fn revision_ok[&r](kind: int, revision: &r [byte]) -> [] bool {
     return true;
 }
 
+// The kind whose revision `text` is, by its shape (40 digits git's, 64 a change id), or -1. A text that names no kind of its own (a task's
+// revision, a line of a journal) is read with this; where a repository row is at hand, the row's kind decides and `revision_ok` checks.
+pub fn revision_kind[&r](text: &r [byte]) -> [] int {
+    if revision_ok(0, text) {
+        return 0;
+    }
+    if revision_ok(1, text) {
+        return 1;
+    }
+    return 0 - 1;
+}
+
+// Whether `text` is as long as a revision of some kind: what a reader of the journal asks of a field that holds a revision or nothing.
+pub fn revision_sized[&r](text: &r [byte]) -> [] bool {
+    return len(text) == revision_digits(0) || len(text) == revision_digits(1);
+}
+
 // Whether the texts that write a repository of `kind` (a branch and a commit with the provenance) exist: only git's do.
 pub fn publish_built(kind: int) -> [] bool {
     return kind == 0;

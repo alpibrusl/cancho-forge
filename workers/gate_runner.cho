@@ -269,7 +269,7 @@ fn finish[&h, &i, &f, &r, &k, &p, &q, &l, &g](heap: &!h Heap, io: &!i Io, fs: &f
 // What the check that the checkout is at the revision found: 0 it is, 1 it is at another revision, 2 the workspace
 // cannot be used, 3 the check passed its deadline, 4 the shell would not start.
 fn check_head[&h, &x, &c, &w, &v, &y](heap: &!h Heap, exec: &x Exec("/bin/sh"), clock: &c Clock, workspace: &w [byte], revision: &v [byte], env: &y [byte], deadline_ms: int) -> [heap, exec("/bin/sh"), exec_detached, clock, poll] int {
-    let script = gate_task.head_script(heap, workspace);
+    let script = gate_task.head_script(heap, workspace, revision);
     var found = 4;
     borrow script as &sb in {
         let (out, ran) = run_sh(heap, exec, clock, buffer.bytes(sb), env, true, 4096, deadline_ms);

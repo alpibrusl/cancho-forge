@@ -107,9 +107,26 @@ fn keys_plain[&t](tp: &t [int], obj: int) -> [] bool {
     return ok;
 }
 
-// 40 digits of `0-9a-f`.
+// A revision of the COMPILER (`compiler_rev`, a pin file): 40 digits of `0-9a-f`. The compiler is a git commit whatever keeps the repository
+// of the row; a revision of the repository itself is `repo_vcs.revision_ok` with `vcs_kind`.
 pub fn rev_ok[&r](rev: &r [byte]) -> [] bool {
-    return gate_task.revision_ok(rev);
+    return repo_vcs.revision_ok(repo_vcs.git(), rev);
+}
+
+// The kind of version control that keeps the repository of the row at node `row` (`repo_vcs.git()` when the row does not say, or there is no row).
+pub fn vcs_kind[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] int {
+    if row < 0 {
+        return repo_vcs.git();
+    }
+    let vcs = json.get(src, tp, row, "vcs");
+    if vcs < 0 || !json.is_string(tp, vcs) {
+        return repo_vcs.git();
+    }
+    let kind = repo_vcs.kind_of(json.string_view(src, tp, vcs));
+    if kind < 0 {
+        return repo_vcs.git();
+    }
+    return kind;
 }
 
 fn name_char(c: int) -> [] bool {
