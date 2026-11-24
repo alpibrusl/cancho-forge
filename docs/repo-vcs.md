@@ -45,7 +45,7 @@ file's `checker` is a file named `cancho`. Any other value is `repos: vcs is not
 
 ## 3. How the cancho texts read a repository
 
-`cancho vcs` (release 0.1.0, the compiler this repository is pinned to) has `status` and `show`, and has no command that
+`cancho vcs` (release 0.1.0, the compiler this repository was pinned to when this was measured; the pin is release 0.1.1 since 2026-11-24) has `status` and `show`, and has no command that
 prints a file at a change or lists a tree. Its store is plain files by design (`docs/vcs-cli.md` section 3 in
 alpibrusl/cancho: "inspectable with the tools an agent has"): `objects/tree/AB/REST` is lines `MODE BLOB PATH`, and
 `objects/blob/AB/REST` is the bytes of a file. So the cancho texts ask `cancho vcs` for the head and for the tree id of
@@ -170,6 +170,14 @@ imports `std.bytes`, it is refused; `cancho check --std` and `cancho test --std`
 found. What follows here: **a publish on `cancho vcs` whose patch touches a file with an import is refused `publish-gate-failed`**, and a test
 file always imports `std.test`, so every change of kind `bug` or `feature` is. The fixtures of the script import nothing.
 
+*Corrected 2026-11-24, later:* the cause was found and fixed in alpibrusl/cancho#824 (the gate of `cancho vcs record` did not follow the imports
+of a file that declares no module), and release 0.1.1 (`d44389e2`) carries it. **This repository is pinned to 0.1.1 from this commit**, so the
+refusal above is what 0.1.0 did and not what the pinned compiler does. *(measured with a model, 2026-11-24, macOS arm64, cancho 0.1.1,
+`claude-haiku-5-5`)* The company of three steps described below, run again on the repository kept by `cancho vcs` with the released binary as
+`checker` and `compiler`: `done: steps accepted 3`, the change (`src/words.cho` and `tests/words_test.cho`, which imports `std.test` and the
+library) is published on `forge/words-e2e2-chg`, the authority verdict is `equal`, and no command of a person came between. One run. The
+fixtures of `repo_publish_cancho.sh` still import nothing.
+
 *(measured with a model, 2026-11-24, macOS arm64, cancho 0.1.0, `claude-haiku-5-5`)* One company of three steps (`repo.change` of kind `bug`,
 `repo.publish`, `repo.authority`) on a repository of one library, one program and one test file, with the real `cancho-build` and `cancho-agent`
 of alpibrusl/cancho-code and no stand-in. On a repository kept by `cancho vcs`: the change was accepted on the first attempt (a patch of two
@@ -181,7 +189,7 @@ destinations travel one to a line and the worker read the list only when it held
 held to a plain path), and `company_change.sh` and `repo_publish_cancho.sh` each publish a patch of two files now. One run of each kind: nothing
 here says how often a model's change is accepted.
 
-**Not measured:** a real repository (the largest one here is three `.cho` files); a publish on `cancho vcs` of a change with an import, which the gate above refuses.
+**Not measured:** a real repository (the largest one here is three `.cho` files); a publish on `cancho vcs` of a change with an import **by a script of the gate** (one run with a model did it, above; the fixtures of the script import nothing).
 
 ## 8. What is still not built
 
