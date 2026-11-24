@@ -11,6 +11,7 @@ import forge.gate_task;
 import forge.journal_io;
 import forge.repo_row;
 import forge.repo_task;
+import forge.repo_vcs;
 import forge.snapshot;
 import forge.verbs;
 
@@ -373,6 +374,15 @@ fn finish[&h, &i, &f, &r, &k, &p, &q, &b, &t, &u, &w](heap: &!h Heap, io: &!i Io
     return 0;
 }
 
+// The kind of version control the task's input names (`"vcs"`: absent for git, which is what every request said before the field was there).
+fn vcs_of[&s, &t](src: &s [byte], tp: &t [int], input: int) -> [] int {
+    let kind = repo_vcs.kind_of(text_of(src, tp, json.get(src, tp, input, "vcs")));
+    if kind < 0 {
+        return repo_vcs.git();
+    }
+    return kind;
+}
+
 // A task that has passed `repo_task.check`: the stages of the head of this file.
 fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), request_id: &r [byte], task_id: &k [byte], src: &s [byte], tp: &t [int], timeout_ms: int) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), exec_detached, clock, poll] int {
     let task = json.get(src, tp, 0, "task");
@@ -383,6 +393,7 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, 
     let provider = text_of(src, tp, json.get(src, tp, input, "provider"));
     let model = text_of(src, tp, json.get(src, tp, input, "model"));
     let rev = text_of(src, tp, json.get(src, tp, input, "compiler_rev"));
+    let vcs = vcs_of(src, tp, input);
     let pins = json.get(src, tp, input, "pins");
     var attempts = int_of_node(src, tp, json.get(src, tp, input, "attempts"));
     var agent_seconds = int_of_node(src, tp, json.get(src, tp, input, "agent_seconds"));
@@ -406,15 +417,18 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, 
     var with_patch = false;
     borrow env as &eb in {
         // 1. the checkout's state
-        let s1 = repo_task.state_script(heap, checkout);
+        let s1 = repo_task.state_script(heap, vcs, checkout);
         borrow s1 as &s1b in {
             let (status, out) = sh(heap, exec, clock, buffer.bytes(s1b), buffer.bytes(eb), 4096, total);
             buffer.drop(heap, state1);
             state1 = out;
             borrow state1 as &st1 in {
-                if status != 0 || !repo_task.state_ok(buffer.bytes(st1)) {
+                if status != 0 || !repo_task.state_of(vcs, buffer.bytes(st1)) {
                     code = "repo-unusable";
                     message = "the checkout is not a git checkout the worker can read";
+                    if vcs != repo_vcs.git() {
+                        message = "the checkout is not a checkout of cancho vcs the worker can read";
+                    }
                 } else if !repo_task.state_clean(buffer.bytes(st1)) {
                     code = "repo-checkout-dirty";
                     message = "the checkout has modified, staged or untracked files";
@@ -429,7 +443,7 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, 
             if copies == 1 {
                 sub = "fresh";
             }
-            let ms = repo_task.materialise_script(heap, checkout, ev, sub);
+            let ms = repo_task.materialise_script(heap, vcs, checkout, ev, sub);
             borrow ms as &msb in {
                 let (status, out) = sh(heap, exec, clock, buffer.bytes(msb), buffer.bytes(eb), 65536, total);
                 buffer.drop(heap, log);
@@ -513,7 +527,7 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, 
             buffer.drop(heap, cs);
         }
         if len(code) == 0 {
-            let s2 = repo_task.state_script(heap, checkout);
+            let s2 = repo_task.state_script(heap, vcs, checkout);
             borrow s2 as &s2b in {
                 let (status, out) = sh(heap, exec, clock, buffer.bytes(s2b), buffer.bytes(eb), 4096, total);
                 var same = false;

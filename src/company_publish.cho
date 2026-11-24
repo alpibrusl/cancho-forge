@@ -19,6 +19,7 @@ import forge.lock;
 import forge.patch_check;
 import forge.publish_plan;
 import forge.repo_row;
+import forge.repo_vcs;
 import forge.snapshot;
 import forge.task;
 import forge.worker;
@@ -632,7 +633,7 @@ fn settle[&h, &f, &i, &m, &s, &d, &p, &b, &y, &a, &o](heap: &!h Heap, fs: &f Fs(
             company_cmd.line(io, "reason: ", "the worker's reply is not what the request asked for");
         } else if json.to_bool(tp, json.get(out, tp, 0, "ok")) {
             let commit = json.get(out, tp, 0, "commit");
-            if json.is_string(tp, commit) == false || len(json.string_view(out, tp, commit)) != 40 {
+            if json.is_string(tp, commit) == false || !repo_vcs.revision_sized(json.string_view(out, tp, commit)) {
                 company_cmd.refuse(io, publish_plan.rule_worker_failed());
                 company_cmd.line(io, "reason: ", "the worker's reply names no commit");
             } else {
@@ -740,7 +741,7 @@ pub fn change_base[&h, &j, &s](heap: &!h Heap, journal: &j [byte], step: &s [byt
                     let kind = json.get(line, tp, 0, "kind");
                     let task = json.get(line, tp, 0, "task");
                     let base = json.get(line, tp, 0, "base");
-                    if json.is_string(tp, kind) && json.is_string(tp, task) && json.is_string(tp, base) && bytes.equal(json.string_view(line, tp, kind), company_state.kind_change()) && bytes.equal(json.string_view(line, tp, task), step) && len(json.string_view(line, tp, base)) == 40 {
+                    if json.is_string(tp, kind) && json.is_string(tp, task) && json.is_string(tp, base) && bytes.equal(json.string_view(line, tp, kind), company_state.kind_change()) && bytes.equal(json.string_view(line, tp, task), step) && repo_vcs.revision_sized(json.string_view(line, tp, base)) {
                         buffer.drop(heap, out);
                         out = buffer.append(heap, buffer.empty(heap, 48), json.string_view(line, tp, base));
                     }
@@ -859,7 +860,7 @@ fn patch_hand_over[&h, &f, &x, &c, &i, &m, &s, &j, &d, &e, &p, &w, &g, &k, &t, &
     var code = company_step.exit_refused();
     var have = false;
     borrow base as &bb in {
-        have = len(buffer.bytes(bb)) == 40;
+        have = repo_vcs.revision_sized(buffer.bytes(bb));
     }
     if have == false {
         company_cmd.refuse(io, publish_plan.rule_not_accepted());

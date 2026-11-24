@@ -57,6 +57,17 @@ fn test_a_revision_is_40_digits_for_git_and_64_for_cancho() -> [] int {
     test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), "0123456789abcdef0123456789abcdef0123456:")), 0);
     test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.git(), "0123456789abcdef0123456789abcdef0123456`")), 0);
     test.assert_eq(flag(repo_vcs.revision_ok(repo_vcs.cancho(), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg")), 0);
+    // The kind a revision is of, by its shape; and the length alone, which is what a reader of the journal asks.
+    test.assert_eq(repo_vcs.revision_kind(c40), repo_vcs.git());
+    test.assert_eq(repo_vcs.revision_kind(c64), repo_vcs.cancho());
+    test.assert_eq(repo_vcs.revision_kind(""), 0 - 1);
+    test.assert_eq(repo_vcs.revision_kind("0123456789abcdef"), 0 - 1);
+    test.assert_eq(repo_vcs.revision_kind("0123456789ABCDEF0123456789abcdef01234567"), 0 - 1);
+    test.assert_eq(repo_vcs.revision_kind("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde;"), 0 - 1);
+    test.assert_eq(flag(repo_vcs.revision_sized(c40)), 1);
+    test.assert_eq(flag(repo_vcs.revision_sized(c64)), 1);
+    test.assert_eq(flag(repo_vcs.revision_sized("")), 0);
+    test.assert_eq(flag(repo_vcs.revision_sized("0123456789abcdef0123456789abcdef012345678")), 0);
     test.assert_eq(repo_vcs.revision_digits(repo_vcs.git()), 40);
     test.assert_eq(repo_vcs.revision_digits(repo_vcs.cancho()), 64);
     return 0;

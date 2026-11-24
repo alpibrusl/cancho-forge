@@ -258,13 +258,13 @@ fn cat3[&h, &a, &b, &c](heap: &!h Heap, out: buffer.Buffer, a: &a [byte], b: &b 
 }
 
 // Print the checkout's HEAD commit, the tree of that commit and whether the working tree is clean (nothing modified, staged or untracked).
-pub fn state_script[&h, &c](heap: &!h Heap, checkout: &c [byte]) -> [heap] buffer.Buffer {
-    return repo_vcs.state_script(heap, repo_vcs.git(), checkout);
+pub fn state_script[&h, &c](heap: &!h Heap, vcs: int, checkout: &c [byte]) -> [heap] buffer.Buffer {
+    return repo_vcs.state_script(heap, vcs, checkout);
 }
 
 // Make `<ev>/<sub>` a copy of the checkout's TRACKED files (no `.git`, nothing untracked): the file list and a tar beside it, removed again.
-pub fn materialise_script[&h, &c, &e, &s](heap: &!h Heap, checkout: &c [byte], ev: &e [byte], sub: &s [byte]) -> [heap] buffer.Buffer {
-    return repo_vcs.materialise_script(heap, repo_vcs.git(), checkout, ev, sub);
+pub fn materialise_script[&h, &c, &e, &s](heap: &!h Heap, vcs: int, checkout: &c [byte], ev: &e [byte], sub: &s [byte]) -> [heap] buffer.Buffer {
+    return repo_vcs.materialise_script(heap, vcs, checkout, ev, sub);
 }
 
 // The build: `cancho-build --repo <ev>/base --change <ev>/change.txt --kind K --checker C --work <ev>/work --agent 'A' --provider P --model M`
@@ -304,39 +304,57 @@ pub fn apply_script[&h, &e](heap: &!h Heap, ev: &e [byte]) -> [heap] buffer.Buff
 
 // ---- reading the checkout's state ------------------------------------------------------------------------------------------
 
-fn hex40_at[&o](out: &o [byte], at: int) -> [] bool {
-    if len(out) < at + 41 || int_of(out[at + 40]) != 10 {
+// Is there a line of `n` digits and a newline at `at`?
+fn digits_at[&o](out: &o [byte], at: int, n: int) -> [] bool {
+    if len(out) < at + n + 1 || int_of(out[at + n]) != 10 {
         return false;
     }
-    return repo_row.rev_ok(out[at..at + 40]);
+    return repo_vcs.revision_kind(out[at..at + n]) >= 0;
 }
 
-// Is `out` what `state_script` prints: two 40-hex lines and `clean` or `dirty`?
-pub fn state_ok[&o](out: &o [byte]) -> [] bool {
-    if !hex40_at(out, 0) || !hex40_at(out, 41) {
-        return false;
+// How many digits the two revisions of a `state_script` output have (40 for git, 64 for `cancho vcs`), or 0 when `out` is not one: two lines
+// of that many digits and `clean` or `dirty`.
+fn state_digits[&o](out: &o [byte]) -> [] int {
+    var n = repo_vcs.revision_digits(repo_vcs.git());
+    if !digits_at(out, 0, n) {
+        n = repo_vcs.revision_digits(repo_vcs.cancho());
     }
-    let rest = out[82..len(out)];
-    return bytes.equal(rest, "clean\n") || bytes.equal(rest, "dirty\n");
+    if !digits_at(out, 0, n) || !digits_at(out, n + 1, n) {
+        return 0;
+    }
+    let rest = out[2 * n + 2..len(out)];
+    if bytes.equal(rest, "clean\n") || bytes.equal(rest, "dirty\n") {
+        return n;
+    }
+    return 0;
+}
+
+// Is `out` what `state_script` prints: two lines of a revision's digits (the head and its tree) and `clean` or `dirty`?
+pub fn state_ok[&o](out: &o [byte]) -> [] bool {
+    return state_digits(out) > 0;
+}
+
+// Is `out` the state of a checkout kept by `vcs`: `state_ok`, with revisions of that kind?
+pub fn state_of[&o](vcs: int, out: &o [byte]) -> [] bool {
+    return state_digits(out) == repo_vcs.revision_digits(vcs);
 }
 
 pub fn state_clean[&o](out: &o [byte]) -> [] bool {
-    return state_ok(out) && bytes.equal(out[82..len(out)], "clean\n");
+    let n = state_digits(out);
+    return n > 0 && bytes.equal(out[2 * n + 2..len(out)], "clean\n");
 }
 
-// The commit and the tree of an `state_ok` output ("" otherwise).
+// The head revision and its tree of a `state_ok` output ("" otherwise).
 pub fn state_head[&o](out: &o [byte]) -> [] &o [byte] {
-    if !state_ok(out) {
-        return out[0..0];
-    }
-    return out[0..40];
+    return out[0..state_digits(out)];
 }
 
 pub fn state_tree[&o](out: &o [byte]) -> [] &o [byte] {
-    if !state_ok(out) {
+    let n = state_digits(out);
+    if n == 0 {
         return out[0..0];
     }
-    return out[41..81];
+    return out[n + 1..2 * n + 1];
 }
 
 // ---- the request -------------------------------------------------------------------------------------------------------------
@@ -363,7 +381,7 @@ fn put_pins[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tp: &t [
 
 // The `execute` request of a `repo.change` task. The pins are a node of `src` (the operator file) or -1. The checkout, the tools directory,
 // the checker and the agent are in `grants`, never in `task.input`.
-pub fn request[&h, &r, &k, &i, &c, &p, &m, &v, &e, &o, &t, &x, &a, &s, &u](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &k [byte], repo: &i [byte], kind: &c [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts: int, agent_seconds: int, timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], checkout: &o [byte], tools_dir: &t [byte], checker: &x [byte], agent: &a [byte]) -> [heap] buffer.Buffer {
+pub fn request[&h, &r, &k, &i, &c, &p, &m, &v, &e, &o, &t, &x, &a, &s, &u](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &k [byte], repo: &i [byte], kind: &c [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts: int, agent_seconds: int, timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], checkout: &o [byte], tools_dir: &t [byte], checker: &x [byte], agent: &a [byte], vcs: int) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 512);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "contract");
@@ -398,6 +416,10 @@ pub fn request[&h, &r, &k, &i, &c, &p, &m, &v, &e, &o, &t, &x, &a, &s, &u](heap:
     w = json.put_int(heap, w, attempts);
     w = json.put_key(heap, w, "agent_seconds");
     w = json.put_int(heap, w, agent_seconds);
+    if vcs != repo_vcs.git() {
+        w = json.put_key(heap, w, "vcs");
+        w = json.put_string(heap, w, repo_vcs.tool(vcs));
+    }
     w = json.end_object(heap, w);
     w = json.end_object(heap, w);
     w = json.put_key(heap, w, "limits");

@@ -30,6 +30,7 @@ import forge.recover_io;
 import forge.repo_call;
 import forge.repo_row;
 import forge.repo_task;
+import forge.repo_vcs;
 import forge.step_run;
 import forge.task;
 import forge.tool_call;
@@ -105,7 +106,7 @@ pub fn authority_step[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t](heap: &!h Heap, fs
 fn authority_row[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &k, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, dir: &d [byte], jpath: &j [byte], op: &s [byte], tp: &t [int], k: int, reviewed: int, seq: int, existed: bool, commit: &k [byte], base: &b [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, dir_write, file_read, file_write, io_write, err_write] int {
     let step = company_manifest.step_at(hm, k);
     let id = company_manifest.step_id(hm, step);
-    if len(commit) != 40 {
+    if !repo_vcs.revision_sized(commit) {
         company_run_io.refuse(io, rule_authority_unpublished());
         company_run_io.say(io, "step: ", id);
         company_run_io.say(io, "reason: ", "the step it reviews was never published; run forge company publish for it first");
@@ -114,7 +115,7 @@ fn authority_row[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &k, &b](heap: &!h Heap,
     let repo = company_manifest.step_repo(hm, company_manifest.step_at(hm, reviewed));
     let row = repo_row.row_of(op, tp, repo);
     let slug = repo_row.field_text(op, tp, row, "slug");
-    if row < 0 || len(slug) == 0 || len(repo_row.field_text(op, tp, row, "compiler")) == 0 || repo_row.authority_count(op, tp, row) < 1 || len(base) != 40 || len(company_step.op_text(op, tp, "workers")) == 0 {
+    if row < 0 || len(slug) == 0 || len(repo_row.field_text(op, tp, row, "compiler")) == 0 || repo_row.authority_count(op, tp, row) < 1 || !repo_vcs.revision_ok(repo_row.vcs_kind(op, tp, row), base) || len(company_step.op_text(op, tp, "workers")) == 0 {
         company_run_io.refuse(io, rule_authority_unconfigured());
         company_run_io.say(io, "step: ", id);
         company_run_io.say(io, "reason: ", "the repos row needs slug, compiler and authority, the operator file workers, and the journal a base commit for the reviewed step");

@@ -112,22 +112,9 @@ pub fn repo_known[&k](key: &k [byte]) -> [] bool {
     return bytes.equal(key, "alpibrusl/cancho-forge") || bytes.equal(key, "alpibrusl/cancho-hdl") || bytes.equal(key, "alpibrusl/cancho") || bytes.equal(key, "alpibrusl/cancho-ui");
 }
 
-// Exactly 40 digits of `0-9a-f`.
+// A revision of a kind of version control Forge reads (`repo_vcs`): 40 digits of `0-9a-f` (a git commit) or 64 (a change of `cancho vcs`).
 pub fn revision_ok[&r](revision: &r [byte]) -> [] bool {
-    if len(revision) != 40 {
-        return false;
-    }
-    var i = 0;
-    while i < len(revision) {
-        let c = int_of(revision[i]);
-        let digit = c >= 48 && c <= 57;
-        let lower = c >= 97 && c <= 102;
-        if !digit && !lower {
-            return false;
-        }
-        i = i + 1;
-    }
-    return true;
+    return repo_vcs.revision_kind(revision) >= 0;
 }
 
 // A directory the runner will put in a shell command and a file path: absolute, 2 to 512 bytes, only letters, digits
@@ -204,10 +191,15 @@ pub fn head_deadline_ms(runner_ms: int) -> [] int {
     return tenth;
 }
 
-// The shell text that prints the checkout's revision: `cd <workspace> && git rev-parse HEAD`. `workspace` has passed
-// `path_ok`, which leaves nothing the shell treats specially. A caller that has not checked it must not call this.
-pub fn head_script[&h, &w](heap: &!h Heap, workspace: &w [byte]) -> [heap] buffer.Buffer {
-    return repo_vcs.head_script(heap, repo_vcs.git(), workspace);
+// The shell text that prints the checkout's revision, for the kind of version control `revision` is a revision of (`cd <workspace> && git
+// rev-parse HEAD` for a commit). `workspace` has passed `path_ok`, which leaves nothing the shell treats specially, and `revision`
+// `revision_ok`. A caller that has not checked them must not call this.
+pub fn head_script[&h, &w, &r](heap: &!h Heap, workspace: &w [byte], revision: &r [byte]) -> [heap] buffer.Buffer {
+    var kind = repo_vcs.revision_kind(revision);
+    if kind < 0 {
+        kind = repo_vcs.git();
+    }
+    return repo_vcs.head_script(heap, kind, workspace);
 }
 
 // The shell text that runs the gate: its output (both streams) to stdout, in the workspace, after a check that each of
@@ -234,17 +226,11 @@ pub fn environment_failure(exit_status: int) -> [] bool {
     return exit_status == 126 || exit_status == 127;
 }
 
-// Is `printed` (what `git rev-parse HEAD` wrote) the revision asked for? One line: the 40 digits and a newline.
+// Is `printed` (what `head_script` wrote) the revision asked for? One line: the digits of the revision and a newline.
 pub fn head_matches[&p, &r](printed: &p [byte], revision: &r [byte]) -> [] bool {
-    if len(printed) != 41 || int_of(printed[40]) != 10 {
+    let n = len(revision);
+    if !revision_ok(revision) || len(printed) != n + 1 || int_of(printed[n]) != 10 {
         return false;
     }
-    var i = 0;
-    while i < 40 {
-        if printed[i] != revision[i] {
-            return false;
-        }
-        i = i + 1;
-    }
-    return true;
+    return bytes.equal(printed[0..n], revision);
 }

@@ -213,11 +213,18 @@ fn test_the_revision_check_gets_a_tenth_of_the_runners_time_and_at_most_ten_seco
 }
 
 fn test_the_shell_text_changes_to_the_workspace_and_asks_git[&h](heap: &!h Heap) -> [heap] int {
-    let head = gate_task.head_script(heap, "/work/forge");
+    let head = gate_task.head_script(heap, "/work/forge", rev());
     borrow head as &hb in {
         test.assert(bytes.equal(buffer.bytes(hb), "cd /work/forge && git rev-parse HEAD"));
     }
     buffer.drop(heap, head);
+    // A workspace asked for a change of `cancho vcs` is asked by `cancho vcs`, and no git is started.
+    let other = gate_task.head_script(heap, "/work/forge", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    borrow other as &ob in {
+        test.assert(bytes.find(buffer.bytes(ob), "git") < 0);
+        test.assert(bytes.find(buffer.bytes(ob), "R=/work/forge; ") >= 0);
+    }
+    buffer.drop(heap, other);
     return 0;
 }
 
@@ -260,6 +267,16 @@ fn test_a_checkout_is_at_the_revision_only_if_git_printed_it_and_a_newline() -> 
     test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567 \n", rev()));
     test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567x", rev()));
     test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567\r", rev()));
+    // A change of `cancho vcs`: 64 digits and a newline, and never the first 40 of them.
+    let change = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    test.assert(gate_task.head_matches("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", change));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", change));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef01234567\n", change));
+    test.assert(!gate_task.head_matches("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n", rev()));
+    test.assert(!gate_task.head_matches("abc\n", "abc"));
+    test.assert(!gate_task.head_matches("\n", ""));
+    test.assert(gate_task.revision_ok(change));
+    test.assert(!gate_task.revision_ok("0123456789abcdef0123456789abcdef0123456789abcdef"));
     return 0;
 }
 

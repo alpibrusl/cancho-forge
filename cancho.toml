@@ -104,7 +104,7 @@ std = true
 
 [[test]]
 name = "company_change"
-sources = ["tests/company_change_test.cho", "src/company_change.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho"]
+sources = ["tests/company_change_test.cho", "src/company_change.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]
@@ -114,7 +114,7 @@ std = true
 
 [[test]]
 name = "company_derive"
-sources = ["tests/company_derive_test.cho", "src/company_derive.cho", "src/company_change.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal_io.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho"]
+sources = ["tests/company_derive_test.cho", "src/company_derive.cho", "src/company_change.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal_io.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]
@@ -129,22 +129,22 @@ std = true
 
 [[test]]
 name = "company_caps"
-sources = ["tests/company_caps_test.cho", "src/company_run.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/company_time.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_change.cho"]
+sources = ["tests/company_caps_test.cho", "src/company_run.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/company_time.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_change.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]
 name = "company_intake"
-sources = ["tests/company_intake_test.cho", "src/company_change.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/company_time.cho", "src/journal.cho", "src/task.cho", "src/event.cho"]
+sources = ["tests/company_intake_test.cho", "src/company_change.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/company_time.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]
 name = "company_state"
-sources = ["tests/company_state_test.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho", "src/company_change.cho"]
+sources = ["tests/company_state_test.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho", "src/company_change.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]
 name = "company_cmd"
-sources = ["tests/company_cmd_test.cho", "src/company_cmd.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/lock.cho", "src/journal_io.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_derive.cho", "src/company_change.cho", "src/company_time.cho"]
+sources = ["tests/company_cmd_test.cho", "src/company_cmd.cho", "src/company_state.cho", "src/company_budget.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/lock.cho", "src/journal_io.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_derive.cho", "src/company_change.cho", "src/company_time.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]
@@ -159,7 +159,7 @@ std = true
 
 [[test]]
 name = "company_run"
-sources = ["tests/company_run_test.cho", "src/company_run.cho", "src/company_budget.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho", "src/company_change.cho"]
+sources = ["tests/company_run_test.cho", "src/company_run.cho", "src/company_budget.cho", "src/company_state.cho", "src/company_graph.cho", "src/company_manifest.cho", "src/journal.cho", "src/task.cho", "src/event.cho", "src/company_time.cho", "src/company_change.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]

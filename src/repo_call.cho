@@ -64,7 +64,7 @@ fn code_of[&h, &o](heap: &!h Heap, out: &o [byte]) -> [heap] &static [byte] {
 
 // Run the task. `journal_path` is the workspace's journal (the caller holds its lock); `workers` the directory holding `repo_change`. The
 // texts are the operator's (`src`, its tape `tp`, `pins` a node of it or -1) and the manifest's.
-pub fn run[&h, &f, &x, &w, &c, &j, &r, &t, &i, &o, &d, &k, &a, &p, &m, &v, &s, &u, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], repo: &r [byte], kind: &t [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts_ceiling: int, agent_seconds: int, checkout: &o [byte], tools_dir: &d [byte], checker: &k [byte], agent: &a [byte], execution_dir: &e [byte], timeout_ms: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write] Finished {
+pub fn run[&h, &f, &x, &w, &c, &j, &r, &t, &i, &o, &d, &k, &a, &p, &m, &v, &s, &u, &e](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), workers: &w Dir, clock: &c Clock, journal_path: &j [byte], repo: &r [byte], kind: &t [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts_ceiling: int, agent_seconds: int, checkout: &o [byte], tools_dir: &d [byte], checker: &k [byte], agent: &a [byte], execution_dir: &e [byte], timeout_ms: int, vcs: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write] Finished {
     let (existing, report, recovered) = journal_io.recover(heap, fs, journal_path);
     if report.rule != 0 || recovered.errno != 0 {
         map.drop(heap, existing);
@@ -104,7 +104,7 @@ pub fn run[&h, &f, &x, &w, &c, &j, &r, &t, &i, &o, &d, &k, &a, &p, &m, &v, &s, &
                     attempts = 1;
                     let request_id = gate_run.request_id_of(heap, tid, attempts);
                     borrow request_id as &rb in {
-                        let req = repo_task.request(heap, buffer.bytes(rb), attempts, tid, repo, kind, provider, model, rev, src, tp, pins, attempts_ceiling, agent_seconds, timeout_ms, 1048576, execution_dir, checkout, tools_dir, checker, agent);
+                        let req = repo_task.request(heap, buffer.bytes(rb), attempts, tid, repo, kind, provider, model, rev, src, tp, pins, attempts_ceiling, agent_seconds, timeout_ms, 1048576, execution_dir, checkout, tools_dir, checker, agent, vcs);
                         borrow req as &qb in {
                             let (out, ran) = worker.run(heap, exec, workers, clock, "repo_change", buffer.bytes(qb), 1048576, timeout_ms);
                             var ending = dispatch.Ending::Timeout;
@@ -220,7 +220,7 @@ fn show[&h, &i](heap: &!h Heap, io: &!i Io, done: Finished) -> [heap, io_write, 
 
 // One `repo.change` task in the workspace `dir` (its journal and lock), its worker beneath `workers`: the lock, the run, the printing. The
 // exit status as `show` has it and the worker's own code ("" when it gave none).
-pub fn run_step[&h, &f, &x, &c, &i, &d, &w, &r, &t, &p, &m, &v, &s, &u, &o, &k, &a, &e, &n](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, timeout_ms: int, dir: &d [byte], workers: &w [byte], repo: &r [byte], kind: &t [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts_ceiling: int, agent_seconds: int, checkout: &o [byte], tools_dir: &n [byte], checker: &k [byte], agent: &a [byte], execution_dir: &e [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] (int, &static [byte]) {
+pub fn run_step[&h, &f, &x, &c, &i, &d, &w, &r, &t, &p, &m, &v, &s, &u, &o, &k, &a, &e, &n](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, timeout_ms: int, dir: &d [byte], workers: &w [byte], repo: &r [byte], kind: &t [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts_ceiling: int, agent_seconds: int, checkout: &o [byte], tools_dir: &n [byte], checker: &k [byte], agent: &a [byte], execution_dir: &e [byte], vcs: int) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_read, file_read, file_write, io_write, err_write] (int, &static [byte]) {
     let jpath = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/journal.jsonl");
     let lpath = buffer.append(heap, buffer.append(heap, buffer.empty(heap, 64), dir), "/lock");
     var code = 0;
@@ -251,7 +251,7 @@ pub fn run_step[&h, &f, &x, &c, &i, &d, &w, &r, &t, &p, &m, &v, &s, &u, &o, &k, 
                             DirOpened::Ok(opened) => {
                                 var wdir = opened;
                                 borrow wdir as &wd in {
-                                    let done = run(heap, fs, exec, wd, clock, buffer.bytes(jb), repo, kind, provider, model, rev, src, tp, pins, attempts_ceiling, agent_seconds, checkout, tools_dir, checker, agent, execution_dir, timeout_ms);
+                                    let done = run(heap, fs, exec, wd, clock, buffer.bytes(jb), repo, kind, provider, model, rev, src, tp, pins, attempts_ceiling, agent_seconds, checkout, tools_dir, checker, agent, execution_dir, timeout_ms, vcs);
                                     worker_code = done.worker_code;
                                     code = show(heap, io, done);
                                 }
