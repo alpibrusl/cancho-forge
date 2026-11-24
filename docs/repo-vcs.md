@@ -153,7 +153,7 @@ names the repository in the provenance.
 that is a person's act, as pushing a git branch is. `pr.md` says so for such a row.
 
 *(measured, 2026-11-24, macOS arm64, cancho 0.1.0)* `tests/conformance/repo_publish_cancho.sh`, with the forge binary and the real change,
-publish and authority workers against repositories made by `cancho vcs init`: **58 checks, all hold**. The change step records a base and a tree of
+publish and authority workers against repositories made by `cancho vcs init`: **62 checks, all hold** (58 when this was written; a patch of two files was added). The change step records a base and a tree of
 64 digits and leaves the checkout as it was. The publish leaves a branch at a change whose one parent is the base, with the intent, touching the
 patch's file and the provenance and nothing else, and the checkout back on its branch, clean. An export made by the oracle is a git commit with
 the file, the provenance and the three trailers. `publish-branch-exists`, `publish-checkout-dirty`, `patch-base-stale` and
@@ -163,12 +163,25 @@ record was lost is adopted; a branch of the same name that is not ours is left a
 another version control, a compiler that is not a file named `cancho`, a session that is not a plain name, a base of 40 digits, and a compiler that
 is not there.
 
-*(measured, same day, and not explained)* The gate of `cancho vcs` 0.1.0 refused, with `unknown-name`, a file that imports `std.io` and that
-`cancho check --std` accepts. The fixture of the script therefore imports nothing. Until that is understood in alpibrusl/cancho, a change that
-touches a `.cho` file importing `std` may be refused `publish-gate-failed` although it checks; a file that imports a package `cancho.toml`
-installs is refused for the reason alpibrusl/cancho's `docs/vcs-cli.md` (R2) already records.
+*Corrected 2026-11-24:* this paragraph said the gate of `cancho vcs` 0.1.0 refused a file that imports `std.io`, "not explained". Measured
+further the same day: **it refuses any file that has an import**, of `std` or of a module of the same tree, with `unknown-name`
+(`cancho vcs record --dry-run` on a library alone is accepted; on a file that imports that library, on one that imports `std.test`, and on one that
+imports `std.bytes`, it is refused; `cancho check --std` and `cancho test --std` accept all of them). The cause is in alpibrusl/cancho and is not
+found. What follows here: **a publish on `cancho vcs` whose patch touches a file with an import is refused `publish-gate-failed`**, and a test
+file always imports `std.test`, so every change of kind `bug` or `feature` is. The fixtures of the script import nothing.
 
-**Not measured:** a real repository (the fixtures are four files); a model as the builder (the build tool is a stand-in); Linux, until CI runs it.
+*(measured with a model, 2026-11-24, macOS arm64, cancho 0.1.0, `claude-haiku-5-5`)* One company of three steps (`repo.change` of kind `bug`,
+`repo.publish`, `repo.authority`) on a repository of one library, one program and one test file, with the real `cancho-build` and `cancho-agent`
+of alpibrusl/cancho-code and no stand-in. On a repository kept by `cancho vcs`: the change was accepted on the first attempt (a patch of two
+files, 33 lines added, 1,027 tokens in and 983 out), and the publish was refused `publish-gate-failed (unknown-name)` for the reason above, with
+the checkout left on its branch and clean. The same company on a git copy of the repository ran to its end with no command of a person between:
+`done: steps accepted 3`, verdict `equal`, and the repository's own gate passes on the published branch (7 tests). The first try found a defect
+of the publish worker that no script had reached: a patch of **two** files was refused `publish-dest-invalid` for both kinds, because the
+destinations travel one to a line and the worker read the list only when it held no escape. It is fixed (the list is decoded, then every line is
+held to a plain path), and `company_change.sh` and `repo_publish_cancho.sh` each publish a patch of two files now. One run of each kind: nothing
+here says how often a model's change is accepted.
+
+**Not measured:** a real repository (the largest one here is three `.cho` files); a publish on `cancho vcs` of a change with an import, which the gate above refuses.
 
 ## 8. What is still not built
 

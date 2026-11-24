@@ -8,7 +8,7 @@
 # parent is the base, the intent recorded, the checkout back where it was, nothing exported or pushed); one case per refusal the publish has on this
 # kind (publish-branch-exists, publish-checkout-dirty, patch-base-stale, publish-gate-failed); `repo.publish` and `repo.authority` as steps
 # with no command of a person between; a publish whose journal record was lost, adopted, and a branch of the same name that is not ours, left alone;
-# the worker's own refusals; a row whose checker is not the compiler.
+# a patch of two files; the worker's own refusals; a row whose checker is not the compiler.
 # Prints `ok ...` / `FAIL ...` lines; exit 1 if any FAIL or a build failed.
 # Usage: CANCHO=path/to/cancho tests/conformance/repo_publish_cancho.sh <scratch directory, empty>
 set -u
@@ -62,6 +62,7 @@ rm -rf "$work/base" "$work/tree"; cp -r "$repo" "$work/base"; cp -r "$repo" "$wo
 case "$mode" in
   good) printf '// edited\n' >> "$work/tree/src/a.cho" ;;
   bad)  printf 'fn broken( -> {\n' >> "$work/tree/src/a.cho" ;;
+  two)  printf '// edited\n' >> "$work/tree/src/a.cho"; printf 'edition 9;\n\npub fn one() -> [] int {\n    return 1;\n}\n' > "$work/tree/src/b.cho" ;;
   *)    exit 2 ;;
 esac
 (cd "$work" && diff -ruN base tree > change.patch)
@@ -184,6 +185,16 @@ echo more >> "$w/ck1/README.md"; cv "$w/ck1" record README.md --time 3 > /dev/nu
 publish "$w/co1" "$w/op1.json" forge/second
 check "refusal: a checkout that moved on from the base is patch-base-stale, exit 1" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: patch-base-stale' '$w/out'"
 is "refusal: no branch was made" "$(branch_at "$w/ck1" forge/second)$(branches "$w/ck1")" "2"
+
+# ---- a patch of two files: a changed one and one that was not there --------------------------------------------------------------------------------
+mkrepo ck2; mkco co2 two; operator op2 "$w/ck2"
+run "$w/co2" "$w/op2.json"
+publish "$w/co2" "$w/op2.json" forge/two
+two=$(sed -n 's/^commit: //p' "$w/out")
+check "two files: published, exit 0, a change id" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'published: forge/two' '$w/out' && [ ${#two} = 64 ]"
+cv "$w/ck2" show "$two" > "$w/show2.json"
+check "two files: the change touches both files and the provenance" sh -c "[ \"\$(grep -c '\"state\": ' '$w/show2.json')\" = 3 ] && grep -q '\"path\": \"src/a.cho\"' '$w/show2.json' && grep -q '\"path\": \"src/b.cho\"' '$w/show2.json'"
+check "two files: the checkout is back, without the new file" sh -c "[ ! -e '$w/ck2/src/b.cho' ]" && check "two files: clean" clean "$w/ck2"
 
 # ---- a tree the gate of cancho vcs refuses: the publish's own refusal ----------------------------------------------------------------------------------
 mkrepo ckg; mkco cog bad; operator opg "$w/ckg"
