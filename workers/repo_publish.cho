@@ -298,12 +298,27 @@ fn undo_and_fail[&h, &i, &x, &c, &v, &k, &b, &d, &e, &o](heap: &!h Heap, io: &!i
 
 // The request has been parsed into `src`/`tp`: check it, then do the publish.
 fn publish[&h, &i, &f, &c, &x, &s, &t](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), src: &s [byte], tp: &t [int]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
+    // The destination. A file publish names one path, written plain. A patch publish names the files the patch touches, one to a line: the line feed
+    // between two of them is an escape in the request, so the text is decoded, and `patch_dests_ok` then holds every line to a plain path.
+    if json.get(src, tp, 0, "patch_base") < 0 {
+        return publish_to(heap, io, fs, clock, exec, src, tp, text_of(src, tp, "dest"));
+    }
+    let dests = decoded_of(heap, src, tp, "dest");
+    var code = 0;
+    borrow dests as &db in {
+        code = publish_to(heap, io, fs, clock, exec, src, tp, buffer.bytes(db));
+    }
+    buffer.drop(heap, dests);
+    return code;
+}
+
+// The request has been parsed and its destination read: check it, then do the publish.
+fn publish_to[&h, &i, &f, &c, &x, &s, &t, &j](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &c Clock, exec: &x Exec("/bin/sh"), src: &s [byte], tp: &t [int], dest: &j [byte]) -> [heap, io_write, fs_read(""), fs_write(""), dir_read, file_read, file_write, exec("/bin/sh"), clock, poll] int {
     let checkout = text_of(src, tp, "checkout");
     let repo = text_of(src, tp, "repo");
     let branch = text_of(src, tp, "branch");
     let src_dir = text_of(src, tp, "src_dir");
     let src_name = text_of(src, tp, "src_name");
-    let dest = text_of(src, tp, "dest");
     let sha = text_of(src, tp, "sha256");
     let prov_dest = text_of(src, tp, "provenance_dest");
     if gate_task.path_ok(checkout) == false || gate_task.path_ok(src_dir) == false {

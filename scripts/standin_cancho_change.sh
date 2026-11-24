@@ -26,6 +26,8 @@ usage() { printf '{"provider":"stand","model":"m1","task":"t","sample":0,"in":%s
 case "$mode" in
   good|The)  # `The`: the first word of every request Forge frames for a derived step (docs/company.md section 19): it edits like `good`
              prepare; printf 'edited\n' >> "$work/tree/src/a.cho"; finish ;;
+  two)       # a change of two files: a line in one, and a file that was not there
+             prepare; printf 'edited\n' >> "$work/tree/src/a.cho"; printf 'new\n' > "$work/tree/src/b.cho"; finish ;;
   spend)     prepare; usage 600; usage 500; printf 'edited\n' >> "$work/tree/src/a.cho"; finish ;;
   outside)   prepare; printf 'more\n' >> "$work/tree/docs/x.md"; finish ;;
   denied)    prepare; printf 'more\n' >> "$work/tree/src/secret/k.cho"; finish ;;

@@ -266,6 +266,17 @@ check "publish: steps/chg/pr.md is written and nothing was pushed" sh -c "[ -s '
 "$F" company publish "$w/co1" "$w/op-pub.json" chg forge/chg > "$w/out" 2> /dev/null; echo $? > "$w/rc"
 check "publish: the same branch again is publish-branch-exists, exit 1" sh -c "[ \$(cat '$w/rc') = 1 ] && grep -qx 'refusal: publish-branch-exists' '$w/out'"
 
+# ---- a patch of two files (the destinations travel one to a line, so the line feed between them is an escape in the worker's request)
+mkrepo ck2f; operator op2f "$w/ck2f"; mkco co2f two
+run "$w/co2f" "$w/op2f.json"
+git -C "$w/ck2f" remote add origin https://github.com/alpibrusl/cancho-diff.git
+git -C "$w/ck2f" config user.email forge@example.invalid; git -C "$w/ck2f" config user.name forge
+home2=$(git -C "$w/ck2f" symbolic-ref --short HEAD)
+printf '{"workers":"%s","tools":"%s","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent","repos":{"diff":{"kind":"library","slug":"alpibrusl/cancho-diff","checkout":"%s","compiler_rev":"%s","publish_allow":["src/**"],"max_patch_files":3,"max_patch_lines":9}}}' "$w/workers" "$w/tools" "$w/ck2f" "$REV" > "$w/op-pub2f.json"
+"$F" company publish "$w/co2f" "$w/op-pub2f.json" chg forge/two > "$w/out" 2> /dev/null; echo $? > "$w/rc"
+check "publish: a patch of two files is published: exit 0, the changed file, the new file and the provenance on the branch, nothing else" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'published: forge/two' '$w/out' && [ \"\$(git -C '$w/ck2f' diff --name-only $home2 forge/two | sort | tr '\\n' ' ')\" = 'docs/provenance/chg.md src/a.cho src/b.cho ' ] && git -C '$w/ck2f' show forge/two:src/b.cho | grep -qx new"
+check "publish: two files: the checkout is back on its branch, clean, without the new file" sh -c "[ \"\$(git -C '$w/ck2f' symbolic-ref --short HEAD)\" = '$home2' ] && [ -z \"\$(git -C '$w/ck2f' status --porcelain --untracked-files=all)\" ] && [ ! -e '$w/ck2f/src/b.cho' ]"
+
 # ---- the authority reviewer on the published commit (docs/reviewer.md section 2, docs/company.md section 25): `forge company authority`
 printf '#!/bin/sh\nprintf "performs\\n    clock\\nnever touches\\n    the network\\n"\n' > "$w/stubc" && chmod +x "$w/stubc"
 pubop op-auth1 ",\"compiler\":\"$w/stubc\",\"authority\":[{\"programs\":[\"src/*.cho\"],\"std\":true,\"ceiling\":\"docs/authority.txt\"}]"
