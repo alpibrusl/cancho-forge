@@ -19,6 +19,7 @@
 #   audit mutants harness  the mutants script's verdict and scratch directory (tests/conformance/audit_mutants_harness.sh)
 #   company derive      derived steps of a flow in `status` and `decide`, nothing derived before admission (tests/conformance/company_derive.sh)
 #   company publish lib `forge company publish` of a library step (tests/conformance/repo_publish_library.sh)
+#   publish cancho      a repository kept by `cancho vcs`: change, publish, authority and adoption, the workers real (tests/conformance/repo_publish_cancho.sh)
 #   company publish     `forge company publish` end to end against throw-away git repositories, the publish worker real: the good path, one case per refusal tag, the hostile cases (tests/conformance/repo_publish.sh)
 #   stub llm             the stub worker against the contract and a journalled flow per ending (scripts/check_stub_llm.sh)
 #   verbs                capabilities, cancel, status and result against the mock worker (every verdict) and the stub LLM and gate runner (capabilities), real child processes
@@ -211,6 +212,12 @@ mkdir "$scratch/repo-publish-library" || exit 1
 CANCHO="$C" sh tests/conformance/repo_publish_library.sh "$scratch/repo-publish-library" > "$scratch/repo-publish-library.out" || fail=1
 cat "$scratch/repo-publish-library.out"
 if grep -q '^FAIL ' "$scratch/repo-publish-library.out"; then fail=1; fi
+
+echo "== a repository kept by cancho vcs through a company (the change, publish and authority workers real; a branch at a change with its intent, every refusal of the kind, adoption; no git: tests/conformance/repo_publish_cancho.sh)"
+mkdir "$scratch/repo-publish-cancho" || exit 1
+CANCHO="$C" sh tests/conformance/repo_publish_cancho.sh "$scratch/repo-publish-cancho" > "$scratch/repo-publish-cancho.out" || fail=1
+cat "$scratch/repo-publish-cancho.out"
+if grep -q '^FAIL ' "$scratch/repo-publish-cancho.out"; then fail=1; fi
 
 echo "== repository layer (src/repo_vcs.cho: each question asked of a git repository and of a cancho vcs repository with the same files, and the answers compared; tests/conformance/repo_vcs.sh)"
 mkdir "$scratch/repo-vcs" || exit 1

@@ -12,6 +12,7 @@ import forge.journal_io;
 import forge.repo_row;
 import forge.repo_task;
 import forge.repo_vcs;
+import forge.repo_vcs_write;
 import forge.snapshot;
 import forge.verbs;
 
@@ -405,7 +406,12 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, 
     let tools = text_of(src, tp, json.get(src, tp, grants, "tools_dir"));
     let checker = text_of(src, tp, json.get(src, tp, grants, "checker"));
     let agent = text_of(src, tp, json.get(src, tp, grants, "agent"));
-    let env = env_block(heap);
+    // A checkout kept by `cancho vcs` is read by `cancho`, started by name: the checker is that compiler, and its directory goes first on the `PATH`.
+    var env = env_block(heap);
+    if vcs == repo_vcs.cancho() {
+        buffer.drop(heap, env);
+        env = repo_vcs_write.tool_env(heap, checker);
+    }
     let total = repo_task.runner_deadline_ms(timeout_ms);
     let start = clock_ms(clock);
     var code = "";

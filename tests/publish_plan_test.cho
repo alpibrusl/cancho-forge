@@ -278,8 +278,8 @@ pub fn test_the_request_carries_more_files_only_when_there_are_some[&h](heap: &!
 }
 
 pub fn test_a_patch_request_asks_to_adopt_only_when_it_says_so[&h](heap: &!h Heap) -> [heap] int {
-    let plain = publish_plan.request_patch(heap, "/c", "o/r", "forge/b", "/e", "change.patch", "src/a.cho", "ab", "1111111111111111111111111111111111111111", "docs/provenance.md", "p", "m", false);
-    let adopt = publish_plan.request_patch(heap, "/c", "o/r", "forge/b", "/e", "change.patch", "src/a.cho", "ab", "1111111111111111111111111111111111111111", "docs/provenance.md", "p", "m", true);
+    let plain = publish_plan.request_patch(heap, "/c", "o/r", "forge/b", "/e", "change.patch", "src/a.cho", "ab", "1111111111111111111111111111111111111111", "docs/provenance.md", "p", "m", false, 0, "", "", "");
+    let adopt = publish_plan.request_patch(heap, "/c", "o/r", "forge/b", "/e", "change.patch", "src/a.cho", "ab", "1111111111111111111111111111111111111111", "docs/provenance.md", "p", "m", true, 0, "", "", "");
     var plain_has = 0;
     var adopt_has = 0;
     borrow plain as &pb in {
@@ -292,5 +292,28 @@ pub fn test_a_patch_request_asks_to_adopt_only_when_it_says_so[&h](heap: &!h Hea
     buffer.drop(heap, adopt);
     test.assert_eq(plain_has, 0);
     test.assert_eq(adopt_has, 1);
+    return 0;
+}
+
+pub fn test_a_patch_request_names_cancho_vcs_only_for_such_a_row[&h](heap: &!h Heap) -> [heap] int {
+    let git = publish_plan.request_patch(heap, "/c", "o/r", "forge/b", "/e", "change.patch", "src/a.cho", "ab", "1111111111111111111111111111111111111111", "docs/provenance.md", "p", "m", false, 0, "/opt/cancho/bin/cancho", "co", "chg");
+    let cv = publish_plan.request_patch(heap, "/c", "o/r", "forge/b", "/e", "change.patch", "src/a.cho", "ab", "1111111111111111111111111111111111111111111111111111111111111111", "docs/provenance.md", "p", "m", false, 1, "/opt/cancho/bin/cancho", "co", "chg");
+    var git_ends = 0;
+    var git_says = 0;
+    var cv_ends = 0;
+    borrow git as &gb in {
+        let g = buffer.bytes(gb);
+        git_ends = flag(bytes.equal(g[len(g) - 15..len(g)], ",\"message\":\"m\"}"));
+        git_says = flag(bytes.find(g, "vcs") >= 0 || bytes.find(g, "compiler") >= 0 || bytes.find(g, "session") >= 0);
+    }
+    borrow cv as &cb in {
+        cv_ends = flag(bytes.find(buffer.bytes(cb), ",\"message\":\"m\",\"vcs\":\"cancho\",\"compiler\":\"/opt/cancho/bin/cancho\",\"session\":\"co\",\"issue\":\"chg\"}") >= 0);
+    }
+    buffer.drop(heap, git);
+    buffer.drop(heap, cv);
+    test.assert_eq(git_ends, 1);
+    test.assert_eq(git_says, 0);
+    test.assert_eq(cv_ends, 1);
+    test.assert_eq(flag(bytes.equal(publish_plan.worker_tag("publish-gate-failed"), "publish-gate-failed")), 1);
     return 0;
 }

@@ -1,9 +1,9 @@
 # The repository layer: one place that says how a repository is asked a question
 
-> **Status: built for the questions (the texts that read a repository), for git and for `cancho vcs`, and for the
-> revisions of both kinds in every task, worker and reader of the journal (section 6). Not built: the publish on
-> `cancho vcs`, so a repository row that names it is still refused.** Issue #116. A claim marked *(measured)* was measured on the date given; one
-> marked *(read)* was read from the source.
+> **Status: built for git and for `cancho vcs`: the questions (the texts that read a repository), the revisions of both kinds in every task,
+> worker and reader of the journal (section 6), and the patch publish (section 7). A repository row that says `"vcs": "cancho"` is accepted.
+> Not built: the review by declaration, and a file publish on `cancho vcs` (section 8).** Issue #116. A claim marked *(measured)* was measured
+> on the date given; one marked *(read)* was read from the source.
 
 ## 1. What was there
 
@@ -34,15 +34,14 @@ texts are byte for byte what they were**: the unit tests that pinned them before
 once more at the layer.
 
 **`src/repo_vcs_write.cho`**: the six scripts of the publish worker, moved unchanged out of
-`workers/repo_publish.cho`, which now holds no `git` command. They are git's only (`repo_vcs.publish_built`). The
+`workers/repo_publish.cho`, which now holds no `git` command. They were git's only; section 7 adds the `cancho` ones. The
 worker's authority report (`docs/authority-repo-publish.txt`) is the same file.
 
 **A revision** is 40 digits for git and 64 for `cancho vcs` (a change id): `repo_vcs.revision_ok(kind, text)`.
 
 **The row.** A `repos` row of the operator file may say `"vcs": "git"`, which is also what a row that does not say
-means. `"vcs": "cancho"` is **refused** (`operator-invalid`, `reason: repos: vcs is cancho, which the tasks are not
-wired to yet (docs/repo-vcs.md): only git`): a row that named it and was run against `git` would be worse than a
-refusal. Any other value is `repos: vcs is not git or cancho`.
+means. `"vcs": "cancho"` was **refused** until the publish was written (section 7); it is accepted now, when the operator
+file's `checker` is a file named `cancho`. Any other value is `repos: vcs is not git or cancho`.
 
 ## 3. How the cancho texts read a repository
 
@@ -65,26 +64,11 @@ or a modified file makes both `dirty`; a file at the earlier revision is the sam
 revision and a directory that is no repository fail for both with the same status; the exported tree is the revision's
 and not the working copy's; the checkout is never written.
 
-## 5. What is not built, and why the row is refused
+## 5. What was not built when the row was refused
 
-The issue's second step ends when the conformance scripts pass unchanged against a row that says `vcs: "cancho"`. That
-is not reached, and these are the pieces between:
-
-* **The publish.** A branch, a commit with the provenance and its trailers, adoption and undo are git's six scripts.
-  For `cancho vcs` they are `record` with the intent (the company, the job and the run as `--intent-session` and
-  `--intent-issue`), and, while there is no cancho remote, `export-git` to the GitHub origin. Not written.
-* **The gate's refusal as the task's refusal.** `cancho vcs record` refuses a tree that does not check (`gate-failed`,
-  with the rule tag). Reported as the publish's own refusal: not written.
-* **The review by declaration.** The review step is given a text diff. `cancho vcs diff` answers by declaration: not
-  wired.
-* **The change worker's `PATH`.** `workers/repo_change.cho` gives its shell a fixed `PATH` (`/usr/local/bin:/usr/bin:/bin`),
-  and the cancho texts start `cancho` by name: on a host where the compiler is elsewhere, the state of a checkout kept
-  by `cancho vcs` cannot be read. The authority worker takes the operator's `env`, which is how section 6 ran it.
-* **What `cancho vcs` itself lacks**: a merge (alpibrusl/cancho#520), and a command that reads a file or a tree at a
-  change (section 3). `replay` (#818) and attestations (#817) are built there and not released.
-
-So the first change (#117) is the issue's first step in full, and of its second step the module and its measurement;
-section 6 is the revisions. The row waits for the publish.
+*Corrected 2026-11-24:* this section listed the pieces between the layer and a row that says `vcs: "cancho"`, and said "the row waits for the
+publish". The publish, the gate's refusal as the publish's own and the workers' `PATH` are built (section 7), and the row is accepted. What is
+still not built is section 8.
 
 *Corrected 2026-11-23:* this section said that the tools a gate needs (`gate_task.required_tools`) would have to take
 the kind. They do not: that list is what a repository's own gate script starts (Forge's gate starts `git` in its
@@ -123,7 +107,74 @@ verdicts; `ceiling.txt` is the base change's file and `head.txt` what the compil
 exported tree; a change the store does not have is `revision-mismatch`; a change with a base of 40 digits is
 `revision-invalid` with nothing written; the repository is left as it was and has no `.git`.
 
-**Not measured:** the gate runner and the change worker against a checkout kept by `cancho vcs`. The gate runner's
-allow-list is four GitHub repositories with their own gate commands; the change worker is reached through `forge
-company run`, which refuses the row. Their texts are the ones section 4 measured, and their revision checks are unit
-tests only.
+**Not measured:** the gate runner against a checkout kept by `cancho vcs` (its allow-list is four GitHub repositories with
+their own gate commands). *Corrected 2026-11-24:* this said the change worker was not measured either, since `forge
+company run` refused the row; it is measured now (section 7).
+
+## 7. The publish on `cancho vcs` *(built 2026-11-24)*
+
+`src/repo_vcs_write.cho` takes the kind, as `repo_vcs` does. Git's six texts are byte for byte what they were (`tests/repo_vcs_write_test.cho`
+pins each against what the module printed before it took a kind). The `cancho` ones ask `cancho vcs` for everything and read no file of the store:
+
+| step | git | cancho |
+|---|---|---|
+| the checks | toplevel, a commit, `origin` is the allow-listed repository, the head is the base, nothing modified, no such branch, no link on the way | `.cancho/vcs` here, a head, the head is the base, `status` says clean, `branch list` has no such branch, no link on the way |
+| the branch | `git checkout -b` | `branch create`, `switch` |
+| the commit | `git add`, `git commit -F -` (hooks off) | `record PATHS --intent-prompt MESSAGE --intent-session COMPANY --intent-issue STEP`; there is no staging |
+| going back | `git checkout` | `switch` |
+| adoption | parent, tree and message of the branch compared | `record --dry-run` with the time the branch's change carries answers the branch's change id |
+| the undo | `git reset --hard`, untracked files removed, the branch deleted | `restore` of each file, `switch`, `branch delete --expect` |
+
+**It is the patch publish only** (`repo.change`, then `forge company publish` or a `repo.publish` step): that is the publish that has a row. The
+request to the worker gains four members for such a row and none for git, so git's request is the bytes it was: `"vcs":"cancho"`, `"compiler"`
+(the operator's `checker`), `"session"` (the company's id) and `"issue"` (the step's id). The answer's `commit` is a change id of 64 digits; the
+journal, `publish.txt` and `pr.md` carry it where they carried a commit.
+
+**The intent.** The commit message Forge writes is the change's intent prompt; the company is the session and the step the issue. `cancho vcs
+export-git` renders them as the commit message and the trailers `Cancho-Change`, `Cancho-Session` and `Cancho-Issue`.
+
+**Adoption** (docs/auto-publish.md section 4) needs no comparison of parts: a change id is the hash of the tree, the parent, the intent, the author
+and the time, so a dry run of the same record at the same time answers the same id exactly when the branch is what this publish would have made.
+
+**The gate's refusal is the publish's.** `record` runs the gate of `cancho vcs` (the touched `.cho` files must check) and nothing here turns it
+off. A tree it refuses is `publish-gate-failed`, with the compiler's rule in the `reason:`, and the publish is undone. Git has no such refusal: its
+publish commits what the step's own check accepted.
+
+**Where `cancho` is found.** The texts start `cancho` by name. For such a row the change worker and the publish worker put the directory of the
+operator's `checker` first on the `PATH` of their shell, and the authority worker the directory of the row's `compiler` (when its request sets
+no environment of its own, and Forge's sets none). So the row is accepted only when `checker` is an absolute plain path to a file named `cancho` (`operator-invalid` otherwise,
+with the reason). This replaces the limitation section 5 recorded.
+
+**No origin.** A repository kept by `cancho vcs` has no remote, so the check that holds a git checkout's `origin` to the allow-listed repository
+has nothing to read: the row's `checkout` is all that says which repository it is. The `slug` is still required and still on the allow-list; it
+names the repository in the provenance.
+
+**It never exports and never pushes.** GitHub speaks git: `cancho vcs export-git <directory>` renders the branch as a git commit, and pushing
+that is a person's act, as pushing a git branch is. `pr.md` says so for such a row.
+
+*(measured, 2026-11-24, macOS arm64, cancho 0.1.0)* `tests/conformance/repo_publish_cancho.sh`, with the forge binary and the real change,
+publish and authority workers against repositories made by `cancho vcs init`: **58 checks, all hold**. The change step records a base and a tree of
+64 digits and leaves the checkout as it was. The publish leaves a branch at a change whose one parent is the base, with the intent, touching the
+patch's file and the provenance and nothing else, and the checkout back on its branch, clean. An export made by the oracle is a git commit with
+the file, the provenance and the three trailers. `publish-branch-exists`, `publish-checkout-dirty`, `patch-base-stale` and
+`publish-gate-failed` each leave no branch and a clean checkout. A `repo.publish` step and a `repo.authority` step run with no command of a person
+between (verdict `equal`, the ceiling read from the base change and the report made in the published change's tree). A publish whose journal
+record was lost is adopted; a branch of the same name that is not ours is left alone and the step held. The worker refuses a request that names
+another version control, a compiler that is not a file named `cancho`, a session that is not a plain name, a base of 40 digits, and a compiler that
+is not there.
+
+*(measured, same day, and not explained)* The gate of `cancho vcs` 0.1.0 refused, with `unknown-name`, a file that imports `std.io` and that
+`cancho check --std` accepts. The fixture of the script therefore imports nothing. Until that is understood in alpibrusl/cancho, a change that
+touches a `.cho` file importing `std` may be refused `publish-gate-failed` although it checks; a file that imports a package `cancho.toml`
+installs is refused for the reason alpibrusl/cancho's `docs/vcs-cli.md` (R2) already records.
+
+**Not measured:** a real repository (the fixtures are four files); a model as the builder (the build tool is a stand-in); Linux, until CI runs it.
+
+## 8. What is still not built
+
+* **The review by declaration.** The review step is given a text diff. `cancho vcs diff` answers by declaration: not wired.
+* **A file publish on `cancho vcs`.** `forge company publish` of a build step takes its repository and checkout from the operator's `publish`
+  entry, which has no row and so no kind: it is git's. The worker refuses a request that asks for it (`publish-worker-failed`).
+* **What `cancho vcs` itself lacks**: a merge (alpibrusl/cancho#520), a command that reads a file or a tree at a change (section 3), and a remote,
+  so that the origin could be held to the allow-list. `replay` (#818) and attestations (#817) are built there and not released.
+* **The gate runner** against a checkout kept by `cancho vcs`: its allow-list is four GitHub repositories with their own gate commands.

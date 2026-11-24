@@ -2,11 +2,13 @@ edition 9;
 module forge.repo_vcs_write;
 
 import std.buffer;
+import forge.gate_env;
 
 // The shell texts that WRITE a repository (docs/repo-vcs.md): the checks of a checkout before a publish, the branch, the commit with the message on
-// standard input, the adoption of a branch an interrupted publish left, and the undo. They are git's, moved here unchanged from
-// `workers/repo_publish.cho`, which is their one caller: `repo_vcs.publish_built` says no other kind has them. Nothing here starts a program; the
-// texts name no remote but `git remote get-url`, so nothing they build can push.
+// standard input, the adoption of a branch an interrupted publish left, and the undo. Each takes the kind of version control. Git's are the ones
+// `workers/repo_publish.cho` held, byte for byte (`tests/repo_vcs_write_test.cho` pins them). The `cancho` ones (section 7 of the document) ask
+// `cancho vcs` for everything: `branch create`, `switch`, `record` with the intent, `restore`, `branch delete`; they read no file of the store and start
+// no `git`. Nothing here starts a program; the texts name no remote but `git remote get-url`, so nothing they build can push.
 
 // The directory part of `dest` (everything before the last slash), or empty.
 pub fn dir_of[&d](dest: &d [byte]) -> [] &d [byte] {
@@ -18,6 +20,14 @@ pub fn dir_of[&d](dest: &d [byte]) -> [] &d [byte] {
         k = k - 1;
     }
     return dest[0..0];
+}
+
+// The environment of a shell that starts `cancho` by name: a `PATH` whose first directory is the one `compiler` (an absolute path the caller
+// checked) is in, then the fixed directories every task's shell has. The compiler that keeps a repository is the one the operator named.
+pub fn tool_env[&h, &c](heap: &!h Heap, compiler: &c [byte]) -> [heap] buffer.Buffer {
+    var b = buffer.append(heap, buffer.empty(heap, 96), "PATH=");
+    b = buffer.append(heap, buffer.append(heap, buffer.append(heap, b, dir_of(compiler)), ":"), gate_env.fixed_path());
+    return buffer.push(heap, b, byte_of(0));
 }
 
 // The end of the line of `text` that starts at `from` (the index of its line feed, or the length).
@@ -67,7 +77,7 @@ fn on_the_way[&h, &t](heap: &!h Heap, out: buffer.Buffer, path: &t [byte]) -> [h
 // Step 1, as a script. Exits: 11 the checkout is not a directory, not the toplevel of a repository, or has no commit; 13 `origin` is not
 // the allow-listed repository on github.com; 14 something is modified or untracked; 15 the branch exists; 16 a link or a directory is where a
 // file goes. On success it prints the branch the checkout is on (or, detached, the commit).
-pub fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte], adopting: bool) -> [heap] buffer.Buffer {
+fn git_checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte], adopting: bool) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 1024), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " 2>/dev/null || exit 11\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 11\nhere=$(pwd -P)\n[ \"$root\" = \"$here\" ] || exit 11\n");
@@ -105,7 +115,7 @@ pub fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [b
 }
 
 // Step 3a: make the branch and the directories. Exit 18 when either fails (the caller then undoes).
-pub fn branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], make_branch: bool) -> [heap] buffer.Buffer {
+fn git_branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], make_branch: bool) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 512), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " || exit 11\n");
@@ -136,7 +146,7 @@ pub fn branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], br
 
 // Step 3b: stage, commit with the message on standard input (hooks off, no signing), print the commit, go back. Exit 19 when staging or
 // committing fails (no identity, an ignored path), 20 when going back fails.
-pub fn commit_script[&h, &c, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
+fn git_commit_script[&h, &c, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 512), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " || exit 11\ngit add -- ");
@@ -149,7 +159,7 @@ pub fn commit_script[&h, &c, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], de
 }
 
 // Does a branch of that name exist in the checkout? Status 0 when it does.
-pub fn exists_script[&h, &c, &b](heap: &!h Heap, checkout: &c [byte], branch: &b [byte]) -> [heap] buffer.Buffer {
+fn git_exists_script[&h, &c, &b](heap: &!h Heap, checkout: &c [byte], branch: &b [byte]) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 256), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " || exit 11\ngit rev-parse --verify --quiet 'refs/heads/");
@@ -161,7 +171,7 @@ pub fn exists_script[&h, &c, &b](heap: &!h Heap, checkout: &c [byte], branch: &b
 // Adoption (docs/auto-publish.md section 4): the files of this publish are in the working tree of a checkout at `base`. Stage them and
 // ask whether the branch is what the publish would have made: one commit above `base`, the very tree the index now holds, the very message
 // (on standard input). Exit 21 when it is not; else print the branch's commit. Nothing is committed and no ref is touched.
-pub fn adopt_script[&h, &c, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte]) -> [heap] buffer.Buffer {
+fn git_adopt_script[&h, &c, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte]) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 768), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " || exit 11\ngit add -- ");
@@ -178,7 +188,7 @@ pub fn adopt_script[&h, &c, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte],
 
 // The undo of a publish that failed after the branch was made. The checkout was clean when it began, so a reset loses nothing of the
 // operator's; a file this publish added that git does not track is removed.
-pub fn undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
+fn git_undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
     var s = put(heap, buffer.empty(heap, 512), "cd ");
     s = q(heap, s, checkout);
     s = put(heap, s, " || exit 11\ngit reset -q --hard\nfor f in ");
@@ -193,4 +203,192 @@ pub fn undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], 
         s = put(heap, s, "\n");
     }
     return s;
+}
+
+// ---- cancho vcs ------------------------------------------------------------------------------------------------------------------------------
+
+// `cd` to the checkout (exit 11) and the shell functions the cancho texts share: `cvs` prints the status document, `cvf NAME` the 64 digits of the
+// member NAME of a document on its standard input, `cvb BRANCH` the change a branch is at (nothing when there is none).
+fn cv_begin[&h, &c](heap: &!h Heap, checkout: &c [byte], quiet: bool) -> [heap] buffer.Buffer {
+    var s = put(heap, buffer.empty(heap, 1024), "cd ");
+    s = q(heap, s, checkout);
+    if quiet {
+        s = put(heap, s, " 2>/dev/null");
+    }
+    s = put(heap, s, " || exit 11\ncvs() { cancho vcs status --output json 2>/dev/null; }\n");
+    s = put(heap, s, "cvf() { sed -n \"s/^  \\\"$1\\\": \\\"\\\\([0-9a-f]\\\\{64\\\\}\\\\)\\\",\\\\{0,1\\\\}\\$/\\\\1/p\"; }\n");
+    return put(heap, s, "cvb() { cancho vcs branch list --output json 2>/dev/null | awk -v n=\"\\\"name\\\": \\\"$1\\\"\" '/\"change\": \"/ { c = $2; gsub(/[^0-9a-f]/, \"\", c) } index($0, n) { print c }'; }\n");
+}
+
+// The words of a `record` after its paths: the intent (the message on standard input was read into `m`; `intent` is the session and the issue, one
+// to a line), and JSON as the output.
+fn cv_intent[&h, &t](heap: &!h Heap, out: buffer.Buffer, intent: &t [byte]) -> [heap] buffer.Buffer {
+    let e = line_end(intent, 0);
+    var s = put(heap, out, "--intent-prompt \"$m\" --intent-session ");
+    s = q(heap, s, intent[0..e]);
+    s = put(heap, s, " --intent-issue ");
+    var from = e + 1;
+    if from > len(intent) {
+        from = len(intent);
+    }
+    s = q(heap, s, intent[from..len(intent)]);
+    return s;
+}
+
+// Step 1 for a checkout kept by `cancho vcs`. The exits are git's, less 13: such a repository has no origin to hold to the allow-list (the row's
+// checkout is all that names it). 11 also when `cancho` is not found. It prints the branch the checkout is on.
+fn cv_checks_script[&h, &c, &b, &d, &e, &a](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte], adopting: bool) -> [heap] buffer.Buffer {
+    var s = cv_begin(heap, checkout, true);
+    s = put(heap, s, "[ -d .cancho/vcs ] || exit 11\ns=$(cvs) || exit 11\nh=$(printf '%s\\n' \"$s\" | cvf head)\n[ -n \"$h\" ] || exit 11\n");
+    if len(base) > 0 {
+        s = put(heap, s, "[ \"$h\" = '");
+        s = put(heap, s, base);
+        s = put(heap, s, "' ] || exit 23\n");
+    }
+    s = put(heap, s, "printf '%s\\n' \"$s\" | grep -q '^  \"clean\": true,\\{0,1\\}$' || exit 14\n");
+    if adopting == false {
+        s = put(heap, s, "[ -z \"$(cvb ");
+        s = q(heap, s, branch);
+        s = put(heap, s, ")\" ] || exit 15\n");
+    }
+    var at = 0;
+    while at < len(dest) {
+        let e = line_end(dest, at);
+        if e > at {
+            s = on_the_way(heap, s, dest[at..e]);
+        }
+        at = e + 1;
+    }
+    s = on_the_way(heap, s, prov);
+    return put(heap, s, "printf '%s\\n' \"$s\" | sed -n 's/^  \"branch\": \"\\(.*\\)\",\\{0,1\\}$/\\1/p'\n");
+}
+
+fn cv_branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], make_branch: bool) -> [heap] buffer.Buffer {
+    var s = cv_begin(heap, checkout, false);
+    if make_branch {
+        s = put(heap, s, "cancho vcs branch create ");
+        s = q(heap, s, branch);
+        s = put(heap, s, " --output json >/dev/null 2>&1 || exit 18\ncancho vcs switch ");
+        s = q(heap, s, branch);
+        s = put(heap, s, " --output json >/dev/null 2>&1 || exit 18\n");
+    }
+    let pd = dir_of(prov);
+    var at = 0;
+    while at < len(dest) {
+        let e = line_end(dest, at);
+        let dd = dir_of(dest[at..e]);
+        if len(dd) > 0 {
+            s = put(heap, s, "mkdir -p ");
+            s = q(heap, s, dd);
+            s = put(heap, s, " || exit 18\n");
+        }
+        at = e + 1;
+    }
+    if len(pd) > 0 {
+        s = put(heap, s, "mkdir -p ");
+        s = q(heap, s, pd);
+        s = put(heap, s, " || exit 18\n");
+    }
+    return s;
+}
+
+// Step 3b: `record` the files with the message as the intent's prompt, print the change, go back. There is no staging. Exit 24 when the gate of
+// `cancho vcs` refuses the tree (it prints the compiler's rule first), 19 when the record fails otherwise or records nothing, 20 when going back fails.
+fn cv_commit_script[&h, &c, &d, &e, &o, &t](heap: &!h Heap, checkout: &c [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte], intent: &t [byte]) -> [heap] buffer.Buffer {
+    var s = cv_begin(heap, checkout, false);
+    s = put(heap, s, "m=$(cat)\nr=$(cancho vcs record ");
+    s = quoted_lines(heap, s, dest);
+    s = q(heap, s, prov);
+    s = put(heap, s, " ");
+    s = cv_intent(heap, s, intent);
+    s = put(heap, s, " --output json 2>/dev/null)\nif [ $? -ne 0 ]; then case \"$r\" in *'\"tag\": \"gate-failed\"'*) printf '%s\\n' \"$r\" | sed -n 's/^    \"rule\": \"\\([a-z-]*\\)\",\\{0,1\\}$/\\1/p'; exit 24 ;; esac; exit 19; fi\n");
+    s = put(heap, s, "printf '%s\\n' \"$r\" | grep -q '^  \"recorded\": true,\\{0,1\\}$' || exit 19\nx=$(printf '%s\\n' \"$r\" | cvf change)\n[ -n \"$x\" ] || exit 19\necho \"$x\"\ncancho vcs switch ");
+    s = q(heap, s, orig);
+    return put(heap, s, " --output json >/dev/null 2>&1 || exit 20\n");
+}
+
+fn cv_exists_script[&h, &c, &b](heap: &!h Heap, checkout: &c [byte], branch: &b [byte]) -> [heap] buffer.Buffer {
+    var s = cv_begin(heap, checkout, false);
+    s = put(heap, s, "[ -n \"$(cvb ");
+    s = q(heap, s, branch);
+    return put(heap, s, ")\" ]\n");
+}
+
+// Adoption: the files of this publish are in the working copy of a checkout at `base` (step 1 held it there). A change id is the hash of the tree,
+// the parent, the intent, the author and the time, so the branch is what this publish would have made exactly when a `record --dry-run` of these
+// files with this intent, at the time the branch's change carries, answers the branch's change. Exit 21 when it does not; else print the change.
+// Nothing is recorded and no ref is touched.
+fn cv_adopt_script[&h, &c, &b, &d, &e, &t](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], intent: &t [byte]) -> [heap] buffer.Buffer {
+    var s = cv_begin(heap, checkout, false);
+    s = put(heap, s, "m=$(cat)\nx=$(cvb ");
+    s = q(heap, s, branch);
+    s = put(heap, s, ")\n[ -n \"$x\" ] || exit 21\nt=$(cancho vcs show \"$x\" --output json 2>/dev/null | sed -n 's/^  \"time\": \\([0-9]*\\),\\{0,1\\}$/\\1/p')\n[ -n \"$t\" ] || exit 21\nr=$(cancho vcs record ");
+    s = quoted_lines(heap, s, dest);
+    s = q(heap, s, prov);
+    s = put(heap, s, " ");
+    s = cv_intent(heap, s, intent);
+    return put(heap, s, " --time \"$t\" --dry-run --output json 2>/dev/null) || exit 21\n[ \"$(printf '%s\\n' \"$r\" | cvf change)\" = \"$x\" ] || exit 21\necho \"$x\"\n");
+}
+
+// The undo: each file of the publish as the head has it (`restore` removes one the head does not have), back to the first branch, and the new
+// branch deleted at the change it is at.
+fn cv_undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
+    var s = cv_begin(heap, checkout, false);
+    s = put(heap, s, "for f in ");
+    s = quoted_lines(heap, s, dest);
+    s = q(heap, s, prov);
+    s = put(heap, s, "; do cancho vcs restore \"$f\" --output json >/dev/null 2>&1; done\ne=$(cvs | cvf head)\ncancho vcs switch ");
+    s = q(heap, s, orig);
+    s = put(heap, s, " --output json >/dev/null 2>&1\n");
+    if len(branch) > 0 {
+        s = put(heap, s, "cancho vcs branch delete ");
+        s = q(heap, s, branch);
+        s = put(heap, s, " --expect \"$e\" --output json >/dev/null 2>&1\n");
+    }
+    return s;
+}
+
+// ---- by kind (0 git, 1 cancho: `repo_vcs.git()`, `repo_vcs.cancho()`) ---------------------------------------------------------------------------
+
+pub fn checks_script[&h, &c, &r, &b, &d, &e, &a](heap: &!h Heap, kind: int, checkout: &c [byte], repo: &r [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte], adopting: bool) -> [heap] buffer.Buffer {
+    if kind == 1 {
+        return cv_checks_script(heap, checkout, branch, dest, prov, base, adopting);
+    }
+    return git_checks_script(heap, checkout, repo, branch, dest, prov, base, adopting);
+}
+
+pub fn branch_script[&h, &c, &b, &d, &e](heap: &!h Heap, kind: int, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], make_branch: bool) -> [heap] buffer.Buffer {
+    if kind == 1 {
+        return cv_branch_script(heap, checkout, branch, dest, prov, make_branch);
+    }
+    return git_branch_script(heap, checkout, branch, dest, prov, make_branch);
+}
+
+// `intent`: for `cancho`, the session and the issue of the change's intent, one to a line; git has no use for it.
+pub fn commit_script[&h, &c, &d, &e, &o, &t](heap: &!h Heap, kind: int, checkout: &c [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte], intent: &t [byte]) -> [heap] buffer.Buffer {
+    if kind == 1 {
+        return cv_commit_script(heap, checkout, dest, prov, orig, intent);
+    }
+    return git_commit_script(heap, checkout, dest, prov, orig);
+}
+
+pub fn exists_script[&h, &c, &b](heap: &!h Heap, kind: int, checkout: &c [byte], branch: &b [byte]) -> [heap] buffer.Buffer {
+    if kind == 1 {
+        return cv_exists_script(heap, checkout, branch);
+    }
+    return git_exists_script(heap, checkout, branch);
+}
+
+pub fn adopt_script[&h, &c, &b, &d, &e, &a, &t](heap: &!h Heap, kind: int, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], base: &a [byte], intent: &t [byte]) -> [heap] buffer.Buffer {
+    if kind == 1 {
+        return cv_adopt_script(heap, checkout, branch, dest, prov, intent);
+    }
+    return git_adopt_script(heap, checkout, branch, dest, prov, base);
+}
+
+pub fn undo_script[&h, &c, &b, &d, &e, &o](heap: &!h Heap, kind: int, checkout: &c [byte], branch: &b [byte], dest: &d [byte], prov: &e [byte], orig: &o [byte]) -> [heap] buffer.Buffer {
+    if kind == 1 {
+        return cv_undo_script(heap, checkout, branch, dest, prov, orig);
+    }
+    return git_undo_script(heap, checkout, branch, dest, prov, orig);
 }

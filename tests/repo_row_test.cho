@@ -321,9 +321,27 @@ fn row_and[&h](heap: &!h Heap, more: &static [byte]) -> [heap] &static [byte] {
     return why;
 }
 
-fn test_a_row_names_its_version_control_and_only_git_runs_yet[&h](heap: &!h Heap) -> [heap] int {
+// The good row with `more` after it, in an operator file whose `checker` is `checker`.
+fn checked_row[&h](heap: &!h Heap, checker: &static [byte], more: &static [byte]) -> [heap] &static [byte] {
+    var o = buffer.append(heap, buffer.append(heap, buffer.append(heap, buffer.empty(heap, 256), "{\"workers\":\"/w\",\"checker\":\""), checker), "\",\"repos\":{\"diff\":{");
+    o = buffer.append(heap, buffer.append(heap, buffer.append(heap, o, good_row()), more), "}}}");
+    var why = "";
+    borrow o as &ob in {
+        why = reason_of(heap, buffer.bytes(ob));
+    }
+    buffer.drop(heap, o);
+    return why;
+}
+
+fn test_a_row_names_its_version_control_and_cancho_needs_the_checker_to_be_cancho[&h](heap: &!h Heap) -> [heap] int {
+    let no_checker = "repos: vcs is cancho, and the operator file's checker is not an absolute path to a file named cancho (the tasks start it by that name)";
     test.assert_eq(len(row_and(heap, ",\"vcs\":\"git\"")), 0);
-    test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"cancho\""), "repos: vcs is cancho, which the tasks are not wired to yet (docs/repo-vcs.md): only git"));
+    test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"cancho\""), no_checker));
+    test.assert_eq(len(checked_row(heap, "/opt/cancho/bin/cancho", ",\"vcs\":\"cancho\"")), 0);
+    test.assert(bytes.equal(checked_row(heap, "/opt/cancho/bin/cancho-0.1", ",\"vcs\":\"cancho\""), no_checker));
+    test.assert(bytes.equal(checked_row(heap, "/opt/bin/mycancho", ",\"vcs\":\"cancho\""), no_checker));
+    test.assert(bytes.equal(checked_row(heap, "bin/cancho", ",\"vcs\":\"cancho\""), no_checker));
+    test.assert_eq(len(checked_row(heap, "/opt/cancho/bin/cancho-0.1", ",\"vcs\":\"git\"")), 0);
     test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"svn\""), "repos: vcs is not git or cancho"));
     test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"\""), "repos: vcs is not git or cancho"));
     test.assert(bytes.equal(row_and(heap, ",\"vcs\":7"), "repos: vcs is not git or cancho"));

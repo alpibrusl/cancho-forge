@@ -39,7 +39,8 @@ fn test_a_row_names_git_or_cancho_and_no_name_is_git() -> [] int {
     test.assert(bytes.equal(repo_vcs.tool(repo_vcs.git()), "git"));
     test.assert(bytes.equal(repo_vcs.tool(repo_vcs.cancho()), "cancho"));
     test.assert_eq(flag(repo_vcs.publish_built(repo_vcs.git())), 1);
-    test.assert_eq(flag(repo_vcs.publish_built(repo_vcs.cancho())), 0);
+    test.assert_eq(flag(repo_vcs.publish_built(repo_vcs.cancho())), 1);
+    test.assert_eq(flag(repo_vcs.publish_built(2)), 0);
     return 0;
 }
 
