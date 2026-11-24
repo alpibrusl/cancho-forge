@@ -17,7 +17,7 @@ import std.bytes;
 //   export       the tree of a revision, as files beneath a directory
 //
 // Every path and revision a text holds was checked by its caller (`gate_task.path_ok`, `revision_ok` here): nothing the shell treats specially.
-// The texts that WRITE a repository (a branch, a commit: `workers/repo_publish.cho`) are the `git` ones only; `publish_built` says so.
+// The texts that WRITE a repository (a branch, a commit: `workers/repo_publish.cho`) are in `repo_vcs_write`, for both kinds; `publish_built` says so.
 
 pub fn git() -> [] int {
     return 0;
@@ -87,9 +87,9 @@ pub fn revision_sized[&r](text: &r [byte]) -> [] bool {
     return len(text) == revision_digits(0) || len(text) == revision_digits(1);
 }
 
-// Whether the texts that write a repository of `kind` (a branch and a commit with the provenance) exist: only git's do.
+// Whether the texts that write a repository of `kind` (a branch and a commit with the provenance) exist: both kinds have them (`repo_vcs_write`).
 pub fn publish_built(kind: int) -> [] bool {
-    return kind == 0;
+    return kind == 0 || kind == 1;
 }
 
 fn cat3[&h, &a, &b, &c](heap: &!h Heap, out: buffer.Buffer, a: &a [byte], b: &b [byte], c: &c [byte]) -> [heap] buffer.Buffer {

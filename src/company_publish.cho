@@ -844,7 +844,7 @@ pub fn patch_row[&h, &f, &x, &c, &i, &m, &s, &j, &d, &o, &t, &p, &b](heap: &!h H
                 if verdict.code != 0 {
                     company_cmd.refuse(io, patch_check.rule_name(verdict.code));
                 } else {
-                    code = patch_hand_over(heap, fs, exec, clock, io, hm, st, journal, at, dir, buffer.bytes(ed), buffer.bytes(pb), want, slug, checkout, trailer, company_step.op_text(src, tp, "workers"), step, branch, adopt);
+                    code = patch_hand_over(heap, fs, exec, clock, io, hm, st, journal, at, dir, buffer.bytes(ed), buffer.bytes(pb), want, slug, checkout, trailer, company_step.op_text(src, tp, "workers"), step, branch, adopt, repo_row.vcs_kind(src, tp, row), company_step.op_text(src, tp, "checker"));
                 }
             }
         }
@@ -855,12 +855,13 @@ pub fn patch_row[&h, &f, &x, &c, &i, &m, &s, &j, &d, &o, &t, &p, &b](heap: &!h H
 }
 
 // Everything is checked on Forge's side: the files the patch touches, the base commit, the provenance and the commit message; then the worker.
-fn patch_hand_over[&h, &f, &x, &c, &i, &m, &s, &j, &d, &e, &p, &w, &g, &k, &t, &u, &n, &b](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], evdir: &e [byte], patch: &p [byte], sha: &w [byte], slug: &g [byte], checkout: &k [byte], trailer: &t [byte], workers: &u [byte], step: &n [byte], branch: &b [byte], adopt: bool) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_write, file_write, io_write] int {
+fn patch_hand_over[&h, &f, &x, &c, &i, &m, &s, &j, &d, &e, &p, &w, &g, &k, &t, &u, &n, &b, &q](heap: &!h Heap, fs: &f Fs(""), exec: &x Exec(""), clock: &c Clock, io: &!i Io, hm: &m company_manifest.Manifest, st: &s company_state.CompanyState, journal: &j [byte], at: int, dir: &d [byte], evdir: &e [byte], patch: &p [byte], sha: &w [byte], slug: &g [byte], checkout: &k [byte], trailer: &t [byte], workers: &u [byte], step: &n [byte], branch: &b [byte], adopt: bool, vcs: int, compiler: &q [byte]) -> [heap, exec_under, clock, poll, fs_read(""), fs_write(""), dir_write, file_write, io_write] int {
     let base = change_base(heap, journal, step);
     var code = company_step.exit_refused();
     var have = false;
     borrow base as &bb in {
-        have = repo_vcs.revision_sized(buffer.bytes(bb));
+        // The base the change worker recorded is of the kind the row says now: a row whose `vcs` was changed after the step ran has none.
+        have = repo_vcs.revision_ok(vcs, buffer.bytes(bb));
     }
     if have == false {
         company_cmd.refuse(io, publish_plan.rule_not_accepted());
@@ -904,7 +905,7 @@ fn patch_hand_over[&h, &f, &x, &c, &i, &m, &s, &j, &d, &e, &p, &w, &g, &k, &t, &
                             company_cmd.refuse(io, publish_plan.rule_worker_failed());
                             company_cmd.line(io, "reason: ", "the provenance is over its size limit");
                         } else {
-                            let req = publish_plan.request_patch(heap, checkout, slug, branch, evdir, "change.patch", buffer.bytes(fb2), sha, buffer.bytes(bb3), buffer.bytes(db), buffer.bytes(pb), buffer.bytes(mb), adopt);
+                            let req = publish_plan.request_patch(heap, checkout, slug, branch, evdir, "change.patch", buffer.bytes(fb2), sha, buffer.bytes(bb3), buffer.bytes(db), buffer.bytes(pb), buffer.bytes(mb), adopt, vcs, compiler, company_manifest.id_of(hm), step);
                             borrow req as &qb in {
                                 code = ask_worker(heap, fs, exec, clock, io, hm, st, at, dir, workers, step, branch, publish_plan.patch_dest(), sha, buffer.bytes(qb));
                             }

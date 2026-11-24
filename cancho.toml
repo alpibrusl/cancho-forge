@@ -193,6 +193,11 @@ sources = ["tests/repo_vcs_test.cho", "src/repo_vcs.cho"]
 std = true
 
 [[test]]
+name = "repo_vcs_write"
+sources = ["tests/repo_vcs_write_test.cho", "src/repo_vcs_write.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
+std = true
+
+[[test]]
 name = "repo_task"
 sources = ["tests/repo_task_test.cho", "src/repo_task.cho", "src/repo_row.cho", "src/authority_task.cho", "src/authority_review.cho", "src/build_task.cho", "src/gate_task.cho", "src/repo_vcs.cho", "src/gate_env.cho"]
 std = true

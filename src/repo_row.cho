@@ -464,6 +464,17 @@ pub fn authority_entry[&s, &t](src: &s [byte], tp: &t [int], row: int, i: int) -
 
 // Why the row at node `row` is refused, or "" (the first fault, in this order: keys, kind, checkout, compiler_rev, publish_allow,
 // publish_deny, the two bounds, pins, authority and compiler, slug, branch).
+// Is the operator file's `checker` an absolute plain path whose last component is `cancho`?
+fn checker_is_cancho[&s, &t](src: &s [byte], tp: &t [int]) -> [] bool {
+    let node = json.get(src, tp, 0, "checker");
+    if node < 0 || !plain(tp, node) {
+        return false;
+    }
+    let path = json.string_view(src, tp, node);
+    let n = len(path);
+    return gate_task.path_ok(path) && n > 7 && bytes.equal(path[n - 7..n], "/cancho");
+}
+
 fn row_reason[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] &static [byte] {
     if !json.is_object(tp, row) || !keys_ok(src, tp, row, row_keys()) {
         return "repos: a row is not an object of the keys kind, checkout, compiler_rev, publish_allow, max_patch_files, max_patch_lines and optionally slug, branch, pins, publish_deny";
@@ -472,15 +483,15 @@ fn row_reason[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] &static [byt
     if !plain(tp, kind) || !kind_ok(json.string_view(src, tp, kind)) {
         return "repos: kind is not library, program or service";
     }
-    // Which version control keeps the repository (docs/repo-vcs.md): `git` when the row does not say. `cancho` is a kind the layer can read
-    // (`repo_vcs`), and the tasks are not wired to it yet, so a row that names it is refused here and not run against `git`.
+    // Which version control keeps the repository (docs/repo-vcs.md): `git` when the row does not say. A repository kept by `cancho vcs` is read and
+    // written by the compiler, started by the name `cancho` from the directory of the operator file's `checker`: so the checker is that file.
     let vcs = json.get(src, tp, row, "vcs");
     if vcs >= 0 {
         if !plain(tp, vcs) || repo_vcs.kind_of(json.string_view(src, tp, vcs)) < 0 || len(json.string_view(src, tp, vcs)) == 0 {
             return "repos: vcs is not git or cancho";
         }
-        if repo_vcs.kind_of(json.string_view(src, tp, vcs)) != repo_vcs.git() {
-            return "repos: vcs is cancho, which the tasks are not wired to yet (docs/repo-vcs.md): only git";
+        if repo_vcs.kind_of(json.string_view(src, tp, vcs)) != repo_vcs.git() && !checker_is_cancho(src, tp) {
+            return "repos: vcs is cancho, and the operator file's checker is not an absolute path to a file named cancho (the tasks start it by that name)";
         }
     }
     let checkout = json.get(src, tp, row, "checkout");

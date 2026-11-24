@@ -1,0 +1,142 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.test;
+import forge.repo_vcs;
+import forge.repo_vcs_write;
+
+// Unit tests for src/repo_vcs_write.cho (docs/repo-vcs.md section 7): the shell texts that write a repository, by kind. The `git` texts are pinned
+// byte for byte to what `workers/repo_publish.cho` ran before a second kind existed (the literals were printed by the module as it was). The
+// `cancho` texts are held to what they must and must not say; what they do, against a real repository and through the real worker, is
+// tests/conformance/repo_publish_cancho.sh. Run with `cancho test`.
+
+fn flag(b: bool) -> [] int {
+    if b {
+        return 1;
+    }
+    return 0;
+}
+
+// Does `text` hold `word`?
+fn holds[&t, &w](text: &t [byte], word: &w [byte]) -> [] int {
+    var at = 0;
+    while at + len(word) <= len(text) {
+        if bytes.equal(text[at..at + len(word)], word) {
+            return 1;
+        }
+        at = at + 1;
+    }
+    return 0;
+}
+
+// Is the text `b` the bytes `want`? The buffer is dropped.
+fn same[&h, &w](heap: &!h Heap, b: buffer.Buffer, want: &w [byte]) -> [heap] int {
+    var r = 0;
+    borrow b as &x in {
+        r = flag(bytes.equal(buffer.bytes(x), want));
+    }
+    buffer.drop(heap, b);
+    return r;
+}
+
+// Does the text `b` hold `word`? The buffer is dropped.
+fn has[&h, &w](heap: &!h Heap, b: buffer.Buffer, word: &w [byte]) -> [heap] int {
+    var r = 0;
+    borrow b as &x in {
+        r = holds(buffer.bytes(x), word);
+    }
+    buffer.drop(heap, b);
+    return r;
+}
+
+pub fn test_git_the_checks_is_the_text_it_was[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(same(heap, repo_vcs_write.checks_script(heap, repo_vcs.git(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "cd '/w/ck' 2>/dev/null || exit 11\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 11\nhere=$(pwd -P)\n[ \"$root\" = \"$here\" ] || exit 11\ngit rev-parse --verify --quiet HEAD >/dev/null 2>&1 || exit 11\nurl=$(git remote get-url origin 2>/dev/null) || exit 13\ncase \"$url\" in\n  'https://github.com/o/r'|'https://github.com/o/r.git'|'git@github.com:o/r'|'git@github.com:o/r.git') ;;\n  *) exit 13 ;;\nesac\n[ \"$(git rev-parse HEAD 2>/dev/null)\" = '1111111111111111111111111111111111111111' ] || exit 23\nmod=$(git status --porcelain --untracked-files=all 2>/dev/null) || exit 11\n[ -z \"$mod\" ] || exit 14\nif git rev-parse --verify --quiet 'refs/heads/forge/b' >/dev/null 2>&1; then exit 15; fi\np=''\nw='src/a.cho'\nIFS=/\nset -f\nfor c in $w; do p=\"$p$c\"; if [ -L \"$p\" ]; then exit 16; fi; p=\"$p/\"; done\nunset IFS\nif [ -d 'src/a.cho' ]; then exit 16; fi\np=''\nw='tests/a_test.cho'\nIFS=/\nset -f\nfor c in $w; do p=\"$p$c\"; if [ -L \"$p\" ]; then exit 16; fi; p=\"$p/\"; done\nunset IFS\nif [ -d 'tests/a_test.cho' ]; then exit 16; fi\np=''\nw='docs/provenance/chg.md'\nIFS=/\nset -f\nfor c in $w; do p=\"$p$c\"; if [ -L \"$p\" ]; then exit 16; fi; p=\"$p/\"; done\nunset IFS\nif [ -d 'docs/provenance/chg.md' ]; then exit 16; fi\ngit symbolic-ref -q --short HEAD || git rev-parse HEAD\n"), 1);
+    return 0;
+}
+
+pub fn test_git_the_checks_of_an_adoption_is_the_text_it_was[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(same(heap, repo_vcs_write.checks_script(heap, repo_vcs.git(), "/w/ck", "o/r", "forge/b", "a.cho", "docs/provenance.md", "", true), "cd '/w/ck' 2>/dev/null || exit 11\nroot=$(git rev-parse --show-toplevel 2>/dev/null) || exit 11\nhere=$(pwd -P)\n[ \"$root\" = \"$here\" ] || exit 11\ngit rev-parse --verify --quiet HEAD >/dev/null 2>&1 || exit 11\nurl=$(git remote get-url origin 2>/dev/null) || exit 13\ncase \"$url\" in\n  'https://github.com/o/r'|'https://github.com/o/r.git'|'git@github.com:o/r'|'git@github.com:o/r.git') ;;\n  *) exit 13 ;;\nesac\nmod=$(git status --porcelain --untracked-files=all 2>/dev/null) || exit 11\n[ -z \"$mod\" ] || exit 14\np=''\nw='a.cho'\nIFS=/\nset -f\nfor c in $w; do p=\"$p$c\"; if [ -L \"$p\" ]; then exit 16; fi; p=\"$p/\"; done\nunset IFS\nif [ -d 'a.cho' ]; then exit 16; fi\np=''\nw='docs/provenance.md'\nIFS=/\nset -f\nfor c in $w; do p=\"$p$c\"; if [ -L \"$p\" ]; then exit 16; fi; p=\"$p/\"; done\nunset IFS\nif [ -d 'docs/provenance.md' ]; then exit 16; fi\ngit symbolic-ref -q --short HEAD || git rev-parse HEAD\n"), 1);
+    return 0;
+}
+
+pub fn test_git_the_branch_is_the_text_it_was[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(same(heap, repo_vcs_write.branch_script(heap, repo_vcs.git(), "/w/ck", "forge/b", "src/a.cho\nb.cho", "docs/provenance/chg.md", true), "cd '/w/ck' || exit 11\ngit checkout -q -b 'forge/b' || exit 18\nmkdir -p 'src' || exit 18\nmkdir -p 'docs/provenance' || exit 18\n"), 1);
+    return 0;
+}
+
+pub fn test_git_the_commit_is_the_text_it_was[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(same(heap, repo_vcs_write.commit_script(heap, repo_vcs.git(), "/w/ck", "src/a.cho\nb.cho", "docs/provenance/chg.md", "main", ""), "cd '/w/ck' || exit 11\ngit add -- 'src/a.cho' 'b.cho' 'docs/provenance/chg.md' || exit 19\ngit -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -q --no-verify -F - || exit 19\ngit rev-parse HEAD || exit 19\ngit checkout -q 'main' || exit 20\n"), 1);
+    return 0;
+}
+
+pub fn test_git_the_branch_probe_is_the_text_it_was[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(same(heap, repo_vcs_write.exists_script(heap, repo_vcs.git(), "/w/ck", "forge/b"), "cd '/w/ck' || exit 11\ngit rev-parse --verify --quiet 'refs/heads/forge/b' >/dev/null 2>&1\n"), 1);
+    return 0;
+}
+
+pub fn test_git_the_adoption_is_the_text_it_was[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(same(heap, repo_vcs_write.adopt_script(heap, repo_vcs.git(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", ""), "cd '/w/ck' || exit 11\ngit add -- 'src/a.cho' 'docs/provenance/chg.md' || exit 19\nb='refs/heads/forge/b'\n[ \"$(git rev-parse --verify --quiet \"$b^\")\" = '1111111111111111111111111111111111111111' ] || exit 21\n[ \"$(git write-tree)\" = \"$(git rev-parse --verify --quiet \"$b^{tree}\")\" ] || exit 21\nwant=$(git stripspace)\ngot=$(git log -1 --format=%B \"$b\" | git stripspace)\n[ \"$want\" = \"$got\" ] || exit 21\ngit rev-parse --verify \"$b\" || exit 21\n"), 1);
+    return 0;
+}
+
+pub fn test_git_the_undo_is_the_text_it_was[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(same(heap, repo_vcs_write.undo_script(heap, repo_vcs.git(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "main"), "cd '/w/ck' || exit 11\ngit reset -q --hard\nfor f in 'src/a.cho' 'docs/provenance/chg.md'; do git ls-files --error-unmatch \"$f\" >/dev/null 2>&1 || rm -f \"$f\"; done\ngit checkout -q 'main'\ngit branch -D -q 'forge/b'\n"), 1);
+    return 0;
+}
+
+pub fn test_no_cancho_text_starts_git_and_each_starts_cancho_vcs[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "git"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "cd '/w/ck'"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "a.cho", "docs/provenance.md", "", true), "git"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "a.cho", "docs/provenance.md", "", true), "cd '/w/ck'"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.branch_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho\nb.cho", "docs/provenance/chg.md", true), "git"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.branch_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho\nb.cho", "docs/provenance/chg.md", true), "cd '/w/ck'"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.commit_script(heap, repo_vcs.cancho(), "/w/ck", "src/a.cho\nb.cho", "docs/provenance/chg.md", "main", "co\nchg"), "git"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.commit_script(heap, repo_vcs.cancho(), "/w/ck", "src/a.cho\nb.cho", "docs/provenance/chg.md", "main", "co\nchg"), "cd '/w/ck'"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.exists_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b"), "git"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.exists_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b"), "cd '/w/ck'"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.adopt_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", "co\nchg"), "git"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.adopt_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", "co\nchg"), "cd '/w/ck'"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.undo_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "main"), "git"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.undo_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "main"), "cd '/w/ck'"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "cancho vcs "), 1);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "a.cho", "docs/provenance.md", "", true), "cancho vcs "), 1);
+    test.assert_eq(has(heap, repo_vcs_write.branch_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho\nb.cho", "docs/provenance/chg.md", true), "cancho vcs "), 1);
+    test.assert_eq(has(heap, repo_vcs_write.commit_script(heap, repo_vcs.cancho(), "/w/ck", "src/a.cho\nb.cho", "docs/provenance/chg.md", "main", "co\nchg"), "cancho vcs "), 1);
+    test.assert_eq(has(heap, repo_vcs_write.exists_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b"), "cancho vcs "), 1);
+    test.assert_eq(has(heap, repo_vcs_write.adopt_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", "co\nchg"), "cancho vcs "), 1);
+    test.assert_eq(has(heap, repo_vcs_write.undo_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "main"), "cancho vcs "), 1);
+    return 0;
+}
+
+pub fn test_the_cancho_checks_hold_the_head_to_the_base_and_have_no_origin[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "[ \"$h\" = '1111111111111111111111111111111111111111' ] || exit 23\n"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "exit 13"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "[ -z \"$(cvb 'forge/b')\" ] || exit 15\n"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "a.cho", "docs/provenance.md", "", true), "exit 15"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "exit 14"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.checks_script(heap, repo_vcs.cancho(), "/w/ck", "o/r", "forge/b", "src/a.cho\ntests/a_test.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", false), "if [ -L \"$p\" ]; then exit 16; fi"), 1);
+    return 0;
+}
+
+pub fn test_the_cancho_commit_records_the_files_with_the_intent_and_goes_back[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(has(heap, repo_vcs_write.commit_script(heap, repo_vcs.cancho(), "/w/ck", "src/a.cho\nb.cho", "docs/provenance/chg.md", "main", "co\nchg"), "m=$(cat)\nr=$(cancho vcs record 'src/a.cho' 'b.cho' 'docs/provenance/chg.md' --intent-prompt \"$m\" --intent-session 'co' --intent-issue 'chg' --output json 2>/dev/null)\n"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.commit_script(heap, repo_vcs.cancho(), "/w/ck", "src/a.cho\nb.cho", "docs/provenance/chg.md", "main", "co\nchg"), "exit 24"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.commit_script(heap, repo_vcs.cancho(), "/w/ck", "src/a.cho\nb.cho", "docs/provenance/chg.md", "main", "co\nchg"), "cancho vcs switch 'main' --output json >/dev/null 2>&1 || exit 20\n"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.commit_script(heap, repo_vcs.cancho(), "/w/ck", "src/a.cho\nb.cho", "docs/provenance/chg.md", "main", "co\nchg"), "--no-gate"), 0);
+    return 0;
+}
+
+pub fn test_the_cancho_adoption_records_nothing_and_the_undo_deletes_the_branch_where_it_is[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(has(heap, repo_vcs_write.adopt_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "1111111111111111111111111111111111111111", "co\nchg"), " --time \"$t\" --dry-run --output json"), 1);
+    test.assert_eq(has(heap, repo_vcs_write.undo_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho", "docs/provenance/chg.md", "main"), "cancho vcs branch delete 'forge/b' --expect \"$e\""), 1);
+    test.assert_eq(has(heap, repo_vcs_write.undo_script(heap, repo_vcs.cancho(), "/w/ck", "", "src/a.cho", "docs/provenance/chg.md", "main"), "branch delete"), 0);
+    test.assert_eq(has(heap, repo_vcs_write.branch_script(heap, repo_vcs.cancho(), "/w/ck", "forge/b", "src/a.cho\nb.cho", "docs/provenance/chg.md", true), "cancho vcs branch create 'forge/b' --output json >/dev/null 2>&1 || exit 18\ncancho vcs switch 'forge/b'"), 1);
+    return 0;
+}
+
+pub fn test_the_environment_of_a_cancho_text_starts_with_the_compilers_directory[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(same(heap, repo_vcs_write.tool_env(heap, "/opt/cancho/bin/cancho"), "PATH=/opt/cancho/bin:/usr/local/bin:/usr/bin:/bin\0"), 1);
+    return 0;
+}

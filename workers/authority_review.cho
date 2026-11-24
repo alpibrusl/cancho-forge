@@ -10,6 +10,8 @@ import forge.authority_task;
 import forge.gate_env;
 import forge.gate_task;
 import forge.journal_io;
+import forge.repo_vcs;
+import forge.repo_vcs_write;
 import forge.snapshot;
 import forge.verbs;
 
@@ -515,7 +517,13 @@ fn serve[&h, &i, &f, &c, &x](heap: &!h Heap, io: &!i Io, fs: &f Fs(""), clock: &
                     if len(refused) > 0 {
                         answer(heap, io, text_of(src, tp, rid), text_of(src, tp, tid), refused, "the task was refused before anything ran", false, "", 0, "", 0, "", 0);
                     } else {
-                        let env = gate_env.block(heap, src, tp, envn);
+                        // A revision of `cancho vcs` is read by `cancho`, started by name: when the request sets no environment of its own, the
+                        // compiler's directory goes first on the `PATH` (docs/repo-vcs.md section 7).
+                        var env = gate_env.block(heap, src, tp, envn);
+                        if envn < 0 && repo_vcs.revision_kind(revision) == repo_vcs.cancho() {
+                            buffer.drop(heap, env);
+                            env = repo_vcs_write.tool_env(heap, compiler);
+                        }
                         let joined = authority_task.programs_text(heap, src, tp, programs);
                         var std = false;
                         if std_node >= 0 {

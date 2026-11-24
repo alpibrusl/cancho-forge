@@ -560,6 +560,7 @@ both documents). `unit` is `cancho test` (`tests/*_test.cho`); `run.sh` is `test
 | `publish-artifact-changed` | the artifact is no longer the file the journal accepted: another digest, another path, a link, unreadable | 1 | `repo_publish.sh` `an artifact edited after acceptance`, `an artifact that became a link` |
 | `publish-journal-unreadable` | `company.journal` cannot be read (a corrupt one is `journal-corrupt`) | 1 | `repo_publish.sh` `no journal` |
 | `publish-commit-failed` | git could not make the branch, stage or commit (no identity, an ignored path); the branch and the files are undone | 1 | `repo_publish.sh` `a commit git refuses (no identity), undone`, `an ignored destination ... undone` |
+| `publish-gate-failed` | the repository is kept by `cancho vcs` and its gate refused the tree of the publish (a `.cho` file of it does not check); the `reason:` ends with the compiler's rule; the branch and the files are undone (`docs/repo-vcs.md` section 7) | 1 | `repo_publish_cancho.sh` `gate: the publish is refused publish-gate-failed`, `gate: undone` |
 | `publish-worker-failed` | the publish worker is not there, did not end, or answered what the request did not ask for; or the provenance is over its limit | 1 | `repo_publish.sh` `a workers directory with no repo_publish` |
 | `publish-push-not-granted` | `forge company publish` was given a seventh word (`push`): pushing and opening the pull request are a person's act | 1 | `repo_publish.sh` `push is not granted` |
 
@@ -842,7 +843,7 @@ is valid and read exactly as before.
 `slug`, `branch`, `pins` (`.cancho-rev` and/or `cancho.toml`; default `.cancho-rev`) and `publish_deny`. `checkout` is an absolute path
 by `gate_task.path_ok`'s rule, `compiler_rev` 40 lower-case hex, the patterns relative paths of letters, digits and `_-./*` with no `..`
 (`*` any run inside a component, a whole component `**` any number of components), `max_patch_files` 1 to 64, `max_patch_lines` 1 to
-100000. `vcs` is `git` (also when absent); `cancho` is refused until the tasks are wired to it (`docs/repo-vcs.md`). 100000. Any other key (the autonomy registry's `gate` and `policy` included) is `operator-invalid`, with a `reason:` line.
+100000. `vcs` is `git` (also when absent) or `cancho`, a repository kept by `cancho vcs`: then the operator file's `checker` must be an absolute path to a file named `cancho`, which the tasks start by that name (`docs/repo-vcs.md` section 7). 100000. Any other key (the autonomy registry's `gate` and `policy` included) is `operator-invalid`, with a `reason:` line.
 
 **Patch bounds** (`src/patch_check.cho`, pure): Forge reads `change.patch` itself and answers `patch-kind-invalid`, then
 `patch-path-denied`, then `patch-too-large`. The patch is `diff -ruN base tree` (`--- base/<path>`, `+++ tree/<path>`); hunk bodies are

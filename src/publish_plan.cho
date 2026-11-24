@@ -8,6 +8,7 @@ import forge.company_graph;
 import forge.company_manifest;
 import forge.company_state;
 import forge.gate_task;
+import forge.repo_vcs;
 
 // The pure half of `forge company publish` (docs/company.md, section 15): what may be named, and what is written. Nothing here opens a
 // file or starts a process; `forge.company_publish` reads and asks, `workers/repo_publish.cho` copies and commits.
@@ -77,6 +78,10 @@ pub fn rule_patch_base_stale() -> [] &static [byte] {
 
 pub fn rule_patch_not_applicable() -> [] &static [byte] {
     return "patch-not-applicable";
+}
+
+pub fn rule_gate_failed() -> [] &static [byte] {
+    return "publish-gate-failed";
 }
 
 pub fn rule_push_not_granted() -> [] &static [byte] {
@@ -461,6 +466,9 @@ pub fn patch_pr_text[&h, &m, &s, &x, &b, &k](heap: &!h Heap, m: &m company_manif
     o = buffer.append(heap, o, ". docs/provenance/");
     o = put_clean(heap, o, company_manifest.step_id(m, step));
     o = buffer.append(heap, o, ".md has the base commit, the files, the tokens, the cost and the decisions a person recorded.\n\nNot done: the branch was not pushed and this pull request was not opened; both are a person's act. If anyone changed the patch after it was accepted, Forge would have refused to publish it.\n");
+    if repo_vcs.revision_kind(commit) == repo_vcs.cancho() {
+        o = buffer.append(heap, o, "\nThe repository is kept by `cancho vcs` and the commit above is a change id. GitHub speaks git: `cancho vcs export-git <directory>` renders the branch as a git commit (the message is this change's intent, with a `Cancho-Change` trailer), and that is what a person pushes.\n");
+    }
     return o;
 }
 
@@ -528,9 +536,9 @@ pub fn request[&h, &c, &r, &b, &s, &n, &d, &x, &p, &g, &z](heap: &!h Heap, check
 }
 
 // The request for a PATCH publish (docs/company.md section 21): the artifact is `src_name` beneath `src_dir`, accepted with `sha`; `dests` are the
-// files the patch touches (one per line); `base` is the commit the patch was made against (40 hex); the provenance goes to `prov_dest`. The worker
+// files the patch touches (one per line); `base` is the revision the patch was made against (a commit of 40 digits, or for `vcs` cancho a change id of 64); the provenance goes to `prov_dest`. The worker
 // applies the patch itself, in cancho, to the checkout at `base`.
-pub fn request_patch[&h, &c, &r, &b, &s, &n, &d, &x, &y, &q, &p, &g](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], src_dir: &s [byte], src_name: &n [byte], dests: &d [byte], sha: &x [byte], base: &y [byte], prov_dest: &q [byte], prov: &p [byte], message: &g [byte], adopt: bool) -> [heap] buffer.Buffer {
+pub fn request_patch[&h, &c, &r, &b, &s, &n, &d, &x, &y, &q, &p, &g, &k, &e, &i](heap: &!h Heap, checkout: &c [byte], repo: &r [byte], branch: &b [byte], src_dir: &s [byte], src_name: &n [byte], dests: &d [byte], sha: &x [byte], base: &y [byte], prov_dest: &q [byte], prov: &p [byte], message: &g [byte], adopt: bool, vcs: int, compiler: &k [byte], session: &e [byte], issue: &i [byte]) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 1024);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "checkout");
@@ -559,6 +567,18 @@ pub fn request_patch[&h, &c, &r, &b, &s, &n, &d, &x, &y, &q, &p, &g](heap: &!h H
     w = json.put_string(heap, w, prov);
     w = json.put_key(heap, w, "message");
     w = json.put_string(heap, w, message);
+    if vcs != repo_vcs.git() {
+        // A checkout kept by `cancho vcs` (docs/repo-vcs.md section 7): the kind, the compiler that keeps it, and the intent's session and issue. A
+        // git request has none of the four, so it is the bytes it was.
+        w = json.put_key(heap, w, "vcs");
+        w = json.put_string(heap, w, "cancho");
+        w = json.put_key(heap, w, "compiler");
+        w = json.put_string(heap, w, compiler);
+        w = json.put_key(heap, w, "session");
+        w = json.put_string(heap, w, session);
+        w = json.put_key(heap, w, "issue");
+        w = json.put_string(heap, w, issue);
+    }
     w = json.end_object(heap, w);
     return json.finish(w);
 }
@@ -594,6 +614,9 @@ pub fn worker_tag[&t](tag: &t [byte]) -> [] &static [byte] {
     }
     if bytes.equal(tag, rule_patch_not_applicable()) {
         return rule_patch_not_applicable();
+    }
+    if bytes.equal(tag, rule_gate_failed()) {
+        return rule_gate_failed();
     }
     return rule_worker_failed();
 }
