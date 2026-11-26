@@ -102,6 +102,8 @@ fn test_an_operator_repo_row_outside_the_shape_is_operator_invalid[&h](heap: &!h
     test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":100001")) > 0);
     test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":\"800\"")) > 0);
     test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"pins\":[\"Makefile\"]")) > 0);
+    test.assert_eq(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"pins\":[\"cancho.toml=0.1.1\"]")), 0);
+    test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"pins\":[\"cancho.toml=latest\"]")) > 0);
     test.assert_eq(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"pins\":[\".cancho-rev\",\"cancho.toml\"],\"slug\":\"a/b\",\"branch\":\"main\"")), 0);
     test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"slug\":\"nope\"")) > 0);
     test.assert(len(replaced(heap, "\"max_patch_lines\":800", "\"max_patch_lines\":800,\"branch\":\"-x\"")) > 0);
@@ -242,6 +244,8 @@ fn test_the_pin_files_are_read_the_way_the_repositories_write_them() -> [] int {
     test.assert_eq(flag(repo_row.pin_matches("cancho.toml", "[package]\ncancho = \"1111111111111111111111111111111111111111\"\n", rev)), 0);
     test.assert_eq(flag(repo_row.pin_matches("cancho.toml", "[package]\nname = \"x\"\n", rev)), 0);
     test.assert_eq(flag(repo_row.pin_matches("Makefile", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", rev)), 0);
+    // the first `cancho = "..."` line decides, whatever it holds: a version line before a revision line is not the revision
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml", "cancho = \"0.1.1\"\ncancho = \"f4ead824f33b291a0ad7620a34a0c1346a7abe4f\"\n", rev)), 0);
     test.assert_eq(flag(repo_row.pin_matches(".cancho-rev", "f4ead82", "f4ead82")), 0);
     return 0;
 }
@@ -346,5 +350,41 @@ fn test_a_row_names_its_version_control_and_cancho_needs_the_checker_to_be_canch
     test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"\""), "repos: vcs is not git or cancho"));
     test.assert(bytes.equal(row_and(heap, ",\"vcs\":7"), "repos: vcs is not git or cancho"));
     test.assert(bytes.equal(row_and(heap, ",\"vcs\":\"Git\""), "repos: vcs is not git or cancho"));
+    return 0;
+}
+
+// A repository of a released compiler pins by version: `cancho = "0.1.1"`. The pin `cancho.toml=0.1.1` is that line holding that version.
+fn test_a_pin_by_version_is_the_version_the_project_file_holds() -> [] int {
+    let rev = "f4ead824f33b291a0ad7620a34a0c1346a7abe4f";
+    let toml = "[package]\nname = \"chain\"\ncancho = \"0.1.1\"   # the compiler these sources were written against\n\n[[bin]]\n";
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml=0.1.1", toml, rev)), 1);
+    // another version, a longer one, a shorter one: not it
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml=0.1.2", toml, rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml=0.1.11", toml, rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml=0.1", toml, rev)), 0);
+    // the plain pin still wants the revision, and a version pin never takes the revision for the version
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml", toml, rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml=0.1.1", "cancho = \"f4ead824f33b291a0ad7620a34a0c1346a7abe4f\"\n", rev)), 0);
+    // no line, an unclosed quote: nothing is pinned
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml=0.1.1", "[package]\nname = \"x\"\n", rev)), 0);
+    test.assert_eq(flag(repo_row.pin_matches("cancho.toml=0.1.1", "cancho = \"0.1.1\n", rev)), 0);
+    // the file a pin is read from
+    test.assert(bytes.equal(repo_row.pin_file("cancho.toml=0.1.1"), "cancho.toml"));
+    test.assert(bytes.equal(repo_row.pin_file(".cancho-rev"), ".cancho-rev"));
+    return 0;
+}
+
+fn test_only_a_version_of_digits_and_dots_is_a_pin_name() -> [] int {
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=0.1.1")), 1);
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=12")), 1);
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=")), 0);
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=0.1.")), 0);
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=.1")), 0);
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=0..1")), 0);
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=0.1.1-rc")), 0);
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=0.1.1=2")), 0);
+    test.assert_eq(flag(repo_row.pin_name_ok(".cancho-rev=0.1.1")), 0);
+    test.assert_eq(flag(repo_row.pin_name_ok("Makefile=0.1.1")), 0);
+    test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=000000000000000000000000000000001")), 0);
     return 0;
 }

@@ -279,7 +279,7 @@ fn pins_hold[&h, &f, &d, &s, &t, &v](heap: &!h Heap, fs: &f Fs(""), base_dir: &d
         if !repo_row.pin_name_ok(name) {
             ok = false;
         } else {
-            let (data, why) = company_files.read_artifact(heap, fs, base_dir, name);
+            let (data, why) = company_files.read_artifact(heap, fs, base_dir, repo_row.pin_file(name));
             var held = false;
             if why == 0 {
                 borrow data as &dbb in {

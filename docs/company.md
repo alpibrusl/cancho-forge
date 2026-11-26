@@ -840,7 +840,7 @@ takes no `contract` or `library`; `repo` and `change_kind` on any other task typ
 is valid and read exactly as before.
 
 **Operator file.** `repos.<id>` = `{kind, checkout, compiler_rev, publish_allow, max_patch_files, max_patch_lines}` and optionally
-`slug`, `branch`, `pins` (`.cancho-rev` and/or `cancho.toml`; default `.cancho-rev`) and `publish_deny`. `checkout` is an absolute path
+`slug`, `branch`, `pins` (`.cancho-rev`, `cancho.toml` and/or `cancho.toml=<version>`; default `.cancho-rev`) and `publish_deny`. `checkout` is an absolute path
 by `gate_task.path_ok`'s rule, `compiler_rev` 40 lower-case hex, the patterns relative paths of letters, digits and `_-./*` with no `..`
 (`*` any run inside a component, a whole component `**` any number of components), `max_patch_files` 1 to 64, `max_patch_lines` 1 to
 100000. `vcs` is `git` (also when absent) or `cancho`, a repository kept by `cancho vcs`: then the operator file's `checker` must be an absolute path to a file named `cancho`, which the tasks start by that name (`docs/repo-vcs.md` section 7). 100000. Any other key (the autonomy registry's `gate` and `policy` included) is `operator-invalid`, with a `reason:` line.
@@ -864,8 +864,11 @@ for the step's repository) and `repo-kind-mismatch` (the row's `kind` is not the
 2. copies the checkout's **tracked** files (`git ls-files`, `tar`; no `.git`) twice, to `ev/base` (given to the build tool) and `ev/fresh`
    (nobody touches it; the check applies the patch to a copy of it, as the design's "second copy"). The checkout is never an argument of the
    build tool, and the worker runs nothing but those read-only git commands against it;
-3. reads each pin file of `ev/base` (`.cancho-rev` and/or `cancho.toml`, the row's `pins`): not the row's `compiler_rev` is
-   `repo-pin-mismatch`, and nothing is built;
+3. reads each pin of `ev/base` (the row's `pins`): `.cancho-rev` must hold the row's `compiler_rev`; `cancho.toml` must hold it on its
+   first `cancho = "..."` line; `cancho.toml=<version>` must hold exactly that version on that line (a repository of a released
+   compiler writes `cancho = "0.1.1"`). Anything else is `repo-pin-mismatch`, and nothing is built. **A version pin is the operator's
+   statement** that the version is `compiler_rev`: Forge looks it up nowhere. What ties the two afterwards is the compiler, which
+   refuses a project file naming another version than its own (not measured here: the conformance build tool is a stand-in);
 4. runs `cancho-build --repo ev/base --change ev/change.txt --kind K --checker C --work ev/work --agent 'A' --provider P --model M` (plus
    `--attempts` and `--agent-seconds` when the operator file sets `attempts` and `agent_seconds`) in a process group of its own, killed at
    its deadline. The agent command is held to a closed character set (`repo_task.agent_ok`) because it goes between quotes in a shell
