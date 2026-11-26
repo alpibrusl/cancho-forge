@@ -371,7 +371,61 @@ fn patterns_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, lo: int, hi: int
 
 // The pin files a row may name.
 pub fn pin_name_ok[&n](name: &n [byte]) -> [] bool {
-    return bytes.equal(name, ".cancho-rev") || bytes.equal(name, "cancho.toml");
+    if bytes.equal(name, ".cancho-rev") || bytes.equal(name, "cancho.toml") {
+        return true;
+    }
+    return bytes.equal(pin_file(name), "cancho.toml") && version_ok(pin_version(name));
+}
+
+// A pin is a file of the repository, or `cancho.toml=<version>`: the same file, pinned by the release VERSION its `cancho = "..."` line holds
+// (the repositories of a released compiler write `cancho = "0.1.1"`, not a commit). The operator who writes that pin says that this version
+// is the row's `compiler_rev`; Forge does not look the version up anywhere. What holds the two together afterwards is the compiler: the gate
+// builds with the compiler of `compiler_rev`, and `cancho build` refuses a project file that names another version.
+// The file a pin is read from: the name up to the first `=`.
+pub fn pin_file[&n](name: &n [byte]) -> [] &n [byte] {
+    var i = 0;
+    while i < len(name) && int_of(name[i]) != 61 {
+        i = i + 1;
+    }
+    return name[0..i];
+}
+
+// The version a pin names: what follows the first `=`, "" when there is none.
+pub fn pin_version[&n](name: &n [byte]) -> [] &n [byte] {
+    var i = 0;
+    while i < len(name) && int_of(name[i]) != 61 {
+        i = i + 1;
+    }
+    if i >= len(name) {
+        return name[0..0];
+    }
+    return name[i + 1..len(name)];
+}
+
+// A release version: 1 to 32 digits and dots, a digit first and last, no two dots together.
+fn version_ok[&v](v: &v [byte]) -> [] bool {
+    if len(v) < 1 || len(v) > 32 {
+        return false;
+    }
+    var ok = true;
+    var dot = true;
+    var i = 0;
+    while i < len(v) {
+        let c = int_of(v[i]);
+        if c == 46 {
+            if dot {
+                ok = false;
+            }
+            dot = true;
+        } else {
+            if c < 48 || c > 57 {
+                ok = false;
+            }
+            dot = false;
+        }
+        i = i + 1;
+    }
+    return ok && !dot;
 }
 
 fn pins_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
@@ -517,7 +571,7 @@ fn row_reason[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] &static [byt
     }
     let pins = json.get(src, tp, row, "pins");
     if pins >= 0 && !pins_ok(src, tp, pins) {
-        return "repos: pins is not 1 to 4 of .cancho-rev, cancho.toml";
+        return "repos: pins is not 1 to 4 of .cancho-rev, cancho.toml, cancho.toml=<version of digits and dots>";
     }
     let authority = json.get(src, tp, row, "authority");
     let compiler = json.get(src, tp, row, "compiler");
@@ -614,8 +668,8 @@ fn space(c: int) -> [] bool {
 }
 
 // Does the text of the pin file `name` (as the checkout holds it at its base commit) pin the compiler to `rev`? `.cancho-rev` holds the
-// revision and nothing else but white space; `cancho.toml` holds a line `cancho = "<40 hex>"` (the first such line decides). Any other
-// name pins nothing.
+// revision and nothing else but white space; `cancho.toml` holds a line `cancho = "<40 hex>"` (the first line `cancho = "..."` decides,
+// whatever it holds); `cancho.toml=<version>` is that line holding exactly the version, and never the revision. Any other name pins nothing.
 pub fn pin_matches[&n, &x, &r](name: &n [byte], text: &x [byte], rev: &r [byte]) -> [] bool {
     if !rev_ok(rev) {
         return false;
@@ -631,7 +685,8 @@ pub fn pin_matches[&n, &x, &r](name: &n [byte], text: &x [byte], rev: &r [byte])
         }
         return bytes.equal(text[a..b], rev);
     }
-    if bytes.equal(name, "cancho.toml") {
+    if bytes.equal(pin_file(name), "cancho.toml") && pin_name_ok(name) {
+        let version = pin_version(name);
         var start = 0;
         while start < len(text) {
             var end = start;
@@ -640,6 +695,9 @@ pub fn pin_matches[&n, &x, &r](name: &n [byte], text: &x [byte], rev: &r [byte])
             }
             let found = toml_pin(text[start..end]);
             if found.0 {
+                if len(version) > 0 {
+                    return bytes.equal(found.1, version);
+                }
                 return bytes.equal(found.1, rev);
             }
             start = end + 1;
@@ -649,7 +707,7 @@ pub fn pin_matches[&n, &x, &r](name: &n [byte], text: &x [byte], rev: &r [byte])
     return false;
 }
 
-// `cancho = "<40 hex>"` on one line: whether it is one, and the 40 bytes.
+// `cancho = "<text>"` on one line: whether it is one, and the text between the quotes (at most 64 bytes, no quote in it).
 fn toml_pin[&l](line: &l [byte]) -> [] (bool, &l [byte]) {
     var i = 0;
     while i < len(line) && space(int_of(line[i])) {
@@ -669,8 +727,15 @@ fn toml_pin[&l](line: &l [byte]) -> [] (bool, &l [byte]) {
     while i < len(line) && space(int_of(line[i])) {
         i = i + 1;
     }
-    if len(line) < i + 42 || int_of(line[i]) != 34 || int_of(line[i + 41]) != 34 {
+    if i >= len(line) || int_of(line[i]) != 34 {
         return (false, line[0..0]);
     }
-    return (true, line[i + 1..i + 41]);
+    var e = i + 1;
+    while e < len(line) && int_of(line[e]) != 34 {
+        e = e + 1;
+    }
+    if e >= len(line) || e - i - 1 > 64 {
+        return (false, line[0..0]);
+    }
+    return (true, line[i + 1..e]);
 }

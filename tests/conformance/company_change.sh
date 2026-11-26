@@ -45,10 +45,10 @@ mkrepo() { # name: a library with a gate that a BROKEN word in src/a.cho fails
 }
 # the operator file: <name> <checkout> [rev] [kind] [max lines]
 operator() {
-  rev=${3:-$REV}; kind=${4:-library}; lines=${5:-20}
+  rev=${3:-$REV}; kind=${4:-library}; lines=${5:-20}; pins=; [ -z "${PINS:-}" ] || pins=",\"pins\":$PINS"
   cat > "$w/$1.json" <<EOT
 {"workers":"$w/workers","tools":"$w/tools","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent","check_timeout_ms":30000,"build_timeout_ms":10000,
- "repos":{"diff":{"kind":"$kind","checkout":"$2","compiler_rev":"$rev","publish_allow":["src/**","tests/**"],"publish_deny":["src/secret/**"],"max_patch_files":3,"max_patch_lines":$lines}}}
+ "repos":{"diff":{"kind":"$kind","checkout":"$2","compiler_rev":"$rev","publish_allow":["src/**","tests/**"],"publish_deny":["src/secret/**"],"max_patch_files":3,"max_patch_lines":$lines$pins}}}
 EOT
 }
 # a company: <name> <input of the step chg> [more steps json, comma first]
@@ -215,6 +215,22 @@ check "dirty: the build tool was never started (no work directory)" sh -c "[ ! -
 mkrepo ck-pin; operator op-pin "$w/ck-pin" 1111111111111111111111111111111111111111
 refused pin repo-pin-mismatch good op-pin ""
 check "pin: nothing was built" sh -c "[ ! -e '$w/co-pin/steps/chg/ev/work' ]"
+# a repository of a released compiler pins by version in cancho.toml: the pin `cancho.toml=<version>` is that line holding that version
+mkverrepo() { # name, the version its project file names: no .cancho-rev at all
+  mkrepo "$1"; rm "$w/$1/.cancho-rev"; printf '[package]\nname = "x"\ncancho = "%s"   # the release\n' "$2" > "$w/$1/cancho.toml"
+  git_in "$w/$1" add -A && git_in "$w/$1" commit -q -m "pin by version" || exit 1
+}
+mkverrepo ck-ver 0.1.1; PINS='["cancho.toml=0.1.1"]'; operator op-ver "$w/ck-ver"; PINS=; mkco co-ver "good"
+run "$w/co-ver" "$w/op-ver.json"
+check "version pin: a project file that names the version the row's pin names is accepted" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: chg' '$w/out'"
+mkverrepo ck-ver2 0.1.2; PINS='["cancho.toml=0.1.1"]'; operator op-ver2 "$w/ck-ver2"; PINS=
+refused ver2 repo-pin-mismatch good op-ver2 ""
+check "version pin: another version in the project file builds nothing" sh -c "[ ! -e '$w/co-ver2/steps/chg/ev/work' ]"
+mkverrepo ck-ver3 0.1.1; PINS='["cancho.toml"]'; operator op-ver3 "$w/ck-ver3"; PINS=
+refused ver3 repo-pin-mismatch good op-ver3 ""
+mkverrepo ck-ver4 0.1.1; operator op-ver4 "$w/ck-ver4"
+refused ver4 repo-pin-mismatch good op-ver4 ""
+check "version pin: a row with no pins still wants .cancho-rev, and a repository without one builds nothing" sh -c "[ ! -e '$w/co-ver4/steps/chg/ev/work' ]"
 mkrepo ck-nogit; : > /dev/null
 rm -rf "$w/ck-nogit/.git"; operator op-nogit "$w/ck-nogit"
 refused nogit repo-unusable good op-nogit ""
