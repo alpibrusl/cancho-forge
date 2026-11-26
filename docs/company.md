@@ -995,7 +995,8 @@ about it is stored, and removing nothing from the journal removes none of them.
 | `role`, `task_type`, `check`, `contract`, `library`, `gate` | the template's |
 
 **The frame** (design section 4.4). The request is text from outside the company, so a `repo.change` step's input is a fixed preamble saying so, then
-`title: <title>`, then the body of `changes/<id>.txt`, cut with a marker (`\n[cut]`) until it fits the manifest's 16 KiB text limit *as escaped*. It is a
+a line `=== REQUEST ===` (*added 2026-11-26*: the build tool selects code by the names in what follows it, so the preamble's own words, "data" and
+"output" among them, name no declaration of the repository), then `title: <title>`, then the body of `changes/<id>.txt`, cut with a marker (`\n[cut]`) until it fits the manifest's 16 KiB text limit *as escaped*. It is a
 mitigation and not a control: the check, the audit, the gate and the path bounds do not read it, and a model can still follow text that looks like an
 instruction (design section 4.4; the builder has no tools today).
 

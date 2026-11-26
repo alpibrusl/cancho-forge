@@ -122,6 +122,10 @@ fn test_a_short_request_is_framed_whole_with_the_title[&h](heap: &!h Heap) -> [h
         test.assert(len(text) > 100);
         test.assert(bytes.equal(text[len(text) - 15..len(text)], "make it quieter"));
         test.assert(bytes.equal(text[0..20], "The text below is a "));
+        // the request proper (the title and the body) follows a line that is exactly the mark, and the preamble is all before it
+        let tail = "\n=== REQUEST ===\ntitle: noisy output\n\nmake it quieter";
+        test.assert(len(text) > len(tail));
+        test.assert(bytes.equal(text[len(text) - len(tail)..len(text)], tail));
     }
     buffer.drop(heap, f);
     return 0;
