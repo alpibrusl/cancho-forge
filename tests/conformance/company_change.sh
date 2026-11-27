@@ -45,7 +45,7 @@ mkrepo() { # name: a library with a gate that a BROKEN word in src/a.cho fails
 }
 # the operator file: <name> <checkout> [rev] [kind] [max lines]
 operator() {
-  rev=${3:-$REV}; kind=${4:-library}; lines=${5:-20}; pins=; [ -z "${PINS:-}" ] || pins=",\"pins\":$PINS"
+  rev=${3:-$REV}; kind=${4:-library}; lines=${5:-20}; pins=; [ -z "${PINS:-}" ] || pins=",\"pins\":$PINS"; [ -z "${SCRIPTS:-}" ] || pins="$pins,\"script_tests\":$SCRIPTS"
   cat > "$w/$1.json" <<EOT
 {"workers":"$w/workers","tools":"$w/tools","checker":"/opt/cancho/bin/cancho","agent":"stand-in-agent","check_timeout_ms":30000,"build_timeout_ms":10000,
  "repos":{"diff":{"kind":"$kind","checkout":"$2","compiler_rev":"$rev","publish_allow":["src/**","tests/**"],"publish_deny":["src/secret/**"],"max_patch_files":3,"max_patch_lines":$lines$pins}}}
@@ -231,6 +231,16 @@ refused ver3 repo-pin-mismatch good op-ver3 ""
 mkverrepo ck-ver4 0.1.1; operator op-ver4 "$w/ck-ver4"
 refused ver4 repo-pin-mismatch good op-ver4 ""
 check "version pin: a row with no pins still wants .cancho-rev, and a repository without one builds nothing" sh -c "[ ! -e '$w/co-ver4/steps/chg/ev/work' ]"
+# a row with script tests: the tool is told, with a file of three lines the worker wrote; a row without is not
+mkrepo ck-scr; SCRIPTS='{"dir":"tests/conformance","command":"sh $SCRIPT_PATH -p $SCRIPT_NAME","show":["tests/conformance/h.py","tests/conformance/one.py"]}'; operator op-scr "$w/ck-scr"; SCRIPTS=; mkco co-scr "good"
+run "$w/co-scr" "$w/op-scr.json"
+check "script tests: the step is accepted" sh -c "[ \$(cat '$w/rc') = 0 ] && grep -qx 'accepted: chg' '$w/out'"
+check "script tests: the tool is given --script-tests and the file" sh -c "grep -qx 'A:--script-tests' '$w/co-scr/steps/chg/ev/work/args.txt' && grep -qx 'A:$w/co-scr/steps/chg/ev/script.tests' '$w/co-scr/steps/chg/ev/work/args.txt'"
+printf 'tests/conformance\nsh $SCRIPT_PATH -p $SCRIPT_NAME\ntests/conformance/h.py tests/conformance/one.py\n' > "$w/want.scr"
+check "script tests: the file is the directory, the command and the scripts shown" cmp -s "$w/want.scr" "$w/co-scr/steps/chg/ev/script.tests"
+check "script tests: a row without them gives the tool no such option" sh -c "! grep -q 'script-tests' '$w/co-ver/steps/chg/ev/work/args.txt'"
+mkrepo ck-scr2; SCRIPTS='{"dir":"src/x","command":"sh a"}'; operator op-scr2 "$w/ck-scr2"; SCRIPTS=
+refused scr2 operator-invalid good op-scr2 "" 1
 mkrepo ck-nogit; : > /dev/null
 rm -rf "$w/ck-nogit/.git"; operator op-nogit "$w/ck-nogit"
 refused nogit repo-unusable good op-nogit ""

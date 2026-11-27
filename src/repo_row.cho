@@ -12,14 +12,14 @@ import forge.repo_vcs;
 // change may touch. This module is pure: it reads a parsed operator file (`src` and its tape `tp`) and opens nothing.
 //
 //   "repos": { "<id>": { "kind", "checkout", "compiler_rev", "publish_allow", "max_patch_files", "max_patch_lines",
-//                        "slug"?, "branch"?, "pins"?, "publish_deny"?, "authority"?, "compiler"?, "vcs"? } ... }
+//                        "slug"?, "branch"?, "pins"?, "publish_deny"?, "authority"?, "compiler"?, "vcs"?, "script_tests"? } ... }
 //
 // The slice reads the rows it needs and rejects every other key of the autonomy registry (`gate`, `policy`: docs/autonomy.md section 3)
 // as `operator-invalid`, with the `reason:` that `rows_reason` gives. The values are checked again where they are used (the patch
 // bounds by `patch_check`, the paths by `repo_task`, the pin by the change worker), so a row grants nothing a user of it does not allow.
 
 fn row_keys() -> [] &static [byte] {
-    return " slug branch checkout kind compiler_rev pins publish_allow publish_deny max_patch_files max_patch_lines authority compiler vcs ";
+    return " slug branch checkout kind compiler_rev pins publish_allow publish_deny max_patch_files max_patch_lines authority compiler vcs script_tests ";
 }
 
 // The most rows, patterns in a list, and bytes of a pattern.
@@ -449,6 +449,115 @@ fn pins_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
     return ok;
 }
 
+// ---- script tests (docs/company.md section 20; cancho-code docs/repo-patch.md, "Script tests") ------------------------------------------
+//
+//   "script_tests": { "dir": "tests/conformance", "command": "python3 -m unittest discover -s tests/conformance -p $SCRIPT_NAME",
+//                     "show": ["tests/conformance/harness.py"] }
+//
+// A repository whose programs are proven by scripts: a change may add or replace a script of `dir`, and the gate runs it with `command`
+// on the changed tree (it must pass) and, for a bug, on the base (it must fail). The command is the OPERATOR's: it is run by the shell
+// with the authority of the build, so it is where a sandbox goes, and it is never read from the repository or from a model.
+
+fn script_path_ok[&p](path: &p [byte]) -> [] bool {
+    let n = len(path);
+    if n < 7 || n > 160 || !bytes.starts_with(path, "tests/") || int_of(path[n - 1]) == 47 {
+        return false;
+    }
+    var i = 0;
+    var ok = true;
+    while i < n {
+        let c = int_of(path[i]);
+        if !(c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 95 || c == 45 || c == 46 || c == 47) {
+            ok = false;
+        }
+        // no empty, hidden or `..` component
+        if c == 47 && i + 1 < n && (int_of(path[i + 1]) == 47 || int_of(path[i + 1]) == 46) {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    return ok;
+}
+
+// The directory of the scripts: a plain relative path under `tests/`.
+pub fn script_dir_ok[&p](dir: &p [byte]) -> [] bool {
+    return script_path_ok(dir);
+}
+
+// The command that runs one script: 1 to 512 printable ASCII bytes with no quote of either kind and no backslash, so that it can be
+// handed on between single quotes and is a JSON string with nothing to escape.
+pub fn script_command_ok[&c](command: &c [byte]) -> [] bool {
+    let n = len(command);
+    if n < 1 || n > 512 {
+        return false;
+    }
+    var i = 0;
+    var ok = true;
+    while i < n {
+        let c = int_of(command[i]);
+        if c < 32 || c > 126 || c == 39 || c == 34 || c == 92 {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    return ok;
+}
+
+// A script that is always shown: a plain path under the directory.
+pub fn script_show_ok[&p, &d](path: &p [byte], dir: &d [byte]) -> [] bool {
+    return script_path_ok(path) && len(path) > len(dir) + 1 && bytes.starts_with(path, dir) && int_of(path[len(dir)]) == 47;
+}
+
+// The scripts always shown, as the task carries them: paths under `dir` with one space between, or nothing.
+pub fn script_shown_ok[&p, &d](show: &p [byte], dir: &d [byte]) -> [] bool {
+    var i = 0;
+    var ok = true;
+    while i < len(show) {
+        var e = i;
+        while e < len(show) && int_of(show[e]) != 32 {
+            e = e + 1;
+        }
+        if !script_show_ok(show[i..e], dir) {
+            ok = false;
+        }
+        i = e + 1;
+    }
+    return ok && (len(show) == 0 || int_of(show[len(show) - 1]) != 32);
+}
+
+fn script_tests_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
+    if !json.is_object(tp, node) || !keys_ok(src, tp, node, " dir command show ") {
+        return false;
+    }
+    let dir = json.get(src, tp, node, "dir");
+    let command = json.get(src, tp, node, "command");
+    if dir < 0 || command < 0 || !plain(tp, dir) || !plain(tp, command) {
+        return false;
+    }
+    if !script_dir_ok(json.string_view(src, tp, dir)) || !script_command_ok(json.string_view(src, tp, command)) {
+        return false;
+    }
+    let show = json.get(src, tp, node, "show");
+    if show < 0 {
+        return true;
+    }
+    if !json.is_array(tp, show) || json.count(tp, show) > 8 {
+        return false;
+    }
+    let n = json.count(tp, show);
+    var k = show + 1;
+    var j = 0;
+    var ok = true;
+    while j < n {
+        if !plain(tp, k) || !script_show_ok(json.string_view(src, tp, k), json.string_view(src, tp, dir)) {
+            ok = false;
+        }
+        k = json.skip(tp, k);
+        j = j + 1;
+    }
+    return ok;
+}
+
 fn count_ok[&s, &t](src: &s [byte], tp: &t [int], node: int, hi: int) -> [] bool {
     if !json.is_int(tp, node) || !json.fits_int(src, tp, node) {
         return false;
@@ -572,6 +681,10 @@ fn row_reason[&s, &t](src: &s [byte], tp: &t [int], row: int) -> [] &static [byt
     let pins = json.get(src, tp, row, "pins");
     if pins >= 0 && !pins_ok(src, tp, pins) {
         return "repos: pins is not 1 to 4 of .cancho-rev, cancho.toml, cancho.toml=<version of digits and dots>";
+    }
+    let scripts = json.get(src, tp, row, "script_tests");
+    if scripts >= 0 && !script_tests_ok(src, tp, scripts) {
+        return "repos: script_tests is not {dir: a path under tests/, command: 1 to 512 printable bytes with no quote and no backslash, show?: up to 8 paths under dir}";
     }
     let authority = json.get(src, tp, row, "authority");
     let compiler = json.get(src, tp, row, "compiler");

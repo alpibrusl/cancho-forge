@@ -1187,3 +1187,25 @@ A reviewer's `repo.review` step needs exactly one `repo.change` step and is advi
 
 The first slice does not write a `company.step.reviewed` record (the design of review-step.md section 6 point 3 named one): the verdict is in `review.json`, whose digest the accepted record carries, and `status` shows the step accepted.
 
+## 20. Script tests of a repository
+
+*Added 2026-11-27. Of nine small defects found on the gateway and cancho-tools, six could not be given to a `repo.change` step: what was wrong sat in a program's `main` or needed real files, and those repositories prove such things with scripts (cancho-tools: `tests/conformance/*.py`), which the build tool could neither write nor run.*
+
+A row of the operator file's `repos` may say that its repository has script tests:
+
+```json
+"script_tests": { "dir": "tests/conformance",
+                  "command": "/abs/path/script-test.sh conformance $SCRIPT_NAME",
+                  "show": ["tests/conformance/harness.py"] }
+```
+
+* `dir`: the directory of the scripts, a plain path under `tests/`.
+* `command`: how one script is run, in the root of a built copy, with `$SCRIPT_PATH` and `$SCRIPT_NAME` set. 1 to 512 printable bytes with no quote of either kind and no backslash (a command that needs more is a script of the operator's, named here).
+* `show` (optional): up to 8 scripts of `dir` the model is always shown.
+
+Any other shape is `operator-invalid`. The change worker checks the three texts again, writes them as the three lines of `<ev>/script.tests` and gives the build tool `--script-tests <ev>/script.tests`; what the tool does with it is cancho-code's `docs/repo-patch.md`, "Script tests": a change may add or replace a script, which must pass on the changed tree and, for a bug, fail on the base. A row without the key gives the tool no such option, and everything is as it was.
+
+**The command is the operator's because it runs what a model wrote.** A cancho test is held by the compiler's effects; a script is not. Forge adds no sandbox: the command is where one goes. The publish bounds are unchanged, so a script outside `publish_allow` is refused like any other path, and the step's own check should run the script again (the build tool's word that it passed is a worker's claim).
+
+**Measured once** (the pilot company, cancho-tools issue 69, `claude-haiku-5-5`, the command a `sandbox-exec` wrapper that allows no network, no writing outside the copy and the temporary directory, and no reading of the home's hidden directories): accepted on the second attempt in 131 seconds; the first run of the step was `change-stuck` after four attempts because the worker's bare environment found a Python without the package the harness imports, which the wrapper now says for itself.
+

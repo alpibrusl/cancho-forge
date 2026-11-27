@@ -388,3 +388,43 @@ fn test_only_a_version_of_digits_and_dots_is_a_pin_name() -> [] int {
     test.assert_eq(flag(repo_row.pin_name_ok("cancho.toml=000000000000000000000000000000001")), 0);
     return 0;
 }
+
+// A row may say its repository has script tests (docs/company.md section 20): where, how one is run, which are always shown.
+fn test_a_row_with_script_tests_is_a_directory_under_tests_a_command_and_scripts_of_it[&h](heap: &!h Heap) -> [heap] int {
+    let k = "\"max_patch_lines\":800";
+    test.assert_eq(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/conformance\",\"command\":\"python3 -m unittest discover -s tests/conformance -p $SCRIPT_NAME\"}")), 0);
+    test.assert_eq(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/conformance\",\"command\":\"sh $SCRIPT_PATH\",\"show\":[\"tests/conformance/harness.py\"]}")), 0);
+    // not under tests/, tests itself, a hidden part, .., a / at the end
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"src/x\",\"command\":\"sh $SCRIPT_PATH\"}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/\",\"command\":\"sh $SCRIPT_PATH\"}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/.x\",\"command\":\"sh $SCRIPT_PATH\"}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/../x\",\"command\":\"sh $SCRIPT_PATH\"}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/x/\",\"command\":\"sh $SCRIPT_PATH\"}")) > 0);
+    // no command, a command with a quote, a key it does not know, a shown script of another directory, not an object
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/x\"}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/x\",\"command\":\"\"}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/x\",\"command\":\"sh 'a'\"}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/x\",\"command\":\"sh a\",\"more\":1}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/x\",\"command\":\"sh a\",\"show\":[\"tests/y/a.py\"]}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":{\"dir\":\"tests/x\",\"command\":\"sh a\",\"show\":[\"tests/x\"]}")) > 0);
+    test.assert(len(replaced(heap, k, "\"max_patch_lines\":800,\"script_tests\":[\"tests/x\",\"sh a\"]")) > 0);
+    return 0;
+}
+
+fn test_the_texts_of_script_tests_are_safe_between_single_quotes() -> [] int {
+    test.assert_eq(flag(repo_row.script_command_ok("python3 -W ignore -m unittest discover -s tests/conformance -p $SCRIPT_NAME")), 1);
+    test.assert_eq(flag(repo_row.script_command_ok("sh 'x'")), 0);
+    test.assert_eq(flag(repo_row.script_command_ok("sh \"x\"")), 0);
+    test.assert_eq(flag(repo_row.script_command_ok("sh x\\y")), 0);
+    test.assert_eq(flag(repo_row.script_command_ok("sh x\ny")), 0);
+    test.assert_eq(flag(repo_row.script_command_ok("")), 0);
+    test.assert_eq(flag(repo_row.script_dir_ok("tests/conformance")), 1);
+    test.assert_eq(flag(repo_row.script_dir_ok("tests/a b")), 0);
+    test.assert_eq(flag(repo_row.script_dir_ok("tests/a'b")), 0);
+    test.assert_eq(flag(repo_row.script_shown_ok("", "tests/x")), 1);
+    test.assert_eq(flag(repo_row.script_shown_ok("tests/x/a.py tests/x/b.py", "tests/x")), 1);
+    test.assert_eq(flag(repo_row.script_shown_ok("tests/x/a.py tests/y/b.py", "tests/x")), 0);
+    test.assert_eq(flag(repo_row.script_shown_ok("tests/x/a.py ", "tests/x")), 0);
+    test.assert_eq(flag(repo_row.script_shown_ok("tests/xy/a.py", "tests/x")), 0);
+    return 0;
+}
