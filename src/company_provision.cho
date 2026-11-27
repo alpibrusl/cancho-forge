@@ -3,7 +3,7 @@ module forge.company_provision;
 
 import std.dirs;
 
-// The provisioner (docs/company-lifecycle.md section 3, docs/company.md section 20): a step that did not exist when the operator prepared the company
+// The provisioner (docs/company-lifecycle.md section 3, docs/company.md section 29): a step that did not exist when the operator prepared the company
 // has no `steps/<id>/ev`, and a worker step needs it. For a DERIVED step (src/company_derive.cho) Forge makes it: `steps/<id>` and `steps/<id>/ev`
 // beneath the company directory, one `mkdirat` each (`dir_mkdir`, edition 9), mode 0755 under the umask, never through a link and never replacing
 // anything (a name that exists is `EEXIST`, which is fine for a directory that is already there and is checked after).

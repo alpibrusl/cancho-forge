@@ -288,7 +288,7 @@ pub fn build_script[&h, &t, &e, &k, &a, &c, &p, &m, &y](heap: &!h Heap, tools: &
     return b;
 }
 
-// The script tests of the row (docs/company.md section 20), for the tool: `<ev>/script.tests`, three lines (the directory, the command, the
+// The script tests of the row (docs/company.md section 29), for the tool: `<ev>/script.tests`, three lines (the directory, the command, the
 // scripts always shown). Each text has passed `repo_row`'s checks, so none holds a quote and each goes between single quotes.
 pub fn scripts_file_script[&h, &e, &d, &c, &s](heap: &!h Heap, ev: &e [byte], dir: &d [byte], command: &c [byte], show: &s [byte]) -> [heap] buffer.Buffer {
     var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 256), "printf '%s\\n' '"), dir, "' '", command);

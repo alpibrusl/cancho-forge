@@ -1187,7 +1187,7 @@ A reviewer's `repo.review` step needs exactly one `repo.change` step and is advi
 
 The first slice does not write a `company.step.reviewed` record (the design of review-step.md section 6 point 3 named one): the verdict is in `review.json`, whose digest the accepted record carries, and `status` shows the step accepted.
 
-## 20. Script tests of a repository
+## 29. Script tests of a repository
 
 *Added 2026-11-27. Of nine small defects found on the gateway and cancho-tools, six could not be given to a `repo.change` step: what was wrong sat in a program's `main` or needed real files, and those repositories prove such things with scripts (cancho-tools: `tests/conformance/*.py`), which the build tool could neither write nor run.*
 

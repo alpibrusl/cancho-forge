@@ -449,7 +449,7 @@ fn pins_ok[&s, &t](src: &s [byte], tp: &t [int], node: int) -> [] bool {
     return ok;
 }
 
-// ---- script tests (docs/company.md section 20; cancho-code docs/repo-patch.md, "Script tests") ------------------------------------------
+// ---- script tests (docs/company.md section 29; cancho-code docs/repo-patch.md, "Script tests") ------------------------------------------
 //
 //   "script_tests": { "dir": "tests/conformance", "command": "python3 -m unittest discover -s tests/conformance -p $SCRIPT_NAME",
 //                     "show": ["tests/conformance/harness.py"] }
