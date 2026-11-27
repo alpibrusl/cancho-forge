@@ -127,6 +127,17 @@ fn test_the_shell_texts_hold_only_paths_and_closed_words[&h](heap: &!h Heap) -> 
         test.assert(bytes.equal(buffer.bytes(bb), "exec 2>&1; rm -rf /ev/work; cd /ev || exit 2; exec /t/cancho-build --repo /ev/base --change /ev/change.txt --kind bug --checker /c/cancho --work /ev/work --agent 'stand-in-agent' --provider stand --model m1"));
     }
     buffer.drop(heap, b);
+    let sf = repo_task.scripts_file_script(heap, "/ev", "tests/conformance", "sh $SCRIPT_PATH", "tests/conformance/h.py");
+    borrow sf as &sfb in {
+        test.assert(bytes.equal(buffer.bytes(sfb), "printf '%s\\n' 'tests/conformance' 'sh $SCRIPT_PATH' 'tests/conformance/h.py' > /ev/script.tests"));
+    }
+    buffer.drop(heap, sf);
+    let b3 = repo_task.with_script_tests(heap, repo_task.build_script(heap, "/t", "/ev", "/c/cancho", "a", "bug", "p", "m", 0, 0), "/ev");
+    borrow b3 as &bb3 in {
+        let t3 = buffer.bytes(bb3);
+        test.assert(bytes.equal(t3[len(t3) - 32..len(t3)], " --script-tests /ev/script.tests"));
+    }
+    buffer.drop(heap, b3);
     let b2 = repo_task.build_script(heap, "/t", "/ev", "/c/cancho", "a", "feature", "p", "m", 3, 90);
     borrow b2 as &bb2 in {
         let t2 = buffer.bytes(bb2);
@@ -161,7 +172,7 @@ fn test_the_request_is_json_with_the_checkout_in_grants_and_not_in_the_input[&h]
     let tape0 = box_slice(heap, json.tape_len(pins), 0);
     borrow mut tape0 as &!tw0 in {
         test.assert(json.parse(pins, contents(tw0)) > 0);
-        let req = repo_task.request(heap, "change-1-1", 1, "change-1", "diff", "bug", "stand", "m1", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", pins, contents(tw0), 0, 3, 0, 10000, 1048576, "/ev", "/ck", "/t", "/c/cancho", "stand-in-agent", repo_vcs.git());
+        let req = repo_task.request(heap, "change-1-1", 1, "change-1", "diff", "bug", "stand", "m1", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", pins, contents(tw0), 0, 0 - 1, 3, 0, 10000, 1048576, "/ev", "/ck", "/t", "/c/cancho", "stand-in-agent", repo_vcs.git());
         borrow req as &rb in {
             let src = buffer.bytes(rb);
             let tape = box_slice(heap, json.tape_len(src), 0);
@@ -184,7 +195,7 @@ fn test_the_request_is_json_with_the_checkout_in_grants_and_not_in_the_input[&h]
             unbox_slice(heap, tape);
         }
         buffer.drop(heap, req);
-        let other = repo_task.request(heap, "change-1-1", 1, "change-1", "diff", "bug", "stand", "m1", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", pins, contents(tw0), 0, 3, 0, 10000, 1048576, "/ev", "/ck", "/t", "/c/cancho", "stand-in-agent", repo_vcs.cancho());
+        let other = repo_task.request(heap, "change-1-1", 1, "change-1", "diff", "bug", "stand", "m1", "f4ead824f33b291a0ad7620a34a0c1346a7abe4f", pins, contents(tw0), 0, 0 - 1, 3, 0, 10000, 1048576, "/ev", "/ck", "/t", "/c/cancho", "stand-in-agent", repo_vcs.cancho());
         borrow other as &ob in {
             test.assert(bytes.find(buffer.bytes(ob), "\"agent_seconds\":0,\"vcs\":\"cancho\"}") >= 0);
         }

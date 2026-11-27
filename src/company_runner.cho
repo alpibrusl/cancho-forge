@@ -830,7 +830,7 @@ fn change_run[&h, &f, &x, &c, &i, &m, &d, &j, &s, &t, &r, &e, &w](heap: &!h Heap
     let rev = repo_row.field_text(op, tp, row, "compiler_rev");
     let pins = json.get(op, tp, row, "pins");
     let bt = company_step.op_ms(op, tp, "build_timeout_ms", step_run.build_spec().timeout);
-    let (ran, worker_code) = repo_call.run_step(heap, fs, exec, clock, io, bt, stepdir, workers, repo, kind, company_manifest.provider_of(hm), company_manifest.model_of(hm), rev, op, tp, pins, company_step.op_int(op, tp, "attempts", 0), company_step.op_int(op, tp, "agent_seconds", 0), repo_row.field_text(op, tp, row, "checkout"), company_step.op_text(op, tp, "tools"), company_step.op_text(op, tp, "checker"), company_step.op_text(op, tp, "agent"), evdir, repo_row.vcs_kind(op, tp, row));
+    let (ran, worker_code) = repo_call.run_step(heap, fs, exec, clock, io, bt, stepdir, workers, repo, kind, company_manifest.provider_of(hm), company_manifest.model_of(hm), rev, op, tp, pins, json.get(op, tp, row, "script_tests"), company_step.op_int(op, tp, "attempts", 0), company_step.op_int(op, tp, "agent_seconds", 0), repo_row.field_text(op, tp, row, "checkout"), company_step.op_text(op, tp, "tools"), company_step.op_text(op, tp, "checker"), company_step.op_text(op, tp, "agent"), evdir, repo_row.vcs_kind(op, tp, row));
     // What the build spent is recorded whatever its ending.
     let (spent_code, after_seq) = company_run_io.record_spend(heap, fs, io, jpath, id, evdir, prices, before, before_cost, next);
     if spent_code != 0 {

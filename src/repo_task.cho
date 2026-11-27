@@ -288,6 +288,53 @@ pub fn build_script[&h, &t, &e, &k, &a, &c, &p, &m, &y](heap: &!h Heap, tools: &
     return b;
 }
 
+// The script tests of the row (docs/company.md section 29), for the tool: `<ev>/script.tests`, three lines (the directory, the command, the
+// scripts always shown). Each text has passed `repo_row`'s checks, so none holds a quote and each goes between single quotes.
+pub fn scripts_file_script[&h, &e, &d, &c, &s](heap: &!h Heap, ev: &e [byte], dir: &d [byte], command: &c [byte], show: &s [byte]) -> [heap] buffer.Buffer {
+    var b = cat3(heap, buffer.append(heap, buffer.empty(heap, 256), "printf '%s\\n' '"), dir, "' '", command);
+    b = cat3(heap, b, "' '", show, "' > ");
+    b = buffer.append(heap, b, ev);
+    return buffer.append(heap, b, "/script.tests");
+}
+
+// `build_script` with the script tests the worker wrote to `<ev>/script.tests`.
+pub fn with_script_tests[&h, &e](heap: &!h Heap, script: buffer.Buffer, ev: &e [byte]) -> [heap] buffer.Buffer {
+    return cat3(heap, script, " --script-tests ", ev, "/script.tests");
+}
+
+// The script tests of a row (`scripts` is a node of `src`, or -1) written as the object the task carries: `show` is one text, the paths
+// with one space between.
+fn put_scripts[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tp: &t [int], scripts: int) -> [heap] json.Writer {
+    var x = json.begin_object(heap, w);
+    x = json.put_key(heap, x, "dir");
+    x = json.put_string(heap, x, repo_row.field_text(src, tp, scripts, "dir"));
+    x = json.put_key(heap, x, "command");
+    x = json.put_string(heap, x, repo_row.field_text(src, tp, scripts, "command"));
+    var all = buffer.empty(heap, 64);
+    let show = json.get(src, tp, scripts, "show");
+    if show >= 0 && json.is_array(tp, show) {
+        let n = json.count(tp, show);
+        var k = show + 1;
+        var j = 0;
+        while j < n {
+            if json.is_string(tp, k) && json.string_plain(tp, k) {
+                if j > 0 {
+                    all = buffer.push(heap, all, byte_of(32));
+                }
+                all = buffer.append(heap, all, json.string_view(src, tp, k));
+            }
+            k = json.skip(tp, k);
+            j = j + 1;
+        }
+    }
+    x = json.put_key(heap, x, "show");
+    borrow all as &ab in {
+        x = json.put_string(heap, x, buffer.bytes(ab));
+    }
+    buffer.drop(heap, all);
+    return json.end_object(heap, x);
+}
+
 // Take the tool's patch (and its usage log, when it left one) out of its work directory as plain regular files of ours: a link of the
 // tool's making is not followed (exit 1 for a patch that is not a regular file there, 2 for a copy that failed).
 pub fn collect_script[&h, &e](heap: &!h Heap, ev: &e [byte]) -> [heap] buffer.Buffer {
@@ -381,7 +428,7 @@ fn put_pins[&h, &s, &t](heap: &!h Heap, w: json.Writer, src: &s [byte], tp: &t [
 
 // The `execute` request of a `repo.change` task. The pins are a node of `src` (the operator file) or -1. The checkout, the tools directory,
 // the checker and the agent are in `grants`, never in `task.input`.
-pub fn request[&h, &r, &k, &i, &c, &p, &m, &v, &e, &o, &t, &x, &a, &s, &u](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &k [byte], repo: &i [byte], kind: &c [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, attempts: int, agent_seconds: int, timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], checkout: &o [byte], tools_dir: &t [byte], checker: &x [byte], agent: &a [byte], vcs: int) -> [heap] buffer.Buffer {
+pub fn request[&h, &r, &k, &i, &c, &p, &m, &v, &e, &o, &t, &x, &a, &s, &u](heap: &!h Heap, request_id: &r [byte], attempt: int, task_id_text: &k [byte], repo: &i [byte], kind: &c [byte], provider: &p [byte], model: &m [byte], rev: &v [byte], src: &s [byte], tp: &u [int], pins: int, scripts: int, attempts: int, agent_seconds: int, timeout_ms: int, max_output_bytes: int, execution_dir: &e [byte], checkout: &o [byte], tools_dir: &t [byte], checker: &x [byte], agent: &a [byte], vcs: int) -> [heap] buffer.Buffer {
     var w = json.writer(heap, 512);
     w = json.begin_object(heap, w);
     w = json.put_key(heap, w, "contract");
@@ -412,6 +459,10 @@ pub fn request[&h, &r, &k, &i, &c, &p, &m, &v, &e, &o, &t, &x, &a, &s, &u](heap:
     w = json.put_string(heap, w, rev);
     w = json.put_key(heap, w, "pins");
     w = put_pins(heap, w, src, tp, pins);
+    if scripts >= 0 {
+        w = json.put_key(heap, w, "script_tests");
+        w = put_scripts(heap, w, src, tp, scripts);
+    }
     w = json.put_key(heap, w, "attempts");
     w = json.put_int(heap, w, attempts);
     w = json.put_key(heap, w, "agent_seconds");

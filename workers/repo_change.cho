@@ -145,6 +145,14 @@ fn text_of[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] &s [byte] {
     return src[0..0];
 }
 
+// The plain text of the member `name` of the object at `node`, or nothing (also when there is no such object).
+fn member_text[&s, &t](src: &s [byte], tape: &t [int], node: int, name: &static [byte]) -> [] &s [byte] {
+    if node < 0 || !json.is_object(tape, node) {
+        return src[0..0];
+    }
+    return text_of(src, tape, json.get(src, tape, node, name));
+}
+
 fn int_of_node[&s, &t](src: &s [byte], tape: &t [int], node: int) -> [] int {
     if node >= 0 && json.is_int(tape, node) && json.fits_int(src, tape, node) {
         return json.to_int(src, tape, node);
@@ -396,6 +404,14 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, 
     let rev = text_of(src, tp, json.get(src, tp, input, "compiler_rev"));
     let vcs = vcs_of(src, tp, input);
     let pins = json.get(src, tp, input, "pins");
+    // the script tests of the row, checked again here: the texts go into a shell script
+    let scripts = json.get(src, tp, input, "script_tests");
+    var sdir = member_text(src, tp, scripts, "dir");
+    let scmd = member_text(src, tp, scripts, "command");
+    let sshow = member_text(src, tp, scripts, "show");
+    if !repo_row.script_dir_ok(sdir) || !repo_row.script_command_ok(scmd) || !repo_row.script_shown_ok(sshow, sdir) {
+        sdir = src[0..0];
+    }
     var attempts = int_of_node(src, tp, json.get(src, tp, input, "attempts"));
     var agent_seconds = int_of_node(src, tp, json.get(src, tp, input, "agent_seconds"));
     if attempts < 0 {
@@ -479,7 +495,20 @@ fn execute_task[&h, &i, &f, &c, &x, &r, &k, &s, &t](heap: &!h Heap, io: &!i Io, 
             if remaining < 1 {
                 remaining = 1;
             }
-            let bs = repo_task.build_script(heap, tools, ev, checker, agent, kind, provider, model, attempts, agent_seconds);
+            var bs = repo_task.build_script(heap, tools, ev, checker, agent, kind, provider, model, attempts, agent_seconds);
+            if len(sdir) > 0 {
+                let sf = repo_task.scripts_file_script(heap, ev, sdir, scmd, sshow);
+                var wrote = 0 - 1;
+                borrow sf as &sfb in {
+                    let (status, out) = sh(heap, exec, clock, buffer.bytes(sfb), buffer.bytes(eb), 4096, 10000);
+                    buffer.drop(heap, out);
+                    wrote = status;
+                }
+                buffer.drop(heap, sf);
+                if wrote == 0 {
+                    bs = repo_task.with_script_tests(heap, bs, ev);
+                }
+            }
             borrow bs as &bsb in {
                 let (status, out) = sh(heap, exec, clock, buffer.bytes(bsb), buffer.bytes(eb), log_cap(), remaining);
                 buffer.drop(heap, log);
