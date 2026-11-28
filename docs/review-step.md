@@ -155,6 +155,10 @@ Tags *(designed)*: `review-step-invalid`, `review-not-granted`, `review-diff-too
   builder to produce (`publish_allow`/`publish_deny` bound it before the review sees it) and the brief it was given. **That is still the diff leaving the machine to a third party**; it is a grant the operator
   makes in `review`, and without it there is no call.
 
+## 9a. A review in a flow *(corrected 2026-11-28)*
+
+The first `repo.review` step that ran in a flow (the pilot company, a gateway bug, Haiku) showed two things no case had: (1) its `company.step.reviewed` record made the journal **`event-malformed` for every verb afterwards**. `company_derive.load` replays the journal against the manifest's own steps before it derives a change's steps, and the record named a step that was not there yet, which the replay counted as malformed, so nothing was derived again. The record of a step of a change the journal holds is now read on the replay with the derived steps (`tests/company_state_test.cho`, `test_a_review_of_a_step_of_a_change_waits_for_the_derived_steps`); one of a step of no change is still malformed. (2) `max_tokens` 2048 was too few for Haiku: the reply was cut and the step held as `review-unavailable` after the call was charged; 8192, the ceiling, gave a whole verdict in 1,654 output tokens. Also, the key file's path may have no hidden component (`gate_task.path_ok`), so a key under `~/.config` has to be named by a link.
+
 ## 10. Open questions
 
 1. **Does a held review (`check-unavailable`) block the company from being done?** Proposed: yes, as any step; the operator leaves the step out of the flow when they do not want the dependence.

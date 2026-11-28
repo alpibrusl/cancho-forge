@@ -508,6 +508,15 @@ fn bump[&h, &k](heap: &!h Heap, ledger: map.Map[int], key: &k [byte], add: int) 
     return map.put(heap, ledger, key, clamp_add(now, add));
 }
 
+// The part of a step id before its first dot (all of it when it has none): the change a derived step's id names.
+fn change_part[&i](id: &i [byte]) -> [] &i [byte] {
+    var k = 0;
+    while k < len(id) && int_of(id[k]) != 46 {
+        k = k + 1;
+    }
+    return id[0..k];
+}
+
 // The change a derived step belongs to: its id up to the first dot (`chg-0007.fix` is of `chg-0007`), or empty for a step of the manifest's own.
 fn change_of_step[&m](man: &m company_manifest.Manifest, at: int) -> [] &m [byte] {
     let id = company_manifest.step_id(man, company_manifest.step_at(man, at));
@@ -669,8 +678,18 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &y, &x](heap: &!h Heap, line: &l [byte], ex
                         }
                     }
                     let at = company_graph.index_of(man, id);
-                    if named == false || code == 0 || json.is_string(tp, json.get(line, tp, 0, "model")) == false || at < 0 || at >= len(reviews) / 2 {
+                    // A step derived from a change's flow (`chg-0001.review`) is not among the steps while the journal is first replayed against
+                    // the manifest's own (`company_derive.load`): a record of one is not malformed then, and is read on the replay after it.
+                    var later = false;
+                    if at < 0 && company_manifest.step_count(man) == company_manifest.own_step_count(man) {
+                        borrow cs as &cb in {
+                            later = change_state_in(cb, change_part(id)) != 0;
+                        }
+                    }
+                    if named == false || code == 0 || json.is_string(tp, json.get(line, tp, 0, "model")) == false || (at < 0 || at >= len(reviews) / 2) && !later {
                         rule = bad;
+                    } else if later {
+                        // read on the replay with the derived steps
                     } else {
                         reviews[2 * at] = code;
                         reviews[2 * at + 1] = items;
