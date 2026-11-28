@@ -942,6 +942,9 @@ replays the journal as `decide` does. Refusals, exit 1 and nothing written: `rep
 copied to `changes/<id>.txt` **before** the journal is touched (an I/O error is exit 3; a stray request file with no record is harmless), and the
 journal holds its SHA-256 and byte length, never the text. The source is `operator`, its reference the OS user as `decide` records it. A `bug` and a
 `compiler-bump` are admitted by the act (a second record in the same write); a `feature` and a `feedback` stay proposed until an `admit:` decision.
+An optional `url=<issue URL>` (section 30) names the GitHub issue the change answers: a URL not of the form `https://github.com/<owner>/<name>/issues/<n>`
+is `change-malformed`, a URL some change already holds is `change-duplicate`, and the record gains the field `issue` (the source stays `operator` and
+admission is unchanged), so that `forge company intake` does not file that issue again.
 Justification by kind: `bug` `defect`; `compiler-bump` `maintenance`; `feature` and `feedback` `operator` or `goal:<id>` (`goals.json` does not
 exist yet, so only the shape of the id is checked).
 
@@ -1264,8 +1267,8 @@ hold, so the operator names one file per call (one `gh issue list` per repositor
 the body hash with an *open* change; the code compares the URL with *any* change from an issue, open or not, so an edited issue is not filed
 again (a person files it with `change add` if it should be). (3) The journal records the URL, not the issue's number or author. (4) Nothing
 writes a request in the form the cancho-code selection reads best (names in backticks): the body is the issue's as it was written, and how
-well such requests build is not measured yet. (5) Only a change *from an issue* is known by its URL: a change the operator filed by hand with
-`change add` for the same issue has no URL in the journal, so intake files that issue again. Seen on 2026-11-28 on a copy of the pilot company,
-whose `chg-0001` is gateway issue 71 filed by hand: an intake of that issue, marked open for the test, filed it a second time. A company that
-moves to intake should file through intake only, or close the issues it filed by hand.
+well such requests build is not measured yet. (5) A change the operator files by hand is known by its URL only when `change add` was given `url=` (section 17). Without it the journal holds no
+URL and intake files that issue again. Seen on 2026-11-28 on a copy of the pilot company, whose `chg-0001` is gateway issue 71 filed by hand before
+`url=` existed: an intake of that issue, marked open for the test, filed it a second time. A record cannot be amended, so a journal from before
+`url=` keeps the gap for its old changes; their issues being closed is what keeps intake from filing them.
 

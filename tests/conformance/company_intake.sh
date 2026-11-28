@@ -148,4 +148,23 @@ has "what was filed before the limit stays" "issue $U/a/diff/issues/1 filed as c
 has "the rest are counted as left" "left: 2 issues of the file, for a later intake"
 check "nothing after the limit was filed" sh -c "! grep -q 'issues/3\|issues/4' '$c2/company.journal'"
 
+# `change add ... url=`: the operator files an issue by hand; intake then knows it, and a second hand filing of it is refused
+c3="$w/c3"
+mkdir -p "$c3/changes" || exit 1
+cp "$co/company.json" "$c3/company.json"
+printf 'by hand' > "$w/hand.txt"
+"$F" company change add "$c3" repo=diff kind=bug justification=defect "title=by hand" "file=$w/hand.txt" "url=$U/a/diff/pull/1" > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "change add with a url= that is not an issue URL is change-malformed" 1 "refusal: change-malformed"
+check "the refused url= wrote nothing" sh -c "[ ! -e '$c3/company.journal' ]"
+"$F" company change add "$c3" repo=diff kind=bug justification=defect "title=by hand" "file=$w/hand.txt" "url=$U/a/diff/issues/1" "url=$U/a/diff/issues/2" > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "url= twice is usage, exit 2" 2 ""
+"$F" company change add "$c3" repo=diff kind=bug justification=defect "title=by hand" "file=$w/hand.txt" "url=$U/a/diff/issues/1" now=2026-11-28 > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "change add with url= files the operator's bug and admits it" 0 "change chg-0001: admitted"
+check "the journal holds the URL as issue, the source still operator" sh -c "grep 'chg-0001' '$c3/company.journal' | grep -q '\"source_type\":\"operator\".*\"issue\":\"$U/a/diff/issues/1\"'"
+"$F" company change add "$c3" repo=diff kind=bug justification=defect "title=again" "file=$w/hand.txt" "url=$U/a/diff/issues/1" > "$w/out" 2>&1; echo $? > "$w/rc"
+expect "a second change add of the same url= is change-duplicate" 1 "refusal: change-duplicate"
+run "$c3" "$w/op.json" "$w/issues.json" "now=2026-11-28"
+has "intake skips the issue filed by hand with url=" "issue $U/a/diff/issues/1 skipped: change-duplicate"
+has "intake files the others" "issue $U/a/api/issues/2 filed as change chg-0002: proposed"
+
 exit "$fail"
