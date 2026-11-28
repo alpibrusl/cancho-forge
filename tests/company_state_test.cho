@@ -1090,6 +1090,38 @@ fn test_a_reviewed_record_replays_as_the_steps_verdict[&h](heap: &!h Heap) -> [h
     return 0;
 }
 
+// A review of a step derived from a change's flow is in the journal before that step is among the manifest's: the first replay of
+// `company_derive.load` is against the manifest's own steps, and found it malformed, so nothing was derived and every verb refused the
+// company from then on (measured on the pilot company, 2026-11-28). It is read on the replay with the derived steps instead. A review
+// of a step of no change the journal holds is still malformed.
+fn test_a_review_of_a_step_of_a_change_waits_for_the_derived_steps[&h](heap: &!h Heap) -> [heap] int {
+    let sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.change_proposed(heap, 1, "chg-0001", "diff", "bug", "operator", "unknown", "a title", sha, 12, "defect"));
+    j = add(heap, j, company_state.change_admitted(heap, 2, "chg-0001"));
+    j = add(heap, j, company_state.reviewed(heap, 3, "chg-0001.review", "concerns", 3, "m1"));
+    borrow j as &jb in {
+        test.assert_eq(probe_of(heap, buffer.bytes(jb)).rule, 0);
+    }
+    buffer.drop(heap, j);
+    var k = buffer.empty(heap, 512);
+    k = add(heap, k, company_state.change_proposed(heap, 1, "chg-0001", "diff", "bug", "operator", "unknown", "a title", sha, 12, "defect"));
+    k = add(heap, k, company_state.reviewed(heap, 2, "chg-0002.review", "concerns", 3, "m1"));
+    borrow k as &kb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(kb)), "event-malformed"));
+    }
+    buffer.drop(heap, k);
+    // the shape is still checked first
+    var m = buffer.empty(heap, 512);
+    m = add(heap, m, company_state.change_proposed(heap, 1, "chg-0001", "diff", "bug", "operator", "unknown", "a title", sha, 12, "defect"));
+    m = add(heap, m, company_state.reviewed(heap, 2, "chg-0001.review", "approve", 2, "m1"));
+    borrow m as &mb in {
+        test.assert(bytes.equal(rule_name_of(heap, buffer.bytes(mb)), "event-malformed"));
+    }
+    buffer.drop(heap, m);
+    return 0;
+}
+
 fn test_a_reviewed_record_that_contradicts_itself_is_event_malformed[&h](heap: &!h Heap) -> [heap] int {
     var a = buffer.empty(heap, 256);
     a = add(heap, a, company_state.reviewed(heap, 1, "a", "approve", 2, "m"));

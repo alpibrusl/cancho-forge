@@ -177,10 +177,12 @@ pub fn trailer_ok[&p](text: &p [byte]) -> [] bool {
     return true;
 }
 
-// The repositories a publish may write to: the gate runner's allow-list and `alpibrusl/cancho-diff`, which the gate runner has no
-// row for yet (it has no `scripts/gate.sh`). They should be one list (docs/autonomy.md, section 3).
+// The repositories a publish may write to: the gate runner's allow-list, `alpibrusl/cancho-diff`, which the gate runner has no row for
+// yet (it has no `scripts/gate.sh`), and the two repositories of the pilot company that maintains cancho repositories (2026-11-28:
+// `alpibrusl/cancho-gateway`, `alpibrusl/cancho-tools`). A publish is a local branch and commit and never a push. They should be one
+// list, read from the registry of docs/autonomy.md section 3, not from this file.
 pub fn repo_ok[&k](key: &k [byte]) -> [] bool {
-    return gate_task.repo_known(key) || bytes.equal(key, "alpibrusl/cancho-diff");
+    return gate_task.repo_known(key) || bytes.equal(key, "alpibrusl/cancho-diff") || bytes.equal(key, "alpibrusl/cancho-gateway") || bytes.equal(key, "alpibrusl/cancho-tools");
 }
 
 // `text` as a line of markdown: a control byte becomes a space and a backtick an apostrophe, so a recorded reason cannot end a code

@@ -88,7 +88,11 @@ pub fn test_trailer_is_one_line_of_printable_text() -> [] int {
 pub fn test_repos_are_the_gates_list_and_cancho_diff() -> [] int {
     test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-forge")), 1);
     test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-diff")), 1);
-    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-tools")), 0);
+    // the pilot company's two repositories (docs/company.md section 27); a repository on no list is still refused
+    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-tools")), 1);
+    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-gateway")), 1);
+    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-os")), 0);
+    test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-tools-x")), 0);
     test.assert_eq(flag(publish_plan.repo_ok("")), 0);
     test.assert_eq(flag(publish_plan.repo_ok("alpibrusl/cancho-diff ")), 0);
     return 0;
