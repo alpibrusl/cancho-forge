@@ -236,3 +236,49 @@ fn test_the_tag_is_the_documented_one() -> [] int {
     test.assert(bytes.equal(company_change.rule_rate_limited(), "change-rate-limited"));
     return 0;
 }
+
+// ---- issue intake: a change filed from an issue is found again by its URL (docs/company.md section 30) --------------------------------------
+
+fn filed_of[&h, &t](heap: &!h Heap, text: &t [byte], url: &static [byte]) -> [heap] bool {
+    var found = false;
+    let d = manifest_with(heap, "");
+    borrow d as &db in {
+        match company_manifest.parse(heap, buffer.bytes(db)) {
+            company_manifest.ManifestResult::Held(m) => {
+                borrow m as &mr in {
+                    let s = company_state.replay(heap, text, mr);
+                    borrow s as &sr in {
+                        test.assert_eq(company_state.report_of(sr).rule, 0);
+                        found = company_state.issue_filed(heap, sr, url);
+                    }
+                    company_state.drop(heap, s);
+                }
+                company_manifest.drop(heap, m);
+            }
+            company_manifest.ManifestResult::Refused(r) => {
+                test.assert(false);
+            }
+        }
+    }
+    buffer.drop(heap, d);
+    return found;
+}
+
+fn test_a_change_filed_from_an_issue_is_found_by_its_url_and_no_other[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.change_proposed(heap, 1, "chg-0001", "diff", "bug", "issue", "https://github.com/a/diff/issues/7", "t", sha(), 1, "defect"));
+    // an operator's change whose user happens to look like a URL is not an issue
+    j = add(heap, j, company_state.change_proposed(heap, 2, "chg-0002", "diff", "bug", "operator", "https://github.com/a/diff/issues/8", "t", sha(), 1, "defect"));
+    borrow j as &jb in {
+        test.assert(filed_of(heap, buffer.bytes(jb), "https://github.com/a/diff/issues/7"));
+        test.assert(filed_of(heap, buffer.bytes(jb), "https://github.com/a/diff/issues/8") == false);
+        test.assert(filed_of(heap, buffer.bytes(jb), "https://github.com/a/diff/issues/70") == false);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
+fn test_a_journal_with_no_issue_has_none_filed[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(filed_of(heap, "", "https://github.com/a/diff/issues/7") == false);
+    return 0;
+}

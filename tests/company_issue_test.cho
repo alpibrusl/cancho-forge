@@ -1,0 +1,133 @@
+edition 9;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+import std.test;
+import forge.company_issue;
+
+// Unit tests for what `forge company intake` reads of one issue (docs/company.md section 30): the URL, the kind the labels give, the state, the
+// title, and the request text with its cut. Run with `cancho test`.
+
+fn test_an_issue_url_gives_its_owner_and_name() -> [] int {
+    test.assert(bytes.equal(company_issue.url_slug("https://github.com/alpibrusl/cancho-gateway/issues/71"), "alpibrusl/cancho-gateway"));
+    test.assert(bytes.equal(company_issue.url_slug("https://github.com/a/b/issues/1"), "a/b"));
+    return 0;
+}
+
+fn test_a_url_not_of_the_form_gives_nothing() -> [] int {
+    // a pull request, another host, no number, a letter in the number, an empty owner, a query, a space, a fragment
+    test.assert_eq(len(company_issue.url_slug("https://github.com/a/b/pull/1")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://gitlab.com/a/b/issues/1")), 0);
+    test.assert_eq(len(company_issue.url_slug("http://github.com/a/b/issues/1")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://github.com/a/b/issues/")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://github.com/a/b/issues/1x")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://github.com//b/issues/1")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://github.com/a/b/issues/1?x=1")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://github.com/a/b c/issues/1")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://github.com/a/b/issues/1#c")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://github.com/a/b/c/issues/1")), 0);
+    test.assert_eq(len(company_issue.url_slug("https://github.com/")), 0);
+    test.assert_eq(len(company_issue.url_slug("")), 0);
+    return 0;
+}
+
+// The kind of the labels of `doc`, a JSON object with a `labels` key (or none).
+fn kind_in[&h](heap: &!h Heap, doc: &static [byte]) -> [heap] int {
+    let tape = box_slice(heap, json.tape_len(doc), 0);
+    borrow mut tape as &!tw in {
+        test.assert(json.parse(doc, contents(tw)) > 0);
+    }
+    var k = 0;
+    borrow tape as &tr in {
+        k = company_issue.kind_of_labels(doc, contents(tr), json.get(doc, contents(tr), 0, "labels"));
+    }
+    unbox_slice(heap, tape);
+    return k;
+}
+
+fn test_the_labels_give_the_kind_by_a_closed_table[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(kind_in(heap, "{\"labels\":[{\"name\":\"bug\",\"color\":\"d73a4a\"}]}"), 1);
+    test.assert_eq(kind_in(heap, "{\"labels\":[{\"name\":\"enhancement\"}]}"), 2);
+    test.assert_eq(kind_in(heap, "{\"labels\":[{\"name\":\"good first issue\"},{\"name\":\"feature\"}]}"), 2);
+    return 0;
+}
+
+fn test_no_label_of_the_table_or_both_kinds_give_no_kind[&h](heap: &!h Heap) -> [heap] int {
+    test.assert_eq(kind_in(heap, "{\"labels\":[]}"), 0);
+    test.assert_eq(kind_in(heap, "{}"), 0);
+    test.assert_eq(kind_in(heap, "{\"labels\":[{\"name\":\"Bug\"},{\"name\":\"question\"}]}"), 0);
+    test.assert_eq(kind_in(heap, "{\"labels\":\"bug\"}"), 0);
+    test.assert_eq(kind_in(heap, "{\"labels\":[\"bug\"]}"), 0);
+    test.assert_eq(kind_in(heap, "{\"labels\":[{\"name\":\"bug\"},{\"name\":\"enhancement\"}]}"), 0 - 1);
+    return 0;
+}
+
+fn closed_in[&h](heap: &!h Heap, doc: &static [byte]) -> [heap] bool {
+    let tape = box_slice(heap, json.tape_len(doc), 0);
+    borrow mut tape as &!tw in {
+        test.assert(json.parse(doc, contents(tw)) > 0);
+    }
+    var c = false;
+    borrow tape as &tr in {
+        c = company_issue.closed(doc, contents(tr), 0);
+    }
+    unbox_slice(heap, tape);
+    return c;
+}
+
+fn test_an_issue_is_closed_when_its_state_is_there_and_not_open[&h](heap: &!h Heap) -> [heap] int {
+    test.assert(closed_in(heap, "{\"state\":\"CLOSED\"}"));
+    test.assert(closed_in(heap, "{\"state\":\"open\"}"));
+    test.assert(closed_in(heap, "{\"state\":1}"));
+    test.assert(closed_in(heap, "{\"state\":\"OPEN\"}") == false);
+    test.assert(closed_in(heap, "{}") == false);
+    return 0;
+}
+
+fn test_a_cut_never_splits_a_character() -> [] int {
+    // "añb": a, then ñ in two bytes (0xC3 0xB1), then b
+    test.assert_eq(company_issue.boundary("añb", 2), 1);
+    test.assert_eq(company_issue.boundary("añb", 3), 3);
+    test.assert_eq(company_issue.boundary("abc", 10), 3);
+    return 0;
+}
+
+fn test_a_title_is_one_line_with_no_control_byte() -> [] int {
+    test.assert(company_issue.title_plain("accesslog: a long path is not marked"));
+    test.assert(company_issue.title_plain("two\nlines") == false);
+    test.assert(company_issue.title_plain("a\ttab") == false);
+    test.assert(company_issue.title_plain("") == false);
+    return 0;
+}
+
+fn test_the_request_is_the_url_the_title_and_the_body[&h](heap: &!h Heap) -> [heap] int {
+    let b = company_issue.body_of(heap, "https://github.com/a/b/issues/1", "t", "the body", 16384);
+    borrow b as &bb in {
+        test.assert(bytes.equal(buffer.bytes(bb), "https://github.com/a/b/issues/1\nt\n\nthe body"));
+    }
+    buffer.drop(heap, b);
+    return 0;
+}
+
+fn test_a_body_that_does_not_fit_is_cut_with_a_marker_within_the_bound[&h](heap: &!h Heap) -> [heap] int {
+    var long = buffer.empty(heap, 20000);
+    var k = 0;
+    while k < 20000 {
+        long = buffer.append(heap, long, "x");
+        k = k + 1;
+    }
+    borrow long as &lb in {
+        let b = company_issue.body_of(heap, "https://github.com/a/b/issues/1", "t", buffer.bytes(lb), 16384);
+        borrow b as &bb in {
+            let out = buffer.bytes(bb);
+            test.assert(len(out) <= 16384);
+            test.assert(len(out) > 16000);
+            test.assert(bytes.equal(out[len(out) - 1..len(out)], "\n"));
+            test.assert(bytes.equal(out[0..35], "https://github.com/a/b/issues/1\nt\n\n"));
+        }
+        buffer.drop(heap, b);
+    }
+    buffer.drop(heap, long);
+    return 0;
+}

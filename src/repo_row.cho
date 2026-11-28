@@ -742,6 +742,33 @@ pub fn row_of[&s, &t, &i](src: &s [byte], tp: &t [int], id: &i [byte]) -> [] int
     return json.get(src, tp, all, id);
 }
 
+// The id of the one row whose `slug` is `slug` (`forge company intake`, docs/company.md section 30), or an empty slice when no row has it or
+// more than one does (two rows of one origin say nothing about which an issue is for).
+pub fn repo_of_slug[&s, &t, &g](src: &s [byte], tp: &t [int], slug: &g [byte]) -> [] &s [byte] {
+    let none = src[0..0];
+    let all = json.get(src, tp, 0, "repos");
+    if all < 0 || !json.is_object(tp, all) || len(slug) == 0 {
+        return none;
+    }
+    var found = none;
+    var hits = 0;
+    let n = json.count(tp, all);
+    var k = all + 1;
+    var j = 0;
+    while j < n {
+        if bytes.equal(field_text(src, tp, k + 1, "slug"), slug) {
+            found = json.string_view(src, tp, k);
+            hits = hits + 1;
+        }
+        k = json.skip(tp, k + 1);
+        j = j + 1;
+    }
+    if hits != 1 {
+        return none;
+    }
+    return found;
+}
+
 // How a manifest's repository and the operator's row relate: 0 they agree, 1 the operator file has no row for it
 // (`repo-unconfigured`), 2 the row's `kind` is not the manifest's (`repo-kind-mismatch`).
 pub fn resolve[&s, &t, &i, &k](src: &s [byte], tp: &t [int], id: &i [byte], manifest_kind: &k [byte]) -> [] int {

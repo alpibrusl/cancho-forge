@@ -133,7 +133,7 @@ pub fn add_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: 
 // Does the manifest's `intake` refuse one more change for `repo` today? 0 no (or no `intake`), 1 too many proposals in the window, 2 too many changes
 // open for the repository. Today is `now=` when given, else the last day the journal holds; with neither there is no window and only the open limit applies.
 // The window is the budget's rolling window, or 30 days when the manifest has none.
-fn limited[&h, &m, &s, &r, &n](heap: &!h Heap, man: &m company_manifest.Manifest, st: &s company_state.CompanyState, repo: &r [byte], now: &n [byte]) -> [heap] int {
+pub fn limited[&h, &m, &s, &r, &n](heap: &!h Heap, man: &m company_manifest.Manifest, st: &s company_state.CompanyState, repo: &r [byte], now: &n [byte]) -> [heap] int {
     if company_manifest.intake_per_window(man) == 0 {
         return 0;
     }
@@ -255,7 +255,7 @@ fn add_replayed[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b, &n](heap: &!h Heap, fs: 
                         }
                         code = 1;
                     } else {
-                        code = add_written(heap, fs, io, dir, jpath, existed, rep, company_state.change_count(sr, 0) + 1, repo, kind, kc, why, title, body, now, company_state.last_day(sr));
+                        code = add_written(heap, fs, io, dir, jpath, existed, rep, company_state.change_count(sr, 0) + 1, repo, kind, kc, why, title, body, now, company_state.last_day(sr), "");
                     }
                 }
                 company_state.drop(heap, state);
@@ -267,8 +267,10 @@ fn add_replayed[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b, &n](heap: &!h Heap, fs: 
     return code;
 }
 
-// The next number is `n`: the body file, then the journal.
-fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b, &w](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], jpath: &j [byte], existed: bool, rep: journal.Report, n: int, repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte], now: &w [byte], last: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+// The next number is `n`: the body file, then the journal. `issue` is the URL of the issue the change was filed from by `forge company intake`
+// (docs/company.md section 30), or empty for the operator's own `change add`: a change from an issue has the source `issue` with the URL as its
+// reference, and is never admitted by the act, whatever its kind.
+pub fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b, &w, &u](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], jpath: &j [byte], existed: bool, rep: journal.Report, n: int, repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte], now: &w [byte], last: int, issue: &u [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     let id = company_change.id_of(heap, n);
     var code = 1;
     borrow id as &ib in {
@@ -288,7 +290,7 @@ fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b, &w](heap: &!h Heap, fs: &
                 company_cmd.line(io, "error: cannot write changes/<id>.txt (the operator makes the directory changes/)", "");
                 code = 3;
             } else {
-                code = add_recorded(heap, fs, io, jpath, existed, rep, buffer.bytes(ib), repo, kind, kc, why, title, body, now, last);
+                code = add_recorded(heap, fs, io, jpath, existed, rep, buffer.bytes(ib), repo, kind, kc, why, title, body, now, last, issue);
             }
         }
         buffer.drop(heap, bpath);
@@ -298,7 +300,7 @@ fn add_written[&h, &f, &i, &d, &j, &r, &k, &y, &t, &b, &w](heap: &!h Heap, fs: &
 }
 
 // The record(s), one write.
-fn add_recorded[&h, &f, &i, &j, &x, &r, &k, &y, &t, &b, &w](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], existed: bool, rep: journal.Report, id: &x [byte], repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte], now: &w [byte], last: int) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+fn add_recorded[&h, &f, &i, &j, &x, &r, &k, &y, &t, &b, &w, &u](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, jpath: &j [byte], existed: bool, rep: journal.Report, id: &x [byte], repo: &r [byte], kind: &k [byte], kc: int, why: &y [byte], title: &t [byte], body: &b [byte], now: &w [byte], last: int, issue: &u [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
     let cut_to = journal.recovery_cut(rep);
     if cut_to >= 0 {
         if journal_io.cut_torn_tail(fs, jpath, cut_to) != 0 {
@@ -320,14 +322,17 @@ fn add_recorded[&h, &f, &i, &j, &x, &r, &k, &y, &t, &b, &w](heap: &!h Heap, fs: 
     buffer.drop(heap, ev);
     borrow sha as &sb in {
         borrow environ as &eb in {
-            if errno == 0 {
+            if len(issue) > 0 {
+                ev = company_state.change_proposed(heap, rep.records + 1 + shift, id, repo, kind, "issue", issue, title, buffer.bytes(sb), len(body), why);
+            } else if errno == 0 {
                 ev = company_state.change_proposed(heap, rep.records + 1 + shift, id, repo, kind, "operator", company_cmd.user_in_environ(buffer.bytes(eb)), title, buffer.bytes(sb), len(body), why);
             } else {
                 ev = company_state.change_proposed(heap, rep.records + 1 + shift, id, repo, kind, "operator", "unknown", title, buffer.bytes(sb), len(body), why);
             }
         }
     }
-    if company_change.admitted_by_operator(kc) {
+    let admit = company_change.admitted_by_operator(kc) && len(issue) == 0;
+    if admit {
         let more = company_state.change_admitted(heap, rep.records + 2 + shift, id);
         borrow more as &mb in {
             ev = buffer.append(heap, ev, buffer.bytes(mb));
@@ -359,7 +364,7 @@ fn add_recorded[&h, &f, &i, &j, &x, &r, &k, &y, &t, &b, &w](heap: &!h Heap, fs: 
     }
     io.write_all(io, "change ");
     io.write_all(io, id);
-    if company_change.admitted_by_operator(kc) {
+    if admit {
         company_cmd.line(io, ": ", "admitted");
     } else {
         company_cmd.line(io, ": ", "proposed");

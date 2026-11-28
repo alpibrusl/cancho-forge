@@ -1,0 +1,369 @@
+edition 9;
+module forge.company_intake_cmd;
+
+import std.buffer;
+import std.bytes;
+import std.io;
+import std.json;
+import forge.company_cmd;
+import forge.company_change;
+import forge.company_change_cmd;
+import forge.company_derive;
+import forge.company_issue;
+import forge.company_manifest;
+import forge.company_state;
+import forge.company_step;
+import forge.company_time;
+import forge.journal_io;
+import forge.lock;
+import forge.repo_row;
+import forge.task;
+
+// `forge company intake <company-dir> <operator-file> <issues-file> [now=YYYY-MM-DD]` (docs/company.md section 30, docs/company-lifecycle.md
+// section 4.4): issue intake from a file. Forge has no network: the operator (or a timer) writes the file with
+// `gh issue list --repo <owner>/<name> --json number,title,body,url,labels,state`, and this verb reads it. Each issue of the array, in the
+// file's order, is either filed as a change request, exactly as `forge company change add` files one (the same writer, the same checks of the
+// manifest and of `intake`), or skipped with a tag; nothing in an issue is an instruction. A change filed from an issue has the source `issue`
+// and the issue's URL as its reference, and it is always `proposed`, a bug too: only `forge company decide <dir> admit:<id> approved` turns it
+// into work.
+//
+// Skips (one line each, `issue <url> skipped: <tag>`, and intake goes on): `intake-issue-malformed` (not an object, no URL of the GitHub form,
+// no title), `intake-issue-closed`, `repo-unknown` (no operator row has the URL's `owner/name` as its `slug`, or the manifest does not list
+// the row's repository), `intake-kind-unmapped` (no label `bug`, `enhancement` or `feature`, or both kinds), `flow-unknown`,
+// `change-malformed` (a title with a control byte), `change-duplicate` (a change was filed from this URL already: intake can run again, on a
+// timer, and files nothing twice). Refusals that stop it: `intake-file-malformed` (the file cannot be read, is over 8 MiB, is not a JSON array
+// or holds over 1000 issues; nothing written), `operator-invalid`, `change-rate-limited` (the changes filed before it stay; the rest are left
+// for a later intake and counted on a `left:` line), the journal's own. The issues file is read and never written or moved.
+// Exit 0 every issue was filed or skipped, 1 a refusal, 2 bad usage or a path refused, 3 an I/O error.
+// Authority: the rows of `change add` (fs_read, fs_write, file_read, file_write, io_write) and no other.
+
+// The value of `now=` in `a`, or an empty slice when `a` is not of that form.
+fn now_in[&a](a: &a [byte]) -> [] &a [byte] {
+    if len(a) > 4 && bytes.equal(a[0..4], "now=") {
+        return a[4..len(a)];
+    }
+    return a[0..0];
+}
+
+pub fn intake_cmd[&h, &f, &i, &g](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, args: &g Args) -> [args, heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    if arg_count(args) != 6 && arg_count(args) != 7 || bytes.equal(arg(args, 2), "intake") == false {
+        return 2;
+    }
+    var now = arg(args, 3)[0..0];
+    if arg_count(args) == 7 {
+        now = now_in(arg(args, 6));
+        if len(now) == 0 {
+            return 2;
+        }
+        if company_time.day_of(now) < 0 {
+            company_cmd.refuse(io, company_time.rule_invalid());
+            return 1;
+        }
+    }
+    let dir = arg(args, 3);
+    let mpath = company_cmd.under(heap, dir, "company.json");
+    let jpath = company_cmd.under(heap, dir, "company.journal");
+    let lpath = company_cmd.under(heap, dir, "lock");
+    var code = 1;
+    borrow mpath as &mp in {
+        borrow jpath as &jp in {
+            borrow lpath as &lp in {
+                if journal_io.path_ok(fs, buffer.bytes(mp)) == false || journal_io.path_ok(fs, buffer.bytes(jp)) == false || journal_io.path_ok(fs, buffer.bytes(lp)) == false || journal_io.path_ok(fs, arg(args, 4)) == false || journal_io.path_ok(fs, arg(args, 5)) == false {
+                    company_cmd.refuse(io, task.rule_name(task.Rule::PathInvalid));
+                    code = 2;
+                } else {
+                    match lock.acquire(fs, buffer.bytes(lp)) {
+                        lock.Lock::Refused(rule) => {
+                            company_cmd.refuse(io, task.rule_code_name(rule));
+                            code = 1;
+                        }
+                        lock.Lock::Failed(errno) => {
+                            company_cmd.line(io, "error: cannot take the lock of the company directory", "");
+                            code = 3;
+                        }
+                        lock.Lock::Held(held) => {
+                            code = with_manifest(heap, fs, io, dir, buffer.bytes(mp), buffer.bytes(jp), arg(args, 4), arg(args, 5), now);
+                            lock.let_go(held);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    buffer.drop(heap, mpath);
+    buffer.drop(heap, jpath);
+    buffer.drop(heap, lpath);
+    return code;
+}
+
+// The lock is held: the manifest, with the steps its admitted changes derived (the open limit needs them, as for `change add`).
+fn with_manifest[&h, &f, &i, &d, &m, &j, &o, &p, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mpath: &m [byte], jpath: &j [byte], opath: &o [byte], ipath: &p [byte], now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, mpath, company_manifest.max_bytes() + 1);
+    var code = 1;
+    if errno != 0 {
+        company_cmd.refuse(io, company_manifest.rule_name(company_manifest.Refusal::ManifestMalformed));
+    } else {
+        borrow text as &tb in {
+            match company_manifest.parse(heap, buffer.bytes(tb)) {
+                company_manifest.ManifestResult::Refused(bad) => {
+                    company_cmd.refuse(io, company_manifest.rule_name(bad));
+                }
+                company_manifest.ManifestResult::Held(held) => {
+                    let (man, derive_why) = company_derive.load(heap, fs, dir, jpath, held);
+                    if derive_why != 0 {
+                        company_cmd.refuse(io, company_derive.rule_of_code(derive_why));
+                    } else {
+                        borrow man as &mm in {
+                            code = with_operator(heap, fs, io, dir, mm, jpath, opath, ipath, now);
+                        }
+                    }
+                    company_manifest.drop(heap, man);
+                }
+            }
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The operator file: its repos rows map an issue's `owner/name` to a repository.
+fn with_operator[&h, &f, &i, &d, &m, &j, &o, &p, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mm: &m company_manifest.Manifest, jpath: &j [byte], opath: &o [byte], ipath: &p [byte], now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, opath, 65536);
+    var code = 1;
+    if errno != 0 {
+        company_cmd.refuse(io, "operator-invalid");
+    } else {
+        borrow text as &tb in {
+            let src = buffer.bytes(tb);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            var parsed = false;
+            borrow mut tape as &!tw in {
+                parsed = json.parse(src, contents(tw)) > 0;
+            }
+            borrow tape as &tr in {
+                let tp = contents(tr);
+                if parsed == false || company_step.operator_ok(src, tp) == false {
+                    company_cmd.refuse(io, "operator-invalid");
+                } else {
+                    code = with_issues(heap, fs, io, dir, mm, jpath, src, tp, ipath, now);
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// The issues file: one JSON array of at most 1000 issues in at most 8 MiB.
+fn with_issues[&h, &f, &i, &d, &m, &j, &s, &t, &p, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mm: &m company_manifest.Manifest, jpath: &j [byte], osrc: &s [byte], otp: &t [int], ipath: &p [byte], now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let (text, errno) = company_cmd.read_limited(heap, fs, ipath, company_issue.max_file() + 1);
+    var code = 1;
+    var size = 0;
+    borrow text as &tb in {
+        size = len(buffer.bytes(tb));
+    }
+    if errno != 0 || size > company_issue.max_file() {
+        company_cmd.refuse(io, company_issue.rule_file_malformed());
+        company_cmd.line(io, "reason: ", "the issues file cannot be read or is over 8 MiB");
+    } else {
+        borrow text as &tb in {
+            let src = buffer.bytes(tb);
+            let tape = box_slice(heap, json.tape_len(src), 0);
+            var parsed = false;
+            borrow mut tape as &!tw in {
+                parsed = json.parse(src, contents(tw)) > 0;
+            }
+            borrow tape as &tr in {
+                let tp = contents(tr);
+                if parsed == false || json.is_array(tp, 0) == false || json.count(tp, 0) > company_issue.max_issues() {
+                    company_cmd.refuse(io, company_issue.rule_file_malformed());
+                    company_cmd.line(io, "reason: ", "the issues file is not a JSON array of at most 1000 issues");
+                } else {
+                    code = each_issue(heap, fs, io, dir, mm, jpath, osrc, otp, src, tp, now);
+                }
+            }
+            unbox_slice(heap, tape);
+        }
+    }
+    buffer.drop(heap, text);
+    return code;
+}
+
+// Every issue in the file's order; a rate limit or a journal refusal stops the walk.
+fn each_issue[&h, &f, &i, &d, &m, &j, &s, &t, &x, &y, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mm: &m company_manifest.Manifest, jpath: &j [byte], osrc: &s [byte], otp: &t [int], isrc: &x [byte], itp: &y [int], now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    let n = json.count(itp, 0);
+    var filed = 0;
+    var skipped = 0;
+    var k = 0;
+    var stop = 0;
+    while k < n && stop == 0 {
+        let r = one_issue(heap, fs, io, dir, mm, jpath, osrc, otp, isrc, itp, json.at(itp, 0, k), now);
+        if r == 0 {
+            filed = filed + 1;
+        } else if r == 1 {
+            skipped = skipped + 1;
+        } else {
+            stop = r;
+        }
+        k = k + 1;
+    }
+    var line = buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 64), "intake: "), filed);
+    line = buffer.push_nat(heap, buffer.append(heap, line, " filed, "), skipped);
+    line = buffer.append(heap, line, " skipped");
+    borrow line as &lb in {
+        company_cmd.line(io, buffer.bytes(lb), "");
+    }
+    buffer.drop(heap, line);
+    if stop == 2 {
+        // The issue that met the limit is not filed: it is counted with the rest that are left.
+        let left = buffer.push_nat(heap, buffer.append(heap, buffer.empty(heap, 64), "left: "), n - k + 1);
+        borrow left as &lb in {
+            company_cmd.line(io, buffer.bytes(lb), " issues of the file, for a later intake");
+        }
+        buffer.drop(heap, left);
+        return 1;
+    }
+    if stop == 4 {
+        return 1;
+    }
+    return stop;
+}
+
+// The decoded text of the string at `node`.
+fn decoded[&h, &s, &t](heap: &!h Heap, src: &s [byte], tp: &t [int], node: int) -> [heap] buffer.Buffer {
+    let n = json.string_length(src, tp, node);
+    var out = buffer.empty(heap, 64);
+    if n <= 0 {
+        return out;
+    }
+    let room = box_slice(heap, n, byte_of(0));
+    borrow mut room as &!rw in {
+        json.string_into(src, tp, node, contents(rw));
+    }
+    borrow room as &rr in {
+        out = buffer.append(heap, out, contents(rr));
+    }
+    unbox_slice(heap, room);
+    return out;
+}
+
+fn skip[&i, &u](io: &!i Io, url: &u [byte], tag: &static [byte]) -> [io_write] int {
+    io.write_all(io, "issue ");
+    if len(url) > 0 {
+        io.write_all(io, url);
+    } else {
+        io.write_all(io, "(no url)");
+    }
+    company_cmd.line(io, " skipped: ", tag);
+    return 1;
+}
+
+// One issue: 0 filed, 1 skipped, 2 the rate limit was met, 3 an I/O error, 4 the journal refused (exit 1).
+fn one_issue[&h, &f, &i, &d, &m, &j, &s, &t, &x, &y, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mm: &m company_manifest.Manifest, jpath: &j [byte], osrc: &s [byte], otp: &t [int], isrc: &x [byte], itp: &y [int], it: int, now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    if json.is_object(itp, it) == false {
+        return skip(io, "", company_issue.rule_issue_malformed());
+    }
+    let un = json.get(isrc, itp, it, "url");
+    if json.is_string(itp, un) == false || json.string_plain(itp, un) == false {
+        return skip(io, "", company_issue.rule_issue_malformed());
+    }
+    let url = json.string_view(isrc, itp, un);
+    let slug = company_issue.url_slug(url);
+    let tn = json.get(isrc, itp, it, "title");
+    if len(slug) == 0 || json.is_string(itp, tn) == false {
+        return skip(io, url, company_issue.rule_issue_malformed());
+    }
+    if company_issue.closed(isrc, itp, it) {
+        return skip(io, url, company_issue.rule_issue_closed());
+    }
+    let repo = repo_row.repo_of_slug(osrc, otp, slug);
+    if len(repo) == 0 || company_manifest.repo_index(mm, repo) < 0 {
+        return skip(io, url, "repo-unknown");
+    }
+    let lk = company_issue.kind_of_labels(isrc, itp, json.get(isrc, itp, it, "labels"));
+    if lk <= 0 {
+        return skip(io, url, company_issue.rule_kind_unmapped());
+    }
+    var kind = "bug";
+    var why = "defect";
+    if lk == 2 {
+        kind = "feature";
+        why = company_issue.justification_issue();
+    }
+    if company_manifest.flow_count(mm) > 0 && company_manifest.flow_index(mm, kind) < 0 {
+        return skip(io, url, company_change.rule_flow_unknown());
+    }
+    let title = decoded(heap, isrc, itp, tn);
+    let bn = json.get(isrc, itp, it, "body");
+    var body = buffer.empty(heap, 1);
+    if bn >= 0 && json.is_string(itp, bn) {
+        buffer.drop(heap, body);
+        body = decoded(heap, isrc, itp, bn);
+    }
+    var code = 1;
+    borrow title as &tb in {
+        let t = buffer.bytes(tb);
+        if company_issue.title_plain(t) == false {
+            code = skip(io, url, company_change.rule_malformed());
+        } else {
+            let text = buffer.bytes(tb);
+            borrow body as &bb in {
+                let req = company_issue.body_of(heap, url, text, buffer.bytes(bb), company_change.max_body());
+                borrow req as &rb in {
+                    code = filed(heap, fs, io, dir, mm, jpath, url, repo, kind, why, text[0..company_issue.boundary(text, company_change.max_title())], buffer.bytes(rb), now);
+                }
+                buffer.drop(heap, req);
+            }
+        }
+    }
+    buffer.drop(heap, title);
+    buffer.drop(heap, body);
+    return code;
+}
+
+// The journal is replayed for every issue, so the id, the limits and the duplicates count what this intake filed before it.
+fn filed[&h, &f, &i, &d, &m, &j, &u, &r, &k, &y, &t, &b, &n](heap: &!h Heap, fs: &f Fs(""), io: &!i Io, dir: &d [byte], mm: &m company_manifest.Manifest, jpath: &j [byte], url: &u [byte], repo: &r [byte], kind: &k [byte], why: &y [byte], title: &t [byte], body: &b [byte], now: &n [byte]) -> [heap, fs_read(""), fs_write(""), file_read, file_write, io_write] int {
+    var code = 1;
+    let existed = journal_io.exists(fs, jpath);
+    let (data, errno) = journal_io.read_all(heap, fs, jpath);
+    if errno != 0 {
+        company_cmd.line(io, "error: cannot read company.journal", "");
+        code = 3;
+    } else {
+        borrow data as &db in {
+            let state = company_state.replay(heap, buffer.bytes(db), mm);
+            borrow state as &sr in {
+                let rep = company_state.report_of(sr);
+                if rep.rule != 0 {
+                    company_cmd.refuse(io, task.rule_code_name(rep.rule));
+                    code = 4;
+                } else if len(now) > 0 && company_time.day_of(now) < company_state.last_day(sr) {
+                    company_cmd.refuse(io, company_time.rule_went_back());
+                    code = 4;
+                } else if company_state.issue_filed(heap, sr, url) {
+                    code = skip(io, url, company_issue.rule_duplicate());
+                } else {
+                    let lim = company_change_cmd.limited(heap, mm, sr, repo, now);
+                    if lim > 0 {
+                        company_cmd.refuse(io, company_change.rule_rate_limited());
+                        if lim == 1 {
+                            company_cmd.line(io, "limit: ", "proposals in the window (intake.max_per_window)");
+                        } else {
+                            company_cmd.line(io, "limit: ", "changes open for the repository (intake.max_open_per_repo)");
+                        }
+                        code = 2;
+                    } else {
+                        io.write_all(io, "issue ");
+                        io.write_all(io, url);
+                        io.write_all(io, " filed as ");
+                        code = company_change_cmd.add_written(heap, fs, io, dir, jpath, existed, rep, company_state.change_count(sr, 0) + 1, repo, kind, company_change.kind_code(kind), why, title, body, now, company_state.last_day(sr), url);
+                    }
+                }
+            }
+            company_state.drop(heap, state);
+        }
+    }
+    buffer.drop(heap, data);
+    return code;
+}

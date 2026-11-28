@@ -717,6 +717,17 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &y, &x](heap: &!h Heap, line: &l [byte], ex
                         a1 = put_decoded(heap, a1, line, tp, json.get(line, tp, 0, "body_sha256"));
                         ar = a1;
                         inf = map.put(heap, inf, id, start * 1048576 + packed);
+                        // A change filed from an issue (`forge company intake`, docs/company.md section 30) is found again by its URL, so a second
+                        // intake of the same issue files nothing. Only a plain reference is kept: intake writes no other kind.
+                        let st_node = json.get(line, tp, 0, "source_type");
+                        let ref_node = json.get(line, tp, 0, "source_ref");
+                        if json.string_plain(tp, st_node) && json.string_plain(tp, ref_node) && bytes.equal(json.string_view(line, tp, st_node), "issue") {
+                            let uk = ledger_key(heap, "u:", json.string_view(line, tp, ref_node));
+                            borrow uk as &ukb in {
+                                inf = map.put(heap, inf, buffer.bytes(ukb), 1);
+                            }
+                            buffer.drop(heap, uk);
+                        }
                         if spend[slot_day()] > 0 {
                             let yk = ledger_key(heap, "y:", id);
                             borrow yk as &ykb in {
@@ -1123,6 +1134,17 @@ pub fn change_day[&h, &i, &s](heap: &!h Heap, s: &s CompanyState, id: &i [byte])
     }
     buffer.drop(heap, k);
     return n;
+}
+
+// Has a change been filed from the issue at `url` (a change whose source is `issue` and whose reference is `url`; docs/company.md section 30)?
+pub fn issue_filed[&h, &u, &s](heap: &!h Heap, s: &s CompanyState, url: &u [byte]) -> [heap] bool {
+    let k = ledger_key(heap, "u:", url);
+    var n = 0;
+    borrow k as &kb in {
+        n = map.get(s.chginfo, buffer.bytes(kb), 0);
+    }
+    buffer.drop(heap, k);
+    return n > 0;
 }
 
 // How many changes were proposed on the `days` days up to and including day number `today` (docs/company.md section 24). A change proposed under no day
