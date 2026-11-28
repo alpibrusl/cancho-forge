@@ -1,0 +1,215 @@
+edition 9;
+module forge.company_issue;
+
+import std.buffer;
+import std.bytes;
+import std.json;
+
+// One issue of a file `forge company intake` reads (docs/company.md section 30, docs/company-lifecycle.md section 4.4): the JSON array that
+// `gh issue list --json number,title,body,url,labels,state` writes. Pure: no row beyond `heap`. Forge reads only the closed fields of an
+// issue: `url`, `title`, `labels[].name` and `state`; the body is copied into the request file and never read.
+//
+//   the URL       `https://github.com/<owner>/<name>/issues/<number>`, at most 300 bytes of letters, digits and `-_./:`; anything else
+//                 is `intake-issue-malformed`. `<owner>/<name>` is matched against the `slug` of the operator file's repos rows.
+//   the kind      from the labels, a closed table: `bug` gives a bug (justification `defect`), `enhancement` or `feature` a feature
+//                 (justification `issue`). No such label, or both, is `intake-kind-unmapped`.
+//   the state     an issue whose `state` is there and is not `OPEN` is `intake-issue-closed`; with no `state` the operator's query chose.
+//   the title     one line with no control byte (`change-malformed` otherwise), cut to 200 bytes on a character boundary.
+//   the request   the URL, the title and the body, cut at 16 KiB with a marker (`body_of`).
+
+pub fn rule_file_malformed() -> [] &static [byte] {
+    return "intake-file-malformed";
+}
+
+pub fn rule_issue_malformed() -> [] &static [byte] {
+    return "intake-issue-malformed";
+}
+
+pub fn rule_issue_closed() -> [] &static [byte] {
+    return "intake-issue-closed";
+}
+
+pub fn rule_kind_unmapped() -> [] &static [byte] {
+    return "intake-kind-unmapped";
+}
+
+pub fn rule_duplicate() -> [] &static [byte] {
+    return "change-duplicate";
+}
+
+// The justification of a feature that came from an issue: nobody at the operator's account asked for it, so it is neither `operator` nor a goal.
+pub fn justification_issue() -> [] &static [byte] {
+    return "issue";
+}
+
+// The largest file intake reads, and the most issues in one.
+pub fn max_file() -> [] int {
+    return 8388608;
+}
+
+pub fn max_issues() -> [] int {
+    return 1000;
+}
+
+pub fn max_url() -> [] int {
+    return 300;
+}
+
+fn url_byte(c: int) -> [] bool {
+    return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 45 || c == 95 || c == 46 || c == 47 || c == 58;
+}
+
+fn digits[&b](b: &b [byte]) -> [] bool {
+    if len(b) < 1 || len(b) > 12 {
+        return false;
+    }
+    var k = 0;
+    while k < len(b) {
+        let c = int_of(b[k]);
+        if c < 48 || c > 57 {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+// The `<owner>/<name>` of an issue URL of the form above, or an empty slice when `url` is not one.
+pub fn url_slug[&u](url: &u [byte]) -> [] &u [byte] {
+    let pre = "https://github.com/";
+    let none = url[0..0];
+    if len(url) <= len(pre) || len(url) > max_url() || bytes.equal(url[0..len(pre)], pre) == false {
+        return none;
+    }
+    var k = 0;
+    while k < len(url) {
+        if url_byte(int_of(url[k])) == false {
+            return none;
+        }
+        k = k + 1;
+    }
+    // The second `/` after the host ends the slug.
+    var slash = 0;
+    var end = 0 - 1;
+    k = len(pre);
+    while k < len(url) && end < 0 {
+        if int_of(url[k]) == 47 {
+            slash = slash + 1;
+            if slash == 2 {
+                end = k;
+            }
+        }
+        k = k + 1;
+    }
+    let mid = "/issues/";
+    if end < 0 || len(url) <= end + len(mid) || bytes.equal(url[end..end + len(mid)], mid) == false || digits(url[end + len(mid)..len(url)]) == false {
+        return none;
+    }
+    let slug = url[len(pre)..end];
+    if len(slug) < 3 || int_of(slug[0]) == 47 || int_of(slug[len(slug) - 1]) == 47 {
+        return none;
+    }
+    return slug;
+}
+
+// The kind the labels of an issue give (`labels`, a node of the tape, -1 for none): 1 bug, 2 feature, 0 no label of the table, -1 both.
+pub fn kind_of_labels[&s, &t](src: &s [byte], tp: &t [int], labels: int) -> [] int {
+    if labels < 0 || json.is_array(tp, labels) == false {
+        return 0;
+    }
+    var bug = false;
+    var feature = false;
+    var k = 0;
+    while k < json.count(tp, labels) {
+        let it = json.at(tp, labels, k);
+        if json.is_object(tp, it) {
+            let name = json.get(src, tp, it, "name");
+            if json.is_string(tp, name) && json.string_plain(tp, name) {
+                let v = json.string_view(src, tp, name);
+                if bytes.equal(v, "bug") {
+                    bug = true;
+                }
+                if bytes.equal(v, "enhancement") || bytes.equal(v, "feature") {
+                    feature = true;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    if bug && feature {
+        return 0 - 1;
+    }
+    if bug {
+        return 1;
+    }
+    if feature {
+        return 2;
+    }
+    return 0;
+}
+
+// Is the issue at node `it` closed: a `state` that is there and is not the string `OPEN`?
+pub fn closed[&s, &t](src: &s [byte], tp: &t [int], it: int) -> [] bool {
+    let st = json.get(src, tp, it, "state");
+    if st < 0 {
+        return false;
+    }
+    return json.is_string(tp, st) == false || json.string_plain(tp, st) == false || bytes.equal(json.string_view(src, tp, st), "OPEN") == false;
+}
+
+// The length of the longest prefix of `b` of at most `most` bytes that ends on a character boundary (no UTF-8 continuation byte cut from its lead).
+pub fn boundary[&b](b: &b [byte], most: int) -> [] int {
+    if len(b) <= most {
+        return len(b);
+    }
+    var n = most;
+    while n > 0 && int_of(b[n]) >= 128 && int_of(b[n]) < 192 {
+        n = n - 1;
+    }
+    return n;
+}
+
+// Is `title` (decoded) one line with no control byte, and not empty?
+pub fn title_plain[&t](title: &t [byte]) -> [] bool {
+    if len(title) < 1 {
+        return false;
+    }
+    var k = 0;
+    while k < len(title) {
+        let c = int_of(title[k]);
+        if c < 32 || c == 127 {
+            return false;
+        }
+        k = k + 1;
+    }
+    return true;
+}
+
+fn marker() -> [] &static [byte] {
+    return "\n[the issue's text was cut here at 16 KiB by forge company intake]\n";
+}
+
+// The request text of an issue: its URL, its title, a blank line, its body; at most `most` bytes in all, the body cut on a character boundary with
+// a marker when it does not fit.
+pub fn body_of[&h, &u, &t, &b](heap: &!h Heap, url: &u [byte], title: &t [byte], body: &b [byte], most: int) -> [heap] buffer.Buffer {
+    var out = buffer.empty(heap, 256);
+    out = buffer.append(heap, out, url);
+    out = buffer.append(heap, out, "\n");
+    out = buffer.append(heap, out, title);
+    out = buffer.append(heap, out, "\n\n");
+    var head = 0;
+    borrow out as &ob in {
+        head = len(buffer.bytes(ob));
+    }
+    if head + len(body) <= most {
+        out = buffer.append(heap, out, body);
+        return out;
+    }
+    var room = most - head - len(marker());
+    if room < 0 {
+        room = 0;
+    }
+    out = buffer.append(heap, out, body[0..boundary(body, room)]);
+    out = buffer.append(heap, out, marker());
+    return out;
+}

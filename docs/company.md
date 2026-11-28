@@ -919,7 +919,8 @@ operator file. (7) `compiler_rev` is compared with the pin file of the copy at t
 **Status: built and tested, no model, no network.** Unit tests `tests/company_change_test.cho`; end to end `tests/conformance/company_change_add.sh`
 (run by `scripts/gate.sh`). This is the first part of slice 2 of the design: the change *records*, the verb that proposes one, and the `admit:`
 gate. **Not built from slice 2:** `flows` and derived steps, the provisioner, intake of issues from files, the patch publish, `change-duplicate`,
-`change-rate-limited` and `change-base-unknown`. A change in this part is a recorded, gated request that nothing yet turns into work.
+`change-rate-limited` and `change-base-unknown`. *(Later built: flows and derived steps, section 18; the provisioner, 20; the publish, 21;
+`change-rate-limited`, 24; intake of issues from a file and `change-duplicate`, 30. `change-base-unknown` is still not built.)* A change in this part is a recorded, gated request that nothing yet turns into work.
 
 **Records.** `company.change.proposed` (the record's `task` is the change id; `repo`, `ckind`, `source_type`, `source_ref`, `title`, `body_sha256`,
 `body_bytes`, `justification`) and `company.change.admitted` (the id only). Replay shapes both and keeps a state per id: *proposed*, *admitted*,
@@ -1140,7 +1141,7 @@ which and nothing written, when
 
 `change add` now derives the steps of the admitted changes (as `status` and `run` do) to tell an open change from a finished one, so it also refuses, as they do, with
 `change-body-missing` when an admitted change's request file is not there. **Where the design and the code differ:** the design's "terminal" states (`abandoned`, `superseded`, `reverted`, `released`,
-`deployed`) do not exist yet; "finished" stands in for them. The refusal does not "leave the file in `intake/`": there is no `intake/` directory until issue intake exists.
+`deployed`) do not exist yet; "finished" stands in for them. The refusal does not "leave the file in `intake/`": issue intake (section 30) reads a file the operator names and never moves it, so what a limit stopped is simply filed by a later intake of the same file.
 
 ---
 
@@ -1209,4 +1210,62 @@ Any other shape is `operator-invalid`. The change worker checks the three texts 
 **The command is the operator's because it runs what a model wrote.** A cancho test is held by the compiler's effects; a script is not. Forge adds no sandbox: the command is where one goes. The publish bounds are unchanged, so a script outside `publish_allow` is refused like any other path, and the step's own check should run the script again (the build tool's word that it passed is a worker's claim).
 
 **Measured once** (the pilot company, cancho-tools issue 69, `claude-haiku-5-5`, the command a `sandbox-exec` wrapper that allows no network, no writing outside the copy and the temporary directory, and no reading of the home's hidden directories): accepted on the second attempt in 131 seconds; the first run of the step was `change-stuck` after four attempts because the worker's bare environment found a Python without the package the harness imports, which the wrapper now says for itself.
+
+## 30. Issue intake: `forge company intake` (slice 7 of [`company-lifecycle.md`](company-lifecycle.md), section 4.4)
+
+**Status: built and tested, no model, no network** (unit tests `tests/company_issue_test.cho` and the issue cases of `tests/company_intake_test.cho`;
+end to end `tests/conformance/company_intake.sh`, run by `scripts/gate.sh`, which reaches every tag below). Added 2026-11-28.
+
+```
+forge company intake <company-dir> <operator-file> <issues-file> [now=YYYY-MM-DD]
+```
+
+Forge has no network, and this verb does not add one: the operator, or a timer, writes the issues file and Forge reads it.
+
+```sh
+gh issue list --repo <owner>/<name> --state open --label bug --json number,title,body,url,labels,state > /abs/issues-<name>.json
+forge company intake /abs/company /abs/operator.json /abs/issues-<name>.json now=2026-11-28
+```
+
+Each element of the array, in the file's order, is filed as a change request or skipped. Filing is `change add`'s: the same writer, the same
+`intake` limits (section 24), the same flow check (section 18), the request text in `changes/<id>.txt` and only its hash in the journal. What an
+issue gives:
+
+| field | how it is read |
+|---|---|
+| `url` | must be `https://github.com/<owner>/<name>/issues/<number>`, at most 300 bytes of letters, digits and `-_./:`. It is the change's `source_ref`; the `source_type` is `issue`. |
+| `<owner>/<name>` | the repository: the one row of the operator file's `repos` whose `slug` it is (no row, or two rows, is `repo-unknown`), and the manifest must list that row's id |
+| `labels[].name` | the kind, by a closed table: `bug` gives `bug` with the justification `defect`; `enhancement` or `feature` gives `feature` with the justification **`issue`** (nobody at the operator's account asked for it, so it is neither `operator` nor a goal). Case matters. No label of the table, or both kinds, is `intake-kind-unmapped`. `feedback` and `compiler-bump` never come from an issue. |
+| `state` | when it is there and is not `OPEN`, the issue is skipped (`intake-issue-closed`); when it is not there, the operator's query chose |
+| `title` | one line with no control byte (else `change-malformed`), kept whole in the request and cut to 200 bytes on a character boundary for the record |
+| `body` | **never read**: decoded and copied after the URL and the title (`<url>\n<title>\n\n<body>`), the whole cut at 16 KiB on a character boundary with a marker line |
+
+Any other field (`number`, `author`, comments) is ignored. **A change filed from an issue is always `proposed`, a bug too**: `forge company decide
+<dir> admit:<id> approved <reason>` is what makes it work (design section 4.4: whoever can open an issue is someone Forge does not know).
+
+**Skips** (a line `issue <url> skipped: <tag>`, and intake goes on): `intake-issue-malformed` (an element that is not an object, a URL not of the
+form, a pull request's URL, no title), `intake-issue-closed`, `repo-unknown`, `intake-kind-unmapped`, `flow-unknown`, `change-malformed`,
+`change-duplicate` (a change was filed from this URL already, earlier in the file or by an earlier intake). Each filed issue is a line
+`issue <url> filed as change <id>: proposed`; the last line is `intake: <n> filed, <m> skipped`. Exit 0.
+
+**Refusals**: `intake-file-malformed` (the file cannot be read, is over 8 MiB, is not JSON, is not an array, or holds over 1000 issues; nothing
+written), `operator-invalid`, `clock-invalid`, `clock-went-back`, `path-invalid` (exit 2), the journal's own; exit 1. `change-rate-limited` stops
+the walk at the issue that met the limit: what was filed before it stays, a `limit:` line says which limit, and a `left: <n>` line counts the
+issues not looked at, for a later intake. Exit 1.
+
+**The file is the operator's.** Forge reads it and never writes, moves or deletes it. Because a URL is filed once, running intake on the same file
+again (on a timer, after a limit) files only what is new, and an issue closed and opened again is not filed a second time.
+
+**Authority: unchanged.** The verb uses the rows of `change add` (`fs_read`, `fs_write`, `file_read`, `file_write`, `io_write`). It lists no
+directory: the issues file is an argument.
+
+**Where the design and the code differ.** (1) The design reads `intake/issues/*.json`; Forge has no directory listing in the rows its company verbs
+hold, so the operator names one file per call (one `gh issue list` per repository). (2) The design's `change-duplicate` compares the reference and
+the body hash with an *open* change; the code compares the URL with *any* change from an issue, open or not, so an edited issue is not filed
+again (a person files it with `change add` if it should be). (3) The journal records the URL, not the issue's number or author. (4) Nothing
+writes a request in the form the cancho-code selection reads best (names in backticks): the body is the issue's as it was written, and how
+well such requests build is not measured yet. (5) Only a change *from an issue* is known by its URL: a change the operator filed by hand with
+`change add` for the same issue has no URL in the journal, so intake files that issue again. Seen on 2026-11-28 on a copy of the pilot company,
+whose `chg-0001` is gateway issue 71 filed by hand: an intake of that issue, marked open for the test, filed it a second time. A company that
+moves to intake should file through intake only, or close the issues it filed by hand.
 

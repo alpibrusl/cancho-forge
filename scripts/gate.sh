@@ -16,6 +16,7 @@
 #   repository layer    each question of src/repo_vcs.cho asked of a git and of a cancho vcs repository with the same files (tests/conformance/repo_vcs.sh)
 #   company review      `forge company run` of a repo.review step, the model reviewer's worker a stand-in (tests/conformance/company_review.sh)
 #   company change add  `forge company change add` and the `admit:` gate end to end, every tag of the verb (tests/conformance/company_change_add.sh)
+#   company intake      `forge company intake` of a file of issues end to end, every skip and refusal of the verb (tests/conformance/company_intake.sh)
 #   audit mutants harness  the mutants script's verdict and scratch directory (tests/conformance/audit_mutants_harness.sh)
 #   company derive      derived steps of a flow in `status` and `decide`, nothing derived before admission (tests/conformance/company_derive.sh)
 #   company publish lib `forge company publish` of a library step (tests/conformance/repo_publish_library.sh)
@@ -312,6 +313,12 @@ CANCHO="$C" sh tests/conformance/company_change_add.sh "$scratch/company-change-
 cat "$scratch/company-change-add.out"
 if grep -q '^FAIL ' "$scratch/company-change-add.out"; then fail=1; fi
 
+echo "== forge company intake (issues from a file as change requests; tests/conformance/company_intake.sh)"
+mkdir "$scratch/company-intake" || exit 1
+CANCHO="$C" sh tests/conformance/company_intake.sh "$scratch/company-intake" > "$scratch/company-intake.out" || fail=1
+cat "$scratch/company-intake.out"
+if grep -q '^FAIL ' "$scratch/company-intake.out"; then fail=1; fi
+
 echo "== derived steps (status and decide over the steps a flow derives for an admitted change; tests/conformance/company_derive.sh)"
 mkdir "$scratch/company-derive" || exit 1
 CANCHO="$C" sh tests/conformance/company_derive.sh "$scratch/company-derive" > "$scratch/company-derive.out" || fail=1
@@ -408,7 +415,7 @@ fi
 
 echo "== docs: every rule tag the company code can print is in docs/company.md and docs/architecture.md"
 # An oracle from outside the program: the tags are the kebab-case string literals of the company files and the tool task (listed; workers/*.cho are left out: their literals include non-tag names).
-company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_change.cho src/company_change_cmd.cho src/company_check.cho src/company_cmd.cho src/company_derive.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_needs.cho src/company_provision.cho src/company_run.cho src/company_runner.cho src/company_run_io.cho src/company_repo_steps.cho src/company_review_step.cho src/review_step.cho src/company_state.cho src/company_step.cho src/company_time.cho src/company_publish.cho src/publish_plan.cho src/step_run.cho src/tool_call.cho src/tool_task.cho src/repo_row.cho src/patch_check.cho src/repo_task.cho src/repo_call.cho src/company_authority.cho src/company_review.cho src/company_autopub.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
+company_tags=$( { grep -ho '"[a-z][a-z]*\(-[a-z][a-z]*\)\+"' src/company_budget.cho src/company_change.cho src/company_change_cmd.cho src/company_intake_cmd.cho src/company_issue.cho src/company_check.cho src/company_cmd.cho src/company_derive.cho src/company_files.cho src/company_graph.cho src/company_manifest.cho src/company_needs.cho src/company_provision.cho src/company_run.cho src/company_runner.cho src/company_run_io.cho src/company_repo_steps.cho src/company_review_step.cho src/review_step.cho src/company_state.cho src/company_step.cho src/company_time.cho src/company_publish.cho src/publish_plan.cho src/step_run.cho src/tool_call.cho src/tool_task.cho src/repo_row.cho src/patch_check.cho src/repo_task.cho src/repo_call.cho src/company_authority.cho src/company_review.cho src/company_autopub.cho | tr -d '"'; echo "journal-corrupt event-malformed workspace-locked path-invalid" | tr ' ' '\n'; } | sort -u)
 for t in $company_tags; do
   for d in docs/company.md docs/architecture.md; do
     if grep -qF "\`$t\`" "$d"; then :; else echo "FAIL docs: tag $t is not in $d"; fail=1; fi
