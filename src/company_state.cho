@@ -333,6 +333,12 @@ pub fn clock_set[&h, &a](heap: &!h Heap, seq: int, at: &a [byte]) -> [heap] buff
 
 // A change `id` was proposed for repository `repo`; `body_sha256` and `body_bytes` name the request text, which is a file and never the journal's.
 pub fn change_proposed[&h, &i, &r, &k, &t, &u, &s, &b, &j](heap: &!h Heap, seq: int, id: &i [byte], repo: &r [byte], ckind: &k [byte], source_type: &t [byte], source_ref: &u [byte], title: &s [byte], body_sha256: &b [byte], body_bytes: int, justification: &j [byte]) -> [heap] buffer.Buffer {
+    return change_proposed_for(heap, seq, id, repo, ckind, source_type, source_ref, title, body_sha256, body_bytes, justification, "");
+}
+
+// The same, with `issue`: the URL of the issue an operator's `change add ... url=<url>` answers (docs/company.md section 30), written as the
+// field `issue` when not empty, so that `forge company intake` does not file that issue a second time.
+pub fn change_proposed_for[&h, &i, &r, &k, &t, &u, &s, &b, &j, &q](heap: &!h Heap, seq: int, id: &i [byte], repo: &r [byte], ckind: &k [byte], source_type: &t [byte], source_ref: &u [byte], title: &s [byte], body_sha256: &b [byte], body_bytes: int, justification: &j [byte], issue: &q [byte]) -> [heap] buffer.Buffer {
     var w = opened(heap, seq, kind_change_proposed(), id);
     w = json.put_key(heap, w, "repo");
     w = json.put_string(heap, w, repo);
@@ -350,6 +356,10 @@ pub fn change_proposed[&h, &i, &r, &k, &t, &u, &s, &b, &j](heap: &!h Heap, seq: 
     w = json.put_int(heap, w, body_bytes);
     w = json.put_key(heap, w, "justification");
     w = json.put_string(heap, w, justification);
+    if len(issue) > 0 {
+        w = json.put_key(heap, w, "issue");
+        w = json.put_string(heap, w, issue);
+    }
     return closed(heap, w);
 }
 
@@ -721,8 +731,16 @@ fn apply[&h, &l, &m, &a, &s, &k, &c, &y, &x](heap: &!h Heap, line: &l [byte], ex
                         // intake of the same issue files nothing. Only a plain reference is kept: intake writes no other kind.
                         let st_node = json.get(line, tp, 0, "source_type");
                         let ref_node = json.get(line, tp, 0, "source_ref");
+                        // An operator's change for an issue (`change add ... url=`) carries the URL as `issue`, and is found again the same way.
+                        let is_node = json.get(line, tp, 0, "issue");
+                        var url_node = 0 - 1;
                         if json.string_plain(tp, st_node) && json.string_plain(tp, ref_node) && bytes.equal(json.string_view(line, tp, st_node), "issue") {
-                            let uk = ledger_key(heap, "u:", json.string_view(line, tp, ref_node));
+                            url_node = ref_node;
+                        } else if is_node >= 0 && json.string_plain(tp, is_node) {
+                            url_node = is_node;
+                        }
+                        if url_node >= 0 {
+                            let uk = ledger_key(heap, "u:", json.string_view(line, tp, url_node));
                             borrow uk as &ukb in {
                                 inf = map.put(heap, inf, buffer.bytes(ukb), 1);
                             }

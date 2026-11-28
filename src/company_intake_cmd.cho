@@ -357,7 +357,7 @@ fn filed[&h, &f, &i, &d, &m, &j, &u, &r, &k, &y, &t, &b, &n](heap: &!h Heap, fs:
                         io.write_all(io, "issue ");
                         io.write_all(io, url);
                         io.write_all(io, " filed as ");
-                        code = company_change_cmd.add_written(heap, fs, io, dir, jpath, existed, rep, company_state.change_count(sr, 0) + 1, repo, kind, company_change.kind_code(kind), why, title, body, now, company_state.last_day(sr), url);
+                        code = company_change_cmd.add_written(heap, fs, io, dir, jpath, existed, rep, company_state.change_count(sr, 0) + 1, repo, kind, company_change.kind_code(kind), why, title, body, now, company_state.last_day(sr), url, true);
                     }
                 }
             }

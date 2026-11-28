@@ -278,6 +278,19 @@ fn test_a_change_filed_from_an_issue_is_found_by_its_url_and_no_other[&h](heap: 
     return 0;
 }
 
+fn test_an_operator_change_with_an_issue_field_is_found_by_that_url[&h](heap: &!h Heap) -> [heap] int {
+    var j = buffer.empty(heap, 512);
+    j = add(heap, j, company_state.change_proposed_for(heap, 1, "chg-0001", "diff", "bug", "operator", "ana", "t", sha(), 1, "defect", "https://github.com/a/diff/issues/7"));
+    j = add(heap, j, company_state.change_proposed_for(heap, 2, "chg-0002", "diff", "bug", "operator", "ana", "t", sha(), 1, "defect", ""));
+    borrow j as &jb in {
+        test.assert(filed_of(heap, buffer.bytes(jb), "https://github.com/a/diff/issues/7"));
+        test.assert(filed_of(heap, buffer.bytes(jb), "ana") == false);
+        test.assert(filed_of(heap, buffer.bytes(jb), "") == false);
+    }
+    buffer.drop(heap, j);
+    return 0;
+}
+
 fn test_a_journal_with_no_issue_has_none_filed[&h](heap: &!h Heap) -> [heap] int {
     test.assert(filed_of(heap, "", "https://github.com/a/diff/issues/7") == false);
     return 0;
